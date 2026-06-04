@@ -37,7 +37,29 @@ _CORS_HEADERS = {
 _BROWSER_SOURCES = {"click", "target", "clipboard", "structured_read"}
 
 
-def make_handler(writer):
+class CollectorStats:
+    """Lightweight, thread-safe-enough counters so the control surface (§6) can
+    report whether the browser extension is connected and when events last
+    arrived. Optional; passing ``None`` to ``make_handler`` preserves the original
+    behavior exactly."""
+
+    def __init__(self):
+        self.browser_event_count = 0
+        self.last_event_ts = None  # ISO-8601 string of the last accepted browser event
+
+    def record(self, ts):
+        self.browser_event_count += 1
+        self.last_event_ts = ts
+
+    def snapshot(self):
+        return {
+            "detected": self.browser_event_count > 0,
+            "browser_event_count": self.browser_event_count,
+            "last_event_ts": self.last_event_ts,
+        }
+
+
+def make_handler(writer, stats=None):
     class Handler(BaseHTTPRequestHandler):
         # quiet the default logging noise
         def log_message(self, *args):  # noqa: D401
@@ -61,7 +83,10 @@ def make_handler(writer):
 
         def do_GET(self):
             if self.path == "/health":
-                self._send(200, {"ok": True, "paused": writer.paused})
+                body = {"ok": True, "paused": writer.paused}
+                if stats is not None:
+                    body.update(stats.snapshot())
+                self._send(200, body)
             else:
                 self._send(404, {"error": "not found"})
 
@@ -84,8 +109,10 @@ def make_handler(writer):
                 source = ev.get("source")
                 if source not in _BROWSER_SOURCES:
                     continue
-                writer.write(source, ev.get("payload", {}), ts=ev.get("ts"))
+                rec = writer.write(source, ev.get("payload", {}), ts=ev.get("ts"))
                 written += 1
+                if stats is not None and rec is not None:
+                    stats.record(rec["ts"])
             self._send(200, {"written": written})
 
     return Handler

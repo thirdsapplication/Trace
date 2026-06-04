@@ -33,6 +33,7 @@ needs.
 trace/
   capture/                 Engine 1a — capture -> raw_events.jsonl
     capture.py             local macOS process: keystrokes + window + clipboard
+    controller.py          programmatic start/stop/pause/resume/status (for the UI)
     keystrokes.py          coalesces keys into typed segments (Appendix A logic)
     window.py              active-window spine (osascript poll)
     clipboard.py           outside-browser pasteboard poll
@@ -47,11 +48,18 @@ trace/
     chunking.py            load/order/id/render + chronological chunking
     validate.py            schema validation, action normalization, fragment checks
     cli.py                 command-line entry point
+  ui/                      local test harness (drives the engine from a window)
+    app.py                 stdlib HTTP backend (local-only); the API
+    keystore.py            secure API-key storage (Keychain / 0600 file)
+    permissions.py         macOS permission + browser-capture status checks
+    sessions.py            dated capture+reconstruct session storage
+    static/                single-page front end (index.html, app.js, style.css)
   schema/                  the frozen contract
     SCHEMA.md              human-readable schema + why each constraint exists
     raw_event.schema.json, event_log.schema.json
   samples/                 a domain-neutral sample raw stream (NOT a test slice)
   tests/                   unittest suite (no API key / pynput required)
+launch_ui.command          double-click launcher for the test UI (macOS)
 ```
 
 Capture is built as **independent capturers feeding one shared append-only
@@ -166,10 +174,45 @@ first chunk — capture and `--dry-run` are unaffected.
 python -m unittest discover -s trace/tests -t . -p "test_*.py"
 ```
 
-The suite (47 tests) covers redaction, keystroke coalescing, the raw writer,
-chunking, schema validation/normalization, fragment-stitch flagging, and the full
-reconstruction pipeline with a mock model — so it runs without an API key or
-`pynput`.
+The suite (69 tests) covers redaction, keystroke coalescing, the raw writer,
+chunking, schema validation/normalization, fragment-stitch flagging, the full
+reconstruction pipeline with a mock model, plus the test-UI backend (key store,
+sessions, capture lifecycle, reconstruct guards) — so it runs without an API key,
+`pynput`, or a browser.
+
+## Local test UI (run the whole engine from a window)
+
+For the operator validating the engine, there's a **local web UI** that drives
+everything above without the terminal: enter/test the API key, start/stop/pause a
+capture, run reconstruction (or a free dry-run preview) with progress, and inspect
+the resulting JSON. It's a thin controller over the *unchanged* engine.
+
+```bash
+python -m trace.ui.app            # opens http://127.0.0.1:8765/ in your browser
+# or on macOS, double-click launch_ui.command
+```
+
+It is **local-only** (binds 127.0.0.1, no accounts, no remote anything — capture
+needs OS permissions and local files). What it does:
+
+- **Settings** — masked API-key field with a **Test key** button (one tiny call to
+  confirm it works), a macOS **permissions** checklist (Accessibility + Input
+  Monitoring), and **browser-capture** status from the collector.
+- **Capture** — one Start/Stop button, a live capturing indicator with elapsed
+  timer and event count, and Pause/Resume.
+- **Reconstruct** — an explicit Reconstruct button (with per-chunk progress) and a
+  free **Preview (dry run)**; guarded against empty/short recordings and a missing
+  key.
+- **Results** — the engine's `event_log.json` shown as pretty JSON, alongside the
+  **review-flags** report and the **raw stream**, with copy/export; plus **session
+  history** to reopen past runs (and re-reconstruct to check run-to-run stability).
+
+The key is stored in the **macOS Keychain** (via `keyring`) when available, else a
+`0600` `~/.trace/config.json`, and is never returned over the API, logged, or
+written into results. The UI adds two small, additive seams to the engine — a
+`CaptureController` (`start/stop/pause/resume/status`) and an optional
+`progress_cb` on `reconstruct()` — but the capture/reconstruction/validation logic
+is unchanged, so what you test through the UI is the real engine.
 
 ## The contract: `event_log.json`
 

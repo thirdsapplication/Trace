@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Trace — Engine 1 Test Harness</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header>
+    <h1>Trace · Engine 1 Test Harness</h1>
+    <span id="statePill" class="pill idle">idle</span>
+  </header>
+
+  <main>
+    <!-- SETTINGS ------------------------------------------------------- -->
+    <section class="panel">
+      <h2>Settings</h2>
+
+      <div class="row">
+        <label for="apiKey">Anthropic API key</label>
+        <input id="apiKey" type="password" placeholder="sk-ant-…" autocomplete="off" />
+        <button id="saveKey">Save</button>
+        <button id="testKey" class="secondary">Test key</button>
+      </div>
+      <p class="help">
+        Paste your key from <code>console.anthropic.com</code> (starts with
+        <code>sk-ant-</code>). Stored securely (macOS Keychain when available);
+        never shown again or written to results.
+      </p>
+      <p id="keyStatus" class="status-line"></p>
+      <p id="testKeyResult" class="status-line"></p>
+
+      <div class="subgrid">
+        <div>
+          <h3>macOS permissions <button id="refreshPerms" class="link">refresh</button></h3>
+          <ul id="perms" class="checklist"><li>checking…</li></ul>
+        </div>
+        <div>
+          <h3>Browser capture</h3>
+          <p id="browserStatus" class="status-line">Only reported while capturing.</p>
+          <p class="help">Keystroke + window capture work without the extension;
+            the extension adds clicks, in-browser clipboard, and structured reads.
+            See <code>trace/extension/README.md</code> to install it (Chrome).</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- CAPTURE -------------------------------------------------------- -->
+    <section class="panel">
+      <h2>Capture</h2>
+      <div class="row">
+        <button id="startStop" class="primary">Start capture</button>
+        <button id="pauseResume" class="secondary" disabled>Pause</button>
+        <span class="metric">⏱ <span id="elapsed">00:00</span></span>
+        <span class="metric">events: <span id="eventCount">0</span></span>
+        <span id="captureSid" class="muted"></span>
+      </div>
+      <p class="help">Start, perform your scripted work session, then Stop. The
+        timer and event count confirm it's recording.</p>
+    </section>
+
+    <!-- RECONSTRUCT ---------------------------------------------------- -->
+    <section class="panel">
+      <h2>Reconstruct</h2>
+      <div class="row">
+        <button id="reconstruct" class="primary" disabled>Reconstruct</button>
+        <button id="dryRun" class="secondary" disabled>Preview (dry run · free)</button>
+        <span id="reconTarget" class="muted"></span>
+      </div>
+      <div id="progressWrap" class="progress-wrap hidden">
+        <div id="progressBar" class="progress-bar"></div>
+        <span id="progressText"></span>
+      </div>
+      <p id="reconMsg" class="status-line"></p>
+      <p class="help">Reconstruct calls Haiku and costs money; Preview shows exactly
+        what would be sent, for free.</p>
+    </section>
+
+    <!-- RESULTS -------------------------------------------------------- -->
+    <section class="panel">
+      <h2>Results <span id="resultsSid" class="muted"></span></h2>
+      <div class="tabs">
+        <button class="tab active" data-tab="event_log">event_log.json</button>
+        <button class="tab" data-tab="validation">review flags</button>
+        <button class="tab" data-tab="raw">raw stream</button>
+        <button class="tab" data-tab="dryrun">dry-run preview</button>
+        <span class="spacer"></span>
+        <button id="copyBtn" class="link">copy</button>
+        <button id="exportBtn" class="link">export</button>
+      </div>
+      <pre id="jsonView" class="json-view">Select or create a session to view its output.</pre>
+    </section>
+
+    <!-- HISTORY -------------------------------------------------------- -->
+    <section class="panel">
+      <h2>Session history <button id="refreshSessions" class="link">refresh</button></h2>
+      <table id="sessionsTable">
+        <thead><tr><th>Session</th><th>Created</th><th>Raw</th><th>Events</th><th>Reconstructed</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,136 @@
+"""Session storage for the test UI.
+
+Each capture-and-reconstruct is a dated session directory under a sessions root:
+
+    <root>/<session_id>/
+        raw_events.jsonl       the captured stream (engine artifact)
+        event_log.json         the reconstruction (engine artifact, after Reconstruct)
+        validation_report.json the review flags / repairs (after Reconstruct)
+        meta.json              UI bookkeeping (created/stopped/reconstructed times, counts)
+
+The UI treats the three engine artifacts as read-only products. ``meta.json`` is
+the only file this module writes beyond what the engine produces.
+"""
+
+import datetime
+import json
+import os
+
+RAW = "raw_events.jsonl"
+EVENT_LOG = "event_log.json"
+VALIDATION = "validation_report.json"
+META = "meta.json"
+
+
+def _now():
+    return datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def new_session_id():
+    # filesystem-safe, sortable
+    return datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
+def session_dir(root, sid):
+    return os.path.join(root, sid)
+
+
+def path(root, sid, name):
+    return os.path.join(session_dir(root, sid), name)
+
+
+def create_session(root, label=None):
+    sid = new_session_id()
+    d = session_dir(root, sid)
+    os.makedirs(d, exist_ok=True)
+    meta = {"id": sid, "label": label, "created_at": _now(),
+            "stopped_at": None, "reconstructed_at": None}
+    write_meta(root, sid, meta)
+    return sid
+
+
+def read_meta(root, sid):
+    try:
+        with open(path(root, sid, META), "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {"id": sid}
+
+
+def write_meta(root, sid, meta):
+    with open(path(root, sid, META), "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
+
+
+def update_meta(root, sid, **fields):
+    meta = read_meta(root, sid)
+    meta.update(fields)
+    write_meta(root, sid, meta)
+    return meta
+
+
+def _count_lines(p):
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            return sum(1 for line in f if line.strip())
+    except FileNotFoundError:
+        return 0
+
+
+def artifacts(root, sid):
+    """Which engine artifacts exist for this session, plus simple counts."""
+    raw_p = path(root, sid, RAW)
+    log_p = path(root, sid, EVENT_LOG)
+    val_p = path(root, sid, VALIDATION)
+    log_count = None
+    if os.path.exists(log_p):
+        try:
+            with open(log_p, "r", encoding="utf-8") as f:
+                log_count = len(json.load(f))
+        except (json.JSONDecodeError, OSError):
+            log_count = None
+    return {
+        "raw": os.path.exists(raw_p),
+        "raw_event_count": _count_lines(raw_p),
+        "event_log": os.path.exists(log_p),
+        "event_count": log_count,
+        "validation": os.path.exists(val_p),
+    }
+
+
+def list_sessions(root):
+    if not os.path.isdir(root):
+        return []
+    out = []
+    for sid in sorted(os.listdir(root), reverse=True):
+        if not os.path.isdir(session_dir(root, sid)):
+            continue
+        meta = read_meta(root, sid)
+        meta = {**meta, "artifacts": artifacts(root, sid)}
+        out.append(meta)
+    return out
+
+
+def read_json_artifact(root, sid, name):
+    """Return parsed JSON for event_log/validation, or None if missing."""
+    p = path(root, sid, name)
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def read_raw_events(root, sid):
+    """Return the raw stream as a parsed array (one object per line)."""
+    p = path(root, sid, RAW)
+    rows = []
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    rows.append(json.loads(line))
+    except FileNotFoundError:
+        return None
+    return rows

@@ -83,11 +83,15 @@ def _build_user_content(summary, rendered_lines):
 
 
 def reconstruct(raw_path, model=DEFAULT_MODEL, chunk_size=120, overlap=20,
-                model_fn=None):
+                model_fn=None, progress_cb=None):
     """Reconstruct an event log from a raw stream.
 
     Returns ``(event_log, report)`` where ``event_log`` is a list of event dicts
     matching the frozen contract and ``report`` is a ``ValidationReport``.
+
+    ``progress_cb`` is an optional ``callable(done, total)`` invoked once before
+    processing (``0, total``) and after each chunk. It is a pure observation hook
+    for UIs/progress bars and does not affect reconstruction logic.
     """
     raw = chunking.load_raw(raw_path)
     raw_by_id = {r["id"]: r for r in raw}
@@ -99,10 +103,13 @@ def reconstruct(raw_path, model=DEFAULT_MODEL, chunk_size=120, overlap=20,
         model_fn = _default_model_fn(model)
 
     chunks = chunking.chunk(raw, chunk_size=chunk_size, overlap=overlap)
+    total = len(chunks)
+    if progress_cb:
+        progress_cb(0, total)
 
     chunk_outputs = []
     running = []  # accumulated *validated* events, for the running summary only
-    for ch in chunks:
+    for i, ch in enumerate(chunks, start=1):
         summary = chunking.summarize(running)
         rendered = [chunking.render_event(ev) for ev in ch]
         user = _build_user_content(summary, rendered)
@@ -114,6 +121,8 @@ def reconstruct(raw_path, model=DEFAULT_MODEL, chunk_size=120, overlap=20,
             cleaned = validate.validate_event(ev, raw_by_id, validate.ValidationReport())
             if cleaned:
                 running.append(cleaned)
+        if progress_cb:
+            progress_cb(i, total)
 
     event_log = validate.stitch(chunk_outputs, raw_by_id, report)
     return event_log, report
