@@ -74,7 +74,7 @@ read-only content is instead recovered by scoped structured reads).
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt          # anthropic; pynput only on macOS
-export ANTHROPIC_API_KEY=sk-...           # for reconstruction
+export ANTHROPIC_API_KEY=sk-ant-...       # for reconstruction (see "Anthropic API key" below)
 ```
 
 ## Running Engine 1 end to end
@@ -94,6 +94,17 @@ python -m trace.capture.capture --out captures/raw_events.jsonl --append
 
 Then load `trace/extension/` as an unpacked Chrome extension (see
 `extension/README.md`). The extension badge shows `REC`; click it to pause.
+
+> **Browser support:** the extension currently works on **Chrome / Chromium-based
+> browsers only** (Chrome, Edge, Brave, Arc, Opera). It is a Manifest V3 extension
+> built on the `chrome.*` APIs and does **not** run on Safari yet — Safari uses a
+> different extension model (a native-app-wrapped Web Extension, the `browser.*`
+> namespace, and native messaging instead of a localhost `fetch`). A Safari port
+> would reuse the `content.js` capture logic but needs a new shell; see the open
+> items below. Note the **local capture process works regardless of browser** — a
+> Safari user still gets keystrokes, window titles, and clipboard; without the
+> extension they only lose the additive browser stack (click targets, in-browser
+> clipboard direction, scoped structured reads).
 
 - The local process needs macOS **Input Monitoring** permission.
 - `Ctrl-Shift-P` pauses/resumes the local capture; `Ctrl-C` stops it.
@@ -119,6 +130,35 @@ python -m trace.reconstruct.cli captures/raw_events.jsonl --dry-run --chunk-size
 ```
 
 A domain-neutral example stream is in `trace/samples/sample_raw_events.jsonl`.
+
+#### Anthropic API key (the Haiku step)
+
+The reconstruct step is the only part that calls a model — `claude-haiku-4-5` via
+the Anthropic API — so it needs an **Anthropic API key**. (Capture, `--dry-run`,
+and the test suite need no key and make no API calls.)
+
+The key is **not** entered interactively or stored in the repo. Under the hood
+`reconstruct.py` constructs `anthropic.Anthropic()`, which by default reads the
+key from the **`ANTHROPIC_API_KEY` environment variable** — so that is where the
+user supplies it:
+
+```bash
+# get a key from https://console.anthropic.com/  (starts with sk-ant-...)
+export ANTHROPIC_API_KEY=sk-ant-...        # current shell, or add to ~/.zshrc
+python -m trace.reconstruct.cli captures/raw_events.jsonl -o captures/event_log.json
+```
+
+Prefer not to export it globally? Set it for the single command, or keep it in a
+git-ignored `.env` and source it:
+
+```bash
+ANTHROPIC_API_KEY=sk-ant-... python -m trace.reconstruct.cli captures/raw_events.jsonl -o out.json
+# or:  echo 'ANTHROPIC_API_KEY=sk-ant-...' > .env && set -a && source .env && set +a
+```
+
+`.env` is already in `.gitignore`, so the key never gets committed. If the key is
+missing or invalid, the Anthropic client raises an authentication error at the
+first chunk — capture and `--dry-run` are unaffected.
 
 ### 3. Run the tests
 
