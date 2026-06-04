@@ -1,0 +1,16 @@
+{"ts": "2026-06-04T09:00:00.000-07:00", "source": "window", "payload": {"app": "Webmail", "title": "Inbox — request from a vendor"}}
+{"ts": "2026-06-04T09:00:04.000-07:00", "source": "structured_read", "payload": {"url": "https://mail.example.com/m/1", "anchor": "page_load", "elements": [{"role": "heading", "label": "Subject", "value": "Quote needed for 3 items"}, {"role": "text", "label": "From", "value": "vendor@example.com"}]}}
+{"ts": "2026-06-04T09:00:30.000-07:00", "source": "window", "payload": {"app": "Preview", "title": "request-form.pdf"}}
+{"ts": "2026-06-04T09:01:10.000-07:00", "source": "window", "payload": {"app": "Numbers", "title": "Worklog — Sheet1"}}
+{"ts": "2026-06-04T09:01:12.000-07:00", "source": "keystroke", "payload": {"text": "Item A 10 units", "window": "Worklog — Sheet1", "ts_end": "2026-06-04T09:01:18.000-07:00"}}
+{"ts": "2026-06-04T09:01:20.000-07:00", "source": "window", "payload": {"app": "Preview", "title": "request-form.pdf"}}
+{"ts": "2026-06-04T09:01:30.000-07:00", "source": "window", "payload": {"app": "Numbers", "title": "Worklog — Sheet1"}}
+{"ts": "2026-06-04T09:01:32.000-07:00", "source": "keystroke", "payload": {"text": " [TAB] 250.00 [ENTER] ", "window": "Worklog — Sheet1", "ts_end": "2026-06-04T09:01:40.000-07:00"}}
+{"ts": "2026-06-04T09:02:00.000-07:00", "source": "click", "payload": {"x": 420, "y": 180, "button": "left", "target": {"role": "combobox", "label": "Status", "value": "Pending"}}}
+{"ts": "2026-06-04T09:02:02.000-07:00", "source": "structured_read", "payload": {"url": "https://app.example.com/orders", "anchor": "click", "elements": [{"role": "option", "label": "Pending", "value": ""}, {"role": "option", "label": "Confirmed", "value": ""}]}}
+{"ts": "2026-06-04T09:02:30.000-07:00", "source": "window", "payload": {"app": "Webmail", "title": "Reply — Quote needed for 3 items"}}
+{"ts": "2026-06-04T09:02:35.000-07:00", "source": "keystroke", "payload": {"text": "Hi, your quote total is 250.00. Thanks. [ENTER] ", "window": "Reply — Quote needed for 3 items", "ts_end": "2026-06-04T09:02:55.000-07:00"}}
+{"ts": "2026-06-04T09:03:00.000-07:00", "source": "click", "payload": {"x": 90, "y": 640, "button": "left", "target": {"role": "button", "label": "Send", "value": ""}}}
+{"ts": "2026-06-04T09:03:30.000-07:00", "source": "clipboard", "payload": {"op": "copy", "content": "REF-00042"}}
+{"ts": "2026-06-04T09:03:40.000-07:00", "source": "window", "payload": {"app": "Numbers", "title": "Worklog — Review tab"}}
+{"ts": "2026-06-04T09:03:45.000-07:00", "source": "clipboard", "payload": {"op": "paste", "content": "REF-00042"}}

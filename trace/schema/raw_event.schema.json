@@ -1,0 +1,129 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://trace.dev/schema/raw_event.schema.json",
+  "title": "Trace raw capture event",
+  "type": "object",
+  "required": ["ts", "source", "payload"],
+  "additionalProperties": false,
+  "properties": {
+    "ts": { "type": "string", "description": "ISO-8601 timestamp, millisecond precision" },
+    "source": {
+      "type": "string",
+      "enum": ["keystroke", "window", "click", "target", "clipboard", "structured_read"]
+    },
+    "payload": { "type": "object" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "source": { "const": "window" } } },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "required": ["app", "title"],
+            "properties": {
+              "app": { "type": "string" },
+              "title": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "source": { "const": "keystroke" } } },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "required": ["text", "window", "ts_end"],
+            "properties": {
+              "text": { "type": "string" },
+              "window": { "type": "string" },
+              "ts_end": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "source": { "const": "click" } } },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "required": ["x", "y", "button"],
+            "properties": {
+              "x": { "type": "number" },
+              "y": { "type": "number" },
+              "button": { "type": "string", "enum": ["left", "right", "middle"] },
+              "target": {
+                "type": ["object", "null"],
+                "properties": {
+                  "role": { "type": "string" },
+                  "label": { "type": "string" },
+                  "value": { "type": "string" }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "source": { "const": "target" } } },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "properties": {
+              "role": { "type": "string" },
+              "label": { "type": "string" },
+              "value": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "source": { "const": "clipboard" } } },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "required": ["op", "content"],
+            "properties": {
+              "op": { "type": "string", "enum": ["copy", "cut", "paste"] },
+              "content": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "source": { "const": "structured_read" } } },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "required": ["anchor", "elements"],
+            "properties": {
+              "url": { "type": "string" },
+              "anchor": { "type": "string", "enum": ["page_load", "click", "focus"] },
+              "elements": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "role": { "type": "string" },
+                    "label": { "type": "string" },
+                    "value": { "type": "string" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

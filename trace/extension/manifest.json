@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "Trace Capture (browser signals)",
+  "version": "1.0.0",
+  "description": "Captures clicks, element targets, in-browser clipboard, and scoped structured reads, and posts them to the local Trace collector. No screenshots, no full-page DOM dumps, never password fields.",
+  "permissions": ["clipboardRead", "storage", "activeTab", "scripting"],
+  "host_permissions": ["http://127.0.0.1:8137/*", "<all_urls>"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
+  "action": {
+    "default_title": "Trace Capture: click to pause/resume"
+  }
+}

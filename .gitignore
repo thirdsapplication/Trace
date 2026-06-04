@@ -1,0 +1,18 @@
+# Captured data — never commit raw capture or reconstructed logs.
+captures/
+*.jsonl
+!trace/samples/*.jsonl
+# reconstructed event logs (but NOT the schema under trace/schema/)
+/event_log.json
+/captures/event_log.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Secrets
+.env

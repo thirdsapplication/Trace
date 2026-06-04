@@ -1,0 +1,11 @@
+# Trace Engine 1 dependencies.
+
+# Reconstruction (Engine 1b) — calls claude-haiku-4-5.
+anthropic>=0.40.0
+
+# Local capture (Engine 1a, macOS only). Not needed to run reconstruction or
+# the test suite; install on the capture machine.
+pynput>=1.7.6 ; sys_platform == "darwin"
+
+# The collector and reconstruction use only the Python standard library
+# otherwise (http.server, json, fcntl, argparse, unittest).

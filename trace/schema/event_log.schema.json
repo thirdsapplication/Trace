@@ -1,0 +1,25 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://trace.dev/schema/event_log.schema.json",
+  "title": "Trace reconstructed event log (Engine 1 -> Engine 2 contract)",
+  "type": "array",
+  "items": {
+    "type": "object",
+    "required": ["id", "ts_start", "ts_end", "app", "window", "action", "detail", "evidence", "confidence"],
+    "additionalProperties": false,
+    "properties": {
+      "id": { "type": "string", "pattern": "^e[0-9]+$" },
+      "ts_start": { "type": "string" },
+      "ts_end": { "type": "string" },
+      "app": { "type": "string" },
+      "window": { "type": "string" },
+      "action": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
+      "detail": { "type": "string" },
+      "evidence": {
+        "type": "array",
+        "items": { "type": "string" }
+      },
+      "confidence": { "type": "string", "enum": ["high", "medium", "low"] }
+    }
+  }
+}
