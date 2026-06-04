@@ -27,6 +27,130 @@ for happens *within* a single day (order intake a dozen times, ship confirmation
 many times, etc.), so one day's log already contains the repetition discovery
 needs.
 
+## Quickstart — launch and test
+
+Full **capture** requires macOS (keystrokes/window/clipboard use mac APIs).
+**Reconstruction, dry-run, and the test suite** run on any OS. Below: the main
+path (the local test UI), then the pure-CLI path, then a no-cost/no-Mac smoke
+test.
+
+### 0. Get the code
+
+```bash
+git clone https://github.com/thirdsapplication/Trace.git
+cd Trace
+git checkout claude/determined-dijkstra-WvqW0
+```
+
+Already have a `Trace` folder? Don't re-clone — update it instead:
+
+```bash
+cd Trace
+git remote -v        # confirm it points at github.com/thirdsapplication/Trace
+git fetch origin
+git checkout claude/determined-dijkstra-WvqW0
+git pull origin claude/determined-dijkstra-WvqW0
+```
+
+Verify you're set up:
+
+```bash
+git branch --show-current     # -> claude/determined-dijkstra-WvqW0
+ls trace/ui/app.py            # -> prints the path if the UI is present
+```
+
+### 1. One-time setup (virtualenv + deps)
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+On macOS this installs `anthropic`, `pynput`, and `keyring`. On other OSes the
+mac-only ones are skipped automatically.
+
+### 2. Launch the test UI (main path)
+
+```bash
+python -m trace.ui.app
+```
+
+Expected output:
+
+```
+Trace test UI: http://127.0.0.1:8765/
+  sessions  -> /…/Trace/captures/sessions
+  collector -> 127.0.0.1:8137 (browser extension target)
+Ctrl-C to stop.
+```
+
+The browser opens to `http://127.0.0.1:8765/` (add `--no-open` to suppress).
+Leave the terminal running; **Ctrl-C stops the whole app.** Then, in the browser:
+
+1. **Settings → API key:** paste your `sk-ant-…` key, **Save**, then **Test key** → expect "valid ✓".
+2. **Settings → permissions:** grant the two macOS permissions (step 3), then click **refresh** → both flip to ✓.
+3. **Capture:** **Start capture** (pill turns green, timer ticks, event count rises), do your scripted session, optionally **Pause/Resume**, then **Stop**.
+4. **Reconstruct:** **Preview (dry run)** first (free — shows exactly what Haiku gets), then **Reconstruct** (paid; watch the progress bar).
+5. **Results:** read `event_log.json`; switch tabs to **review flags** and **raw stream**; **copy/export**. Past runs are under **Session history**.
+
+macOS alternative to the command: double-click **`launch_ui.command`** at the repo root.
+
+### 3. macOS permissions (required before capture records anything)
+
+Grant these to the app that runs the command (your Terminal/iTerm, or the launcher):
+
+- **System Settings → Privacy & Security → Input Monitoring** → enable your terminal.
+- **System Settings → Privacy & Security → Accessibility** → enable your terminal.
+
+Then **quit and relaunch the terminal** (macOS applies these only on restart) and re-run step 2.
+
+### 4. (Optional) Browser signals — clicks, in-browser clipboard, structured reads
+
+The UI already runs the collector on port **8137**, so just install the extension
+(Chrome/Chromium only):
+
+1. `chrome://extensions` → enable **Developer mode** → **Load unpacked** → select `trace/extension/`.
+2. The badge shows **REC**; during capture the UI's browser-capture status flips to "✓ extension sending".
+
+Don't start a separate collector when using the UI — it already owns port 8137.
+
+### 5. Alternative — pure CLI path (no UI)
+
+Three terminals from the repo root, venv activated:
+
+```bash
+# Terminal A — browser-event collector (only if using the extension)
+python -m trace.capture.collector --out captures/raw_events.jsonl --port 8137
+```
+```bash
+# Terminal B — local capture (keystrokes + window + clipboard)
+python -m trace.capture.capture --out captures/raw_events.jsonl --append
+#   Ctrl-Shift-P pauses/resumes · Ctrl-C stops
+```
+```bash
+# Terminal C — reconstruct after stopping capture
+export ANTHROPIC_API_KEY=sk-ant-...
+python -m trace.reconstruct.cli captures/raw_events.jsonl -o captures/event_log.json
+cat captures/event_log.json
+```
+
+### 6. Anywhere smoke test (no key, no Mac, no cost)
+
+```bash
+# full automated suite (69 tests)
+python -m unittest discover -s trace/tests -t . -p "test_*.py"
+
+# preview the chunked prompt on the bundled sample (no model call)
+python -m trace.reconstruct.cli trace/samples/sample_raw_events.jsonl --dry-run --chunk-size 8 --overlap 2
+```
+
+Expect `Ran 69 tests … OK`, and a printed system prompt + 3 rendered chunks.
+
+**Useful flags:**
+- UI: `python -m trace.ui.app --port 8765 --collector-port 8137 --sessions-root captures/sessions --no-open`
+- Reconstruct: `--model claude-haiku-4-5 --chunk-size 120 --overlap 20 --dry-run`
+
 ## Architecture
 
 ```
