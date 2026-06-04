@@ -16,8 +16,18 @@ class FakeController:
         self._paused = False
 
     def start(self):
-        open(self.out, "w").close()  # create an (empty) raw stream
+        # write a couple of local-only events so the completed-session summary is
+        # non-empty (and, lacking any browser-only sources, raises the warning)
+        with open(self.out, "w") as f:
+            f.write(json.dumps({"ts": "t", "source": "window", "payload": {}}) + "\n")
+            f.write(json.dumps({"ts": "t", "source": "keystroke", "payload": {}}) + "\n")
         self._running = True
+
+    def summary(self, min_browser_events=1):
+        from trace.capture import sources, controller
+        rows = controller.read_raw_rows(self.out)
+        return sources.capture_health(sources.summarize_sources(rows),
+                                      min_browser_events=min_browser_events)
 
     def stop(self):
         self._running = False
@@ -162,6 +172,16 @@ class UIBackendTest(unittest.TestCase):
     def test_pause_when_not_running(self):
         code, data = self.req("POST", "/api/capture/pause")
         self.assertEqual(code, 409)
+
+    def test_stop_reports_capture_health_and_warning(self):
+        # FakeController writes local-only events on start, so the completed
+        # session reports a by-source summary and the browser-missing warning.
+        self.req("POST", "/api/capture/start")
+        code, data = self.req("POST", "/api/capture/stop")
+        self.assertEqual(code, 200)
+        self.assertIn("capture_health", data)
+        self.assertIn("by_source", data["capture_health"])
+        self.assertTrue(data["capture_health"]["warning"])
 
     # --- guards ---
     def test_reconstruct_empty_recording_rejected(self):

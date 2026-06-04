@@ -220,26 +220,111 @@ def _check_fragmentation(ev, raw_by_id, report):
         )
 
 
+# Raw sources that are pure navigation/context and may be legitimately cited by
+# more than one distinct action. Everything else is "material": a discrete signal
+# the worker authored that belongs to exactly one logical action, so two events
+# citing overlapping material evidence are two views of the *same* action.
+_CONTEXT_SOURCES = {"window", "structured_read", "target"}
+_CONFIDENCE_RANK = {"high": 3, "medium": 2, "low": 1}
+
+
+def _evidence_index(rid):
+    digits = re.sub(r"\D", "", rid or "")
+    return int(digits) if digits else None
+
+
+def _material_range(ev, raw_by_id):
+    """The [min, max] raw-index span of an event's *material* evidence (keystroke/
+    click/clipboard — not navigation context), or None if it cites none."""
+    idxs = []
+    for r in ev["evidence"]:
+        src = raw_by_id.get(r, {}).get("source")
+        if src and src not in _CONTEXT_SOURCES:
+            i = _evidence_index(r)
+            if i is not None:
+                idxs.append(i)
+    return (min(idxs), max(idxs)) if idxs else None
+
+
+def _ranges_overlap(a, b):
+    return a is not None and b is not None and a[0] <= b[1] and b[0] <= a[1]
+
+
+def _same_action(a, b):
+    """Structural sameness: same window context + action type, with app as a soft
+    match. The window title is the strong identifier (it is reliably backfilled
+    from the cited window/keystroke evidence); app may be absent on an event
+    reconstructed from a chunk that began mid-action (its window event out of
+    view), so an empty app matches anything rather than blocking a merge."""
+    if a["action"] != b["action"] or a["window"] != b["window"]:
+        return False
+    aa, ba = a.get("app", ""), b.get("app", "")
+    return aa == ba or not aa or not ba
+
+
+def _is_same_underlying(a, b, raw_by_id):
+    """True when ``a`` and ``b`` are two reconstructions of the *same* action,
+    rather than two genuinely distinct (possibly similar) actions.
+
+    Both cases require structural sameness (same app + window + action type), so a
+    navigation event is never absorbed into a data-entry event that merely shares
+    its window. Given that, two events are the same action when:
+    - one's evidence is identical to or a subset of the other's (exact/contained
+      overlap duplicate); or
+    - their *material* evidence spans overlap (the discriminator for a boundary-
+      straddling action: both chunk-views cite the same authored keystrokes/clicks).
+    Distinct similar actions cite disjoint material spans, so they are NOT merged."""
+    if not _same_action(a, b):
+        return False
+    aids, bids = set(a["evidence"]), set(b["evidence"])
+    if aids and bids and (aids <= bids or bids <= aids):
+        return True
+    return _ranges_overlap(_material_range(a, raw_by_id), _material_range(b, raw_by_id))
+
+
+def _completeness(ev, raw_by_id):
+    """Higher = more complete reconstruction. Prefers more material evidence, then
+    a wider material span, then higher confidence, then more total evidence."""
+    rng = _material_range(ev, raw_by_id)
+    span = (rng[1] - rng[0] + 1) if rng else 0
+    material_count = sum(
+        1 for r in ev["evidence"]
+        if raw_by_id.get(r, {}).get("source") not in _CONTEXT_SOURCES
+    )
+    return (material_count, span, _CONFIDENCE_RANK.get(ev["confidence"], 0), len(ev["evidence"]))
+
+
+def resequence(events):
+    """Sort an event log chronologically by ts_start and assign sequential ids."""
+    events = sorted(events, key=lambda e: (e.get("ts_start") or "", e.get("id") or ""))
+    for i, ev in enumerate(events, start=1):
+        ev["id"] = f"e{i:03d}"
+    return events
+
+
 def stitch(chunk_outputs, raw_by_id, report):
-    """Merge per-chunk event lists into one log, deduping the overlap region and
-    renumbering ids. An event whose evidence is fully contained in evidence already
-    claimed by accepted events is treated as an overlap duplicate and skipped."""
+    """Merge per-chunk event lists into one log.
+
+    De-duplication recognizes two events as the *same* action by structural
+    sameness + overlapping material evidence (or a subset relationship), not by
+    requiring identical/subset evidence — so an action whose evidence straddles a
+    chunk boundary (truncated in the earlier chunk, complete in the later) collapses
+    to a single event, kept as its most complete reconstruction. Distinct similar
+    actions cite disjoint material spans and are preserved."""
     accepted = []
-    claimed = set()
     for events in chunk_outputs:
         for ev in events:
             cleaned = validate_event(ev, raw_by_id, report)
             if cleaned is None:
                 continue
-            ev_ids = set(cleaned["evidence"])
-            if ev_ids and ev_ids <= claimed:
-                # fully within already-covered raw evidence -> overlap duplicate
-                continue
-            accepted.append(cleaned)
-            claimed |= ev_ids
+            dup_idx = next(
+                (i for i, acc in enumerate(accepted)
+                 if _is_same_underlying(cleaned, acc, raw_by_id)),
+                None,
+            )
+            if dup_idx is None:
+                accepted.append(cleaned)
+            elif _completeness(cleaned, raw_by_id) > _completeness(accepted[dup_idx], raw_by_id):
+                accepted[dup_idx] = cleaned  # keep the more complete instance
 
-    # order by ts_start (fallback: keep arrival order via stable sort)
-    accepted.sort(key=lambda e: (e.get("ts_start") or "", ))
-    for i, ev in enumerate(accepted, start=1):
-        ev["id"] = f"e{i:03d}"
-    return accepted
+    return resequence(accepted)

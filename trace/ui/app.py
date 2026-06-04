@@ -224,13 +224,19 @@ def make_handler(state):
                 if not (state.controller and state.controller.running):
                     return self._json(409, {"error": "not_running"})
                 sid = state.current_sid
-                state.controller.stop()
+                controller = state.controller
+                controller.stop()
                 count = sessions.artifacts(root, sid)["raw_event_count"]
+                # Completed-session observability + fail-loud signal (Item 3).
+                health = controller.summary()
                 sessions.update_meta(root, sid, stopped_at=sessions._now(),
-                                     raw_event_count=count)
+                                     raw_event_count=count,
+                                     source_summary=health["by_source"],
+                                     capture_warning=health["message"])
                 state.controller = None
                 state.current_sid = None
-            return self._json(200, {"session_id": sid, "raw_event_count": count})
+            return self._json(200, {"session_id": sid, "raw_event_count": count,
+                                    "capture_health": health})
 
         def _capture_ctl(self, action):
             with state.lock:

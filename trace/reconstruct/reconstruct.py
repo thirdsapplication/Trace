@@ -18,7 +18,7 @@ network/keys; the default builds a real ``claude-haiku-4-5`` client.
 import json
 import re
 
-from . import chunking, validate
+from . import augment, chunking, validate
 from .prompt import SYSTEM_PROMPT
 
 DEFAULT_MODEL = "claude-haiku-4-5"
@@ -83,7 +83,8 @@ def _build_user_content(summary, rendered_lines):
 
 
 def reconstruct(raw_path, model=DEFAULT_MODEL, chunk_size=120, overlap=20,
-                model_fn=None, progress_cb=None):
+                model_fn=None, progress_cb=None,
+                open_persistence_seconds=augment.DEFAULT_OPEN_PERSISTENCE_SECONDS):
     """Reconstruct an event log from a raw stream.
 
     Returns ``(event_log, report)`` where ``event_log`` is a list of event dicts
@@ -92,6 +93,10 @@ def reconstruct(raw_path, model=DEFAULT_MODEL, chunk_size=120, overlap=20,
     ``progress_cb`` is an optional ``callable(done, total)`` invoked once before
     processing (``0, total``) and after each chunk. It is a pure observation hook
     for UIs/progress bars and does not affect reconstruction logic.
+
+    ``open_persistence_seconds`` is the dwell threshold for surfacing a sustained
+    window focus as an "opened/viewed" action (symmetric across browser/native
+    apps; see ``augment``).
     """
     raw = chunking.load_raw(raw_path)
     raw_by_id = {r["id"]: r for r in raw}
@@ -125,4 +130,9 @@ def reconstruct(raw_path, model=DEFAULT_MODEL, chunk_size=120, overlap=20,
             progress_cb(i, total)
 
     event_log = validate.stitch(chunk_outputs, raw_by_id, report)
+    # Symmetric document-open detection: surface sustained native-app (and browser)
+    # document opens that the model did not already represent, then re-sequence ids.
+    event_log = augment.augment_document_opens(
+        event_log, raw, persistence_seconds=open_persistence_seconds)
+    event_log = validate.resequence(event_log)
     return event_log, report

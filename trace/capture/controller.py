@@ -14,11 +14,31 @@ backend that imports it) loads on any platform; capture itself is macOS-only.
 import threading
 from http.server import ThreadingHTTPServer
 
+import json
+
+from . import sources
 from .clipboard import clipboard_loop
 from .collector import CollectorStats, make_handler
 from .keystrokes import KeystrokeCoalescer
 from .raw_writer import RawWriter, now_iso
 from .window import window_loop
+
+
+def read_raw_rows(path):
+    """Parse the raw stream into a list of dicts (one per line)."""
+    rows = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        rows.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        pass
+    except FileNotFoundError:
+        pass
+    return rows
 
 
 def count_events(path):
@@ -163,3 +183,10 @@ class CaptureController:
             "out_path": self.out_path,
             "browser": self._stats.snapshot(),
         }
+
+    def summary(self, min_browser_events=1):
+        """Completed-session observability (Item 3): raw-event counts by source
+        type plus a non-blocking warning if browser-only sources are absent."""
+        rows = read_raw_rows(self.out_path)
+        return sources.capture_health(sources.summarize_sources(rows),
+                                      min_browser_events=min_browser_events)

@@ -138,14 +138,14 @@ cat captures/event_log.json
 ### 6. Anywhere smoke test (no key, no Mac, no cost)
 
 ```bash
-# full automated suite (69 tests)
+# full automated suite (89 tests)
 python -m unittest discover -s trace/tests -t . -p "test_*.py"
 
 # preview the chunked prompt on the bundled sample (no model call)
 python -m trace.reconstruct.cli trace/samples/sample_raw_events.jsonl --dry-run --chunk-size 8 --overlap 2
 ```
 
-Expect `Ran 69 tests … OK`, and a printed system prompt + 3 rendered chunks.
+Expect `Ran 89 tests … OK`, and a printed system prompt + 3 rendered chunks.
 
 **Useful flags:**
 - UI: `python -m trace.ui.app --port 8765 --collector-port 8137 --sessions-root captures/sessions --no-open`
@@ -255,6 +255,22 @@ prompt, then validates, stitches, and renumbers the result. Determinism matters:
 the same raw input yields a materially identical log, because Engine 2's
 recurrence detection depends on it.
 
+Two structural rules in the stitch/finalize step keep the log faithful:
+
+- **Boundary-straddle de-duplication.** An action whose evidence crosses a chunk
+  seam is reconstructed truncated in the earlier chunk and complete in the later
+  one. The merge recognizes them as the same action by structural sameness
+  (window context + action type) plus overlapping *material* evidence
+  (keystrokes/clicks/clipboard — never shared navigation context), and keeps the
+  most complete instance. Two genuinely distinct-but-similar actions cite disjoint
+  material spans and are both preserved (no over-merge).
+- **Symmetric document-open detection.** A focus that persists beyond a brief
+  flicker on a window not otherwise represented in the log is recorded as an
+  "opened/viewed «window»" action — the *same* persistence/duration rule for
+  browser tabs and separate native apps alike (no app allowlist, no file-type
+  branching). Contents are never fabricated; only the window-title identifier is
+  recorded. Sub-threshold window oscillation produces no events.
+
 Inspect exactly what Haiku will see, with **no API cost**:
 
 ```bash
@@ -323,7 +339,12 @@ needs OS permissions and local files). What it does:
   confirm it works), a macOS **permissions** checklist (Accessibility + Input
   Monitoring), and **browser-capture** status from the collector.
 - **Capture** — one Start/Stop button, a live capturing indicator with elapsed
-  timer and event count, and Pause/Resume.
+  timer and event count, and Pause/Resume. On Stop it shows a **by-source-type
+  count summary** and a **non-blocking warning** if the session has local events
+  but none of the browser-only source types (clicks/targets/structured reads) —
+  i.e. the extension likely wasn't connected. The summary is derived generically
+  from source-origin metadata (`trace/capture/sources.py`), so a new source type
+  needs no code change, and the threshold is configurable.
 - **Reconstruct** — an explicit Reconstruct button (with per-chunk progress) and a
   free **Preview (dry run)**; guarded against empty/short recordings and a missing
   key.

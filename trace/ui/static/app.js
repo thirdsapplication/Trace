@@ -141,6 +141,7 @@ $("startStop").onclick = async () => {
       selectedSid = data.session_id;
       $("reconTarget").textContent = `target: ${selectedSid} (${data.raw_event_count} events)`;
       enableReconButtons(true);
+      renderCaptureSummary(data.capture_health);
       await loadAndShow("raw");
       await refreshSessions();
       setPill("results");
@@ -156,6 +157,19 @@ $("pauseResume").onclick = async () => {
 
 function startPolling() { stopPolling(); pollTimer = setInterval(pollStatus, 1000); }
 function stopPolling() { if (pollTimer) clearInterval(pollTimer); pollTimer = null; }
+
+function renderCaptureSummary(health) {
+  const el = $("captureSummary");
+  if (!health) { el.textContent = ""; return; }
+  const by = health.by_source || {};
+  const parts = Object.keys(by).sort().map(k => `${k}: ${by[k]}`).join(" · ");
+  const counts = `<span class="muted">captured — ${parts || "no events"}</span>`;
+  if (health.warning) {
+    el.innerHTML = `<span class="warn">⚠ ${health.message}</span><br>${counts}`;
+  } else {
+    el.innerHTML = counts;
+  }
+}
 
 // ===========================================================================
 // Reconstruction
