@@ -78,3 +78,23 @@ th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line
 th { color: var(--muted); font-weight: 500; }
 td.dot-yes { color: var(--ok); } td.dot-no { color: var(--muted); }
 tr.selected { background: rgba(79,140,255,.08); }
+
+/* ---- Stage 3 review surface ---- */
+.review-item { border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px;
+  margin-top: 12px; background: #0f1115; }
+.review-item.anti { border-left: 3px solid var(--warn); }
+.review-item.bundle { border-left: 3px solid var(--ok); }
+.review-item h4 { margin: 0 0 8px; font-size: 13px; }
+.review-item label { min-width: 90px; font-size: 12px; }
+.review-item .field { display: flex; gap: 8px; align-items: flex-start; margin: 6px 0; }
+.review-item input[type=text], .review-item textarea, .review-item select {
+  flex: 1; background: #181b21; color: var(--fg); border: 1px solid var(--line);
+  border-radius: 5px; padding: 5px 8px; font: inherit; font-size: 12.5px; }
+.review-item textarea { min-height: 44px; font-family: var(--mono); }
+.step-row { display: flex; gap: 6px; align-items: center; margin: 3px 0; }
+.step-row input[type=text] { flex: 1; }
+.step-row .cp-note { flex: 1.4; }
+.ex-row { display: flex; gap: 8px; align-items: flex-start; margin: 3px 0; font-size: 12px; }
+.ex-row .ex-text { font-family: var(--mono); color: var(--muted); }
+.review-sub { color: var(--muted); font-size: 11px; text-transform: uppercase; margin: 10px 0 2px; letter-spacing: .04em; }
+.markdown-view { white-space: pre-wrap; }

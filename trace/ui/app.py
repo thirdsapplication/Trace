@@ -28,6 +28,10 @@ from ..discovery import scorer as discovery_scorer
 from ..discovery.discover import discover as _real_discover
 from ..discovery.discover import load_event_log, render_event_log
 from ..discovery.prompt import SYSTEM_PROMPT as DISCOVERY_SYSTEM_PROMPT
+from ..artifact import review as artifact_review
+from ..artifact.artifact import build_prompt_material
+from ..artifact.artifact import generate_specs as _real_generate_specs
+from ..artifact.prompt import SYSTEM_PROMPT as ARTIFACT_SYSTEM_PROMPT
 from . import keystore, permissions, sessions
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
@@ -59,12 +63,13 @@ _CONTENT_TYPES = {".html": "text/html", ".js": "application/javascript",
 class AppState:
     def __init__(self, sessions_root, collector_port=8137,
                  reconstruct_fn=None, controller_factory=None, key_store=None,
-                 discovery_fn=None, score_fn=None):
+                 discovery_fn=None, score_fn=None, artifact_fn=None):
         self.sessions_root = sessions_root
         self.collector_port = collector_port
         self.reconstruct_fn = reconstruct_fn or _real_reconstruct
         self.discovery_fn = discovery_fn or _real_discover
         self.score_fn = score_fn or discovery_scorer.score
+        self.artifact_fn = artifact_fn or _real_generate_specs
         self.controller_factory = controller_factory or (
             lambda out: CaptureController(out, collector_port=collector_port))
         self.keystore = key_store or keystore
@@ -72,6 +77,7 @@ class AppState:
         self.current_sid = None
         self.recon_jobs = {}         # sid -> {state, current, total, error, flags, errors}
         self.discover_jobs = {}      # sid -> {state, error, bundles, anti_bundles}
+        self.spec_jobs = {}          # sid -> {state, error, built, notes}
         self.lock = threading.Lock()
         os.makedirs(sessions_root, exist_ok=True)
 
@@ -131,6 +137,48 @@ class AppState:
                                      discovered_at=sessions._now())
                 job.update(state="done", bundles=len(discovery["bundles"]),
                            anti_bundles=len(discovery["anti_bundles"]))
+            except Exception as e:
+                job.update(state="error", error=str(e))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    # --- spec generation job (Stage 3) -----------------------------------
+    def start_spec_generation(self, sid):
+        reviewed_path = sessions.path(self.sessions_root, sid, sessions.REVIEWED)
+        event_log_path = sessions.path(self.sessions_root, sid, sessions.EVENT_LOG)
+        job = {"state": "running", "error": None, "built": 0, "notes": ""}
+        self.spec_jobs[sid] = job
+
+        def run():
+            try:
+                # only the build path needs the model/key; anti/reject do not
+                with open(reviewed_path, encoding="utf-8") as rf:
+                    reviewed = json.load(rf)
+                approved = sum(1 for b in (reviewed.get("bundles") or [])
+                               if b.get("disposition") == "approve_for_build"
+                               and b.get("classification", "bundle") == "bundle")
+                key = self.keystore.get_key()
+                if approved and not key:
+                    raise RuntimeError("no_api_key")
+                if key:
+                    os.environ["ANTHROPIC_API_KEY"] = key
+
+                results, report = self.artifact_fn(reviewed_path, event_log_path)
+                specs_dir = sessions.path(self.sessions_root, sid, sessions.SPECS_DIR)
+                os.makedirs(specs_dir, exist_ok=True)
+                for fn in os.listdir(specs_dir):           # clear stale specs
+                    if fn.endswith(".md"):
+                        os.remove(os.path.join(specs_dir, fn))
+                built = 0
+                for r in results:
+                    if r.get("markdown") is None:
+                        continue
+                    with open(os.path.join(specs_dir, r["filename"]), "w", encoding="utf-8") as f:
+                        f.write(r["markdown"])
+                    if r.get("built"):
+                        built += 1
+                sessions.update_meta(self.sessions_root, sid, specs_generated_at=sessions._now())
+                job.update(state="done", built=built, notes=str(report))
             except Exception as e:
                 job.update(state="error", error=str(e))
 
@@ -215,7 +263,8 @@ def make_handler(state):
             if p == "/api/load-fixture":
                 return self._load_fixture(body)
             m = re.match(r"^/api/sessions/([^/]+)/"
-                         r"(dry-run|reconstruct|discovery-dry-run|discover|score)$", p)
+                         r"(dry-run|reconstruct|discovery-dry-run|discover|score|"
+                         r"reviewed-bundles|generate-specs|specs-dry-run)$", p)
             if m:
                 sid, action = m.group(1), m.group(2)
                 if action == "dry-run":
@@ -226,7 +275,13 @@ def make_handler(state):
                     return self._discovery_dry_run(sid)
                 if action == "discover":
                     return self._discover(sid)
-                return self._score(sid, body)
+                if action == "score":
+                    return self._score(sid, body)
+                if action == "reviewed-bundles":
+                    return self._save_reviewed(sid, body)
+                if action == "generate-specs":
+                    return self._generate_specs(sid)
+                return self._specs_dry_run(sid)
             return self._json(404, {"error": "not_found"})
 
         def do_DELETE(self):
@@ -347,6 +402,17 @@ def make_handler(state):
             if sub == "/discover/status":
                 job = state.discover_jobs.get(sid)
                 return self._json(200, job or {"state": "idle"})
+            if sub == "/review-data":
+                return self._review_data(sid)
+            if sub == "/reviewed-bundles":
+                data = sessions.read_json_artifact(root, sid, sessions.REVIEWED)
+                return self._json(200 if data is not None else 404,
+                                  data if data is not None else {"error": "not_reviewed"})
+            if sub == "/specs":
+                return self._json(200, {"specs": sessions.list_specs(root, sid)})
+            if sub == "/generate-specs/status":
+                job = state.spec_jobs.get(sid)
+                return self._json(200, job or {"state": "idle"})
             return self._json(404, {"error": "not_found"})
 
         # --- reconstruction ---
@@ -454,6 +520,76 @@ def make_handler(state):
                 json.dump(sc, f, indent=2, ensure_ascii=False)
             sessions.update_meta(root, sid, scored_at=sessions._now())
             return self._json(200, sc)
+
+        # --- review step (Stage 3) ---
+        def _review_data(self, sid):
+            """Seed the review surface: the editable bundles/anti-bundles plus the
+            verbatim observed examples (by event id) for the UI to render."""
+            event_log = sessions.read_json_artifact(root, sid, sessions.EVENT_LOG)
+            if event_log is None:
+                return self._json(404, {"error": "no_event_log"})
+            # resume prior edits if a reviewed file exists; else seed from discovery
+            reviewed = sessions.read_json_artifact(root, sid, sessions.REVIEWED)
+            if reviewed is None:
+                discovery = sessions.read_json_artifact(root, sid, sessions.DISCOVERY)
+                if discovery is None:
+                    return self._json(404, {"error": "not_discovered"})
+                reviewed = artifact_review.seed_review(discovery)
+            idx = artifact_review.event_index(event_log)
+            ids = set()
+            for item in reviewed.get("bundles", []) + reviewed.get("anti_bundles", []):
+                ids.update(item.get("evidence_event_ids", []))
+                ids.update(item.get("included_example_event_ids", []))
+            examples = {i: {k: idx[i].get(k) for k in artifact_review._EXAMPLE_FIELDS}
+                        for i in ids if i in idx}
+            return self._json(200, {"reviewed": reviewed, "examples_by_id": examples})
+
+        def _save_reviewed(self, sid, body):
+            event_log = sessions.read_json_artifact(root, sid, sessions.EVENT_LOG)
+            if event_log is None:
+                return self._json(404, {"error": "no_event_log"})
+            report = artifact_review.ReviewReport()
+            cleaned = artifact_review.validate_reviewed(
+                body or {}, set(artifact_review.event_index(event_log)), report)
+            with open(sessions.path(root, sid, sessions.REVIEWED), "w", encoding="utf-8") as f:
+                json.dump(cleaned, f, indent=2, ensure_ascii=False)
+            sessions.update_meta(root, sid, reviewed_at=sessions._now())
+            return self._json(200, {"saved": True, "reviewed": cleaned,
+                                    "errors": report.errors, "flags": report.flags})
+
+        # --- artifact engine (Stage 3) ---
+        def _specs_dry_run(self, sid):
+            reviewed = sessions.read_json_artifact(root, sid, sessions.REVIEWED)
+            event_log = sessions.read_json_artifact(root, sid, sessions.EVENT_LOG)
+            if reviewed is None:
+                return self._json(400, {"error": "not_reviewed"})
+            report = artifact_review.ReviewReport()
+            reviewed = artifact_review.validate_reviewed(
+                reviewed, set(artifact_review.event_index(event_log or [])), report)
+            approved = [b for b in reviewed["bundles"]
+                        if b.get("disposition") == "approve_for_build"]
+            return self._json(200, {
+                "system_prompt": ARTIFACT_SYSTEM_PROMPT,
+                "approved_count": len(approved),
+                "bundles": [{"id": b["id"], "material": build_prompt_material(
+                    b, artifact_review.fetch_examples(event_log or [], b["included_example_event_ids"]))}
+                    for b in approved],
+            })
+
+        def _generate_specs(self, sid):
+            if not sessions.artifacts(root, sid)["reviewed"]:
+                return self._json(400, {"error": "not_reviewed"})
+            reviewed = sessions.read_json_artifact(root, sid, sessions.REVIEWED) or {}
+            approved = sum(1 for b in (reviewed.get("bundles") or [])
+                           if b.get("disposition") == "approve_for_build")
+            if approved and not state.keystore.get_key():
+                return self._json(400, {"error": "no_api_key"})
+            with state.lock:
+                existing = state.spec_jobs.get(sid)
+                if existing and existing.get("state") == "running":
+                    return self._json(409, {"error": "already_running"})
+                state.start_spec_generation(sid)
+            return self._json(202, {"state": "running", "session_id": sid})
 
     return Handler
 

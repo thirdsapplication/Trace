@@ -98,16 +98,36 @@
         Load a fixture with a known answer key to run the gate scorer from here.</p>
     </section>
 
+    <!-- REVIEW / EDIT (Stage 3) --------------------------------------- -->
+    <section class="panel">
+      <h2>Review &amp; edit <span class="muted">(Stage 3 — correct before building)</span></h2>
+      <div class="row">
+        <button id="loadReviewBtn" class="secondary" disabled>Load discovery for review</button>
+        <button id="saveReviewBtn" class="primary" disabled>Save reviewed bundles</button>
+        <button id="genSpecBtn" class="primary" disabled>Generate specs</button>
+        <button id="specDryRun" class="secondary" disabled>Spec dry run · free</button>
+        <span id="reviewMsg" class="status-line"></span>
+      </div>
+      <div id="reviewContainer"></div>
+      <p class="help">Light edits only: reword intent/steps, reclassify between
+        bundle and anti-bundle, set disposition, flag per-step human checkpoints,
+        include/exclude observed examples (verbatim), add acceptance criteria, set a
+        preferred output. Only <code>approve_for_build</code> bundles become specs.</p>
+    </section>
+
     <!-- RESULTS -------------------------------------------------------- -->
     <section class="panel">
       <h2>Results <span id="resultsSid" class="muted"></span></h2>
       <div class="tabs">
         <button class="tab active" data-tab="event_log">event_log.json</button>
         <button class="tab" data-tab="discovery">discovery.json</button>
+        <button class="tab" data-tab="reviewed">reviewed_bundles</button>
+        <button class="tab" data-tab="specs">specs (.md)</button>
         <button class="tab" data-tab="validation">review flags</button>
         <button class="tab" data-tab="raw">raw stream</button>
         <button class="tab" data-tab="dryrun">recon dry-run</button>
         <button class="tab" data-tab="discdryrun">discovery dry-run</button>
+        <button class="tab" data-tab="specdryrun">spec dry-run</button>
         <span class="spacer"></span>
         <button id="copyBtn" class="link">copy</button>
         <button id="exportBtn" class="link">export</button>

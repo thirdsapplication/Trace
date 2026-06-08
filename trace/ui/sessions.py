@@ -21,6 +21,8 @@ EVENT_LOG = "event_log.json"
 VALIDATION = "validation_report.json"
 DISCOVERY = "discovery.json"
 SCORECARD = "scorecard.json"
+REVIEWED = "reviewed_bundles.json"
+SPECS_DIR = "specs"
 META = "meta.json"
 
 
@@ -100,6 +102,9 @@ def artifacts(root, sid):
             bundle_count = len(d.get("bundles", [])) + len(d.get("anti_bundles", []))
         except (json.JSONDecodeError, OSError):
             bundle_count = None
+    specs_dir = path(root, sid, SPECS_DIR)
+    spec_count = (len([f for f in os.listdir(specs_dir) if f.endswith(".md")])
+                  if os.path.isdir(specs_dir) else 0)
     return {
         "raw": os.path.exists(raw_p),
         "raw_event_count": _count_lines(raw_p),
@@ -109,7 +114,22 @@ def artifacts(root, sid):
         "discovery": os.path.exists(disc_p),
         "candidate_count": bundle_count,
         "scorecard": os.path.exists(path(root, sid, SCORECARD)),
+        "reviewed": os.path.exists(path(root, sid, REVIEWED)),
+        "specs": spec_count,
     }
+
+
+def list_specs(root, sid):
+    """Return generated spec files as [{filename, markdown}], or []."""
+    d = path(root, sid, SPECS_DIR)
+    if not os.path.isdir(d):
+        return []
+    out = []
+    for fn in sorted(os.listdir(d)):
+        if fn.endswith(".md"):
+            with open(os.path.join(d, fn), "r", encoding="utf-8") as f:
+                out.append({"filename": fn, "markdown": f.read()})
+    return out
 
 
 def list_sessions(root):

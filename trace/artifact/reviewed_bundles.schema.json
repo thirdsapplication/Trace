@@ -1,0 +1,70 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://trace.dev/schema/reviewed_bundles.schema.json",
+  "title": "Trace reviewed bundles (Review step -> Artifact Engine contract)",
+  "type": "object",
+  "required": ["bundles", "anti_bundles", "notes"],
+  "additionalProperties": false,
+  "properties": {
+    "bundles": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "classification", "name", "description", "trigger",
+                     "steps", "disposition", "human_checkpoints",
+                     "included_example_event_ids", "added_acceptance_criteria",
+                     "preferred_output", "evidence_event_ids", "confidence",
+                     "reclassified_from", "original_reason_for_judgment"],
+        "properties": {
+          "id": { "type": "string" },
+          "classification": { "type": "string", "enum": ["bundle"] },
+          "name": { "type": "string" },
+          "description": { "type": "string" },
+          "trigger": { "type": "string" },
+          "steps": { "type": "array", "items": { "type": "string" } },
+          "disposition": { "type": "string", "enum": ["approve_for_build", "reject"] },
+          "human_checkpoints": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["step_index", "note"],
+              "properties": {
+                "step_index": { "type": "integer" },
+                "note": { "type": "string" }
+              }
+            }
+          },
+          "included_example_event_ids": { "type": "array", "items": { "type": "string" } },
+          "added_acceptance_criteria": { "type": "array", "items": { "type": "string" } },
+          "preferred_output": { "type": "string" },
+          "evidence_event_ids": { "type": "array", "items": { "type": "string" } },
+          "confidence": { "type": "string", "enum": ["high", "medium", "low"] },
+          "reclassified_from": { "type": ["string", "null"], "enum": ["bundle", "anti_bundle", null] },
+          "original_reason_for_judgment": { "type": "string" }
+        }
+      }
+    },
+    "anti_bundles": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "classification", "name", "description", "why_judgment",
+                     "recommended_handling", "included_example_event_ids",
+                     "evidence_event_ids", "confidence", "reclassified_from"],
+        "properties": {
+          "id": { "type": "string" },
+          "classification": { "type": "string", "enum": ["anti_bundle"] },
+          "name": { "type": "string" },
+          "description": { "type": "string" },
+          "why_judgment": { "type": "string" },
+          "recommended_handling": { "type": "string" },
+          "included_example_event_ids": { "type": "array", "items": { "type": "string" } },
+          "evidence_event_ids": { "type": "array", "items": { "type": "string" } },
+          "confidence": { "type": "string", "enum": ["high", "medium", "low"] },
+          "reclassified_from": { "type": ["string", "null"], "enum": ["bundle", "anti_bundle", null] }
+        }
+      }
+    },
+    "notes": { "type": "string" }
+  }
+}

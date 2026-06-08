@@ -7,22 +7,31 @@ It is three engines run in sequence over one observed workday:
 Raw capture stream
    │
    ▼
-Engine 1 — Event Log Engine    ← THIS REPO  (capture -> event_log.json)
+Stage 1 — Event Log Engine     ← THIS REPO  (capture -> event_log.json)
    │   hands off event_log.json  (the frozen contract)
    ▼
-Engine 2 — Discovery Engine    ← THIS REPO  (event_log.json -> discovery.json)
+Stage 2 — Discovery Engine     ← THIS REPO  (event_log.json -> discovery.json)
    │   hands off discovery.json (bundles + anti-bundles + evidence)
    ▼
-Engine 3 — Artifact Engine     (later) — turns each workflow into a buildable spec
+Review / edit (Test UI)        ← THIS REPO  (discovery.json -> reviewed_bundles.json)
+   │   human corrects intent / reclassifies / sets disposition
+   ▼
+Stage 3 — Artifact Engine      ← THIS REPO  (reviewed_bundles.json -> spec_<id>.md)
+   │   one buildable spec per approved workflow
+   ▼
+A developer / coding agent builds the workflow's agent from the spec  (out of scope)
 ```
 
-This repository implements **Engine 1 (Event Log)** and **Engine 2 (Discovery)**.
-Engine 1 captures a lean, privacy-preserving signal stream of a real browser-work
-session and uses Haiku to reconstruct it into a clean `event_log.json`. Engine 2
-(`trace/discovery/`) reads that log and proposes the automatable workflows inside
-it — **bundles** (automatable) and **anti-bundles** (judgment-required,
-human-checkpoint) — in one domain-neutral Sonnet call over the whole day. See
-[the Stage 2 section](#stage-2--discovery-engine) below.
+This repository implements the **whole MVP spine**: **Stage 1 (Event Log)**,
+**Stage 2 (Discovery)**, a lightweight **review/edit** step, and **Stage 3
+(Artifact Engine)**. Stage 1 captures a lean, privacy-preserving signal stream and
+reconstructs it (Haiku) into `event_log.json`; Stage 2 (`trace/discovery/`)
+proposes workflows — **bundles** (automatable) and **anti-bundles**
+(judgment-required) — in one Sonnet call over the whole day; the operator lightly
+corrects them in the review surface (`reviewed_bundles.json`); Stage 3
+(`trace/artifact/`) turns each approved bundle into a paste-ready Artifact C
+markdown spec. See [Stage 2](#stage-2--discovery-engine) and
+[Stage 3](#stage-3--review--edit--artifact-engine).
 
 Engine 1 runs over **one full workday** — capture runs continuously, and the
 result is a single `event_log.json` for that day. The recurrence Engine 2 looks
@@ -141,14 +150,14 @@ cat captures/event_log.json
 ### 6. Anywhere smoke test (no key, no Mac, no cost)
 
 ```bash
-# full automated suite (144 tests)
+# full automated suite (164 tests)
 python -m unittest discover -s trace/tests -t . -p "test_*.py"
 
 # preview the chunked prompt on the bundled sample (no model call)
 python -m trace.reconstruct.cli trace/samples/sample_raw_events.jsonl --dry-run --chunk-size 8 --overlap 2
 ```
 
-Expect `Ran 144 tests … OK`, and a printed system prompt + 3 rendered chunks.
+Expect `Ran 164 tests … OK`, and a printed system prompt + 3 rendered chunks.
 
 **Useful flags:**
 - UI: `python -m trace.ui.app --port 8765 --collector-port 8137 --sessions-root captures/sessions --no-open`
@@ -183,6 +192,12 @@ trace/
     cli.py                 entry point + --dry-run
     discovery.schema.json, DISCOVERY_SCHEMA.md
     fixtures/              marcy + recruiter event logs + answer keys (test data)
+  artifact/                Stage 3 — reviewed_bundles.json -> spec_<id>.md
+    review.py              reviewed_bundles contract (seed/validate/fetch examples)
+    artifact.py            one model call/bundle + deterministic markdown assembly
+    prompt.py              the domain-neutral spec-writing prompt
+    cli.py                 entry point + --dry-run
+    reviewed_bundles.schema.json, ARTIFACT_SCHEMA.md
   ui/                      local test harness (drives the engine from a window)
     app.py                 stdlib HTTP backend (local-only); the API
     keystore.py            secure API-key storage (Keychain / 0600 file)
@@ -333,12 +348,16 @@ first chunk — capture and `--dry-run` are unaffected.
 python -m unittest discover -s trace/tests -t . -p "test_*.py"
 ```
 
-The suite (144 tests) covers redaction, keystroke coalescing, the raw writer,
+The suite (164 tests) covers redaction, keystroke coalescing, the raw writer,
 chunking, schema validation/normalization, fragment-stitch flagging, boundary
 de-duplication, contiguous-entry coalescing, document-open detection/coverage,
 the browser-capture collector path, the full reconstruction pipeline with a mock
-model, plus the test-UI backend (key store, sessions, capture lifecycle,
-reconstruct guards) — so it runs without an API key, `pynput`, or a browser.
+model, the discovery engine + validator + scorer + fixture gate, the Stage 3
+review contract (seed/validate/reclassification routing/checkpoint mapping) and
+Artifact Engine (verbatim example fetching, criteria assembly, divergence marking),
+plus the test-UI backends for every stage (key store, sessions, capture lifecycle,
+reconstruct/discovery/review/spec guards) — so it runs without an API key,
+`pynput`, or a browser.
 
 ## Local test UI (run the whole engine from a window)
 
@@ -443,6 +462,49 @@ only by the scorer/tests — never by the engine.
 > key; the gate's empirical pass is run by the operator. The harness itself — schema
 > validation, the scorer's overlap/handling/verdict logic, dry-run rendering, and
 > the UI wiring — is covered by tests that run with a stub, no key, and no network.
+
+## Stage 3 — review / edit + Artifact Engine
+
+Discovery is good but not perfect, so a **lightweight review step** sits between
+discovery and spec generation: the operator corrects each workflow at the cheapest
+point, before it becomes a spec. It is editing, not workflow-building.
+
+**Review surface (in the Test UI).** Loads a `discovery.json` and shows each
+bundle with its intent fields, evidence, and the **verbatim observed examples**
+(pulled from `event_log.json` by evidence id). Allowed edits, and only these:
+reword name/description/trigger/steps; **reclassify** between bundle and
+anti-bundle in either direction; set a bundle's **disposition**
+(`approve_for_build` | `reject`); flag any step as a **human checkpoint** with a
+note; **include/exclude** observed examples (never edit their text); add/edit/remove
+**acceptance criteria**; set an optional **preferred output**. Saving writes the
+frozen `reviewed_bundles.json` (contract in `trace/artifact/ARTIFACT_SCHEMA.md`) —
+the only workflow input the Artifact Engine reads.
+
+**Artifact Engine (`trace/artifact/`).** For each item classified as a `bundle`
+with disposition `approve_for_build`, one model call (default `claude-sonnet-4-6`,
+injectable) produces the intent prose, example-supported acceptance criteria, and a
+representative/illustrative assessment of each example; deterministic code then
+assembles the three-layer **Artifact C** markdown spec so that the verbatim
+examples, every user-added criterion, and a "pause and request human input"
+criterion per checkpoint are guaranteed to appear exactly. Anti-bundles emit a
+short "handle manually — here's why" note instead; `reject` emits nothing.
+
+```bash
+# render the prompt + bundle + verbatim examples per approved bundle (free)
+python -m trace.artifact.cli reviewed_bundles.json event_log.json --dry-run
+
+# generate one spec_<id>.md per approved bundle (needs ANTHROPIC_API_KEY)
+python -m trace.artifact.cli reviewed_bundles.json event_log.json -o specs/
+```
+
+**Divergence rule.** When the edited intent contradicts an observed example
+(because the user corrected a habit or generalized past a one-off), **intent and
+acceptance criteria win**, and the contradicted example is marked *illustrative of
+context, not a target* so the coding agent doesn't build to it.
+
+**From the Test UI.** The full spine runs from one window: capture → reconstruct →
+discover → **review/edit/reclassify** → **generate specs** (with a free dry-run) →
+view each `spec_<id>.md` as markdown in the results tabs, with copy/export.
 
 ## Faithfulness over richness
 

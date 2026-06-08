@@ -262,8 +262,8 @@ function pollRecon() {
 // Results (JSON views)
 // ===========================================================================
 const ENDPOINTS = { event_log: "event_log", validation: "validation", raw: "raw",
-                    discovery: "discovery" };
-const LOCAL_TABS = { dryrun: 1, discdryrun: 1 };  // rendered client-side, no GET
+                    discovery: "discovery", reviewed: "reviewed-bundles" };
+const LOCAL_TABS = { dryrun: 1, discdryrun: 1, specdryrun: 1 };  // client-side, no GET
 
 document.querySelectorAll(".tab").forEach(t => {
   t.onclick = () => switchTab(t.dataset.tab);
@@ -290,12 +290,30 @@ async function loadAndShow(tab) {
     setView(cache[selectedSid].discdryrun || "Click discovery “Preview (dry run)” to render what Sonnet would be sent.");
     return;
   }
+  if (tab === "specdryrun") {
+    setView(cache[selectedSid].specdryrun || "Click “Spec dry run” to render what the Artifact Engine would be sent.");
+    return;
+  }
   if (cache[selectedSid][tab] !== undefined) { setView(cache[selectedSid][tab]); return; }
+
+  if (tab === "specs") {       // markdown artifacts, not JSON
+    const { ok, data } = await api("GET", `/api/sessions/${selectedSid}/specs`);
+    let text;
+    if (!ok || !data.specs.length) {
+      text = "No specs yet — review bundles, then Generate specs.";
+    } else {
+      text = data.specs.map(s => `===== ${s.filename} =====\n\n${s.markdown}`).join("\n\n\n");
+    }
+    cache[selectedSid][tab] = text;
+    setView(text);
+    return;
+  }
 
   const { ok, data } = await api("GET", `/api/sessions/${selectedSid}/${ENDPOINTS[tab]}`);
   let text;
   if (!ok) {
     if (tab === "discovery") text = "Not discovered yet — run Discovery.";
+    else if (tab === "reviewed") text = "Not reviewed yet — Load discovery for review, edit, and Save.";
     else if (tab === "event_log" || tab === "validation") text = "Not reconstructed yet — run Reconstruct.";
     else text = "No raw stream for this session.";
   } else {
@@ -315,11 +333,13 @@ $("copyBtn").onclick = async () => {
 
 $("exportBtn").onclick = () => {
   if (!lastViewText) return;
-  const isJson = !LOCAL_TABS[activeTab];
-  const blob = new Blob([lastViewText], { type: isJson ? "application/json" : "text/plain" });
+  let ext = "json", type = "application/json";
+  if (activeTab === "specs") { ext = "md"; type = "text/markdown"; }
+  else if (LOCAL_TABS[activeTab] || activeTab === "raw") { ext = "txt"; type = "text/plain"; }
+  const blob = new Blob([lastViewText], { type });
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
-  a.download = `${selectedSid || "session"}-${activeTab}.${isJson ? "json" : "txt"}`;
+  a.download = `${selectedSid || "session"}-${activeTab}.${ext}`;
   a.click();
   URL.revokeObjectURL(a.href);
 };
@@ -411,6 +431,7 @@ function pollDiscover() {
       $("discoverMsg").innerHTML = `<span class="ok">done</span> — ${data.bundles} bundle(s), ${data.anti_bundles} anti-bundle(s).`;
       setPill("results");
       if (scoreAvailable) $("scoreBtn").disabled = false;
+      enableReviewButtons(true, false);   // discovery exists -> can load for review
       delete cache[selectedSid];
       await loadAndShow("discovery");
       await refreshSessions();
@@ -485,12 +506,230 @@ async function refreshSessions() {
       enableDiscoverButtons(!!art.event_log);
       scoreAvailable = !!(meta.data && meta.data.answer_key_path);
       $("scoreBtn").disabled = !(scoreAvailable && art.discovery);
+      enableReviewButtons(!!art.discovery, false);
+      reviewData = null;
+      $("reviewContainer").innerHTML = "";
       $("discoverTarget").textContent = art.event_log ? `target: ${selectedSid}` : "";
       $("scorecardView").classList.add("hidden");
       await loadAndShow("event_log");
       await refreshSessions();
     };
   });
+}
+
+// ===========================================================================
+// Stage 3 — Review / edit + spec generation
+// ===========================================================================
+let reviewData = null;        // {reviewed, examples_by_id}
+let specTimer = null;
+const ESC = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, c =>
+  ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+function enableReviewButtons(canLoad, loaded) {
+  $("loadReviewBtn").disabled = !canLoad;
+  $("saveReviewBtn").disabled = !loaded;
+  $("genSpecBtn").disabled = !loaded;
+  $("specDryRun").disabled = !loaded;
+}
+
+$("loadReviewBtn").onclick = async () => {
+  if (!selectedSid) return;
+  $("reviewMsg").textContent = "loading…";
+  const { ok, data } = await api("GET", `/api/sessions/${selectedSid}/review-data`);
+  if (!ok) {
+    $("reviewMsg").innerHTML = `<span class="err">${(data && data.error) || "failed"}</span>` +
+      (data && data.error === "not_discovered" ? " — run Discovery first." : "");
+    return;
+  }
+  reviewData = data;
+  renderReview();
+  enableReviewButtons(true, true);
+  $("reviewMsg").textContent = "loaded — edit, then Save.";
+};
+
+function itemCard(item, isAnti) {
+  const ex = reviewData.examples_by_id || {};
+  const steps = item.steps || [];
+  const cpByStep = {};
+  (item.human_checkpoints || []).forEach(c => { cpByStep[c.step_index] = c.note || ""; });
+  const included = new Set(item.included_example_event_ids || []);
+  const exIds = item.evidence_event_ids || [];
+
+  const stepRows = steps.map((s, i) => `
+    <div class="step-row">
+      <input type="text" class="step-text" value="${ESC(s)}" />
+      <label><input type="checkbox" class="step-cp" ${cpByStep[i] !== undefined ? "checked" : ""}/> checkpoint</label>
+      <input type="text" class="cp-note" placeholder="pause-and-ask note" value="${ESC(cpByStep[i] || "")}" />
+    </div>`).join("");
+
+  const exRows = exIds.map(id => `
+    <div class="ex-row">
+      <label><input type="checkbox" class="ex-incl" data-eid="${ESC(id)}" ${included.has(id) ? "checked" : ""}/> ${ESC(id)}</label>
+      <span class="ex-text">${ESC(ex[id] ? ex[id].detail : "(example text unavailable)")}</span>
+    </div>`).join("") || `<div class="muted">no examples</div>`;
+
+  return `
+  <div class="review-item ${isAnti ? "anti" : "bundle"}" data-id="${ESC(item.id)}"
+       data-orig-class="${isAnti ? "anti_bundle" : "bundle"}"
+       data-orig-why="${ESC(item.why_judgment || "")}">
+    <h4>${ESC(item.id)} · <span class="muted">${item.confidence || ""}</span></h4>
+    <div class="field"><label>name</label><input type="text" class="f-name" value="${ESC(item.name)}"/></div>
+    <div class="field"><label>classification</label>
+      <select class="f-class">
+        <option value="bundle" ${!isAnti ? "selected" : ""}>bundle (automatable)</option>
+        <option value="anti_bundle" ${isAnti ? "selected" : ""}>anti-bundle (judgment)</option>
+      </select>
+      <label>disposition</label>
+      <select class="f-disp">
+        <option value="approve_for_build" ${item.disposition !== "reject" ? "selected" : ""}>approve_for_build</option>
+        <option value="reject" ${item.disposition === "reject" ? "selected" : ""}>reject</option>
+      </select>
+    </div>
+    <div class="field"><label>description</label><textarea class="f-desc">${ESC(item.description)}</textarea></div>
+    <div class="field"><label>trigger</label><input type="text" class="f-trigger" value="${ESC(item.trigger || "")}"/></div>
+    <div class="field"><label>why judgment</label><textarea class="f-why" placeholder="(for anti-bundle / reclassification)">${ESC(item.why_judgment || "")}</textarea></div>
+    <div class="field"><label>handling</label><input type="text" class="f-handling" value="${ESC(item.recommended_handling || "")}"/></div>
+    <div class="review-sub">steps (toggle a checkpoint per step)</div>
+    <div class="steps">${stepRows}</div>
+    <button class="link add-step">+ add step</button>
+    <div class="review-sub">observed examples (include / exclude — verbatim)</div>
+    ${exRows}
+    <div class="review-sub">added acceptance criteria (one per line)</div>
+    <div class="field"><textarea class="f-criteria">${ESC((item.added_acceptance_criteria || []).join("\n"))}</textarea></div>
+    <div class="review-sub">preferred output (optional)</div>
+    <div class="field"><textarea class="f-prefout">${ESC(item.preferred_output || "")}</textarea></div>
+  </div>`;
+}
+
+function renderReview() {
+  const c = $("reviewContainer");
+  const r = reviewData.reviewed;
+  c.innerHTML =
+    (r.bundles || []).map(b => itemCard(b, false)).join("") +
+    (r.anti_bundles || []).map(a => itemCard(a, true)).join("");
+  c.querySelectorAll(".add-step").forEach(btn => {
+    btn.onclick = () => {
+      const steps = btn.previousElementSibling;
+      const div = document.createElement("div");
+      div.className = "step-row";
+      div.innerHTML = `<input type="text" class="step-text" value=""/>
+        <label><input type="checkbox" class="step-cp"/> checkpoint</label>
+        <input type="text" class="cp-note" placeholder="pause-and-ask note"/>`;
+      steps.appendChild(div);
+    };
+  });
+}
+
+function scrapeReview() {
+  const bundles = [], anti = [];
+  $("reviewContainer").querySelectorAll(".review-item").forEach(el => {
+    const cls = el.querySelector(".f-class").value;
+    const origClass = el.dataset.origClass;
+    const steps = [], checkpoints = [];
+    el.querySelectorAll(".step-row").forEach((row, i) => {
+      const txt = row.querySelector(".step-text").value.trim();
+      if (!txt) return;
+      const idx = steps.length;
+      steps.push(txt);
+      if (row.querySelector(".step-cp").checked)
+        checkpoints.push({ step_index: idx, note: row.querySelector(".cp-note").value.trim() });
+    });
+    const incl = [];
+    el.querySelectorAll(".ex-incl").forEach(cb => { if (cb.checked) incl.push(cb.dataset.eid); });
+    const crit = el.querySelector(".f-criteria").value.split("\n").map(s => s.trim()).filter(Boolean);
+    const item = {
+      id: el.dataset.id, classification: cls,
+      name: el.querySelector(".f-name").value.trim(),
+      description: el.querySelector(".f-desc").value.trim(),
+      trigger: el.querySelector(".f-trigger").value.trim(),
+      steps,
+      disposition: el.querySelector(".f-disp").value,
+      human_checkpoints: checkpoints,
+      included_example_event_ids: incl,
+      added_acceptance_criteria: crit,
+      preferred_output: el.querySelector(".f-prefout").value.trim(),
+      why_judgment: el.querySelector(".f-why").value.trim(),
+      recommended_handling: el.querySelector(".f-handling").value.trim(),
+      evidence_event_ids: incl.slice(),  // provenance kept; server filters to known ids
+      reclassified_from: cls !== origClass ? origClass : null,
+      original_reason_for_judgment: (cls === "bundle" && origClass === "anti_bundle")
+        ? el.dataset.origWhy : "",
+    };
+    // keep full evidence provenance (union of original examples)
+    el.querySelectorAll(".ex-incl").forEach(cb => {
+      if (!item.evidence_event_ids.includes(cb.dataset.eid)) item.evidence_event_ids.push(cb.dataset.eid);
+    });
+    (cls === "anti_bundle" ? anti : bundles).push(item);
+  });
+  return { bundles, anti_bundles: anti, notes: (reviewData.reviewed.notes || "") };
+}
+
+async function saveReview() {
+  const body = scrapeReview();
+  const { ok, data } = await api("POST", `/api/sessions/${selectedSid}/reviewed-bundles`, body);
+  if (ok) {
+    reviewData.reviewed = data.reviewed;
+    delete cache[selectedSid];
+    await refreshSessions();
+  }
+  return { ok, data };
+}
+
+$("saveReviewBtn").onclick = async () => {
+  $("reviewMsg").textContent = "saving…";
+  const { ok, data } = await saveReview();
+  $("reviewMsg").innerHTML = ok
+    ? `<span class="ok">saved</span> — ${data.errors.length} repair(s), ${data.flags.length} flag(s).`
+    : `<span class="err">save failed</span>`;
+};
+
+$("specDryRun").onclick = async () => {
+  $("reviewMsg").textContent = "saving + rendering…";
+  await saveReview();
+  const { ok, data } = await api("POST", `/api/sessions/${selectedSid}/specs-dry-run`);
+  if (!ok) { $("reviewMsg").innerHTML = `<span class="err">${(data && data.error) || "failed"}</span>`; return; }
+  cache[selectedSid] = cache[selectedSid] || {};
+  cache[selectedSid].specdryrun =
+    `// SPEC DRY RUN — ${data.approved_count} approved bundle(s), one model call each. No cost.\n\n` +
+    `===== SYSTEM PROMPT =====\n${data.system_prompt}\n\n` +
+    data.bundles.map(b => `===== BUNDLE ${b.id} =====\n${b.material}`).join("\n\n");
+  $("reviewMsg").textContent = "";
+  switchTab("specdryrun");
+};
+
+$("genSpecBtn").onclick = async () => {
+  $("reviewMsg").textContent = "saving + generating…";
+  await saveReview();
+  const { ok, status, data } = await api("POST", `/api/sessions/${selectedSid}/generate-specs`);
+  if (status === 400 && data && data.error === "no_api_key") {
+    $("reviewMsg").innerHTML = `<span class="err">no API key</span> — add one in Settings (only the build path needs it).`; return;
+  }
+  if (!ok && status !== 202) {
+    $("reviewMsg").innerHTML = `<span class="err">${(data && data.error) || "failed"}</span>`; return;
+  }
+  setPill("reconstructing");
+  pollSpecs();
+};
+
+function pollSpecs() {
+  if (specTimer) clearInterval(specTimer);
+  specTimer = setInterval(async () => {
+    const { data } = await api("GET", `/api/sessions/${selectedSid}/generate-specs/status`);
+    if (!data) return;
+    if (data.state === "done") {
+      clearInterval(specTimer); specTimer = null;
+      $("reviewMsg").innerHTML = `<span class="ok">done</span> — ${data.built} build spec(s) generated.`;
+      setPill("results");
+      delete cache[selectedSid];
+      await loadAndShow("specs");
+      await refreshSessions();
+    } else if (data.state === "error") {
+      clearInterval(specTimer); specTimer = null;
+      const e = data.error === "no_api_key" ? "no API key (add one in Settings)" : data.error;
+      $("reviewMsg").innerHTML = `<span class="err">spec generation failed</span> — ${e}`;
+      setPill("idle");
+    }
+  }, 800);
 }
 
 $("refreshPerms").onclick = refreshPermissions;

@@ -1,0 +1,61 @@
+"""CLI for the Artifact Engine:  reviewed_bundles.json + event_log.json -> specs.
+
+    python -m trace.artifact.cli reviewed_bundles.json event_log.json -o specs/
+
+Writes one ``spec_<id>.md`` per approved bundle (and a ``spec_<id>_manual.md`` note
+per anti-bundle). ``--dry-run`` renders, for each approved bundle, the prompt + the
+bundle + the verbatim examples that would be sent — no model call, no cost.
+"""
+
+import argparse
+import os
+import sys
+
+from . import review
+from .artifact import (DEFAULT_MODEL, build_prompt_material, generate_specs,
+                       load_json)
+from .prompt import SYSTEM_PROMPT
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Trace Artifact Engine (Stage 3)")
+    ap.add_argument("reviewed", help="path to reviewed_bundles.json")
+    ap.add_argument("event_log", help="path to event_log.json")
+    ap.add_argument("-o", "--out", default="specs", help="output directory for spec files")
+    ap.add_argument("--model", default=DEFAULT_MODEL)
+    ap.add_argument("--dry-run", action="store_true",
+                    help="render the prompt + bundle + verbatim examples; no model call")
+    args = ap.parse_args()
+
+    if args.dry_run:
+        reviewed = load_json(args.reviewed)
+        event_log = load_json(args.event_log)
+        rep = review.ReviewReport()
+        reviewed = review.validate_reviewed(reviewed, set(review.event_index(event_log)), rep)
+        print("=== SYSTEM PROMPT ===")
+        print(SYSTEM_PROMPT)
+        approved = [b for b in reviewed["bundles"] if b.get("disposition") == "approve_for_build"]
+        print(f"\n# {len(approved)} approved bundle(s) -> one model call each\n")
+        for b in approved:
+            examples = review.fetch_examples(event_log, b["included_example_event_ids"])
+            print(f"===== BUNDLE {b['id']} =====")
+            print(build_prompt_material(b, examples))
+            print()
+        return
+
+    results, report = generate_specs(args.reviewed, args.event_log, model=args.model)
+    os.makedirs(args.out, exist_ok=True)
+    written = 0
+    for r in results:
+        if r["markdown"] is None:
+            continue
+        with open(os.path.join(args.out, r["filename"]), "w", encoding="utf-8") as f:
+            f.write(r["markdown"])
+        written += 1
+    built = sum(1 for r in results if r["built"])
+    print(f"Wrote {written} file(s) ({built} build spec(s)) -> {args.out}", file=sys.stderr)
+    print("Validation: " + str(report), file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()
