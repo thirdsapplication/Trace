@@ -103,15 +103,21 @@ interface Engine 2 consumes. **Do not change this shape without versioning it.**
 
 ### Controlled `action` vocabulary (v1, small-but-fixed)
 Starting set; expand only as real sessions demand (see Open Decision in README).
-Domain-neutral on purpose — no business-specific verbs.
+Domain-neutral on purpose — no business-, format-, or app-specific verbs.
 
 ```
 read_email, reply_email, send_email, compose_email,
-open_document, view_pdf, read_document,
+open_document,
 enter_data, update_data, copy_value, paste_value,
 search, navigate, select_option, click_control,
 switch_window, unknown
 ```
+
+Documents use **one** action regardless of application or file format:
+`open_document` (there is deliberately no format-specific verb such as
+`view_pdf` — that would make the same real task look different across apps and
+break Engine 2's recurrence detection). Document open/view/read synonyms are
+normalized to `open_document`.
 
 `unknown` is the explicit escape hatch for ambiguous signals (paired with
 `confidence: low`) so the model never has to guess a meaning.

@@ -40,49 +40,82 @@ def _dwell_seconds(this_ts, next_ts):
     return (b - a).total_seconds()
 
 
-def augment_document_opens(event_log, raw, persistence_seconds=DEFAULT_OPEN_PERSISTENCE_SECONDS):
-    """Return ``event_log`` plus synthesized open events for sustained, otherwise
-    unrepresented window focuses. ``raw`` is the ordered raw-event list (each
-    ``{id, ts, source, payload}``). Pure function; does not mutate ``event_log``
-    in place beyond appending new events to a copy.
+def _evidence_index_set(ev, idx_of):
+    return {idx_of[r] for r in ev.get("evidence", []) if r in idx_of}
 
-    The caller is responsible for re-sequencing ids afterwards.
+
+def _represents_focus(ev, idx_of, raw, lo, hi):
+    """True when ``ev`` already represents the window focused over raw rows
+    ``[lo, hi)`` — i.e. an action that happened *in* this window.
+
+    Structural test, robust to model-normalized titles/app strings (no string
+    matching): ``ev`` represents the focus iff it cites at least one row inside the
+    span AND every *content* (non-window) row it cites lies inside the span. A
+    navigation cites the focus's window row with no content (vacuously inside). A
+    data-entry/compose/reply in this window cites content rows inside the span. An
+    action anchored elsewhere that merely cites this window row incidentally has
+    content rows *outside* the span, so it does NOT represent this focus."""
+    ev_idxs = _evidence_index_set(ev, idx_of)
+    if not ev_idxs:
+        return False
+    in_span = any(lo <= k < hi for k in ev_idxs)
+    if not in_span:
+        return False
+    content_idxs = [k for k in ev_idxs if raw[k]["source"] != "window"]
+    return all(lo <= k < hi for k in content_idxs)
+
+
+def augment_document_opens(event_log, raw, persistence_seconds=DEFAULT_OPEN_PERSISTENCE_SECONDS):
+    """Return ``event_log`` plus synthesized open events for window focuses that are
+    **sustained** and **not already represented** by another action over that
+    focus's rows. ``raw`` is the ordered raw-event list (each
+    ``{id, ts, source, payload}``). Pure function; appends to a copy.
+
+    A standalone open is emitted only when, during a window's focus span, no other
+    action represents it (so a window the worker immediately acts in is covered by
+    that action, not double-counted), the focus persists beyond the flicker
+    threshold, and the title is not blank/anonymous. One open per distinct window.
+    The caller re-sequences ids afterwards.
     """
-    windows = [(i, r) for i, r in enumerate(raw) if r["source"] == "window"]
-    if not windows:
+    window_positions = [k for k, r in enumerate(raw) if r["source"] == "window"]
+    if not window_positions:
         return list(event_log)
 
-    last_ts = raw[-1]["ts"]
-    # An existing event "represents" a window if it is *about* that window
-    # (same app + title) — not merely cites it as incidental evidence.
-    represented = {(e.get("app", ""), e.get("window", "")) for e in event_log}
-
+    idx_of = {r["id"]: k for k, r in enumerate(raw)}
     out = list(event_log)
     seen_keys = set()  # one synthesized open per distinct (app, title)
 
-    for pos, (idx, w) in enumerate(windows):
+    for n, i in enumerate(window_positions):
+        w = raw[i]
         app = w["payload"].get("app", "")
         title = w["payload"].get("title", "")
-        key = (app, title)
 
-        # dwell = until the next focus change (or end of session for the last one)
-        next_ts = windows[pos + 1][1]["ts"] if pos + 1 < len(windows) else last_ts
-        dwell = _dwell_seconds(w["ts"], next_ts)
+        if not (title or "").strip():
+            continue  # blank/anonymous window title -> not a document, suppress
+
+        # focus span = [i, j): from this window event up to the next focus change
+        j = window_positions[n + 1] if n + 1 < len(window_positions) else len(raw)
+        dwell = _dwell_seconds(w["ts"], raw[j]["ts"] if j < len(raw) else raw[-1]["ts"])
         if dwell is None or dwell < persistence_seconds:
             continue  # brief flicker / sub-threshold oscillation -> no event
-        if key in represented or key in seen_keys:
-            continue  # already surfaced (e.g. a browser-doc navigation) -> no dup
+
+        key = (app, title)
+        if key in seen_keys:
+            continue
+        # suppress if any existing action already represents this focus
+        if any(_represents_focus(e, idx_of, raw, i, j) for e in event_log):
+            continue
 
         seen_keys.add(key)
         out.append({
             "id": "",  # assigned by resequence
             "ts_start": w["ts"],
-            "ts_end": next_ts,
+            "ts_end": raw[j]["ts"] if j < len(raw) else w["ts"],
             "app": app,
             "window": title,
             "action": OPEN_ACTION,
             # grounded only in the window title; contents are never invented
-            "detail": f'Opened/viewed "{title}".' if title else f"Opened/viewed {app}.",
+            "detail": f'Opened/viewed "{title}".',
             "evidence": [w["id"]],
             "confidence": "medium",
         })

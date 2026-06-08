@@ -45,17 +45,25 @@ class CollectorStats:
 
     def __init__(self):
         self.browser_event_count = 0
-        self.last_event_ts = None  # ISO-8601 string of the last accepted browser event
+        self.last_event_ts = None   # ISO-8601 of the last accepted browser event
+        self.last_hello_ts = None   # ISO-8601 of the last extension heartbeat
 
     def record(self, ts):
         self.browser_event_count += 1
         self.last_event_ts = ts
 
+    def hello(self, ts):
+        self.last_hello_ts = ts
+
     def snapshot(self):
         return {
+            # "detected": browser events actually arrived (sending)
             "detected": self.browser_event_count > 0,
+            # "connected": extension announced itself, even before the first event
+            "connected": self.last_hello_ts is not None or self.browser_event_count > 0,
             "browser_event_count": self.browser_event_count,
             "last_event_ts": self.last_event_ts,
+            "last_hello_ts": self.last_hello_ts,
         }
 
 
@@ -91,6 +99,13 @@ def make_handler(writer, stats=None):
                 self._send(404, {"error": "not found"})
 
         def do_POST(self):
+            if self.path == "/hello":
+                # extension presence heartbeat; writes nothing to the raw stream
+                import datetime
+                if stats is not None:
+                    stats.hello(datetime.datetime.now().astimezone().isoformat(timespec="milliseconds"))
+                self._send(200, {"ok": True})
+                return
             if self.path != "/event":
                 self._send(404, {"error": "not found"})
                 return
@@ -120,7 +135,8 @@ def make_handler(writer, stats=None):
 
 def serve(out_path, port=8137):
     writer = RawWriter(out_path, reset=False)
-    httpd = ThreadingHTTPServer(("127.0.0.1", port), make_handler(writer))
+    stats = CollectorStats()
+    httpd = ThreadingHTTPServer(("127.0.0.1", port), make_handler(writer, stats))
     print(f"Trace collector listening on http://127.0.0.1:{port}  ->  {out_path}")
     print("Browser extension should POST normalized events to /event. Ctrl-C to stop.")
     try:

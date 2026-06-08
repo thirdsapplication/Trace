@@ -33,11 +33,15 @@ _SYNONYMS = {
     "send_mail": "send_email",
     "write_email": "compose_email",
     "draft_email": "compose_email",
-    "open_pdf": "view_pdf",
-    "read_pdf": "view_pdf",
+    # all document open/view/read verbs -> ONE document action (no format/app split)
+    "open_pdf": "open_document",
+    "view_pdf": "open_document",
+    "read_pdf": "open_document",
     "open_file": "open_document",
     "open_doc": "open_document",
-    "read_doc": "read_document",
+    "view_document": "open_document",
+    "read_document": "open_document",
+    "read_doc": "open_document",
     "enter_order_data": "enter_data",
     "enter_order": "enter_data",
     "input_data": "enter_data",
@@ -300,6 +304,60 @@ def resequence(events):
     for i, ev in enumerate(events, start=1):
         ev["id"] = f"e{i:03d}"
     return events
+
+
+def _has_material(ev, raw_by_id):
+    """True if the event cites authored-content evidence (keystroke/click/clipboard
+    — not pure navigation context). Authored-content actions are the ones a model
+    may fragment across many keystrokes; navigations/reads are not coalesced."""
+    return _material_range(ev, raw_by_id) is not None
+
+
+def _merge_fragments(a, b, raw_by_id):
+    """Combine two fragments of one action into a single event, preserving all
+    observed values (evidence unioned, detail concatenated, span widened)."""
+    ev_ids = list(dict.fromkeys(a["evidence"] + b["evidence"]))
+    ev_ids.sort(key=lambda r: (_evidence_index(r) if _evidence_index(r) is not None else 0))
+    detail = a["detail"]
+    if b["detail"] and b["detail"] not in detail:
+        detail = f"{detail}; {b['detail']}"
+    rank = min(_CONFIDENCE_RANK.get(a["confidence"], 0), _CONFIDENCE_RANK.get(b["confidence"], 0))
+    confidence = next(c for c, r in _CONFIDENCE_RANK.items() if r == rank) if rank else "low"
+    return {
+        "id": a["id"],
+        "ts_start": min(a["ts_start"], b["ts_start"]) if a["ts_start"] and b["ts_start"] else (a["ts_start"] or b["ts_start"]),
+        "ts_end": max(a["ts_end"], b["ts_end"]) if a["ts_end"] and b["ts_end"] else (a["ts_end"] or b["ts_end"]),
+        "app": a["app"] or b["app"],
+        "window": a["window"] or b["window"],
+        "action": a["action"],
+        "detail": detail,
+        "evidence": ev_ids,
+        "confidence": confidence,
+    }
+
+
+def coalesce_contiguous(events, raw_by_id):
+    """Coalesce runs of consecutive authored-content events that share the same
+    window context + action type with no intervening action of a different kind
+    into one event — so a single logical record fragmented across many keystrokes
+    is assembled consistently, regardless of how the model chunked it or where in
+    the stream it occurs.
+
+    Events must already be in chronological order. This is the symmetric counterpart
+    to the de-dup guard: distinct actions separated by *any* different action (or
+    window) are not adjacent-same and so are never coalesced; one action's fragments
+    are. Navigations/reads (no material evidence) are never coalesced."""
+    if not events:
+        return events
+    merged = [dict(events[0])]
+    for ev in events[1:]:
+        prev = merged[-1]
+        if (_same_action(prev, ev)
+                and _has_material(prev, raw_by_id) and _has_material(ev, raw_by_id)):
+            merged[-1] = _merge_fragments(prev, ev, raw_by_id)
+        else:
+            merged.append(dict(ev))
+    return merged
 
 
 def stitch(chunk_outputs, raw_by_id, report):

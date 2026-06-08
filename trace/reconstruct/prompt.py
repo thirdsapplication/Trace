@@ -11,9 +11,11 @@ recurrence). The vocabulary is generic verbs, not domain verbs.
 """
 
 # Small, fixed, domain-neutral controlled vocabulary (see schema/SCHEMA.md).
+# Documents use ONE action regardless of application or format (open_document);
+# there is deliberately no format-specific verb (e.g. no "view_pdf").
 ACTION_VOCAB = [
     "read_email", "reply_email", "send_email", "compose_email",
-    "open_document", "view_pdf", "read_document",
+    "open_document",
     "enter_data", "update_data", "copy_value", "paste_value",
     "search", "navigate", "select_option", "click_control",
     "switch_window", "unknown",
@@ -47,7 +49,12 @@ RULES:
 - Preserve concrete values exactly as captured: line items, totals, prices,
   tracking numbers, recipients, message text, dropdown selections.
 - If a signal is ambiguous (a stray keystroke, a find-bar query, a shortcut),
-  record it with low confidence rather than guessing its meaning.
+  record it with low confidence rather than guessing its meaning. A short token
+  typed into a find/search box is a query, not field data — do not record it as
+  entered field data at high confidence.
+- Do not assert a specific field role or value semantics the stream does not
+  support (e.g. whether a number is a unit price vs a running total). Prefer a
+  neutral, grounded description over a confident but unsupported label.
 - Where an action plainly involves a human judgment call (e.g. a credit decision,
   handling a complaint, setting a custom/exception price), make that legible in
   the detail rather than flattening it into a routine data-entry step.

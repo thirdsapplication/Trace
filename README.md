@@ -138,14 +138,14 @@ cat captures/event_log.json
 ### 6. Anywhere smoke test (no key, no Mac, no cost)
 
 ```bash
-# full automated suite (89 tests)
+# full automated suite (108 tests)
 python -m unittest discover -s trace/tests -t . -p "test_*.py"
 
 # preview the chunked prompt on the bundled sample (no model call)
 python -m trace.reconstruct.cli trace/samples/sample_raw_events.jsonl --dry-run --chunk-size 8 --overlap 2
 ```
 
-Expect `Ran 89 tests … OK`, and a printed system prompt + 3 rendered chunks.
+Expect `Ran 108 tests … OK`, and a printed system prompt + 3 rendered chunks.
 
 **Useful flags:**
 - UI: `python -m trace.ui.app --port 8765 --collector-port 8137 --sessions-root captures/sessions --no-open`
@@ -255,7 +255,7 @@ prompt, then validates, stitches, and renumbers the result. Determinism matters:
 the same raw input yields a materially identical log, because Engine 2's
 recurrence detection depends on it.
 
-Two structural rules in the stitch/finalize step keep the log faithful:
+Structural rules in the stitch/finalize step keep the log faithful and stable:
 
 - **Boundary-straddle de-duplication.** An action whose evidence crosses a chunk
   seam is reconstructed truncated in the earlier chunk and complete in the later
@@ -264,12 +264,20 @@ Two structural rules in the stitch/finalize step keep the log faithful:
   (keystrokes/clicks/clipboard — never shared navigation context), and keeps the
   most complete instance. Two genuinely distinct-but-similar actions cite disjoint
   material spans and are both preserved (no over-merge).
+- **Contiguous-entry coalescing.** A single logical record fragmented across many
+  keystrokes in one window (with no intervening action of a different kind) is
+  assembled into one `enter_data` event — consistently, regardless of fragment
+  count or stream position — restoring stable reconstruction of fragmented canvas
+  typing. Distinct actions separated by a different action (or window) are never
+  coalesced.
 - **Symmetric document-open detection.** A focus that persists beyond a brief
-  flicker on a window not otherwise represented in the log is recorded as an
-  "opened/viewed «window»" action — the *same* persistence/duration rule for
-  browser tabs and separate native apps alike (no app allowlist, no file-type
-  branching). Contents are never fabricated; only the window-title identifier is
-  recorded. Sub-threshold window oscillation produces no events.
+  flicker and is *not already represented* by another action over its rows is
+  recorded once as an `open_document` action — the *same* rule and the *same*
+  single vocabulary for browser tabs and separate native apps (no app allowlist,
+  no file-type branching). A window the worker immediately acts in is represented
+  by that action, so no separate open is emitted; blank/anonymous titles and
+  sub-threshold oscillation produce nothing. Contents are never fabricated — only
+  the window-title identifier is recorded.
 
 Inspect exactly what Haiku will see, with **no API cost**:
 
@@ -314,11 +322,12 @@ first chunk — capture and `--dry-run` are unaffected.
 python -m unittest discover -s trace/tests -t . -p "test_*.py"
 ```
 
-The suite (69 tests) covers redaction, keystroke coalescing, the raw writer,
-chunking, schema validation/normalization, fragment-stitch flagging, the full
-reconstruction pipeline with a mock model, plus the test-UI backend (key store,
-sessions, capture lifecycle, reconstruct guards) — so it runs without an API key,
-`pynput`, or a browser.
+The suite (108 tests) covers redaction, keystroke coalescing, the raw writer,
+chunking, schema validation/normalization, fragment-stitch flagging, boundary
+de-duplication, contiguous-entry coalescing, document-open detection/coverage,
+the browser-capture collector path, the full reconstruction pipeline with a mock
+model, plus the test-UI backend (key store, sessions, capture lifecycle,
+reconstruct guards) — so it runs without an API key, `pynput`, or a browser.
 
 ## Local test UI (run the whole engine from a window)
 

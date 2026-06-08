@@ -130,9 +130,14 @@ def reconstruct(raw_path, model=DEFAULT_MODEL, chunk_size=120, overlap=20,
             progress_cb(i, total)
 
     event_log = validate.stitch(chunk_outputs, raw_by_id, report)
-    # Symmetric document-open detection: surface sustained native-app (and browser)
-    # document opens that the model did not already represent, then re-sequence ids.
+    # Symmetric document-open detection: surface sustained, otherwise-unrepresented
+    # document opens (browser or native) the model did not already represent.
     event_log = augment.augment_document_opens(
         event_log, raw, persistence_seconds=open_persistence_seconds)
+    event_log = validate.resequence(event_log)
+    # Stable assembly of one logical record fragmented across many keystrokes:
+    # coalesce contiguous same-window data-entry fragments (no intervening action
+    # of a different kind) into one event, then re-sequence.
+    event_log = validate.coalesce_contiguous(event_log, raw_by_id)
     event_log = validate.resequence(event_log)
     return event_log, report
