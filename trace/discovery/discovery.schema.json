@@ -1,0 +1,53 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://trace.dev/schema/discovery.schema.json",
+  "title": "Trace discovery output (Discovery Engine -> Artifact C contract)",
+  "type": "object",
+  "required": ["bundles", "anti_bundles", "unclustered_or_noise_event_ids", "notes"],
+  "additionalProperties": false,
+  "properties": {
+    "bundles": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "name", "description", "trigger", "steps", "frequency",
+                     "evidence_event_ids", "why_automatable", "confidence"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string", "pattern": "^B[0-9]+$" },
+          "name": { "type": "string" },
+          "description": { "type": "string" },
+          "trigger": { "type": "string" },
+          "steps": { "type": "array", "items": { "type": "string" } },
+          "frequency": { "type": "string" },
+          "evidence_event_ids": { "type": "array", "items": { "type": "string" } },
+          "why_automatable": { "type": "string" },
+          "confidence": { "type": "string", "enum": ["high", "medium", "low"] }
+        }
+      }
+    },
+    "anti_bundles": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "name", "description", "why_judgment",
+                     "recommended_handling", "evidence_event_ids", "confidence"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string", "pattern": "^A[0-9]+$" },
+          "name": { "type": "string" },
+          "description": { "type": "string" },
+          "why_judgment": { "type": "string" },
+          "recommended_handling": { "type": "string" },
+          "evidence_event_ids": { "type": "array", "items": { "type": "string" } },
+          "confidence": { "type": "string", "enum": ["high", "medium", "low"] }
+        }
+      }
+    },
+    "unclustered_or_noise_event_ids": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "notes": { "type": "string" }
+  }
+}

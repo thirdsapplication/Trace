@@ -1,0 +1,32 @@
+{
+  "_comment": "Answer key for the Marcy gate fixture. Read ONLY by the Scorer, never by the engine. event_ids list the events that belong to each workflow; intent is plain-language for the intent-judge.",
+  "bundles": [
+    {"id": "AKB1", "intent": "Customer purchase-order intake: read an inbound PO email, open the attached PO, enter the order into the ERP, and reply confirming receipt and ship date.",
+     "event_ids": ["e001","e002","e003","e004","e009","e010","e011","e012"]},
+    {"id": "AKB2", "intent": "Send ship-confirmation emails for orders shipped, with carrier and tracking number, to each affected customer.",
+     "event_ids": ["e016","e017","e018"]},
+    {"id": "AKB3", "intent": "Supplier price update: read the new supplier costs and update the pricing sheet, and if a SKU falls below the margin threshold, copy it into a review tab (a conditional branch within one workflow).",
+     "event_ids": ["e023","e024","e025","e026"]},
+    {"id": "AKB4", "intent": "Reorder low-stock items: flag low-stock SKUs to a reorder list in the morning, then later place the reorders from that list and mark them ordered (trigger and execution separated in time, linked by the reorder-list artifact).",
+     "event_ids": ["e005","e006","e032","e033","e034"]},
+    {"id": "AKB5", "intent": "Send batch payment reminders to customers with overdue invoices.",
+     "event_ids": ["e028","e029","e030","e031"]},
+    {"id": "AKB6", "intent": "Daily inventory reconciliation: compare counted vs system quantities and post adjustments.",
+     "event_ids": ["e037","e038","e039"]},
+    {"id": "AKB7", "intent": "Post a notice to the team chat channel whenever a large order is received.",
+     "event_ids": ["e035","e036"]},
+    {"id": "AKB8", "intent": "Compile and send the weekly summary report from the week's order and revenue numbers.",
+     "event_ids": ["e042","e043","e044"]}
+  ],
+  "anti_bundles": [
+    {"id": "AKA1", "intent": "Custom pricing / bespoke quotes: deciding a discretionary discount or a one-off quote based on relationship, volume, and margins — a judgment call that differs each time.",
+     "event_ids": ["e013","e014","e015","e040","e041"]},
+    {"id": "AKA2", "intent": "Handling an upset customer complaint: crafting a personalized apology and resolution that depends on context and relationship.",
+     "event_ids": ["e020","e021","e022"]}
+  ],
+  "rubric": {
+    "overlap_threshold": 0.5,
+    "pass_min_bundles": 6,
+    "automation_penalty_per_antibundle": 1
+  }
+}

@@ -243,6 +243,8 @@ function pollRecon() {
       showProgress(false);
       $("reconMsg").innerHTML = `<span class="ok">done</span> — ${data.flags} review flag(s), ${data.errors} repair(s).`;
       setPill("results");
+      enableDiscoverButtons(true);   // event log now exists -> discovery can run
+      $("discoverTarget").textContent = `target: ${selectedSid}`;
       delete cache[selectedSid];
       await loadAndShow("event_log");
       await refreshSessions();
@@ -259,7 +261,9 @@ function pollRecon() {
 // ===========================================================================
 // Results (JSON views)
 // ===========================================================================
-const ENDPOINTS = { event_log: "event_log", validation: "validation", raw: "raw" };
+const ENDPOINTS = { event_log: "event_log", validation: "validation", raw: "raw",
+                    discovery: "discovery" };
+const LOCAL_TABS = { dryrun: 1, discdryrun: 1 };  // rendered client-side, no GET
 
 document.querySelectorAll(".tab").forEach(t => {
   t.onclick = () => switchTab(t.dataset.tab);
@@ -282,14 +286,18 @@ async function loadAndShow(tab) {
     setView(cache[selectedSid].dryrun || "Click “Preview (dry run)” to render what Haiku would be sent.");
     return;
   }
+  if (tab === "discdryrun") {
+    setView(cache[selectedSid].discdryrun || "Click discovery “Preview (dry run)” to render what Sonnet would be sent.");
+    return;
+  }
   if (cache[selectedSid][tab] !== undefined) { setView(cache[selectedSid][tab]); return; }
 
   const { ok, data } = await api("GET", `/api/sessions/${selectedSid}/${ENDPOINTS[tab]}`);
   let text;
   if (!ok) {
-    text = tab === "event_log" || tab === "validation"
-      ? "Not reconstructed yet — run Reconstruct."
-      : "No raw stream for this session.";
+    if (tab === "discovery") text = "Not discovered yet — run Discovery.";
+    else if (tab === "event_log" || tab === "validation") text = "Not reconstructed yet — run Reconstruct.";
+    else text = "No raw stream for this session.";
   } else {
     text = JSON.stringify(data, null, 2);
   }
@@ -307,7 +315,7 @@ $("copyBtn").onclick = async () => {
 
 $("exportBtn").onclick = () => {
   if (!lastViewText) return;
-  const isJson = activeTab !== "dryrun";
+  const isJson = !LOCAL_TABS[activeTab];
   const blob = new Blob([lastViewText], { type: isJson ? "application/json" : "text/plain" });
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
@@ -317,6 +325,129 @@ $("exportBtn").onclick = () => {
 };
 
 // ===========================================================================
+// Discovery (Stage 2)
+// ===========================================================================
+let discoverTimer = null;
+let scoreAvailable = false;   // selected session has an answer key
+
+function enableDiscoverButtons(on) {
+  $("discoverBtn").disabled = !on;
+  $("discoverDryRun").disabled = !on;
+}
+
+async function loadFixtures() {
+  const { data } = await api("GET", "/api/fixtures");
+  const sel = $("fixtureSelect");
+  sel.innerHTML = "";
+  if (!data || !data.fixtures.length) {
+    sel.innerHTML = `<option value="">(no fixtures)</option>`;
+    return;
+  }
+  for (const f of data.fixtures) {
+    const o = document.createElement("option");
+    o.value = f.name;
+    o.textContent = f.name + (f.has_answer_key ? " ✓key" : "");
+    sel.appendChild(o);
+  }
+}
+
+$("loadFixtureBtn").onclick = async () => {
+  const name = $("fixtureSelect").value;
+  if (!name) return;
+  $("discoverMsg").textContent = "loading fixture…";
+  const { ok, data } = await api("POST", "/api/load-fixture", { name });
+  if (!ok) { $("discoverMsg").innerHTML = `<span class="err">${(data && data.error) || "failed"}</span>`; return; }
+  selectedSid = data.session_id;
+  scoreAvailable = !!data.has_answer_key;
+  $("discoverTarget").textContent = `target: ${selectedSid} (fixture ${name}, ${data.event_count} events)`;
+  enableDiscoverButtons(true);
+  $("scoreBtn").disabled = !scoreAvailable;
+  $("scorecardView").classList.add("hidden");
+  $("discoverMsg").innerHTML = `loaded fixture <b>${name}</b>` + (scoreAvailable ? " (answer key available)" : "");
+  delete cache[selectedSid];
+  await loadAndShow("event_log");
+  await refreshSessions();
+};
+
+$("discoverDryRun").onclick = async () => {
+  if (!selectedSid) return;
+  $("discoverMsg").textContent = "rendering discovery preview…";
+  const { ok, data } = await api("POST", `/api/sessions/${selectedSid}/discovery-dry-run`);
+  if (!ok) { $("discoverMsg").innerHTML = `<span class="err">${(data && data.error) || "failed"}</span>`; return; }
+  cache[selectedSid] = cache[selectedSid] || {};
+  cache[selectedSid].discdryrun =
+    `// DISCOVERY DRY RUN — ${data.event_count} events, ONE call (no chunking). No cost.\n\n` +
+    `===== SYSTEM PROMPT =====\n${data.system_prompt}\n\n` +
+    `===== RENDERED EVENT LOG (model input) =====\n${data.rendered_log}`;
+  $("discoverMsg").textContent = "";
+  switchTab("discdryrun");
+};
+
+$("discoverBtn").onclick = async () => {
+  if (!selectedSid) return;
+  $("discoverMsg").textContent = "starting discovery…";
+  const { ok, status, data } = await api("POST", `/api/sessions/${selectedSid}/discover`);
+  if (status === 400 && data && data.error === "no_api_key") {
+    $("discoverMsg").innerHTML = `<span class="err">no API key</span> — add one in Settings.`; return;
+  }
+  if (status === 400 && data && data.error === "no_event_log") {
+    $("discoverMsg").innerHTML = `<span class="err">no event log</span> — reconstruct or load a fixture first.`; return;
+  }
+  if (!ok && status !== 202) {
+    $("discoverMsg").innerHTML = `<span class="err">${(data && data.error) || "failed"}</span>`; return;
+  }
+  setPill("reconstructing");
+  $("discoverMsg").innerHTML = `<span class="muted">discovering workflows over the whole day…</span>`;
+  pollDiscover();
+};
+
+function pollDiscover() {
+  if (discoverTimer) clearInterval(discoverTimer);
+  discoverTimer = setInterval(async () => {
+    const { data } = await api("GET", `/api/sessions/${selectedSid}/discover/status`);
+    if (!data) return;
+    if (data.state === "done") {
+      clearInterval(discoverTimer); discoverTimer = null;
+      $("discoverMsg").innerHTML = `<span class="ok">done</span> — ${data.bundles} bundle(s), ${data.anti_bundles} anti-bundle(s).`;
+      setPill("results");
+      if (scoreAvailable) $("scoreBtn").disabled = false;
+      delete cache[selectedSid];
+      await loadAndShow("discovery");
+      await refreshSessions();
+    } else if (data.state === "error") {
+      clearInterval(discoverTimer); discoverTimer = null;
+      const e = data.error === "no_api_key" ? "no API key (add one in Settings)" : data.error;
+      $("discoverMsg").innerHTML = `<span class="err">discovery failed</span> — ${e}`;
+      setPill("idle");
+    }
+  }, 800);
+}
+
+$("scoreBtn").onclick = async () => {
+  if (!selectedSid) return;
+  $("discoverMsg").textContent = "running gate scorer…";
+  const { ok, data } = await api("POST", `/api/sessions/${selectedSid}/score`);
+  if (!ok) {
+    const e = (data && (data.detail || data.error)) || "failed";
+    $("discoverMsg").innerHTML = `<span class="err">score failed</span> — ${e}`; return;
+  }
+  $("discoverMsg").textContent = "";
+  renderScorecard(data);
+};
+
+function renderScorecard(sc) {
+  const v = $("scorecardView");
+  v.classList.remove("hidden");
+  const verdict = sc.passed === null ? "" : (sc.passed ? "  VERDICT: PASS" : "  VERDICT: FAIL");
+  v.textContent =
+    `GATE SCORECARD\n` +
+    `bundles identified: ${sc.bundles_identified} of ${sc.bundles_total}  (overlap >= ${sc.overlap_threshold})\n` +
+    `automation penalties: ${sc.automation_penalties}\n` +
+    `sensitivity: ${Object.entries(sc.sensitivity || {}).map(([t, n]) => `${t}:${n}`).join(", ")}\n` +
+    verdict + "\n\n" + JSON.stringify(sc, null, 2);
+}
+
+// ===========================================================================
 // Session history
 // ===========================================================================
 async function refreshSessions() {
@@ -324,20 +455,22 @@ async function refreshSessions() {
   const tbody = $("sessionsTable").querySelector("tbody");
   tbody.innerHTML = "";
   if (!data || !data.sessions.length) {
-    tbody.innerHTML = `<tr><td colspan="6" class="muted">No sessions yet.</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="7" class="muted">No sessions yet.</td></tr>`;
     return;
   }
   for (const s of data.sessions) {
     const a = s.artifacts || {};
     const tr = document.createElement("tr");
     if (s.id === selectedSid) tr.className = "selected";
+    const disc = a.discovery ? `✓ ${a.candidate_count != null ? a.candidate_count : ""}` : "—";
     tr.innerHTML = `
-      <td><code>${s.id}</code></td>
+      <td><code>${s.id}</code>${s.fixture ? ` <span class="muted">(${s.fixture})</span>` : ""}</td>
       <td class="muted">${s.created_at || ""}</td>
       <td class="${a.raw ? "dot-yes" : "dot-no"}">${a.raw ? a.raw_event_count : "—"}</td>
       <td>${a.event_count != null ? a.event_count : "—"}</td>
       <td class="${a.event_log ? "dot-yes" : "dot-no"}">${a.event_log ? "✓" : "—"}</td>
-      <td><button class="link" data-open="${s.id}">open</button></td>`;
+      <td class="${a.discovery ? "dot-yes" : "dot-no"}">${disc}</td>
+      <td><button class="link" data-open="${s.id}" data-ak="${s.answer_key_path ? 1 : 0}">open</button></td>`;
     tbody.appendChild(tr);
   }
   tbody.querySelectorAll("[data-open]").forEach(b => {
@@ -346,6 +479,14 @@ async function refreshSessions() {
       delete cache[selectedSid];
       $("reconTarget").textContent = `target: ${selectedSid}`;
       enableReconButtons(true);
+      // a session with an event log can be discovered; with an answer key, scored
+      const meta = await api("GET", `/api/sessions/${selectedSid}`);
+      const art = (meta.data && meta.data.artifacts) || {};
+      enableDiscoverButtons(!!art.event_log);
+      scoreAvailable = !!(meta.data && meta.data.answer_key_path);
+      $("scoreBtn").disabled = !(scoreAvailable && art.discovery);
+      $("discoverTarget").textContent = art.event_log ? `target: ${selectedSid}` : "";
+      $("scorecardView").classList.add("hidden");
       await loadAndShow("event_log");
       await refreshSessions();
     };
@@ -359,7 +500,8 @@ $("refreshSessions").onclick = refreshSessions;
 // Boot
 // ===========================================================================
 (async function init() {
-  await Promise.all([refreshSettings(), refreshPermissions(), refreshSessions(), pollStatus()]);
+  await Promise.all([refreshSettings(), refreshPermissions(), refreshSessions(),
+                     loadFixtures(), pollStatus()]);
   // If a capture is already running (e.g. page reloaded), resume polling.
   if (capturing) startPolling();
 })();

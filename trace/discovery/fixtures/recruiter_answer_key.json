@@ -1,0 +1,26 @@
+{
+  "_comment": "Generalization fixture (different domain). Read ONLY by the Scorer. Structurally different from Marcy: fewer bundles, different apps, its own conditional-branch and time-separated workflows and anti-bundles.",
+  "bundles": [
+    {"id": "RKB1", "intent": "Resume screening intake: when a new applicant appears, open the resume and score it against a checklist, then if it meets the bar advance to the phone-screen stage, otherwise send a templated rejection (one workflow with a conditional branch).",
+     "event_ids": ["e001","e002","e003","e008","e009","e010","e011","e014","e015","e016"]},
+    {"id": "RKB2", "intent": "Schedule a phone screen by sending a calendar invite to candidates who advanced.",
+     "event_ids": ["e004","e017"]},
+    {"id": "RKB3", "intent": "Log structured interview feedback into the ATS after interviews.",
+     "event_ids": ["e024","e025"]},
+    {"id": "RKB4", "intent": "Build a candidate shortlist in the morning and send it to the hiring manager in the afternoon (trigger and execution separated in time, linked by the shortlist artifact).",
+     "event_ids": ["e012","e026"]},
+    {"id": "RKB5", "intent": "Source candidates and send a standard outreach message.",
+     "event_ids": ["e005","e006","e023"]}
+  ],
+  "anti_bundles": [
+    {"id": "RKA1", "intent": "Decide whether to extend an offer and at what level and compensation — a discretionary judgment based on scorecards and leveling.",
+     "event_ids": ["e018","e019","e020"]},
+    {"id": "RKA2", "intent": "Respond to a candidate upset about the process with a personalized, relationship-sensitive message.",
+     "event_ids": ["e021","e022"]}
+  ],
+  "rubric": {
+    "overlap_threshold": 0.5,
+    "pass_min_bundles": 4,
+    "automation_penalty_per_antibundle": 1
+  }
+}

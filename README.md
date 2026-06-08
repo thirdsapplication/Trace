@@ -7,19 +7,22 @@ It is three engines run in sequence over one observed workday:
 Raw capture stream
    │
    ▼
-Engine 1 — Event Log Engine   ← THIS REPO
-   │   hands off event_log.json  (the contract with Engine 2)
+Engine 1 — Event Log Engine    ← THIS REPO  (capture -> event_log.json)
+   │   hands off event_log.json  (the frozen contract)
    ▼
-Engine 2 — Discovery Engine    (later) — finds workflows that recur within the day
-   │
+Engine 2 — Discovery Engine    ← THIS REPO  (event_log.json -> discovery.json)
+   │   hands off discovery.json (bundles + anti-bundles + evidence)
    ▼
 Engine 3 — Artifact Engine     (later) — turns each workflow into a buildable spec
 ```
 
-This repository implements **Engine 1 only**. Its job: capture a lean,
-privacy-preserving signal stream of a real browser-work session, then use Haiku to
-reconstruct it into a clean, ordered `event_log.json` faithful enough that
-Engine 2 can mine it for recurring workflows.
+This repository implements **Engine 1 (Event Log)** and **Engine 2 (Discovery)**.
+Engine 1 captures a lean, privacy-preserving signal stream of a real browser-work
+session and uses Haiku to reconstruct it into a clean `event_log.json`. Engine 2
+(`trace/discovery/`) reads that log and proposes the automatable workflows inside
+it — **bundles** (automatable) and **anti-bundles** (judgment-required,
+human-checkpoint) — in one domain-neutral Sonnet call over the whole day. See
+[the Stage 2 section](#stage-2--discovery-engine) below.
 
 Engine 1 runs over **one full workday** — capture runs continuously, and the
 result is a single `event_log.json` for that day. The recurrence Engine 2 looks
@@ -138,14 +141,14 @@ cat captures/event_log.json
 ### 6. Anywhere smoke test (no key, no Mac, no cost)
 
 ```bash
-# full automated suite (108 tests)
+# full automated suite (144 tests)
 python -m unittest discover -s trace/tests -t . -p "test_*.py"
 
 # preview the chunked prompt on the bundled sample (no model call)
 python -m trace.reconstruct.cli trace/samples/sample_raw_events.jsonl --dry-run --chunk-size 8 --overlap 2
 ```
 
-Expect `Ran 108 tests … OK`, and a printed system prompt + 3 rendered chunks.
+Expect `Ran 144 tests … OK`, and a printed system prompt + 3 rendered chunks.
 
 **Useful flags:**
 - UI: `python -m trace.ui.app --port 8765 --collector-port 8137 --sessions-root captures/sessions --no-open`
@@ -172,6 +175,14 @@ trace/
     chunking.py            load/order/id/render + chronological chunking
     validate.py            schema validation, action normalization, fragment checks
     cli.py                 command-line entry point
+  discovery/               Engine 2 — event_log.json -> discovery.json
+    discover.py            ONE Sonnet call over the whole day (no chunking)
+    prompt.py              the domain-neutral discovery prompt
+    validate.py            discovery.json schema validation/repair
+    scorer.py              gate harness (the ONLY code that reads an answer key)
+    cli.py                 entry point + --dry-run
+    discovery.schema.json, DISCOVERY_SCHEMA.md
+    fixtures/              marcy + recruiter event logs + answer keys (test data)
   ui/                      local test harness (drives the engine from a window)
     app.py                 stdlib HTTP backend (local-only); the API
     keystore.py            secure API-key storage (Keychain / 0600 file)
@@ -322,7 +333,7 @@ first chunk — capture and `--dry-run` are unaffected.
 python -m unittest discover -s trace/tests -t . -p "test_*.py"
 ```
 
-The suite (108 tests) covers redaction, keystroke coalescing, the raw writer,
+The suite (144 tests) covers redaction, keystroke coalescing, the raw writer,
 chunking, schema validation/normalization, fragment-stitch flagging, boundary
 de-duplication, contiguous-entry coalescing, document-open detection/coverage,
 the browser-capture collector path, the full reconstruction pipeline with a mock
@@ -385,6 +396,53 @@ and rationale live in [`schema/SCHEMA.md`](trace/schema/SCHEMA.md). Key points:
   "observed examples."
 - Human-judgment steps are kept legible in `detail` rather than flattened, so
   Engine 2 can separate automatable work from judgment-dependent work.
+
+## Stage 2 — Discovery Engine
+
+`trace/discovery/` reads a frozen `event_log.json` and proposes the automatable
+workflows inside it as `discovery.json`: **bundles** (automatable), **anti-bundles**
+(judgment-required — surfaced as a human-checkpoint, **never** proposed for full
+automation), and unclustered noise, each candidate citing `evidence_event_ids`.
+It reasons over the **whole day in one Sonnet call (no chunking)** so a workflow
+whose trigger and execution are hours apart — linked only by an artifact — stays
+visible. The contract is `trace/discovery/DISCOVERY_SCHEMA.md`.
+
+```bash
+# render the prompt + whole event log that would be sent (free, no model call)
+python -m trace.discovery.cli trace/discovery/fixtures/marcy_event_log.json --dry-run
+
+# run discovery (needs ANTHROPIC_API_KEY; default model claude-sonnet-4-6)
+export ANTHROPIC_API_KEY=sk-ant-...
+python -m trace.discovery.cli path/to/event_log.json -o discovery.json
+```
+
+**The gate (Scorer).** `scorer.py` is a *separate* harness and the **only** code
+that reads an answer key — the engine can't reach it. It grades a `discovery.json`
+by **evidence-overlap + an intent-judge call** (never by recognizing bundle
+ids/names), reports "X of N bundles identified", anti-bundle handling, automation
+penalties, threshold sensitivity, and a verdict against rubric thresholds supplied
+*alongside* the answer key:
+
+```bash
+python -m trace.discovery.scorer discovery.json trace/discovery/fixtures/marcy_answer_key.json
+```
+
+**From the Test UI.** The whole pipeline (capture → reconstruct → discover) plus
+the gate score runs from the same local window: a **Run discovery** action with a
+free **dry-run preview**, a `discovery.json` results tab, a **Load fixture**
+control (run discovery on the bundled Marcy/recruiter logs), and a **Run gate
+score** button that shows the scorecard when an answer key is present.
+
+**Anti-overfitting (highest-risk here).** The engine never sees an answer key; the
+prompt and engine code carry no business-, domain-, or answer-key-specific names,
+counts, or ids. Generality is proven on a second, structurally-different fixture (a
+recruiter's day) with its own answer key. The bundled fixtures are *test data* read
+only by the scorer/tests — never by the engine.
+
+> Note: the model-requiring steps (real discovery + the intent-judge) need an API
+> key; the gate's empirical pass is run by the operator. The harness itself — schema
+> validation, the scorer's overlap/handling/verdict logic, dry-run rendering, and
+> the UI wiring — is covered by tests that run with a stub, no key, and no network.
 
 ## Faithfulness over richness
 

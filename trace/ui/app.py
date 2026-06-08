@@ -24,10 +24,33 @@ from ..capture.controller import CaptureController
 from ..reconstruct import chunking
 from ..reconstruct.prompt import SYSTEM_PROMPT
 from ..reconstruct.reconstruct import reconstruct as _real_reconstruct
+from ..discovery import scorer as discovery_scorer
+from ..discovery.discover import discover as _real_discover
+from ..discovery.discover import load_event_log, render_event_log
+from ..discovery.prompt import SYSTEM_PROMPT as DISCOVERY_SYSTEM_PROMPT
 from . import keystore, permissions, sessions
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
+DISCOVERY_FIXTURES_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)), "discovery", "fixtures")
 SHORT_RECORDING_THRESHOLD = 5  # events; below this, warn before a paid run
+
+
+def list_fixtures():
+    """Discover bundled validation fixtures: *_event_log.json files, each with an
+    optional matching *_answer_key.json so the gate can be run from the UI."""
+    out = []
+    if not os.path.isdir(DISCOVERY_FIXTURES_DIR):
+        return out
+    for fn in sorted(os.listdir(DISCOVERY_FIXTURES_DIR)):
+        if not fn.endswith("_event_log.json"):
+            continue
+        name = fn[: -len("_event_log.json")]
+        ak = os.path.join(DISCOVERY_FIXTURES_DIR, f"{name}_answer_key.json")
+        out.append({"name": name,
+                    "event_log": os.path.join(DISCOVERY_FIXTURES_DIR, fn),
+                    "answer_key": ak if os.path.exists(ak) else None})
+    return out
 
 _CONTENT_TYPES = {".html": "text/html", ".js": "application/javascript",
                   ".css": "text/css", ".json": "application/json"}
@@ -35,16 +58,20 @@ _CONTENT_TYPES = {".html": "text/html", ".js": "application/javascript",
 
 class AppState:
     def __init__(self, sessions_root, collector_port=8137,
-                 reconstruct_fn=None, controller_factory=None, key_store=None):
+                 reconstruct_fn=None, controller_factory=None, key_store=None,
+                 discovery_fn=None, score_fn=None):
         self.sessions_root = sessions_root
         self.collector_port = collector_port
         self.reconstruct_fn = reconstruct_fn or _real_reconstruct
+        self.discovery_fn = discovery_fn or _real_discover
+        self.score_fn = score_fn or discovery_scorer.score
         self.controller_factory = controller_factory or (
             lambda out: CaptureController(out, collector_port=collector_port))
         self.keystore = key_store or keystore
         self.controller = None       # current CaptureController (one session at a time)
         self.current_sid = None
         self.recon_jobs = {}         # sid -> {state, current, total, error, flags, errors}
+        self.discover_jobs = {}      # sid -> {state, error, bundles, anti_bundles}
         self.lock = threading.Lock()
         os.makedirs(sessions_root, exist_ok=True)
 
@@ -80,6 +107,31 @@ class AppState:
                 job.update(state="done", flags=len(report.flags),
                            errors=len(report.errors))
             except Exception as e:  # surface real detail (handoff §4.5)
+                job.update(state="error", error=str(e))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    # --- discovery job (parallel to reconstruction) ----------------------
+    def start_discovery(self, sid):
+        log_path = sessions.path(self.sessions_root, sid, sessions.EVENT_LOG)
+        job = {"state": "running", "error": None, "bundles": 0, "anti_bundles": 0}
+        self.discover_jobs[sid] = job
+
+        def run():
+            try:
+                key = self.keystore.get_key()
+                if not key:
+                    raise RuntimeError("no_api_key")
+                os.environ["ANTHROPIC_API_KEY"] = key
+                discovery, report = self.discovery_fn(log_path)
+                with open(sessions.path(self.sessions_root, sid, sessions.DISCOVERY),
+                          "w", encoding="utf-8") as f:
+                    json.dump(discovery, f, indent=2, ensure_ascii=False)
+                sessions.update_meta(self.sessions_root, sid,
+                                     discovered_at=sessions._now())
+                job.update(state="done", bundles=len(discovery["bundles"]),
+                           anti_bundles=len(discovery["anti_bundles"]))
+            except Exception as e:
                 job.update(state="error", error=str(e))
 
         threading.Thread(target=run, daemon=True).start()
@@ -136,6 +188,10 @@ def make_handler(state):
                 return self._json(200, permissions.check_all())
             if p == "/api/sessions":
                 return self._json(200, {"sessions": sessions.list_sessions(root)})
+            if p == "/api/fixtures":
+                return self._json(200, {"fixtures": [
+                    {"name": f["name"], "has_answer_key": bool(f["answer_key"])}
+                    for f in list_fixtures()]})
             m = re.match(r"^/api/sessions/([^/]+)(/.*)?$", p)
             if m:
                 return self._session_get(m.group(1), m.group(2) or "")
@@ -156,12 +212,21 @@ def make_handler(state):
                 return self._capture_ctl("pause")
             if p == "/api/capture/resume":
                 return self._capture_ctl("resume")
-            m = re.match(r"^/api/sessions/([^/]+)/(dry-run|reconstruct)$", p)
+            if p == "/api/load-fixture":
+                return self._load_fixture(body)
+            m = re.match(r"^/api/sessions/([^/]+)/"
+                         r"(dry-run|reconstruct|discovery-dry-run|discover|score)$", p)
             if m:
                 sid, action = m.group(1), m.group(2)
                 if action == "dry-run":
                     return self._dry_run(sid, body)
-                return self._reconstruct(sid, body)
+                if action == "reconstruct":
+                    return self._reconstruct(sid, body)
+                if action == "discovery-dry-run":
+                    return self._discovery_dry_run(sid)
+                if action == "discover":
+                    return self._discover(sid)
+                return self._score(sid, body)
             return self._json(404, {"error": "not_found"})
 
         def do_DELETE(self):
@@ -271,6 +336,17 @@ def make_handler(state):
             if sub == "/reconstruct/status":
                 job = state.recon_jobs.get(sid)
                 return self._json(200, job or {"state": "idle"})
+            if sub == "/discovery":
+                data = sessions.read_json_artifact(root, sid, sessions.DISCOVERY)
+                return self._json(200 if data is not None else 404,
+                                  data if data is not None else {"error": "not_discovered"})
+            if sub == "/scorecard":
+                data = sessions.read_json_artifact(root, sid, sessions.SCORECARD)
+                return self._json(200 if data is not None else 404,
+                                  data if data is not None else {"error": "not_scored"})
+            if sub == "/discover/status":
+                job = state.discover_jobs.get(sid)
+                return self._json(200, job or {"state": "idle"})
             return self._json(404, {"error": "not_found"})
 
         # --- reconstruction ---
@@ -312,6 +388,72 @@ def make_handler(state):
                     return self._json(409, {"error": "already_running"})
                 state.start_reconstruction(sid)
             return self._json(202, {"state": "running", "session_id": sid})
+
+        # --- discovery (Stage 2) ---
+        def _load_fixture(self, body):
+            name = (body or {}).get("name", "")
+            fx = next((f for f in list_fixtures() if f["name"] == name), None)
+            if not fx:
+                return self._json(404, {"error": "unknown_fixture"})
+            sid = sessions.create_session(root, label=f"fixture:{name}")
+            with open(fx["event_log"], "r", encoding="utf-8") as src, \
+                    open(sessions.path(root, sid, sessions.EVENT_LOG), "w", encoding="utf-8") as dst:
+                dst.write(src.read())
+            try:
+                with open(sessions.path(root, sid, sessions.EVENT_LOG)) as f:
+                    n = len(json.load(f))
+            except (OSError, json.JSONDecodeError):
+                n = None
+            sessions.update_meta(root, sid, fixture=name,
+                                 answer_key_path=fx["answer_key"], event_count=n)
+            return self._json(200, {"session_id": sid, "fixture": name,
+                                    "has_answer_key": bool(fx["answer_key"]),
+                                    "event_count": n})
+
+        def _discovery_dry_run(self, sid):
+            log_path = sessions.path(root, sid, sessions.EVENT_LOG)
+            try:
+                events = load_event_log(log_path)
+            except FileNotFoundError:
+                return self._json(404, {"error": "no_event_log"})
+            return self._json(200, {
+                "event_count": len(events),
+                "system_prompt": DISCOVERY_SYSTEM_PROMPT,
+                "rendered_log": render_event_log(events),
+            })
+
+        def _discover(self, sid):
+            if not sessions.artifacts(root, sid)["event_log"]:
+                return self._json(400, {"error": "no_event_log"})
+            if not state.keystore.get_key():
+                return self._json(400, {"error": "no_api_key"})
+            with state.lock:
+                existing = state.discover_jobs.get(sid)
+                if existing and existing.get("state") == "running":
+                    return self._json(409, {"error": "already_running"})
+                state.start_discovery(sid)
+            return self._json(202, {"state": "running", "session_id": sid})
+
+        def _score(self, sid, body):
+            discovery = sessions.read_json_artifact(root, sid, sessions.DISCOVERY)
+            if discovery is None:
+                return self._json(400, {"error": "not_discovered"})
+            meta = sessions.read_meta(root, sid)
+            ak_path = (body or {}).get("answer_key_path") or meta.get("answer_key_path")
+            if not ak_path or not os.path.exists(ak_path):
+                return self._json(400, {"error": "no_answer_key"})
+            if not state.keystore.get_key():
+                return self._json(400, {"error": "no_api_key"})
+            os.environ["ANTHROPIC_API_KEY"] = state.keystore.get_key()
+            try:
+                answer_key = discovery_scorer.load_answer_key(ak_path)
+                sc = state.score_fn(discovery, answer_key)
+            except Exception as e:
+                return self._json(500, {"error": "score_failed", "detail": str(e)})
+            with open(sessions.path(root, sid, sessions.SCORECARD), "w", encoding="utf-8") as f:
+                json.dump(sc, f, indent=2, ensure_ascii=False)
+            sessions.update_meta(root, sid, scored_at=sessions._now())
+            return self._json(200, sc)
 
     return Handler
 

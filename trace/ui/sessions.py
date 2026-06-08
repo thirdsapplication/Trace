@@ -19,6 +19,8 @@ import os
 RAW = "raw_events.jsonl"
 EVENT_LOG = "event_log.json"
 VALIDATION = "validation_report.json"
+DISCOVERY = "discovery.json"
+SCORECARD = "scorecard.json"
 META = "meta.json"
 
 
@@ -89,12 +91,24 @@ def artifacts(root, sid):
                 log_count = len(json.load(f))
         except (json.JSONDecodeError, OSError):
             log_count = None
+    disc_p = path(root, sid, DISCOVERY)
+    bundle_count = None
+    if os.path.exists(disc_p):
+        try:
+            with open(disc_p, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            bundle_count = len(d.get("bundles", [])) + len(d.get("anti_bundles", []))
+        except (json.JSONDecodeError, OSError):
+            bundle_count = None
     return {
         "raw": os.path.exists(raw_p),
         "raw_event_count": _count_lines(raw_p),
         "event_log": os.path.exists(log_p),
         "event_count": log_count,
         "validation": os.path.exists(val_p),
+        "discovery": os.path.exists(disc_p),
+        "candidate_count": bundle_count,
+        "scorecard": os.path.exists(path(root, sid, SCORECARD)),
     }
 
 

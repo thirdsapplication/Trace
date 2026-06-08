@@ -78,14 +78,36 @@
         what would be sent, for free.</p>
     </section>
 
+    <!-- DISCOVERY (Stage 2) -------------------------------------------- -->
+    <section class="panel">
+      <h2>Discovery <span class="muted">(Stage 2 — workflows)</span></h2>
+      <div class="row">
+        <button id="discoverBtn" class="primary" disabled>Run discovery</button>
+        <button id="discoverDryRun" class="secondary" disabled>Preview (dry run · free)</button>
+        <span id="discoverTarget" class="muted"></span>
+      </div>
+      <div class="row">
+        <label for="fixtureSelect">Or run on a fixture</label>
+        <select id="fixtureSelect"></select>
+        <button id="loadFixtureBtn" class="secondary">Load fixture</button>
+        <button id="scoreBtn" class="secondary" disabled>Run gate score</button>
+      </div>
+      <p id="discoverMsg" class="status-line"></p>
+      <pre id="scorecardView" class="json-view hidden" style="max-height:260px"></pre>
+      <p class="help">Discovery reasons over the whole event log in one Sonnet call.
+        Load a fixture with a known answer key to run the gate scorer from here.</p>
+    </section>
+
     <!-- RESULTS -------------------------------------------------------- -->
     <section class="panel">
       <h2>Results <span id="resultsSid" class="muted"></span></h2>
       <div class="tabs">
         <button class="tab active" data-tab="event_log">event_log.json</button>
+        <button class="tab" data-tab="discovery">discovery.json</button>
         <button class="tab" data-tab="validation">review flags</button>
         <button class="tab" data-tab="raw">raw stream</button>
-        <button class="tab" data-tab="dryrun">dry-run preview</button>
+        <button class="tab" data-tab="dryrun">recon dry-run</button>
+        <button class="tab" data-tab="discdryrun">discovery dry-run</button>
         <span class="spacer"></span>
         <button id="copyBtn" class="link">copy</button>
         <button id="exportBtn" class="link">export</button>
@@ -97,7 +119,7 @@
     <section class="panel">
       <h2>Session history <button id="refreshSessions" class="link">refresh</button></h2>
       <table id="sessionsTable">
-        <thead><tr><th>Session</th><th>Created</th><th>Raw</th><th>Events</th><th>Reconstructed</th><th></th></tr></thead>
+        <thead><tr><th>Session</th><th>Created</th><th>Raw</th><th>Events</th><th>Reconstructed</th><th>Discovered</th><th></th></tr></thead>
         <tbody></tbody>
       </table>
     </section>
