@@ -140,11 +140,14 @@ class QuestionsAndContractTest(unittest.TestCase):
         rec2 = environment.validate_environment(json.loads(json.dumps(rec)))
         self.assertEqual(rec2["bundle_id"], "BA")
         self.assertEqual(len(rec2["artifacts"]), len(rec["artifacts"]))
-        # mark all uploaded -> complete
+        # uploaded but no instruction -> still incomplete (instruction is required)
         for a in rec2["artifacts"]:
             a["uploaded"] = True
-        rec2 = environment.validate_environment(rec2)
-        self.assertEqual(rec2["status"], "complete")
+        self.assertEqual(environment.validate_environment(rec2)["status"], "incomplete")
+        # uploaded + instruction -> complete (extraction status is irrelevant)
+        for a in rec2["artifacts"]:
+            a["user_instruction"] = "use this file as the reference"
+        self.assertEqual(environment.validate_environment(rec2)["status"], "complete")
 
     def test_attach_upload_extracts_and_updates(self):
         d = tempfile.mkdtemp()

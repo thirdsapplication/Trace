@@ -150,14 +150,14 @@ cat captures/event_log.json
 ### 6. Anywhere smoke test (no key, no Mac, no cost)
 
 ```bash
-# full automated suite (180 tests)
+# full automated suite (187 tests)
 python -m unittest discover -s trace/tests -t . -p "test_*.py"
 
 # preview the chunked prompt on the bundled sample (no model call)
 python -m trace.reconstruct.cli trace/samples/sample_raw_events.jsonl --dry-run --chunk-size 8 --overlap 2
 ```
 
-Expect `Ran 180 tests … OK`, and a printed system prompt + 3 rendered chunks.
+Expect `Ran 187 tests … OK`, and a printed system prompt + 3 rendered chunks.
 
 **Useful flags:**
 - UI: `python -m trace.ui.app --port 8765 --collector-port 8137 --sessions-root captures/sessions --no-open`
@@ -350,7 +350,7 @@ first chunk — capture and `--dry-run` are unaffected.
 python -m unittest discover -s trace/tests -t . -p "test_*.py"
 ```
 
-The suite (180 tests) covers redaction, keystroke coalescing, the raw writer,
+The suite (187 tests) covers redaction, keystroke coalescing, the raw writer,
 chunking, schema validation/normalization, fragment-stitch flagging, boundary
 de-duplication, contiguous-entry coalescing, document-open detection/coverage,
 the browser-capture collector path, the full reconstruction pipeline with a mock
@@ -358,7 +358,9 @@ model, the discovery engine + validator + scorer + fixture gate, the Stage 3
 review contract (seed/validate/reclassification routing/checkpoint mapping), the
 Artifact Engine (verbatim example fetching, criteria assembly, divergence marking),
 Review 2 environment capture (evidence-derived requests across two domains, per-kind
-extraction, question derivation, environment folding + environment-incomplete flag),
+extraction, the courier/annotator model — authoritative instruction, raw file always
+carried, non-load-bearing extraction, criteria targeting the user-designated
+location, completeness off uploads+instructions),
 plus the test-UI backends for every stage (key store, sessions, capture lifecycle,
 reconstruct/discovery/review/spec guards) — so it runs without an API key,
 `pynput`, or a browser.
@@ -506,22 +508,33 @@ python -m trace.artifact.cli reviewed_bundles.json event_log.json -o specs/
 acceptance criteria win**, and the contradicted example is marked *illustrative of
 context, not a target* so the coding agent doesn't build to it.
 
-**Review 2 — environment capture.** Between review and spec generation, the system
-gathers the environment specifics the event log can't contain — the real work
-products the workflow reads/writes. For each approved bundle it **derives, from that
-bundle's own event evidence** (any action that reads/writes an external artifact),
-which files to request — tagged input/output/reference with the justifying event
-ids — and asks a few **derived questions** (e.g. an output column absent from the
-uploaded source → "how is this filled?"). The user **uploads** the real files
-(Trace never touches live accounts); per-kind **extractors** (`extract.py`,
-stdlib-only) recover what a builder needs — spreadsheet headers/rows/tabs/**format**,
-doc/pdf text + field layout — keyed on artifact *kind*, not workflow. This is
-written to `environment_<id>.json` (contract in `ARTIFACT_SCHEMA.md`). The engine
-folds it in: the **uploaded artifacts lead the Observed Examples** (event-log
-instances become supplementary) and the **Acceptance Criteria gain real-schema
-assertions** (correct field parsing, output mapping, file format). A spec embedding
-real files carries a sensitivity header; a missing/incomplete record flags the spec
-`environment-incomplete` but still generates (never hard-blocks).
+**Review 2 — environment capture (courier + annotator).** Between review and spec
+generation, the system gathers the environment specifics the event log can't
+contain — the real work products the workflow reads/writes. For each approved bundle
+it **derives, from that bundle's own event evidence** (any action that reads/writes
+an external artifact), which files to request — tagged input/output/reference with
+the justifying event ids. The user **uploads** the real files (Trace never touches
+live accounts) and, next to each, types a one-line **authoritative instruction**
+("use the Open_Orders tab; match its columns"). Review 2 is a *courier + annotator*,
+not the expert on the files:
+
+- the **user instruction is authoritative** — nothing auto-derived overrides it;
+- the **raw file always travels** to the spec, so the downstream coding agent reads
+  it live;
+- **auto-extraction is best-effort and non-load-bearing** — per-kind extractors
+  (`extract.py`, stdlib-only) still run as a sanity aid, but a failed/empty/wrong
+  extraction **never blocks**, never overrides the instruction, and is **never the
+  basis for an assertion** — it shows only as a clearly-labeled "auto-read,
+  unverified" note.
+
+This is written to `environment_<id>.json` (contract in `ARTIFACT_SCHEMA.md`). The
+engine folds it in: each uploaded artifact's **raw file + instruction lead the
+Observed Examples**; **Acceptance Criteria target the user-designated location and
+are checked live** against the real file (never against an auto-extracted schema).
+**Completeness keys off uploads + instructions**, not extraction. A spec embedding
+real files carries a sensitivity header; a record missing a required upload or
+instruction flags the spec `environment-incomplete` but still generates (never
+hard-blocks).
 
 ```bash
 # fold real uploaded artifacts into the spec (env records live beside reviewed_bundles)

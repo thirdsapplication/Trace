@@ -222,7 +222,8 @@ class EnvironmentIntegrationTest(unittest.TestCase):
             env = {"bundle_id": "B1", "artifacts": [
                 {"role": "input", "kind": "spreadsheet",
                  "derived_from_event_ids": ["e2"], "label_shown_to_user": "the source sheet",
-                 "uploaded": True, "file_ref": "/x/src.csv",
+                 "user_instruction": "use this sheet as the source for the order fields",
+                 "uploaded": True, "file_ref": "/x/src.csv", "extraction_status": "ok",
                  "extracted": {"format": "csv", "headers": ["Customer", "Item", "Qty"],
                                "sample_rows": [["Acme", "widgets", "3"]], "tab_names": ["(single sheet)"]}}],
                 "answers": [], "status": "complete"}
@@ -242,12 +243,14 @@ class EnvironmentIntegrationTest(unittest.TestCase):
         md = next(r for r in results if r["id"] == "B1")["markdown"]
         # the extracted real schema reached the model
         self.assertIn("EXTRACTED ENVIRONMENT ARTIFACTS", self.captured)
-        # Observed Examples lead with the real uploaded artifact + its real columns
+        # Observed Examples carry the raw file + the authoritative instruction
         self.assertIn("Real uploaded artifacts", md)
-        self.assertIn("Customer", md)
-        self.assertIn("format `csv`", md)
-        # acceptance criteria reference the real schema
-        self.assertIn("(against real artifact)", md)
+        self.assertIn("use this sheet as the source for the order fields", md)
+        self.assertIn("Raw file (read live)", md)
+        # auto-read extraction is present but clearly labelled unverified, not authoritative
+        self.assertIn("UNVERIFIED", md)
+        # acceptance criteria are live-checked against the uploaded file, via the instruction
+        self.assertIn("(live-checked against the uploaded file)", md)
         # privacy boundary surfaced; not flagged incomplete
         self.assertIn("embeds real business documents", md)
         self.assertNotIn("environment-incomplete", md)

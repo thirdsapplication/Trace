@@ -36,25 +36,36 @@ answers for facts no artifact contains. Full shape in `environment.schema.json`.
   "artifacts": [
     { "role": "input | output | reference", "kind": "pdf | spreadsheet | doc | …",
       "derived_from_event_ids": ["<events that justified the request>"],
-      "label_shown_to_user": "<the ask>", "uploaded": true,
-      "file_ref": "<path in the dated session folder>",
-      "extracted": { "<kind-specific structure: headers/rows/tabs/format or text/fields>": "…" } }
+      "label_shown_to_user": "<the ask>",
+      "user_instruction": "<AUTHORITATIVE free text: what this file is / how to use it; may name a tab or section>",
+      "uploaded": true,
+      "file_ref": "<path in the dated session folder — ALWAYS present>",
+      "extraction_status": "ok | partial | failed",
+      "extracted": "<best-effort, may be null/empty; NEVER authoritative>" }
   ],
   "answers": [ { "question": "<derived/minimal>", "answer": "<user free text>" } ],
   "status": "complete | incomplete"
 }
 ```
 
+Review 2 is a **courier + annotator**, not the expert on the user's files:
+
+- **The user instruction is authoritative.** Each artifact carries a free-text
+  `user_instruction` (what it is, how to use it, which tab/section applies). Nothing
+  auto-derived may override it.
+- **The raw file always travels** (`file_ref` always present). The downstream coding
+  agent reads it live; the pipeline never depends on Trace having parsed it.
+- **Auto-extraction is best-effort and non-load-bearing.** It still runs (keyed on
+  artifact *kind*, not workflow) as a sanity aid, but its **failure never blocks**
+  (`extraction_status: failed` is normal), it **never overrides an instruction**, and
+  it is **never the sole basis for an assertion** — it appears in the spec only as a
+  clearly-labeled, unverified aid.
 - **Requests are derived from the bundle's own event evidence** (any action that
   reads/writes an external artifact), grouped so repeated instances collapse to one
   real example — never a per-workflow-type list.
-- **Extraction is keyed on artifact kind**, not workflow: spreadsheet → headers, a
-  few rows, tab names, detected format; doc/pdf → text + field layout. Kinds are
-  extensible. Extracted text is redacted at write; the raw file is retained, not
-  inlined blindly.
 - `file_ref` lives in the dated session folder (same redaction/retention posture).
-- `status` lets the UI block or let the user **skip** — a skipped/incomplete record
-  yields a spec flagged `environment-incomplete` rather than silently degraded.
+- **`status: complete` keys off uploads + instructions**, independent of extraction.
+  `environment-incomplete` is reserved for a missing required upload or instruction.
 
 ## Output: `spec_<id>.md` (FROZEN TEMPLATE)
 One markdown file per `approve_for_build` bundle, self-contained for pasting into
@@ -81,13 +92,16 @@ Claude Code / Cursor. Anti-bundles instead get a `spec_<id>_manual.md`
 - **Every** user-added criterion and **every** checkpoint criterion appears exactly.
 - **Divergence rule:** when the edited intent contradicts an example, intent +
   criteria win and the example is marked *illustrative of context, not a target*.
-- **Environment folding (Review 2):** when `environment_<id>.json` is present, the
-  uploaded artifacts **lead** the Observed Examples (real columns/fields/format/rows)
-  and event-log instances become supplementary; Acceptance Criteria gain
-  deterministic real-schema assertions (correct field parsing, output mapping, file
-  format) plus each answered question. A spec that embeds real files carries a
-  sensitivity header; a missing/incomplete record flags it `environment-incomplete`
-  but still generates (never hard-blocks).
+- **Environment folding (Review 2, courier model):** when `environment_<id>.json` is
+  present, each uploaded artifact's **raw file reference + authoritative instruction**
+  lead the Observed Examples; auto-extraction appears only as an "auto-read,
+  unverified" aid; event-log instances are supplementary. Acceptance Criteria target
+  the **user-designated artifact/location** and are checked **live** against the real
+  file (`"…use the «file» exactly as instructed: '<instruction>', reading it live…"`)
+  — they never assert against an auto-extracted schema/location. If extraction
+  contradicts the instruction, the extracted detail is dropped from criteria. A spec
+  embedding real files carries a sensitivity header; a record missing a required
+  upload or instruction flags it `environment-incomplete` but still generates.
 
 The model call (one per approved bundle; default `claude-sonnet-4-6`, injectable)
 produces only the intent prose, the example-supported derived criteria, and the

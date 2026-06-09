@@ -10,15 +10,20 @@
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["role", "kind", "derived_from_event_ids", "label_shown_to_user", "uploaded"],
+        "required": ["role", "kind", "derived_from_event_ids", "label_shown_to_user",
+                     "user_instruction", "uploaded"],
         "properties": {
           "role": { "type": "string", "enum": ["input", "output", "reference"] },
           "kind": { "type": "string" },
           "derived_from_event_ids": { "type": "array", "items": { "type": "string" } },
           "label_shown_to_user": { "type": "string" },
+          "user_instruction": { "type": "string",
+            "description": "authoritative free-text from the user; nothing auto-derived may override it" },
           "uploaded": { "type": "boolean" },
-          "file_ref": { "type": ["string", "null"] },
-          "extracted": { "type": ["object", "null"] }
+          "file_ref": { "type": ["string", "null"], "description": "raw file, always travels to the spec" },
+          "extraction_status": { "type": ["string", "null"], "enum": ["ok", "partial", "failed", null] },
+          "extracted": { "type": ["object", "null"],
+            "description": "best-effort, non-authoritative; may be null/empty" }
         }
       }
     },

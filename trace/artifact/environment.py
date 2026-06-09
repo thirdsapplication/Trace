@@ -79,9 +79,12 @@ def derive_requests(bundle, idx):
             "kind": g["kind"],
             "derived_from_event_ids": g["event_ids"],
             "label_shown_to_user": (f"Upload one real example of the {kind_word} you {verb} "
-                                    f"in {g['app']} (e.g. “{sample_title}”)."),
+                                    f"in {g['app']} (e.g. “{sample_title}”), and say in one line "
+                                    f"what it is / how to use it (name the tab or section if relevant)."),
+            "user_instruction": "",
             "uploaded": False,
             "file_ref": None,
+            "extraction_status": None,
             "extracted": None,
         })
     # stable order: inputs, then outputs, then references
@@ -147,24 +150,47 @@ def seed_environment(bundle, event_log):
 
 
 def compute_status(record):
-    """complete iff every requested artifact is uploaded and every question answered."""
+    """complete iff every requested artifact is uploaded AND has a user instruction.
+
+    Auto-extraction is non-load-bearing (R5): a failed/empty extraction with the raw
+    file and instruction present is COMPLETE. ``environment-incomplete`` is reserved
+    for a missing required upload or a missing instruction."""
     arts = record.get("artifacts", [])
-    answers = record.get("answers", [])
-    all_uploaded = all(a.get("uploaded") for a in arts) if arts else True
-    all_answered = all(str(q.get("answer", "")).strip() for q in answers) if answers else True
-    return "complete" if (all_uploaded and all_answered) else "incomplete"
+    for a in arts:
+        if not a.get("uploaded"):
+            return "incomplete"
+        if not str(a.get("user_instruction", "") or "").strip():
+            return "incomplete"
+    return "complete"
+
+
+def _extraction_status(extracted):
+    """Classify a best-effort extraction result. Never authoritative."""
+    if not isinstance(extracted, dict):
+        return "failed"
+    has_content = bool(extracted.get("headers") or extracted.get("sample_rows")
+                       or str(extracted.get("text", "")).strip() or extracted.get("field_layout"))
+    if not has_content:
+        return "failed"
+    return "partial" if extracted.get("note") else "ok"
 
 
 def _norm_artifact(a):
     role = a.get("role") if a.get("role") in VALID_ROLE else "input"
+    extracted = a.get("extracted") if isinstance(a.get("extracted"), dict) else None
+    es = a.get("extraction_status")
+    if es not in ("ok", "partial", "failed"):
+        es = _extraction_status(extracted) if a.get("uploaded") else None
     return {
         "role": role,
         "kind": str(a.get("kind", "unknown") or "unknown"),
         "derived_from_event_ids": [str(x) for x in (a.get("derived_from_event_ids") or [])],
         "label_shown_to_user": str(a.get("label_shown_to_user", "") or ""),
+        "user_instruction": str(a.get("user_instruction", "") or ""),
         "uploaded": bool(a.get("uploaded")),
         "file_ref": a.get("file_ref"),
-        "extracted": a.get("extracted") if isinstance(a.get("extracted"), dict) else None,
+        "extraction_status": es,
+        "extracted": extracted,
     }
 
 
@@ -196,13 +222,18 @@ def attach_upload(record, artifact_index, file_path, original_filename):
         kind = arts[artifact_index].get("kind") or "unknown"
     elif kind == "unknown":
         kind = arts[artifact_index]["kind"]
+    # Best-effort, non-load-bearing extraction (R3): never raises, never overrides
+    # the user instruction, never the sole basis for an assertion.
+    extracted = extract.extract(kind, file_path)
     arts[artifact_index].update({
         "uploaded": True,
-        "file_ref": file_path,
+        "file_ref": file_path,                       # raw file always travels (R2)
         "kind": kind if kind != "unknown" else arts[artifact_index]["kind"],
-        "extracted": extract.extract(kind, file_path),
+        "extraction_status": _extraction_status(extracted),
+        "extracted": extracted,
+        # user_instruction is intentionally NOT touched here (set via the UI/save)
     })
-    # re-derive questions from the new artifact set, preserving existing answers
+    # re-derive advisory questions from the new artifact set, preserving answers
     prior = {q["question"]: q["answer"] for q in record.get("answers", [])}
     record["answers"] = [{"question": q, "answer": prior.get(q, "")}
                          for q in derive_questions(arts)]
@@ -213,49 +244,56 @@ def attach_upload(record, artifact_index, file_path, original_filename):
 # --------------------------------------------------------------------------
 # Rendering for the engine (folded into the spec prompt + assembly)
 # --------------------------------------------------------------------------
+def artifact_basename(a):
+    ref = a.get("file_ref") or ""
+    return os.path.basename(ref) if ref else (a.get("label_shown_to_user") or a.get("kind") or "file")
+
+
 def render_artifact_for_prompt(a):
+    """Render an artifact for the model: the user instruction is AUTHORITATIVE; the
+    raw file is always referenced; auto-extraction appears only as a clearly-labeled,
+    unverified aid (R1–R3)."""
+    lines = [f'- {a["role"].upper()} artifact — raw file: {artifact_basename(a)}'
+             f' (path: {a.get("file_ref")})']
+    instr = (a.get("user_instruction") or "").strip()
+    lines.append(f'    USER INSTRUCTION (authoritative): {instr or "(none given)"}')
     ex = a.get("extracted") or {}
-    lines = [f'- {a["role"].upper()} artifact ({a.get("kind")}, format={ex.get("format", "?")}):'
-             f' {a.get("label_shown_to_user", "")}']
-    if ex.get("tab_names"):
-        lines.append(f'    sheets: {", ".join(str(t) for t in ex["tab_names"])}')
-    if ex.get("headers"):
-        lines.append(f'    columns: {", ".join(str(h) for h in ex["headers"])}')
-    for row in ex.get("sample_rows", [])[:3]:
-        lines.append(f'    row: {", ".join(str(c) for c in row)}')
-    if ex.get("field_layout"):
-        fields = ", ".join(f.get("label", "") for f in ex["field_layout"][:12])
-        lines.append(f'    fields: {fields}')
-    if ex.get("text"):
-        lines.append(f'    text: {ex["text"][:300]}')
-    if ex.get("note"):
-        lines.append(f'    note: {ex["note"]}')
+    es = a.get("extraction_status")
+    if ex and es in ("ok", "partial"):
+        bits = [f'format={ex.get("format", "?")}']
+        if ex.get("tab_names"):
+            bits.append("sheets=" + ", ".join(str(t) for t in ex["tab_names"]))
+        if ex.get("headers"):
+            bits.append("columns=" + ", ".join(str(h) for h in ex["headers"]))
+        if ex.get("field_layout"):
+            bits.append("fields=" + ", ".join(f.get("label", "") for f in ex["field_layout"][:12]))
+        if ex.get("text"):
+            bits.append("text=" + ex["text"][:200])
+        lines.append(f'    auto-read (UNVERIFIED, best-effort — do not treat as ground truth): '
+                     f'{" | ".join(bits)}')
+    else:
+        lines.append(f'    auto-read: {es or "none"} (rely on the raw file + instruction, not extraction)')
     return "\n".join(lines)
 
 
-def schema_criteria(record):
-    """Deterministic acceptance criteria checkable against the real artifacts —
-    correct field parsing, correct output mapping, correct format handling."""
+def instruction_criteria(record):
+    """Deterministic acceptance criteria that target the USER-DESIGNATED artifact and
+    location and are checkable LIVE against the real uploaded file (R4). They never
+    assert against an auto-extracted schema/location; extraction is not ground truth.
+    """
     crit = []
     for a in record.get("artifacts", []):
         if not a.get("uploaded"):
             continue
-        ex = a.get("extracted") or {}
-        label = a.get("label_shown_to_user", a.get("kind"))
-        fmt = ex.get("format", "?")
-        fields = [str(h) for h in ex.get("headers", [])] or \
-                 [f.get("label", "") for f in ex.get("field_layout", [])]
-        fields = [f for f in fields if f][:20]
-        if a["role"] == "input" or a["role"] == "reference":
-            if fields:
-                crit.append(f"The agent must correctly parse these fields from the {a['role']} "
-                            f"artifact ({fmt}): {', '.join(fields)}.")
-            crit.append(f"The agent must correctly handle the {fmt} format of the {a['role']} artifact.")
-        else:  # output
-            if fields:
-                crit.append(f"The agent must correctly populate these output columns/fields ({fmt}): "
-                            f"{', '.join(fields)}.")
-            crit.append(f"The agent must write the output in the {fmt} format.")
+        instr = (a.get("user_instruction") or "").strip()
+        name = artifact_basename(a)
+        if instr:
+            crit.append(f'The agent must use the {a["role"]} artifact «{name}» exactly as the user '
+                        f'instructed — "{instr}" — reading the real uploaded file live at build/test '
+                        f'time (do not rely on any auto-extracted summary).')
+        else:
+            crit.append(f'The agent must read the {a["role"]} artifact «{name}» live from the real '
+                        f'uploaded file (its instruction was not provided).')
     for q in record.get("answers", []):
         if str(q.get("answer", "")).strip():
             crit.append(f"{q['question']} → {q['answer']}")

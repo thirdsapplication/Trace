@@ -169,25 +169,32 @@ def assemble_spec(bundle, examples, model_out, env_record=None):
 
     md += ["", "## 2. Observed examples", ""]
     if uploaded:
-        md += ["### 2a. Real uploaded artifacts (primary — build to these)", ""]
+        md += ["### 2a. Real uploaded artifacts (primary — read these live; the user "
+               "instruction is authoritative)", ""]
         for a in uploaded:
             ex = a.get("extracted") or {}
-            md += [f"**{a['role']} · {a.get('kind')} · format `{ex.get('format', '?')}`** — "
-                   f"{a.get('label_shown_to_user', '')}"]
-            if a.get("file_ref"):
-                md += [f"<!-- file: {a['file_ref']} -->"]
-            if ex.get("tab_names"):
-                md += [f"- sheets: {', '.join(str(t) for t in ex['tab_names'])}"]
-            if ex.get("headers"):
-                md += [f"- columns: `{'` | `'.join(str(h) for h in ex['headers'])}`"]
-            for row in ex.get("sample_rows", [])[:3]:
-                md += [f"- row: {', '.join(str(c) for c in row)}"]
-            if ex.get("field_layout"):
-                md += ["- fields: " + ", ".join(f"`{f.get('label', '')}`" for f in ex["field_layout"][:15])]
-            if ex.get("text"):
-                md += ["", "```", ex["text"][:800], "```"]
-            if ex.get("note"):
-                md += [f"- _note: {ex['note']}_"]
+            instr = (a.get("user_instruction") or "").strip()
+            base = environment.artifact_basename(a)
+            md += [f"**{a['role']} — `{base}`**"]
+            md += [f"<!-- raw file: {a.get('file_ref')} -->"]
+            md += [f"- **Instruction (authoritative):** {instr or '_(none provided)_'}",
+                   f"- Raw file (read live): `{a.get('file_ref')}`"]
+            es = a.get("extraction_status")
+            if ex and es in ("ok", "partial"):
+                aid = []
+                if ex.get("format"):
+                    aid.append(f"format `{ex['format']}`")
+                if ex.get("tab_names"):
+                    aid.append("sheets: " + ", ".join(str(t) for t in ex["tab_names"]))
+                if ex.get("headers"):
+                    aid.append("columns: " + ", ".join(str(h) for h in ex["headers"]))
+                if ex.get("field_layout"):
+                    aid.append("fields: " + ", ".join(f.get("label", "") for f in ex["field_layout"][:15]))
+                md += [f"- _auto-read (UNVERIFIED, best-effort — not authoritative): {'; '.join(aid)}_"]
+                if ex.get("text"):
+                    md += ["", "> _auto-read text (unverified):_", "", "```", ex["text"][:800], "```"]
+            else:
+                md += [f"- _auto-read: {es or 'none'} — rely on the raw file and instruction above._"]
             md += [""]
         md += ["### 2b. Supplementary observed instances (from the event log)", ""]
     else:
@@ -212,7 +219,8 @@ def assemble_spec(bundle, examples, model_out, env_record=None):
            "_The built agent must satisfy every criterion. A wrong build should fail "
            "these loudly._", ""]
     crit = list(derived)
-    crit += [f"{c}  _(against real artifact)_" for c in environment.schema_criteria(env_record or {})]
+    crit += [f"{c}  _(live-checked against the uploaded file)_"
+             for c in environment.instruction_criteria(env_record or {})]
     crit += [f"{c}  _(user-specified)_" for c in bundle.get("added_acceptance_criteria", [])]
     for cp in bundle.get("human_checkpoints", []):
         crit.append(_checkpoint_criterion(cp, bundle.get("steps", [])) + "  _(human checkpoint)_")

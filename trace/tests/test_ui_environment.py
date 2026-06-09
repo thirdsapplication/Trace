@@ -112,8 +112,11 @@ class UIEnvironmentTest(unittest.TestCase):
         self.req("POST", f"/api/sessions/{self.sid}/environment/B1/upload?artifact=1&filename=l.csv",
                  raw=b"A,B\n1,2\n")
         _, rec = self.req("GET", f"/api/sessions/{self.sid}/environment/B1")
-        for q in rec["answers"]:
-            q["answer"] = "answered"
+        # answers alone don't complete it; a user instruction per artifact does
+        code, saved = self.req("POST", f"/api/sessions/{self.sid}/environment/B1", rec)
+        self.assertEqual(saved["status"], "incomplete")
+        for a in rec["artifacts"]:
+            a["user_instruction"] = "use this file as instructed"
         code, saved = self.req("POST", f"/api/sessions/{self.sid}/environment/B1", rec)
         self.assertEqual(code, 200)
         self.assertEqual(saved["status"], "complete")
@@ -132,8 +135,8 @@ class UIEnvironmentTest(unittest.TestCase):
         _, specs = self.req("GET", f"/api/sessions/{self.sid}/specs")
         md = next(s["markdown"] for s in specs["specs"] if s["filename"] == "spec_B1.md")
         self.assertIn("Real uploaded artifacts", md)
-        self.assertIn("OrderId", md)
-        self.assertIn("(against real artifact)", md)
+        self.assertIn("Raw file (read live)", md)         # the raw file always travels
+        self.assertIn("(live-checked against the uploaded file)", md)
 
 
 if __name__ == "__main__":

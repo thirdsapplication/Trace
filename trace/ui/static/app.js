@@ -759,13 +759,14 @@ $("loadEnvBtn").onclick = async () => {
 function envArtifactRow(bid, idx, a) {
   const ex = a.extracted || {};
   let preview = "";
-  if (a.uploaded) {
+  if (a.uploaded && (a.extraction_status === "ok" || a.extraction_status === "partial")) {
     const bits = [`format ${ex.format || "?"}`];
     if (ex.headers && ex.headers.length) bits.push(`columns: ${ex.headers.join(", ")}`);
     if (ex.tab_names && ex.tab_names.length) bits.push(`sheets: ${ex.tab_names.join(", ")}`);
     if (ex.field_layout && ex.field_layout.length) bits.push(`fields: ${ex.field_layout.map(f => f.label).join(", ")}`);
-    if (ex.note) bits.push(`note: ${ex.note}`);
-    preview = `<div class="ex-text">✓ ${ESC(bits.join(" · "))}</div>`;
+    preview = `<div class="ex-text">auto-read (unverified): ${ESC(bits.join(" · "))}</div>`;
+  } else if (a.uploaded) {
+    preview = `<div class="ex-text">auto-read: ${ESC(a.extraction_status || "none")} — the raw file + your instruction are what's used</div>`;
   }
   return `
   <div class="field" style="flex-direction:column">
@@ -773,8 +774,10 @@ function envArtifactRow(bid, idx, a) {
       <span class="muted">(from ${ESC((a.derived_from_event_ids || []).join(", "))})</span></div>
     <div class="step-row">
       <input type="file" data-bid="${ESC(bid)}" data-idx="${idx}" class="env-file"/>
-      ${a.uploaded ? '<span class="ok">uploaded</span>' : '<span class="warn">needed</span>'}
+      ${a.uploaded ? '<span class="ok">uploaded ✓</span>' : '<span class="warn">file needed</span>'}
     </div>
+    <textarea class="env-instr" data-bid="${ESC(bid)}" data-aidx="${idx}"
+      placeholder="Instruction (authoritative): what is this file & how to use it? name a tab/section if relevant">${ESC(a.user_instruction || "")}</textarea>
     ${preview}
   </div>`;
 }
@@ -795,7 +798,7 @@ function renderEnv() {
       ${arts || '<div class="muted">no artifacts required</div>'}
       <div class="review-sub">questions</div>
       ${qs}
-      <button class="link env-save" data-bid="${ESC(bid)}">save answers</button>
+      <button class="link env-save" data-bid="${ESC(bid)}">save instructions &amp; answers</button>
     </div>`;
   }).join("");
 
@@ -803,12 +806,28 @@ function renderEnv() {
     inp.onchange = () => uploadEnvFile(inp.dataset.bid, parseInt(inp.dataset.idx, 10), inp.files[0]);
   });
   c.querySelectorAll(".env-save").forEach(btn => {
-    btn.onclick = () => saveEnvAnswers(btn.dataset.bid);
+    btn.onclick = () => saveEnv(btn.dataset.bid);
   });
+}
+
+// scrape the DOM (instructions + answers) into the in-memory record for a bundle
+function scrapeEnv(bid) {
+  const rec = envState.environments[bid];
+  $("envContainer").querySelectorAll(`.env-instr[data-bid="${bid}"]`).forEach(t => {
+    const i = parseInt(t.dataset.aidx, 10);
+    if (rec.artifacts[i]) rec.artifacts[i].user_instruction = t.value;
+  });
+  $("envContainer").querySelectorAll(`.env-answer[data-bid="${bid}"]`).forEach(inp => {
+    const qi = parseInt(inp.dataset.qi, 10);
+    if (rec.answers[qi]) rec.answers[qi].answer = inp.value;
+  });
+  return rec;
 }
 
 async function uploadEnvFile(bid, idx, file) {
   if (!file) return;
+  // persist any typed instructions first so the upload (server re-reads the record) keeps them
+  await api("POST", `/api/sessions/${selectedSid}/environment/${bid}`, scrapeEnv(bid));
   $("envMsg").textContent = `uploading ${file.name}…`;
   const buf = await file.arrayBuffer();
   const url = `/api/sessions/${selectedSid}/environment/${bid}/upload`
@@ -817,21 +836,18 @@ async function uploadEnvFile(bid, idx, file) {
   const rec = await res.json();
   envState.environments[bid] = rec;
   renderEnv();
-  $("envMsg").innerHTML = res.ok ? `<span class="ok">extracted</span> ${ESC(file.name)}`
+  $("envMsg").innerHTML = res.ok
+    ? `<span class="ok">file carried</span> ${ESC(file.name)} (auto-read: ${ESC(rec.artifacts[idx].extraction_status || "?")})`
     : `<span class="err">upload failed</span>`;
   await refreshSessions();
 }
 
-async function saveEnvAnswers(bid) {
-  const rec = envState.environments[bid];
-  $("envContainer").querySelectorAll(`.env-answer[data-bid="${bid}"]`).forEach(inp => {
-    const qi = parseInt(inp.dataset.qi, 10);
-    if (rec.answers[qi]) rec.answers[qi].answer = inp.value;
-  });
-  const { ok, data } = await api("POST", `/api/sessions/${selectedSid}/environment/${bid}`, rec);
+async function saveEnv(bid) {
+  const { ok, data } = await api("POST", `/api/sessions/${selectedSid}/environment/${bid}`, scrapeEnv(bid));
   if (ok) { envState.environments[bid] = data; renderEnv(); }
   $("envMsg").innerHTML = ok ? `<span class="ok">saved</span> — status ${data.status}`
     : `<span class="err">save failed</span>`;
+  await refreshSessions();
 }
 
 $("refreshPerms").onclick = refreshPermissions;
