@@ -25,6 +25,37 @@ because reclassification moves items between them. Full shape in
 Read-only, only to fetch the **verbatim** text of cited examples. Examples are
 copied field-for-field; never paraphrased.
 
+## Input C: `environment_<id>.json` (Review 2 — FROZEN CONTRACT, one per approved bundle)
+Gathered between Review 1 and the engine: the real work products the workflow reads
+and writes (uploaded by the user — Trace never logs into live accounts) plus short
+answers for facts no artifact contains. Full shape in `environment.schema.json`.
+
+```json
+{
+  "bundle_id": "<id>",
+  "artifacts": [
+    { "role": "input | output | reference", "kind": "pdf | spreadsheet | doc | …",
+      "derived_from_event_ids": ["<events that justified the request>"],
+      "label_shown_to_user": "<the ask>", "uploaded": true,
+      "file_ref": "<path in the dated session folder>",
+      "extracted": { "<kind-specific structure: headers/rows/tabs/format or text/fields>": "…" } }
+  ],
+  "answers": [ { "question": "<derived/minimal>", "answer": "<user free text>" } ],
+  "status": "complete | incomplete"
+}
+```
+
+- **Requests are derived from the bundle's own event evidence** (any action that
+  reads/writes an external artifact), grouped so repeated instances collapse to one
+  real example — never a per-workflow-type list.
+- **Extraction is keyed on artifact kind**, not workflow: spreadsheet → headers, a
+  few rows, tab names, detected format; doc/pdf → text + field layout. Kinds are
+  extensible. Extracted text is redacted at write; the raw file is retained, not
+  inlined blindly.
+- `file_ref` lives in the dated session folder (same redaction/retention posture).
+- `status` lets the UI block or let the user **skip** — a skipped/incomplete record
+  yields a spec flagged `environment-incomplete` rather than silently degraded.
+
 ## Output: `spec_<id>.md` (FROZEN TEMPLATE)
 One markdown file per `approve_for_build` bundle, self-contained for pasting into
 Claude Code / Cursor. Anti-bundles instead get a `spec_<id>_manual.md`
@@ -50,6 +81,13 @@ Claude Code / Cursor. Anti-bundles instead get a `spec_<id>_manual.md`
 - **Every** user-added criterion and **every** checkpoint criterion appears exactly.
 - **Divergence rule:** when the edited intent contradicts an example, intent +
   criteria win and the example is marked *illustrative of context, not a target*.
+- **Environment folding (Review 2):** when `environment_<id>.json` is present, the
+  uploaded artifacts **lead** the Observed Examples (real columns/fields/format/rows)
+  and event-log instances become supplementary; Acceptance Criteria gain
+  deterministic real-schema assertions (correct field parsing, output mapping, file
+  format) plus each answered question. A spec that embeds real files carries a
+  sensitivity header; a missing/incomplete record flags it `environment-incomplete`
+  but still generates (never hard-blocks).
 
 The model call (one per approved bundle; default `claude-sonnet-4-6`, injectable)
 produces only the intent prose, the example-supported derived criteria, and the

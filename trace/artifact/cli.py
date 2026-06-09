@@ -11,9 +11,9 @@ import argparse
 import os
 import sys
 
-from . import review
-from .artifact import (DEFAULT_MODEL, build_prompt_material, generate_specs,
-                       load_json)
+from . import environment, review
+from .artifact import (DEFAULT_MODEL, build_prompt_material, environment_filename,
+                       generate_specs, load_json)
 from .prompt import SYSTEM_PROMPT
 
 
@@ -22,6 +22,8 @@ def main():
     ap.add_argument("reviewed", help="path to reviewed_bundles.json")
     ap.add_argument("event_log", help="path to event_log.json")
     ap.add_argument("-o", "--out", default="specs", help="output directory for spec files")
+    ap.add_argument("--env-dir", default=None,
+                    help="directory of environment_<id>.json records (default: reviewed file's dir)")
     ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--dry-run", action="store_true",
                     help="render the prompt + bundle + verbatim examples; no model call")
@@ -35,15 +37,19 @@ def main():
         print("=== SYSTEM PROMPT ===")
         print(SYSTEM_PROMPT)
         approved = [b for b in reviewed["bundles"] if b.get("disposition") == "approve_for_build"]
+        env_dir = args.env_dir or os.path.dirname(os.path.abspath(args.reviewed))
         print(f"\n# {len(approved)} approved bundle(s) -> one model call each\n")
         for b in approved:
             examples = review.fetch_examples(event_log, b["included_example_event_ids"])
+            ep = os.path.join(env_dir, environment_filename(b["id"]))
+            env_rec = environment.validate_environment(load_json(ep)) if os.path.exists(ep) else None
             print(f"===== BUNDLE {b['id']} =====")
-            print(build_prompt_material(b, examples))
+            print(build_prompt_material(b, examples, env_rec))
             print()
         return
 
-    results, report = generate_specs(args.reviewed, args.event_log, model=args.model)
+    results, report = generate_specs(args.reviewed, args.event_log, model=args.model,
+                                     env_dir=args.env_dir)
     os.makedirs(args.out, exist_ok=True)
     written = 0
     for r in results:

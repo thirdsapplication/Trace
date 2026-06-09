@@ -24,6 +24,15 @@ You are given (in the user turn):
 - the steps flagged as HUMAN CHECKPOINTS (where the agent must pause and ask);
 - optionally, an ORIGINAL REASON FOR JUDGMENT, if the user reclassified this from
   judgment-required work into an automatable one.
+- optionally, EXTRACTED ENVIRONMENT ARTIFACTS: real work products the user uploaded
+  (their kind, role input/output/reference, detected format, columns/fields, and a
+  few real rows or text), plus short ANSWERS to questions no artifact could answer.
+
+When environment artifacts are present, they are the PRIMARY examples of the real
+input->output shape; event-log instances become supplementary context. Use the real
+columns/fields/format to write acceptance criteria that are checkable against
+reality — correct field parsing, correct output mapping, correct format handling.
+Do not invent fields or formats not present in the artifacts.
 
 The EDITED INTENT is the authority for what the agent should do. The observed
 examples are illustration of real input->output shape, not the target definition.

@@ -206,5 +206,62 @@ class GenerateSpecsTest(unittest.TestCase):
         raise AssertionError("model_fn must not be called here")
 
 
+class EnvironmentIntegrationTest(unittest.TestCase):
+    """Review 2 folded into the engine: real uploaded artifacts lead the Observed
+    Examples and sharpen Acceptance Criteria; a missing record flags the spec."""
+
+    def _setup(self, with_env):
+        from trace.artifact.artifact import environment_filename
+        d = tempfile.mkdtemp()
+        reviewed = review.seed_review(DISCOVERY)
+        with open(os.path.join(d, "reviewed.json"), "w") as f:
+            json.dump(reviewed, f)
+        with open(os.path.join(d, "events.json"), "w") as f:
+            json.dump(EVENTS, f)
+        if with_env:
+            env = {"bundle_id": "B1", "artifacts": [
+                {"role": "input", "kind": "spreadsheet",
+                 "derived_from_event_ids": ["e2"], "label_shown_to_user": "the source sheet",
+                 "uploaded": True, "file_ref": "/x/src.csv",
+                 "extracted": {"format": "csv", "headers": ["Customer", "Item", "Qty"],
+                               "sample_rows": [["Acme", "widgets", "3"]], "tab_names": ["(single sheet)"]}}],
+                "answers": [], "status": "complete"}
+            with open(os.path.join(d, environment_filename("B1")), "w") as f:
+                json.dump(env, f)
+        return d
+
+    def _stub(self, system, user):
+        self.captured = user
+        return json.dumps({"intent": "i", "derived_acceptance_criteria": [],
+                           "example_assessments": {}, "notes": ""})
+
+    def test_environment_folds_into_spec(self):
+        d = self._setup(with_env=True)
+        results, _ = generate_specs(os.path.join(d, "reviewed.json"),
+                                    os.path.join(d, "events.json"), model_fn=self._stub)
+        md = next(r for r in results if r["id"] == "B1")["markdown"]
+        # the extracted real schema reached the model
+        self.assertIn("EXTRACTED ENVIRONMENT ARTIFACTS", self.captured)
+        # Observed Examples lead with the real uploaded artifact + its real columns
+        self.assertIn("Real uploaded artifacts", md)
+        self.assertIn("Customer", md)
+        self.assertIn("format `csv`", md)
+        # acceptance criteria reference the real schema
+        self.assertIn("(against real artifact)", md)
+        # privacy boundary surfaced; not flagged incomplete
+        self.assertIn("embeds real business documents", md)
+        self.assertNotIn("environment-incomplete", md)
+        self.assertEqual(next(r for r in results if r["id"] == "B1")["environment_status"], "complete")
+
+    def test_missing_environment_flags_incomplete_but_still_builds(self):
+        d = self._setup(with_env=False)
+        results, _ = generate_specs(os.path.join(d, "reviewed.json"),
+                                    os.path.join(d, "events.json"), model_fn=self._stub)
+        spec = next(r for r in results if r["id"] == "B1")
+        self.assertTrue(spec["built"])                       # never hard-blocks
+        self.assertIn("environment-incomplete", spec["markdown"])
+        self.assertEqual(spec["environment_status"], "missing")
+
+
 if __name__ == "__main__":
     unittest.main()

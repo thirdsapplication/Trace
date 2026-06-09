@@ -507,8 +507,10 @@ async function refreshSessions() {
       scoreAvailable = !!(meta.data && meta.data.answer_key_path);
       $("scoreBtn").disabled = !(scoreAvailable && art.discovery);
       enableReviewButtons(!!art.discovery, false);
-      reviewData = null;
+      enableEnvButton(!!art.reviewed);
+      reviewData = null; envState = null;
       $("reviewContainer").innerHTML = "";
+      $("envContainer").innerHTML = "";
       $("discoverTarget").textContent = art.event_log ? `target: ${selectedSid}` : "";
       $("scorecardView").classList.add("hidden");
       await loadAndShow("event_log");
@@ -669,6 +671,7 @@ async function saveReview() {
   const { ok, data } = await api("POST", `/api/sessions/${selectedSid}/reviewed-bundles`, body);
   if (ok) {
     reviewData.reviewed = data.reviewed;
+    enableEnvButton(true);   // reviewed bundles exist -> can run environment capture
     delete cache[selectedSid];
     await refreshSessions();
   }
@@ -730,6 +733,105 @@ function pollSpecs() {
       setPill("idle");
     }
   }, 800);
+}
+
+// ===========================================================================
+// Review 2 — environment capture
+// ===========================================================================
+let envState = null;   // {approved_ids, environments}
+
+function enableEnvButton(on) { $("loadEnvBtn").disabled = !on; }
+
+$("loadEnvBtn").onclick = async () => {
+  if (!selectedSid) return;
+  $("envMsg").textContent = "loading…";
+  const { ok, data } = await api("GET", `/api/sessions/${selectedSid}/environment-data`);
+  if (!ok) {
+    $("envMsg").innerHTML = `<span class="err">${(data && data.error) || "failed"}</span>` +
+      (data && data.error === "not_reviewed" ? " — save reviewed bundles first." : "");
+    return;
+  }
+  envState = data;
+  renderEnv();
+  $("envMsg").textContent = "upload the real files, answer the questions, then Save.";
+};
+
+function envArtifactRow(bid, idx, a) {
+  const ex = a.extracted || {};
+  let preview = "";
+  if (a.uploaded) {
+    const bits = [`format ${ex.format || "?"}`];
+    if (ex.headers && ex.headers.length) bits.push(`columns: ${ex.headers.join(", ")}`);
+    if (ex.tab_names && ex.tab_names.length) bits.push(`sheets: ${ex.tab_names.join(", ")}`);
+    if (ex.field_layout && ex.field_layout.length) bits.push(`fields: ${ex.field_layout.map(f => f.label).join(", ")}`);
+    if (ex.note) bits.push(`note: ${ex.note}`);
+    preview = `<div class="ex-text">✓ ${ESC(bits.join(" · "))}</div>`;
+  }
+  return `
+  <div class="field" style="flex-direction:column">
+    <div><b>${ESC(a.role)}</b> · ${ESC(a.kind)} <span class="muted">— ${ESC(a.label_shown_to_user)}</span>
+      <span class="muted">(from ${ESC((a.derived_from_event_ids || []).join(", "))})</span></div>
+    <div class="step-row">
+      <input type="file" data-bid="${ESC(bid)}" data-idx="${idx}" class="env-file"/>
+      ${a.uploaded ? '<span class="ok">uploaded</span>' : '<span class="warn">needed</span>'}
+    </div>
+    ${preview}
+  </div>`;
+}
+
+function renderEnv() {
+  const c = $("envContainer");
+  c.innerHTML = (envState.approved_ids || []).map(bid => {
+    const rec = envState.environments[bid] || { artifacts: [], answers: [] };
+    const arts = (rec.artifacts || []).map((a, i) => envArtifactRow(bid, i, a)).join("");
+    const qs = (rec.answers || []).map((q, i) => `
+      <div class="field"><label>${ESC(q.question)}</label>
+        <input type="text" class="env-answer" data-bid="${ESC(bid)}" data-qi="${i}" value="${ESC(q.answer)}"/></div>`).join("")
+      || `<div class="muted">no questions yet — upload files to derive them</div>`;
+    const cls = rec.status === "complete" ? "ok" : "warn";
+    return `<div class="review-item bundle" data-bid="${ESC(bid)}">
+      <h4>${ESC(bid)} — environment <span class="${cls}">${ESC(rec.status || "incomplete")}</span></h4>
+      <div class="review-sub">required artifacts (upload one real example each)</div>
+      ${arts || '<div class="muted">no artifacts required</div>'}
+      <div class="review-sub">questions</div>
+      ${qs}
+      <button class="link env-save" data-bid="${ESC(bid)}">save answers</button>
+    </div>`;
+  }).join("");
+
+  c.querySelectorAll(".env-file").forEach(inp => {
+    inp.onchange = () => uploadEnvFile(inp.dataset.bid, parseInt(inp.dataset.idx, 10), inp.files[0]);
+  });
+  c.querySelectorAll(".env-save").forEach(btn => {
+    btn.onclick = () => saveEnvAnswers(btn.dataset.bid);
+  });
+}
+
+async function uploadEnvFile(bid, idx, file) {
+  if (!file) return;
+  $("envMsg").textContent = `uploading ${file.name}…`;
+  const buf = await file.arrayBuffer();
+  const url = `/api/sessions/${selectedSid}/environment/${bid}/upload`
+    + `?artifact=${idx}&filename=${encodeURIComponent(file.name)}`;
+  const res = await fetch(url, { method: "POST", body: buf });
+  const rec = await res.json();
+  envState.environments[bid] = rec;
+  renderEnv();
+  $("envMsg").innerHTML = res.ok ? `<span class="ok">extracted</span> ${ESC(file.name)}`
+    : `<span class="err">upload failed</span>`;
+  await refreshSessions();
+}
+
+async function saveEnvAnswers(bid) {
+  const rec = envState.environments[bid];
+  $("envContainer").querySelectorAll(`.env-answer[data-bid="${bid}"]`).forEach(inp => {
+    const qi = parseInt(inp.dataset.qi, 10);
+    if (rec.answers[qi]) rec.answers[qi].answer = inp.value;
+  });
+  const { ok, data } = await api("POST", `/api/sessions/${selectedSid}/environment/${bid}`, rec);
+  if (ok) { envState.environments[bid] = data; renderEnv(); }
+  $("envMsg").innerHTML = ok ? `<span class="ok">saved</span> — status ${data.status}`
+    : `<span class="err">save failed</span>`;
 }
 
 $("refreshPerms").onclick = refreshPermissions;

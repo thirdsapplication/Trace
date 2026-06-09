@@ -17,6 +17,7 @@ import json
 import os
 import re
 import threading
+import urllib.parse
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -28,8 +29,9 @@ from ..discovery import scorer as discovery_scorer
 from ..discovery.discover import discover as _real_discover
 from ..discovery.discover import load_event_log, render_event_log
 from ..discovery.prompt import SYSTEM_PROMPT as DISCOVERY_SYSTEM_PROMPT
+from ..artifact import environment as artifact_env
 from ..artifact import review as artifact_review
-from ..artifact.artifact import build_prompt_material
+from ..artifact.artifact import build_prompt_material, environment_filename
 from ..artifact.artifact import generate_specs as _real_generate_specs
 from ..artifact.prompt import SYSTEM_PROMPT as ARTIFACT_SYSTEM_PROMPT
 from . import keystore, permissions, sessions
@@ -247,7 +249,14 @@ def make_handler(state):
 
         def do_POST(self):
             p = self.path.split("?", 1)[0]
+            # environment file upload: raw bytes, handled before JSON parsing
+            mu = re.match(r"^/api/sessions/([^/]+)/environment/([^/]+)/upload$", p)
+            if mu:
+                return self._upload_environment(mu.group(1), mu.group(2))
             body = self._body()
+            me = re.match(r"^/api/sessions/([^/]+)/environment/([^/]+)$", p)
+            if me:
+                return self._save_environment(me.group(1), me.group(2), body)
             if p == "/api/settings/key":
                 return self._save_key(body)
             if p == "/api/settings/test-key":
@@ -413,6 +422,11 @@ def make_handler(state):
             if sub == "/generate-specs/status":
                 job = state.spec_jobs.get(sid)
                 return self._json(200, job or {"state": "idle"})
+            if sub == "/environment-data":
+                return self._environment_data(sid)
+            me = re.match(r"^/environment/([^/]+)$", sub)
+            if me:
+                return self._json(200, self._load_or_seed_env(sid, me.group(1)) or {"error": "n/a"})
             return self._json(404, {"error": "not_found"})
 
         # --- reconstruction ---
@@ -590,6 +604,72 @@ def make_handler(state):
                     return self._json(409, {"error": "already_running"})
                 state.start_spec_generation(sid)
             return self._json(202, {"state": "running", "session_id": sid})
+
+        # --- Review 2: environment capture (Stage 3) ---
+        def _approved_bundles(self, sid):
+            reviewed = sessions.read_json_artifact(root, sid, sessions.REVIEWED)
+            event_log = sessions.read_json_artifact(root, sid, sessions.EVENT_LOG) or []
+            if reviewed is None:
+                return None, event_log
+            rep = artifact_review.ReviewReport()
+            reviewed = artifact_review.validate_reviewed(
+                reviewed, set(artifact_review.event_index(event_log)), rep)
+            return [b for b in reviewed["bundles"]
+                    if b.get("disposition") == "approve_for_build"], event_log
+
+        def _load_or_seed_env(self, sid, bid):
+            """Load a bundle's saved environment record, or seed it from the reviewed
+            bundle + event log (requests derived, nothing uploaded)."""
+            saved = sessions.read_json_artifact(root, sid, environment_filename(bid))
+            if saved is not None:
+                return artifact_env.validate_environment(saved)
+            approved, event_log = self._approved_bundles(sid)
+            if approved is None:
+                return None
+            b = next((x for x in approved if x["id"] == bid), None)
+            return artifact_env.seed_environment(b, event_log) if b else None
+
+        def _save_env_record(self, sid, rec):
+            with open(sessions.path(root, sid, environment_filename(rec["bundle_id"])),
+                      "w", encoding="utf-8") as f:
+                json.dump(rec, f, indent=2, ensure_ascii=False)
+
+        def _environment_data(self, sid):
+            approved, event_log = self._approved_bundles(sid)
+            if approved is None:
+                return self._json(404, {"error": "not_reviewed"})
+            envs = {b["id"]: self._load_or_seed_env(sid, b["id"]) for b in approved}
+            return self._json(200, {"approved_ids": [b["id"] for b in approved],
+                                    "environments": envs})
+
+        def _save_environment(self, sid, bid, body):
+            rec = artifact_env.validate_environment(body or {})
+            rec["bundle_id"] = bid
+            self._save_env_record(sid, rec)
+            return self._json(200, rec)
+
+        def _upload_environment(self, sid, bid):
+            qs = urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
+            try:
+                artifact_idx = int(qs.get("artifact", ["-1"])[0])
+            except ValueError:
+                artifact_idx = -1
+            filename = qs.get("filename", ["upload.bin"])[0]
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            data = self.rfile.read(length) if length else b""
+
+            rec = self._load_or_seed_env(sid, bid)
+            if rec is None:
+                return self._json(404, {"error": "not_reviewed"})
+            updir = os.path.join(sessions.session_dir(root, sid), "env", bid)
+            os.makedirs(updir, exist_ok=True)
+            safe = "".join(c if (c.isalnum() or c in "._-") else "_" for c in filename) or "upload.bin"
+            fpath = os.path.join(updir, safe)
+            with open(fpath, "wb") as f:
+                f.write(data)
+            artifact_env.attach_upload(rec, artifact_idx, fpath, filename)
+            self._save_env_record(sid, rec)
+            return self._json(200, rec)
 
     return Handler
 

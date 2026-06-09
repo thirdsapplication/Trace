@@ -115,6 +115,20 @@
         preferred output. Only <code>approve_for_build</code> bundles become specs.</p>
     </section>
 
+    <!-- ENVIRONMENT CAPTURE (Review 2) --------------------------------- -->
+    <section class="panel">
+      <h2>Environment capture <span class="muted">(Review 2 — real files &amp; facts)</span></h2>
+      <div class="row">
+        <button id="loadEnvBtn" class="secondary" disabled>Load environment capture</button>
+        <span id="envMsg" class="status-line"></span>
+      </div>
+      <div id="envContainer"></div>
+      <p class="help">For each approved workflow, upload one real example of each
+        input/output file it touches and answer the few derived questions. The
+        generated spec then carries the real schema and format; missing files flag
+        the spec <code>environment-incomplete</code> (it still generates).</p>
+    </section>
+
     <!-- RESULTS -------------------------------------------------------- -->
     <section class="panel">
       <h2>Results <span id="resultsSid" class="muted"></span></h2>
