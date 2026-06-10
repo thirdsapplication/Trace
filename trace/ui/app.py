@@ -253,8 +253,11 @@ class AppState:
                             "deploy_recommended": report.get("deploy_recommended"),
                             "passed": report.get("passed"), "failed": report.get("failed"),
                             "not_testable_in_sandbox": report.get("not_testable_in_sandbox")}
-                    except RuntimeError as e:
-                        job["reports"][b["id"]] = {"test_skipped": str(e)}
+                    except Exception as e:
+                        # Compilation already succeeded and the envelopes are written;
+                        # a sandbox-test failure (no key, SDK/API drift, network) is
+                        # recorded per-bundle and never fails the whole job.
+                        job["reports"][b["id"]] = {"test_skipped": f"{type(e).__name__}: {e}"}
                 sessions.update_meta(root, sid, stage4_at=sessions._now())
                 job.update(state="done")
             except Exception as e:

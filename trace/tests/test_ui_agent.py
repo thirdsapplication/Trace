@@ -115,6 +115,28 @@ class UIAgentTest(unittest.TestCase):
         self.assertEqual(code, 400)
         self.assertEqual(data["error"], "no_specs")
 
+    def test_sandbox_test_failure_does_not_crash_job(self):
+        # a failing test run (API/SDK drift, no key) must still leave the envelopes
+        # compiled and the job 'done', recording the failure per bundle.
+        def boom(*a, **k):
+            raise AttributeError("'Anthropic' object has no attribute 'files'")
+        self.state.run_test_fn = boom
+        code, _ = self.req("POST", f"/api/sessions/{self.sid}/compile-test")
+        self.assertEqual(code, 202)
+        for _ in range(60):
+            _, st = self.req("GET", f"/api/sessions/{self.sid}/compile-test/status")
+            if st["state"] in ("done", "error"):
+                break
+            time.sleep(0.05)
+        self.assertEqual(st["state"], "done")        # never a hard failure
+        self.assertEqual(st["compiled"], 1)          # envelopes still produced
+        self.assertEqual(st["tested"], 0)
+        self.assertIn("test_skipped", st["reports"]["B1"])
+        # the compiled envelopes are present and readable
+        _, data = self.req("GET", f"/api/sessions/{self.sid}/agents")
+        agent = next(a for a in data["agents"] if a["bundle_id"] == "B1")
+        self.assertIn("system:", agent["test_yaml"])
+
 
 if __name__ == "__main__":
     unittest.main()
