@@ -1,0 +1,41 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://trace.dev/schema/test_report.schema.json",
+  "title": "Trace Stage 4 sandbox test report",
+  "type": "object",
+  "required": ["bundle_id", "criteria_total", "passed", "failed",
+               "not_testable_in_sandbox", "results", "zero_coaching",
+               "deploy_recommended", "sessions_run"],
+  "properties": {
+    "bundle_id": { "type": "string" },
+    "criteria_total": { "type": "integer" },
+    "passed": { "type": "integer" },
+    "failed": { "type": "integer" },
+    "not_testable_in_sandbox": { "type": "integer" },
+    "results": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["criterion", "verdict"],
+        "properties": {
+          "criterion": { "type": "string" },
+          "verdict": { "type": "string", "enum": ["pass", "fail", "not_testable_in_sandbox"] },
+          "evidence": { "type": "string" }
+        }
+      }
+    },
+    "zero_coaching": {
+      "type": "object",
+      "required": ["stalled", "asked_question"],
+      "properties": {
+        "stalled": { "type": "boolean" },
+        "asked_question": { "type": "boolean" },
+        "note": { "type": "string" }
+      }
+    },
+    "deploy_recommended": { "type": "boolean" },
+    "sessions_run": { "type": "integer" },
+    "retention_clean": { "type": ["boolean", "null"] },
+    "instances": { "type": "array" }
+  }
+}

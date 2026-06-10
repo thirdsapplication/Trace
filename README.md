@@ -16,10 +16,13 @@ Stage 2 — Discovery Engine     ← THIS REPO  (event_log.json -> discovery.jso
 Review / edit (Test UI)        ← THIS REPO  (discovery.json -> reviewed_bundles.json)
    │   human corrects intent / reclassifies / sets disposition
    ▼
-Stage 3 — Artifact Engine      ← THIS REPO  (reviewed_bundles.json -> spec_<id>.md)
-   │   one buildable spec per approved workflow
+Stage 3 — Artifact Engine      ← THIS REPO  (reviewed_bundles.json -> spec_<id>.md bundle)
+   │   one self-contained buildable spec per approved workflow
    ▼
-A developer / coding agent builds the workflow's agent from the spec  (out of scope)
+Stage 4 — Agent Compiler + Test Deployer  ← THIS REPO
+   │   spec -> agent_<id>.{test,live}.yaml; sandbox-test the test agent + grade it
+   ▼
+Live deployment of the tested agent  (separate, later handoff — out of scope here)
 ```
 
 This repository implements the **whole MVP spine**: **Stage 1 (Event Log)**,
@@ -150,14 +153,14 @@ cat captures/event_log.json
 ### 6. Anywhere smoke test (no key, no Mac, no cost)
 
 ```bash
-# full automated suite (194 tests)
+# full automated suite (218 tests)
 python -m unittest discover -s trace/tests -t . -p "test_*.py"
 
 # preview the chunked prompt on the bundled sample (no model call)
 python -m trace.reconstruct.cli trace/samples/sample_raw_events.jsonl --dry-run --chunk-size 8 --overlap 2
 ```
 
-Expect `Ran 194 tests … OK`, and a printed system prompt + 3 rendered chunks.
+Expect `Ran 218 tests … OK`, and a printed system prompt + 3 rendered chunks.
 
 **Useful flags:**
 - UI: `python -m trace.ui.app --port 8765 --collector-port 8137 --sessions-root captures/sessions --no-open`
@@ -200,6 +203,14 @@ trace/
     prompt.py              the domain-neutral spec-writing prompt
     cli.py                 entry point + --dry-run
     reviewed_bundles.schema.json, environment.schema.json, ARTIFACT_SCHEMA.md
+  agent/                   Stage 4 — spec -> Managed Agents agent + sandbox test
+    compiler.py            wrap spec into agent_<id>.{test,live}.yaml (pure, no network)
+    trigger.py             trigger messages from the bundle's observed instances
+    grader.py              grade a run vs the spec's own criteria (walled off)
+    deployer.py            full sandbox test run (upload/mount/trigger/grade/cleanup)
+    api_client.py          the ONE beta-pinned Managed Agents/Files API client
+    config.py              app→MCP table, framing templates, defaults (editable)
+    agent_envelope.schema.json, test_report.schema.json
   ui/                      local test harness (drives the engine from a window)
     app.py                 stdlib HTTP backend (local-only); the API
     keystore.py            secure API-key storage (Keychain / 0600 file)
@@ -350,7 +361,7 @@ first chunk — capture and `--dry-run` are unaffected.
 python -m unittest discover -s trace/tests -t . -p "test_*.py"
 ```
 
-The suite (194 tests) covers redaction, keystroke coalescing, the raw writer,
+The suite (218 tests) covers redaction, keystroke coalescing, the raw writer,
 chunking, schema validation/normalization, fragment-stitch flagging, boundary
 de-duplication, contiguous-entry coalescing, document-open detection/coverage,
 the browser-capture collector path, the full reconstruction pipeline with a mock
@@ -362,10 +373,14 @@ extraction, the courier/annotator model — authoritative instruction, raw file 
 carried, non-load-bearing extraction, criteria targeting the user-designated
 location, completeness off uploads+instructions), self-contained spec bundles
 (byte-identical artifact export, spec-relative paths, move-and-resolve, mandatory
-preflight, filename-collision safety, on two domains),
+preflight, filename-collision safety, on two domains), Stage 4 (envelope compile
+test/live with verbatim spec content + path rewrite + connector derivation + safe
+permission defaults across two domains, trigger generation, the walled-off grader's
+pass/fail/not-testable + gate-can-fail, the deployer's upload/mount/zero-coaching/
+retention via a stub API client),
 plus the test-UI backends for every stage (key store, sessions, capture lifecycle,
-reconstruct/discovery/review/environment/spec guards) — so it runs without an API
-key, `pynput`, or a browser.
+reconstruct/discovery/review/environment/spec/agent guards) — so it runs without an
+API key, `pynput`, or a browser.
 
 ## Local test UI (run the whole engine from a window)
 
@@ -557,6 +572,46 @@ python -m trace.artifact.cli reviewed_bundles.json event_log.json --env-dir <dir
 discover → **review/edit/reclassify** → **environment capture** (upload files,
 answer derived questions) → **generate specs** (free dry-run) → view each
 `spec_<id>.md` as markdown in the results tabs, with copy/export.
+
+## Stage 4 — Agent Compiler + Test Deployer (Claude Managed Agents)
+
+`trace/agent/` turns an approved bundle into a **tested agent** on the Managed
+Agents platform (beta `managed-agents-2026-04-01`). Two components:
+
+**Agent Compiler** (pure, no network). Wraps `spec_<id>.md` into a Managed Agents
+definition — the spec's substantive content (preflight, intent, examples, criteria)
+travels **verbatim** into the `system` field; only mechanical adaptations are made
+(prepend a framing paragraph, rewrite artifact paths to the session **mount** path,
+drop coding-agent wrapper lines, reword the preflight trigger). It emits both
+`agent_<id>.test.yaml` and `agent_<id>.live.yaml`:
+- **test**: no external connections; outbound actions become text; no MCP servers.
+- **live**: MCP servers derived from the bundle's **observed apps** via an editable
+  `app → MCP` table (apps with no row are surfaced as a `# unmapped` comment, never
+  guessed); every write capability defaults to an **approval-required** policy.
+  *Emitted and schema-validated only — never deployed by this stage.*
+
+**Test Deployer** (API orchestration). Through the single beta-pinned
+`api_client.py`: uploads the bundle's Review 2 files, creates the agent + a sandbox
+cloud environment, mounts the files, sends **only** a trigger generated from the
+bundle's observed instances (zero coaching — no steering messages), captures the
+event stream, downloads outputs, and **deletes the session and files** (nothing
+persists). A walled-off **grader** (own prompt, like the discovery Scorer) judges
+the run against the **spec's own acceptance criteria** → `test_report_<id>.json`,
+per-criterion pass / fail / **not-testable-in-sandbox** (criteria needing live
+services are never silently passed). A failing criterion or a stall blocks the
+deploy recommendation — the gate can fail.
+
+```bash
+# compile the agent envelopes for approved bundles (offline, no API)
+python -m trace.agent.cli reviewed_bundles.json event_log.json --specs-dir <specs> -o <out>
+```
+
+**From the Test UI.** A **Compile & test agents** action runs Compiler → Test
+Deployer and shows the per-bundle verdict; the `agents` results tab shows both
+envelopes and the test report. The whole of Stage 4 is offline-testable (the API
+client is injected/stubbed); real platform calls happen only in the explicit gate
+run. Live deployment (OAuth, real MCP connections, scheduling, the refinement loop)
+is a separate, later handoff.
 
 ## Faithfulness over richness
 

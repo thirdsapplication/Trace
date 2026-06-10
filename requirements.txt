@@ -14,3 +14,6 @@ keyring>=24.0 ; sys_platform == "darwin"
 
 # The collector and reconstruction use only the Python standard library
 # otherwise (http.server, json, fcntl, argparse, unittest).
+
+# Stage 4 (Agent Compiler) — emit/validate Managed Agents agent-definition YAML.
+PyYAML>=6.0

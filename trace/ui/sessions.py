@@ -15,6 +15,7 @@ the only file this module writes beyond what the engine produces.
 import datetime
 import json
 import os
+import re
 
 RAW = "raw_events.jsonl"
 EVENT_LOG = "event_log.json"
@@ -129,6 +130,44 @@ def list_specs(root, sid):
         if fn.endswith(".md"):
             with open(os.path.join(d, fn), "r", encoding="utf-8") as f:
                 out.append({"filename": fn, "markdown": f.read()})
+    return out
+
+
+def _safe_id(bid):
+    return "".join(c if c.isalnum() else "_" for c in str(bid))
+
+
+def agent_yaml_name(bid, mode):
+    return f"agent_{_safe_id(bid)}.{mode}.yaml"
+
+
+def test_report_name(bid):
+    return f"test_report_{_safe_id(bid)}.json"
+
+
+def list_agents(root, sid):
+    """Return Stage-4 outputs per bundle: agent envelopes + test report (if any)."""
+    d = path(root, sid, SPECS_DIR)
+    if not os.path.isdir(d):
+        return []
+    bundles = {}
+    for fn in sorted(os.listdir(d)):
+        m = re.match(r"^agent_(.+)\.(test|live)\.yaml$", fn)
+        if m:
+            with open(os.path.join(d, fn), encoding="utf-8") as f:
+                bundles.setdefault(m.group(1), {})[m.group(2) + "_yaml"] = f.read()
+    out = []
+    for bid, data in bundles.items():
+        rpath = os.path.join(d, f"test_report_{bid}.json")
+        report = None
+        if os.path.exists(rpath):
+            try:
+                with open(rpath, encoding="utf-8") as f:
+                    report = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                report = None
+        out.append({"bundle_id": bid, "test_yaml": data.get("test_yaml"),
+                    "live_yaml": data.get("live_yaml"), "test_report": report})
     return out
 
 

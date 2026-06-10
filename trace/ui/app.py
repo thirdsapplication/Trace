@@ -34,8 +34,15 @@ from ..artifact import environment as artifact_env
 from ..artifact import review as artifact_review
 from ..artifact.artifact import build_prompt_material, environment_filename, write_spec_bundle
 from ..artifact.artifact import generate_specs as _real_generate_specs
+from ..artifact.artifact import _spec_filename
 from ..artifact.prompt import SYSTEM_PROMPT as ARTIFACT_SYSTEM_PROMPT
+from ..agent import compiler as agent_compiler
 from . import keystore, permissions, sessions
+
+
+def _compile_agent(bundle, spec_md, event_log):
+    """Default Stage-4 compiler seam (pure, no network)."""
+    return agent_compiler.compile_agent(bundle, spec_md, event_log)
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 DISCOVERY_FIXTURES_DIR = os.path.join(
@@ -66,13 +73,16 @@ _CONTENT_TYPES = {".html": "text/html", ".js": "application/javascript",
 class AppState:
     def __init__(self, sessions_root, collector_port=8137,
                  reconstruct_fn=None, controller_factory=None, key_store=None,
-                 discovery_fn=None, score_fn=None, artifact_fn=None):
+                 discovery_fn=None, score_fn=None, artifact_fn=None,
+                 compile_agent_fn=None, run_test_fn=None):
         self.sessions_root = sessions_root
         self.collector_port = collector_port
         self.reconstruct_fn = reconstruct_fn or _real_reconstruct
         self.discovery_fn = discovery_fn or _real_discover
         self.score_fn = score_fn or discovery_scorer.score
         self.artifact_fn = artifact_fn or _real_generate_specs
+        self.compile_agent_fn = compile_agent_fn or _compile_agent
+        self.run_test_fn = run_test_fn or self._default_run_test
         self.controller_factory = controller_factory or (
             lambda out: CaptureController(out, collector_port=collector_port))
         self.keystore = key_store or keystore
@@ -81,8 +91,20 @@ class AppState:
         self.recon_jobs = {}         # sid -> {state, current, total, error, flags, errors}
         self.discover_jobs = {}      # sid -> {state, error, bundles, anti_bundles}
         self.spec_jobs = {}          # sid -> {state, error, built, notes}
+        self.stage4_jobs = {}        # sid -> {state, error, compiled, tested, reports}
         self.lock = threading.Lock()
         os.makedirs(sessions_root, exist_ok=True)
+
+    def _default_run_test(self, bundle, spec_md, env_record, event_log, test_dict):
+        """Real Stage-4 sandbox run: requires a key; builds the beta-pinned client."""
+        key = self.keystore.get_key()
+        if not key:
+            raise RuntimeError("no_api_key")
+        os.environ["ANTHROPIC_API_KEY"] = key
+        from ..agent.api_client import ManagedAgentsClient
+        from ..agent.deployer import run_test as _run_test
+        client = ManagedAgentsClient(api_key=key)
+        return _run_test(bundle, spec_md, env_record, event_log, test_dict, client)
 
     # --- reconstruction job ----------------------------------------------
     def start_reconstruction(self, sid):
@@ -183,6 +205,67 @@ class AppState:
 
         threading.Thread(target=run, daemon=True).start()
 
+    # --- Stage 4: compile + sandbox-test agents (P10) --------------------
+    def start_stage4(self, sid):
+        root = self.sessions_root
+        specs_dir = sessions.path(root, sid, sessions.SPECS_DIR)
+        job = {"state": "running", "error": None, "compiled": 0, "tested": 0, "reports": {}}
+        self.stage4_jobs[sid] = job
+
+        def run():
+            try:
+                reviewed = sessions.read_json_artifact(root, sid, sessions.REVIEWED) or {}
+                event_log = sessions.read_json_artifact(root, sid, sessions.EVENT_LOG) or []
+                rep = artifact_review.ReviewReport()
+                reviewed = artifact_review.validate_reviewed(
+                    reviewed, set(artifact_review.event_index(event_log)), rep)
+                approved = [b for b in reviewed["bundles"]
+                            if b.get("disposition") == "approve_for_build"]
+                os.makedirs(specs_dir, exist_ok=True)
+                for b in approved:
+                    spec_path = os.path.join(specs_dir, _spec_filename(b["id"], True))
+                    if not os.path.exists(spec_path):
+                        continue
+                    with open(spec_path, encoding="utf-8") as f:
+                        spec_md = f.read()
+                    compiled = self.compile_agent_fn(b, spec_md, event_log)   # pure, offline
+                    for mode in ("test", "live"):
+                        with open(os.path.join(specs_dir, sessions.agent_yaml_name(b["id"], mode)),
+                                  "w", encoding="utf-8") as f:
+                            f.write(compiled[mode]["yaml"])
+                    job["compiled"] += 1
+                    # sandbox test (needs the API; skipped gracefully without a key)
+                    env_record = sessions.read_json_artifact(root, sid, environment_filename(b["id"])) or {}
+                    try:
+                        report, artifacts = self.run_test_fn(
+                            b, spec_md, env_record, event_log, compiled["test"]["dict"])
+                        with open(os.path.join(specs_dir, sessions.test_report_name(b["id"])),
+                                  "w", encoding="utf-8") as f:
+                            json.dump(report, f, indent=2, ensure_ascii=False)
+                        odir = os.path.join(specs_dir, f"agent_{_safe(b['id'])}_outputs")
+                        if artifacts.get("output_files"):
+                            os.makedirs(odir, exist_ok=True)
+                            for nm, content in artifacts["output_files"].items():
+                                with open(os.path.join(odir, _safe(nm)), "w", encoding="utf-8") as f:
+                                    f.write(content if isinstance(content, str) else str(content))
+                        job["tested"] += 1
+                        job["reports"][b["id"]] = {
+                            "deploy_recommended": report.get("deploy_recommended"),
+                            "passed": report.get("passed"), "failed": report.get("failed"),
+                            "not_testable_in_sandbox": report.get("not_testable_in_sandbox")}
+                    except RuntimeError as e:
+                        job["reports"][b["id"]] = {"test_skipped": str(e)}
+                sessions.update_meta(root, sid, stage4_at=sessions._now())
+                job.update(state="done")
+            except Exception as e:
+                job.update(state="error", error=str(e))
+
+        threading.Thread(target=run, daemon=True).start()
+
+
+def _safe(s):
+    return "".join(c if c.isalnum() else "_" for c in str(s))
+
 
 # --------------------------------------------------------------------------
 # Request handling
@@ -270,7 +353,7 @@ def make_handler(state):
                 return self._load_fixture(body)
             m = re.match(r"^/api/sessions/([^/]+)/"
                          r"(dry-run|reconstruct|discovery-dry-run|discover|score|"
-                         r"reviewed-bundles|generate-specs|specs-dry-run)$", p)
+                         r"reviewed-bundles|generate-specs|specs-dry-run|compile-test)$", p)
             if m:
                 sid, action = m.group(1), m.group(2)
                 if action == "dry-run":
@@ -287,7 +370,9 @@ def make_handler(state):
                     return self._save_reviewed(sid, body)
                 if action == "generate-specs":
                     return self._generate_specs(sid)
-                return self._specs_dry_run(sid)
+                if action == "specs-dry-run":
+                    return self._specs_dry_run(sid)
+                return self._compile_test(sid)
             return self._json(404, {"error": "not_found"})
 
         def do_DELETE(self):
@@ -418,6 +503,11 @@ def make_handler(state):
                 return self._json(200, {"specs": sessions.list_specs(root, sid)})
             if sub == "/generate-specs/status":
                 job = state.spec_jobs.get(sid)
+                return self._json(200, job or {"state": "idle"})
+            if sub == "/agents":
+                return self._json(200, {"agents": sessions.list_agents(root, sid)})
+            if sub == "/compile-test/status":
+                job = state.stage4_jobs.get(sid)
                 return self._json(200, job or {"state": "idle"})
             if sub == "/environment-data":
                 return self._environment_data(sid)
@@ -600,6 +690,17 @@ def make_handler(state):
                 if existing and existing.get("state") == "running":
                     return self._json(409, {"error": "already_running"})
                 state.start_spec_generation(sid)
+            return self._json(202, {"state": "running", "session_id": sid})
+
+        # --- Stage 4: compile + sandbox-test agents ---
+        def _compile_test(self, sid):
+            if not sessions.list_specs(root, sid):
+                return self._json(400, {"error": "no_specs"})
+            with state.lock:
+                existing = state.stage4_jobs.get(sid)
+                if existing and existing.get("state") == "running":
+                    return self._json(409, {"error": "already_running"})
+                state.start_stage4(sid)
             return self._json(202, {"state": "running", "session_id": sid})
 
         # --- Review 2: environment capture (Stage 3) ---

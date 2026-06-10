@@ -129,6 +129,21 @@
         the spec <code>environment-incomplete</code> (it still generates).</p>
     </section>
 
+    <!-- STAGE 4 — compile & test agent --------------------------------- -->
+    <section class="panel">
+      <h2>Compile &amp; test agent <span class="muted">(Stage 4 — Managed Agents)</span></h2>
+      <div class="row">
+        <button id="compileTestBtn" class="primary" disabled>Compile &amp; test agents</button>
+        <span id="stage4Msg" class="status-line"></span>
+      </div>
+      <div id="stage4Summary"></div>
+      <p class="help">Wraps each approved bundle's spec into an agent envelope
+        (<code>agent_&lt;id&gt;.test.yaml</code> / <code>.live.yaml</code>) and runs a
+        sandbox test of the test-mode agent, graded against the spec's own acceptance
+        criteria. Live envelopes are emitted but never deployed. See the
+        <b>agents</b> results tab.</p>
+    </section>
+
     <!-- RESULTS -------------------------------------------------------- -->
     <section class="panel">
       <h2>Results <span id="resultsSid" class="muted"></span></h2>
@@ -137,6 +152,7 @@
         <button class="tab" data-tab="discovery">discovery.json</button>
         <button class="tab" data-tab="reviewed">reviewed_bundles</button>
         <button class="tab" data-tab="specs">specs (.md)</button>
+        <button class="tab" data-tab="agents">agents (yaml + report)</button>
         <button class="tab" data-tab="validation">review flags</button>
         <button class="tab" data-tab="raw">raw stream</button>
         <button class="tab" data-tab="dryrun">recon dry-run</button>

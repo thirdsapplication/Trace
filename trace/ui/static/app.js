@@ -309,6 +309,24 @@ async function loadAndShow(tab) {
     return;
   }
 
+  if (tab === "agents") {      // Stage-4 envelopes + test reports
+    const { ok, data } = await api("GET", `/api/sessions/${selectedSid}/agents`);
+    let text;
+    if (!ok || !data.agents.length) {
+      text = "No agents yet — generate specs, then Compile & test agents.";
+    } else {
+      text = data.agents.map(a =>
+        `===== ${a.bundle_id} — agent (test) =====\n${a.test_yaml || "(none)"}\n\n` +
+        `===== ${a.bundle_id} — agent (live, NOT deployed) =====\n${a.live_yaml || "(none)"}\n\n` +
+        `===== ${a.bundle_id} — test_report =====\n` +
+        (a.test_report ? JSON.stringify(a.test_report, null, 2) : "(not run — needs API key)")
+      ).join("\n\n\n");
+    }
+    cache[selectedSid][tab] = text;
+    setView(text);
+    return;
+  }
+
   const { ok, data } = await api("GET", `/api/sessions/${selectedSid}/${ENDPOINTS[tab]}`);
   let text;
   if (!ok) {
@@ -508,7 +526,8 @@ async function refreshSessions() {
       $("scoreBtn").disabled = !(scoreAvailable && art.discovery);
       enableReviewButtons(!!art.discovery, false);
       enableEnvButton(!!art.reviewed);
-      reviewData = null; envState = null;
+      enableStage4((art.specs || 0) > 0);
+      reviewData = null; envState = null; $("stage4Summary").innerHTML = "";
       $("reviewContainer").innerHTML = "";
       $("envContainer").innerHTML = "";
       $("discoverTarget").textContent = art.event_log ? `target: ${selectedSid}` : "";
@@ -723,6 +742,7 @@ function pollSpecs() {
       clearInterval(specTimer); specTimer = null;
       $("reviewMsg").innerHTML = `<span class="ok">done</span> — ${data.built} build spec(s) generated.`;
       setPill("results");
+      if (data.built > 0) enableStage4(true);    // specs exist -> can compile & test agents
       delete cache[selectedSid];
       await loadAndShow("specs");
       await refreshSessions();
@@ -848,6 +868,61 @@ async function saveEnv(bid) {
   $("envMsg").innerHTML = ok ? `<span class="ok">saved</span> — status ${data.status}`
     : `<span class="err">save failed</span>`;
   await refreshSessions();
+}
+
+// ===========================================================================
+// Stage 4 — compile & test agent
+// ===========================================================================
+let stage4Timer = null;
+
+function enableStage4(on) { $("compileTestBtn").disabled = !on; }
+
+$("compileTestBtn").onclick = async () => {
+  if (!selectedSid) return;
+  $("stage4Msg").textContent = "compiling + testing…";
+  const { ok, status, data } = await api("POST", `/api/sessions/${selectedSid}/compile-test`);
+  if (status === 400 && data && data.error === "no_specs") {
+    $("stage4Msg").innerHTML = `<span class="err">no specs</span> — generate specs first.`; return;
+  }
+  if (!ok && status !== 202) {
+    $("stage4Msg").innerHTML = `<span class="err">${(data && data.error) || "failed"}</span>`; return;
+  }
+  setPill("reconstructing");
+  pollStage4();
+};
+
+function pollStage4() {
+  if (stage4Timer) clearInterval(stage4Timer);
+  stage4Timer = setInterval(async () => {
+    const { data } = await api("GET", `/api/sessions/${selectedSid}/compile-test/status`);
+    if (!data) return;
+    if (data.state === "done") {
+      clearInterval(stage4Timer); stage4Timer = null;
+      $("stage4Msg").innerHTML = `<span class="ok">done</span> — ${data.compiled} compiled, ${data.tested} sandbox-tested.`;
+      renderStage4Summary(data.reports || {});
+      setPill("results");
+      delete cache[selectedSid];
+      await loadAndShow("agents");
+      await refreshSessions();
+    } else if (data.state === "error") {
+      clearInterval(stage4Timer); stage4Timer = null;
+      $("stage4Msg").innerHTML = `<span class="err">stage 4 failed</span> — ${data.error}`;
+      setPill("idle");
+    }
+  }, 800);
+}
+
+function renderStage4Summary(reports) {
+  const el = $("stage4Summary");
+  const ids = Object.keys(reports);
+  if (!ids.length) { el.innerHTML = ""; return; }
+  el.innerHTML = ids.map(id => {
+    const r = reports[id];
+    if (r.test_skipped) return `<div class="ex-text">${id}: compiled (test skipped — ${ESC(r.test_skipped)})</div>`;
+    const verdict = r.deploy_recommended
+      ? `<span class="ok">deploy-recommended</span>` : `<span class="warn">not recommended</span>`;
+    return `<div class="ex-text">${id}: ${verdict} — ${r.passed}✓ / ${r.failed}✗ / ${r.not_testable_in_sandbox} n/a</div>`;
+  }).join("");
 }
 
 $("refreshPerms").onclick = refreshPermissions;
