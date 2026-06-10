@@ -20,7 +20,7 @@ Stage 3 — Artifact Engine      ← THIS REPO  (reviewed_bundles.json -> spec_<
    │   one self-contained buildable spec per approved workflow
    ▼
 Stage 4 — Agent Compiler + Test Deployer  ← THIS REPO
-   │   spec -> agent_<id>.{test,live}.yaml; sandbox-test the test agent + grade it
+   │   spec -> agent_<id>.{test,live}.yaml; run the test agent (evaluate manually)
    ▼
 Live deployment of the tested agent  (separate, later handoff — out of scope here)
 ```
@@ -153,14 +153,14 @@ cat captures/event_log.json
 ### 6. Anywhere smoke test (no key, no Mac, no cost)
 
 ```bash
-# full automated suite (231 tests)
+# full automated suite (232 tests)
 python -m unittest discover -s trace/tests -t . -p "test_*.py"
 
 # preview the chunked prompt on the bundled sample (no model call)
 python -m trace.reconstruct.cli trace/samples/sample_raw_events.jsonl --dry-run --chunk-size 8 --overlap 2
 ```
 
-Expect `Ran 231 tests … OK`, and a printed system prompt + 3 rendered chunks.
+Expect `Ran 232 tests … OK`, and a printed system prompt + 3 rendered chunks.
 
 **Useful flags:**
 - UI: `python -m trace.ui.app --port 8765 --collector-port 8137 --sessions-root captures/sessions --no-open`
@@ -203,11 +203,11 @@ trace/
     prompt.py              the domain-neutral spec-writing prompt
     cli.py                 entry point + --dry-run
     reviewed_bundles.schema.json, environment.schema.json, ARTIFACT_SCHEMA.md
-  agent/                   Stage 4 — spec -> Managed Agents agent + sandbox test
+  agent/                   Stage 4 — spec -> Managed Agents agent + run (manual eval)
     compiler.py            wrap spec into agent_<id>.{test,live}.yaml (pure, no network)
     trigger.py             trigger messages from the bundle's observed instances
-    grader.py              grade a run vs the spec's own criteria (walled off)
-    deployer.py            full sandbox test run (upload/mount/trigger/grade/cleanup)
+    grader.py              grade a run vs the spec's own criteria (walled off; DISCONNECTED in manual mode)
+    deployer.py            run flow: upload/mount/trigger; returns a run pointer (no grade, no delete)
     api_client.py          the ONE beta-pinned Managed Agents/Files API client
     config.py              app→MCP table, framing templates, defaults (editable)
     agent_envelope.schema.json, test_report.schema.json
@@ -361,7 +361,7 @@ first chunk — capture and `--dry-run` are unaffected.
 python -m unittest discover -s trace/tests -t . -p "test_*.py"
 ```
 
-The suite (231 tests) covers redaction, keystroke coalescing, the raw writer,
+The suite (232 tests) covers redaction, keystroke coalescing, the raw writer,
 chunking, schema validation/normalization, fragment-stitch flagging, boundary
 de-duplication, contiguous-entry coalescing, document-open detection/coverage,
 the browser-capture collector path, the full reconstruction pipeline with a mock
@@ -376,8 +376,10 @@ location, completeness off uploads+instructions), self-contained spec bundles
 preflight, filename-collision safety, on two domains), Stage 4 (envelope compile
 test/live with verbatim spec content + path rewrite + connector derivation + safe
 permission defaults across two domains, trigger generation, the walled-off grader's
-pass/fail/not-testable + gate-can-fail, the deployer's upload/mount/zero-coaching/
-retention via a stub API client),
+pass/fail/not-testable + gate-can-fail — kept passing though disconnected from the
+flow, and the manual-evaluation deployer's upload/mount/zero-coaching, agent
+create-or-reuse, run-pointer record, event-stream persistence, no-auto-delete, and
+explicit one-click cleanup via a stub API client),
 plus the test-UI backends for every stage (key store, sessions, capture lifecycle,
 reconstruct/discovery/review/environment/spec/agent guards) — so it runs without an
 API key, `pynput`, or a browser.
@@ -590,33 +592,45 @@ drop coding-agent wrapper lines, reword the preflight trigger). It emits both
   guessed); every write capability defaults to an **approval-required** policy.
   *Emitted and schema-validated only — never deployed by this stage.*
 
-**Test Deployer** (API orchestration). Through the single beta-pinned
-`api_client.py`: uploads the bundle's Review 2 files, creates the agent + a sandbox
-cloud environment, mounts the files, sends **only** a trigger generated from the
-bundle's observed instances (zero coaching — no steering messages), captures the
-event stream, downloads outputs, and **deletes the session and files** (nothing
-persists). The captured stream is written to `events_<id>.json` the instant it is
-collected — **before** any download is attempted — so a download failure can never
-lose the evidence. Only the agent's own files (those it writes under
-`/workspace/outputs/`) are downloaded; the read-only mounted inputs are excluded,
-and each file is fetched independently so one un-downloadable file is a warning, not
-a failed run. A walled-off **grader** (own prompt, like the discovery Scorer) judges
-the run against the **spec's own acceptance criteria** → `test_report_<id>.json`,
-per-criterion pass / fail / **not-testable-in-sandbox** (criteria needing live
-services are never silently passed). A failing criterion or a stall blocks the
-deploy recommendation — the gate can fail.
+**Test Deployer** (API orchestration — **manual-evaluation mode**). The single
+question this flow answers right now is whether Trace can take a spec, compile it,
+create the agent on Managed Agents, and have the agent actually run the workflow.
+**Evaluation is done by the user** in the Console (or by pasting the transcript into
+a chat model), so the automated grader, the deploy recommendation, and automatic
+cleanup are intentionally **disconnected** (the grader code stays in the tree, unused
+by this flow, and returns later). Through the single beta-pinned `api_client.py`:
+uploads the bundle's Review 2 files, **creates-or-reuses** the agent (agents have
+Trace-deterministic names, so a re-run reuses the existing agent rather than
+accumulating duplicates) + a sandbox cloud environment, mounts the files (read-only),
+and sends **only** a trigger (zero coaching). It runs **one session per bundle**
+(credit guard) and **deletes nothing** — the session stays in the Console for the
+user to read. The result is a **pointer**, `run_<id>.json`: agent id/name, session
+id + a Console link, run status, and the **names** of files the agent wrote under
+`/workspace/outputs/` (listed, not downloaded). The full event stream is still
+persisted locally to `events_<id>.json` the instant it is collected — a backup if
+the Console session is ever purged.
+
+**Retention policy (Q2), deliberately revised for this mode:** in manual-evaluation
+mode nothing is auto-deleted after a run, because the live session *is* the artifact
+being evaluated. Deletion is still **one action away** — a **Clean up platform**
+button removes exactly the sessions, files, and agents Trace created (`client.cleanup`)
+— but it is **human-initiated**, never automatic. This is a deliberate, temporary
+change while evaluation is manual; the auto-cleanup gate returns with automated grading.
 
 ```bash
 # compile the agent envelopes for approved bundles (offline, no API)
 python -m trace.agent.cli reviewed_bundles.json event_log.json --specs-dir <specs> -o <out>
 ```
 
-**From the Test UI.** A **Compile & test agents** action runs Compiler → Test
-Deployer and shows the per-bundle verdict; the `agents` results tab shows both
-envelopes and the test report. The whole of Stage 4 is offline-testable (the API
-client is injected/stubbed); real platform calls happen only in the explicit gate
-run. Live deployment (OAuth, real MCP connections, scheduling, the refinement loop)
-is a separate, later handoff.
+**From the Test UI.** A **Compile & run** action lets you pick which bundles to run
+(checkboxes, defaulting to only those with Review 2 files attached), runs Compiler →
+Test Deployer, and shows the per-bundle **run pointer** (agent id, session id +
+Console link, status, output filenames). The `agents` results tab shows both
+envelopes and the run record. A separate **Clean up platform** button deletes the
+Trace-created sessions/files/agents on demand. The whole of Stage 4 is
+offline-testable (the API client is injected/stubbed); real platform calls happen
+only in the explicit run. Live deployment (OAuth, real MCP connections, scheduling,
+the refinement loop) is a separate, later handoff.
 
 ## Faithfulness over richness
 

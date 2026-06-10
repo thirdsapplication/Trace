@@ -1,11 +1,23 @@
-"""Component B — the Test Deployer (P6–P9).
+"""Component B — the Test Deployer (manual-evaluation mode).
 
-Orchestrates a full sandbox test run through the injected API client: upload the
-Review 2 artifact files, create/reuse the agent + a cloud environment, create a
-session with files mounted, send ONLY the trigger message(s), capture the event
-stream, download outputs, then delete the session and uploaded files (nothing
-persists server-side after a test). It never sends a steering message (zero
-coaching, P9). The run is graded against the spec's own acceptance criteria (P8).
+The single question this flow answers right now is: *can Trace take a compiled
+agent envelope, create (or reuse) that agent on Claude Managed Agents, run a
+session, and have the agent actually execute the workflow?* Evaluation of the run
+is done by the **user**, in the Console (and/or by pasting the transcript into a
+chat model). So this deployer:
+
+  - uploads the Review 2 artifact files and mounts them (read-only),
+  - creates OR REUSES the agent (same name -> reuse, never accumulate),
+  - runs ONE session per observed instance (default capped at 1) sending ONLY the
+    trigger (zero coaching, P9),
+  - returns a POINTER record — agent id/name, session id + Console link, status,
+    and the NAMES of files the agent wrote under the outputs path (listed, not
+    downloaded),
+  - persists the full event stream locally as a backup.
+
+It does NOT grade (the grader stays in the tree, disconnected) and it does NOT
+delete anything: the session must remain visible in the Console for manual review.
+Cleanup is a separate, explicit, human-initiated action (``client.cleanup``).
 
 The ``client`` is injected so the whole flow runs offline against a stub.
 """
@@ -13,13 +25,14 @@ The ``client`` is injected so the whole flow runs offline against a stub.
 import json
 import os
 
-from . import config, grader
+from . import config
 from .trigger import generate_triggers
 
 
 def _persist_events(events_path, bundle, records):
-    """Write the full, untruncated captured stream to disk so it survives any later
-    download failure. Best-effort: a write error must never crash the run."""
+    """Write the full, untruncated captured stream to disk the instant it is
+    collected — a local backup if the Console session is ever purged. Best-effort:
+    a write error must never crash the run."""
     if not events_path:
         return
     try:
@@ -30,47 +43,23 @@ def _persist_events(events_path, bundle, records):
         pass
 
 
-def _events_to_transcript(events):
-    """Render normalized events ({type, text, name}) to a transcript. Event types:
-    user.message (our trigger), agent.message (text blocks), agent.tool_use (.name),
-    session.status_idle (terminal)."""
-    parts = []
+def _run_status(events):
+    """``(status, error)`` from the captured stream: 'errored' if it reported a
+    failure or never reached a terminal event, else 'completed'."""
     for e in events or []:
         if not isinstance(e, dict):
             continue
         et = e.get("type") or ""
-        if et == "agent.tool_use":
-            parts.append(f"[tool_use] {e.get('name', '')}".strip())
-        else:
-            text = (e.get("text") or "").strip()
-            if text:
-                parts.append(f"[{et}] {text}")
-    return "\n".join(parts)
-
-
-def _detect_asked(events):
-    """The agent posed a question to the operator (an agent.message containing '?')."""
-    return any(isinstance(e, dict) and e.get("type") == "agent.message"
-               and "?" in str(e.get("text", "")) for e in (events or []))
-
-
-def _detect_stalled(events, outputs):
-    """No agent text output and no produced files => the agent stalled."""
-    produced = bool(outputs)
-    any_agent_text = any(isinstance(e, dict) and e.get("type") == "agent.message"
-                         and str(e.get("text", "")).strip() for e in (events or []))
-    return not produced and not any_agent_text
+        if "failed" in et or et in ("client.error", "client.timeout", "client.download_error"):
+            return "errored", (e.get("text") or et)
+    return "completed", None
 
 
 def run_test(bundle, spec_md, env_record, event_log, test_envelope_dict, client,
-             judge_fn=None, mount_path=None, max_sessions=None, events_path=None):
-    """Run the sandbox test for one bundle. Returns ``(report, artifacts)`` where
-    ``report`` is the ``test_report`` dict and ``artifacts`` carries downloaded output
-    files for the UI to save.
-
-    If ``events_path`` is given, the full captured event stream is written there the
-    instant it is collected — before any download is attempted — so the evidence
-    survives a download failure. The grader grades that real stream."""
+             mount_path=None, max_sessions=None, events_path=None):
+    """Run one bundle in manual-evaluation mode. Returns a single ``run_record``
+    pointer dict (see module docstring). ``spec_md``/``event_log`` are accepted for
+    signature stability but are not graded in this mode."""
     mount = mount_path or config.MOUNT_PATH
     max_sessions = max_sessions or config.DEFAULT_MAX_SESSIONS
 
@@ -83,84 +72,70 @@ def run_test(bundle, spec_md, env_record, event_log, test_envelope_dict, client,
         file_ids[os.path.basename(a["file_ref"])] = fid
         uploaded_ids.append(fid)
 
-    # 2. agent + cloud environment (limited networking, package install available)
-    agent_id = client.create_agent(test_envelope_dict)
+    # 2. create OR REUSE the agent (C6) + a cloud environment
+    agent = client.create_or_reuse_agent(test_envelope_dict)
+    if isinstance(agent, dict):
+        agent_id = agent.get("id")
+        agent_name = agent.get("name") or test_envelope_dict.get("name")
+        agent_reused = bool(agent.get("reused"))
+    else:                                            # tolerate a bare id from a stub
+        agent_id, agent_name, agent_reused = agent, test_envelope_dict.get("name"), False
     environment_id = client.create_environment(config.ENVIRONMENT_DEFAULTS)
 
-    # 3–6. one session per observed instance; send ONLY the trigger (P9)
+    # 3. one session per observed instance; send ONLY the trigger (P9). NO deletion —
+    #    the session stays in the Console for the user to evaluate.
     resources = [{"file_id": fid, "mount_path": f"{mount.rstrip('/')}/{name}"}
                  for name, fid in file_ids.items()]
     triggers = generate_triggers(bundle, env_record, mount, max_sessions)
-    instances, session_ids, records = [], [], []
+    sessions_out, records = [], []
     for t in triggers:
         sid = client.create_session(agent_id, environment_id, resources,
-                                    title=f"Trace test — {bundle.get('id')}")
-        session_ids.append(sid)
+                                    title=f"Trace run — {bundle.get('id')}")
 
-        # (a) collect the event stream; record whatever we got even if it errored
         try:
             events = client.send_trigger_and_collect(sid, t["message"])  # only the trigger
-            stream_ok = True
+            status, error = _run_status(events)
         except Exception as e:
             events = [{"type": "client.error", "text": str(e), "name": None}]
-            stream_ok = False
-        # persist the real, untruncated stream to disk NOW — before any download —
-        # so a download failure can never lose it
-        rec = {"trigger": t["message"], "events": events, "download_warnings": []}
+            status, error = "errored", str(e)
+
+        # persist the raw stream immediately (local backup; informational only)
+        rec = {"trigger": t["message"], "session_id": sid,
+               "status": status, "error": error, "events": events}
         records.append(rec)
         _persist_events(events_path, bundle, records)
 
-        # (b) download outputs in a SEPARATE failure domain: a download error is
-        # appended to the record, it never replaces the captured events. A broken
-        # stream means the session never really ran, so skip the download for it.
-        outputs, dl_warnings = {}, []
+        # list (do NOT download) the files the agent wrote under the outputs path
         try:
-            if stream_ok:
-                res = client.download_outputs(sid, exclude_ids=uploaded_ids)
-                outputs, dl_warnings = res if isinstance(res, tuple) else (res, [])
-        except Exception as e:
-            events.append({"type": "client.download_error", "text": str(e), "name": None})
-        finally:
-            client.delete_session(sid)               # 7. retention: always clean up
-        rec["download_warnings"] = dl_warnings
-        _persist_events(events_path, bundle, records)   # re-persist with download result
+            output_files = client.list_output_files(sid, exclude_ids=uploaded_ids)
+        except Exception:
+            output_files = []
+        rec["output_files"] = output_files
+        _persist_events(events_path, bundle, records)
 
-        instances.append({
+        sessions_out.append({
+            "session_id": sid,
+            "console_url": config.console_session_url(sid, agent_id),
+            "console_hint": config.CONSOLE_SESSIONS_HINT,
+            "status": status,
+            "error": error,
+            "output_files": output_files,
             "trigger": t["message"],
-            "transcript": _events_to_transcript(events),
-            "output_files": outputs,
-            "asked_question": _detect_asked(events),
-            "stalled": _detect_stalled(events, outputs),
-            "download_warnings": dl_warnings,
         })
 
-    for fid in uploaded_ids:
-        client.delete_file(fid)
-
-    # retention verification (acceptance #4): nothing of ours remains server-side
-    try:
-        remaining_sessions = [s for s in client.list_sessions() if s in session_ids]
-        remaining_files = [f for f in client.list_files() if f in uploaded_ids]
-        retention_clean = not remaining_sessions and not remaining_files
-    except Exception:
-        retention_clean = None
-
-    combined = {
-        "transcript": "\n\n=== NEXT INSTANCE ===\n\n".join(i["transcript"] for i in instances),
-        "output_files": {k: v for i in instances for k, v in i["output_files"].items()},
-        "stalled": any(i["stalled"] for i in instances),
-        "asked_question": any(i["asked_question"] for i in instances),
-    }
-    criteria = grader.parse_acceptance_criteria(spec_md)
-    report = grader.grade(criteria, combined, judge_fn)
-    report.update({
+    return {
         "bundle_id": bundle.get("id"),
-        "sessions_run": len(instances),
-        "retention_clean": retention_clean,
-        "download_warnings": [w for i in instances for w in i.get("download_warnings", [])],
-        "instances": [{"trigger": i["trigger"], "stalled": i["stalled"],
-                       "asked_question": i["asked_question"],
-                       "output_files": list(i["output_files"].keys()),
-                       "download_warnings": i.get("download_warnings", [])} for i in instances],
-    })
-    return report, {"output_files": combined["output_files"]}
+        "agent_id": agent_id,
+        "agent_name": agent_name,
+        "agent_reused": agent_reused,
+        "environment_id": environment_id,
+        "uploaded_file_ids": uploaded_ids,
+        "sessions": sessions_out,
+        "events_file": os.path.basename(events_path) if events_path else None,
+        "ran_at": _now(),
+    }
+
+
+def _now():
+    import datetime
+    return datetime.datetime.now().astimezone().isoformat(timespec="seconds")

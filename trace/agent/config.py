@@ -11,7 +11,10 @@ AGENT_TOOLSET_TYPE = "agent_toolset_20260401"
 
 # --- pipeline defaults (overridable) ---------------------------------------
 DEFAULT_MODEL = "claude-sonnet-4-6"
-DEFAULT_MAX_SESSIONS = 3                 # cost guard: sessions per test run
+# Manual-evaluation mode (current): evaluation is done by the user in the Console,
+# so we keep each run cheap — one session per bundle, a single session's tokens —
+# and never fan out. Recent rounds burned credits running many sessions.
+DEFAULT_MAX_SESSIONS = 1                 # cost guard: sessions per run
 # Bound a sandbox run so it can never hang waiting on the platform: stop a session
 # after this wall-clock or event count and clean up anyway (a real run is usually
 # under a minute once the environment is warm).
@@ -30,6 +33,20 @@ OUTPUTS_PATH = "/workspace/outputs"
 # P5 — safe default: every outbound-write capability requires approval. Never
 # emit always_allow by default. Confirm the exact enum against current docs.
 APPROVAL_PERMISSION_POLICY = "require_approval"
+
+# --- Console (manual-evaluation mode) --------------------------------------
+# The run result is a POINTER to the live session, read by the user in the Console.
+# The exact deep-link path to a single session is not finalized in the beta docs,
+# so we link to the Managed Agents area and always surface the session id + this
+# hint; the user opens the agent's Sessions tab to read the run.
+CONSOLE_BASE = "https://platform.claude.com"
+CONSOLE_SESSIONS_HINT = "Console -> Managed Agents -> Sessions"
+
+
+def console_session_url(session_id=None, agent_id=None):
+    """Best-effort Console link for a run. Returns the Managed Agents area; the
+    session id is shown alongside so the user can locate it under Sessions."""
+    return f"{CONSOLE_BASE}/managed-agents"
 
 # Environment defaults for the sandbox (documented shape: name + config).
 ENVIRONMENT_DEFAULTS = {

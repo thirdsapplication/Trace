@@ -74,7 +74,7 @@ class AppState:
     def __init__(self, sessions_root, collector_port=8137,
                  reconstruct_fn=None, controller_factory=None, key_store=None,
                  discovery_fn=None, score_fn=None, artifact_fn=None,
-                 compile_agent_fn=None, run_test_fn=None):
+                 compile_agent_fn=None, run_test_fn=None, cleanup_fn=None):
         self.sessions_root = sessions_root
         self.collector_port = collector_port
         self.reconstruct_fn = reconstruct_fn or _real_reconstruct
@@ -83,6 +83,7 @@ class AppState:
         self.artifact_fn = artifact_fn or _real_generate_specs
         self.compile_agent_fn = compile_agent_fn or _compile_agent
         self.run_test_fn = run_test_fn or self._default_run_test
+        self.cleanup_fn = cleanup_fn or self._default_cleanup
         self.controller_factory = controller_factory or (
             lambda out: CaptureController(out, collector_port=collector_port))
         self.keystore = key_store or keystore
@@ -91,13 +92,14 @@ class AppState:
         self.recon_jobs = {}         # sid -> {state, current, total, error, flags, errors}
         self.discover_jobs = {}      # sid -> {state, error, bundles, anti_bundles}
         self.spec_jobs = {}          # sid -> {state, error, built, notes}
-        self.stage4_jobs = {}        # sid -> {state, error, compiled, tested, reports}
+        self.stage4_jobs = {}        # sid -> {state, error, compiled, ran, runs}
         self.lock = threading.Lock()
         os.makedirs(sessions_root, exist_ok=True)
 
     def _default_run_test(self, bundle, spec_md, env_record, event_log, test_dict,
                           events_path=None):
-        """Real Stage-4 sandbox run: requires a key; builds the beta-pinned client."""
+        """Real manual-evaluation run: requires a key; builds the beta-pinned client.
+        Returns a run-pointer record (no grading, no deletion)."""
         key = self.keystore.get_key()
         if not key:
             raise RuntimeError("no_api_key")
@@ -107,6 +109,17 @@ class AppState:
         client = ManagedAgentsClient(api_key=key)
         return _run_test(bundle, spec_md, env_record, event_log, test_dict, client,
                          events_path=events_path)
+
+    def _default_cleanup(self, session_ids, file_ids, agent_ids):
+        """Real, human-initiated platform cleanup: requires a key; builds the client
+        and deletes exactly the Trace-created ids it is given."""
+        key = self.keystore.get_key()
+        if not key:
+            raise RuntimeError("no_api_key")
+        os.environ["ANTHROPIC_API_KEY"] = key
+        from ..agent.api_client import ManagedAgentsClient
+        client = ManagedAgentsClient(api_key=key)
+        return client.cleanup(session_ids=session_ids, file_ids=file_ids, agent_ids=agent_ids)
 
     # --- reconstruction job ----------------------------------------------
     def start_reconstruction(self, sid):
@@ -207,22 +220,47 @@ class AppState:
 
         threading.Thread(target=run, daemon=True).start()
 
-    # --- Stage 4: compile + sandbox-test agents (P10) --------------------
-    def start_stage4(self, sid):
+    # --- Stage 4: compile + run agents (manual-evaluation mode) ----------
+    def stage4_bundles(self, sid):
+        """Approved bundles the UI offers for compile-and-run, each tagged with
+        whether it has Review 2 artifacts (drives the default checkbox state)."""
+        root = self.sessions_root
+        approved, _ = self._approved_for_stage4(sid)
+        out = []
+        for b in approved:
+            specs_dir = sessions.path(root, sid, sessions.SPECS_DIR)
+            spec_ready = os.path.exists(os.path.join(specs_dir, _spec_filename(b["id"], True)))
+            env = sessions.read_json_artifact(root, sid, environment_filename(b["id"])) or {}
+            n = len([a for a in env.get("artifacts", [])
+                     if a.get("uploaded") and a.get("file_ref")])
+            out.append({"id": b["id"], "name": b.get("name") or b["id"],
+                        "has_artifacts": n > 0, "artifact_count": n,
+                        "spec_ready": spec_ready})
+        return out
+
+    def _approved_for_stage4(self, sid):
+        root = self.sessions_root
+        reviewed = sessions.read_json_artifact(root, sid, sessions.REVIEWED) or {}
+        event_log = sessions.read_json_artifact(root, sid, sessions.EVENT_LOG) or []
+        rep = artifact_review.ReviewReport()
+        reviewed = artifact_review.validate_reviewed(
+            reviewed, set(artifact_review.event_index(event_log)), rep)
+        approved = [b for b in reviewed["bundles"]
+                    if b.get("disposition") == "approve_for_build"]
+        return approved, event_log
+
+    def start_stage4(self, sid, selected_ids=None):
         root = self.sessions_root
         specs_dir = sessions.path(root, sid, sessions.SPECS_DIR)
-        job = {"state": "running", "error": None, "compiled": 0, "tested": 0, "reports": {}}
+        job = {"state": "running", "error": None, "compiled": 0, "ran": 0, "runs": {}}
         self.stage4_jobs[sid] = job
 
         def run():
             try:
-                reviewed = sessions.read_json_artifact(root, sid, sessions.REVIEWED) or {}
-                event_log = sessions.read_json_artifact(root, sid, sessions.EVENT_LOG) or []
-                rep = artifact_review.ReviewReport()
-                reviewed = artifact_review.validate_reviewed(
-                    reviewed, set(artifact_review.event_index(event_log)), rep)
-                approved = [b for b in reviewed["bundles"]
-                            if b.get("disposition") == "approve_for_build"]
+                approved, event_log = self._approved_for_stage4(sid)
+                # C5 — only the user-selected bundles are compiled-and-run
+                if selected_ids is not None:
+                    approved = [b for b in approved if b["id"] in set(selected_ids)]
                 os.makedirs(specs_dir, exist_ok=True)
                 for b in approved:
                     spec_path = os.path.join(specs_dir, _spec_filename(b["id"], True))
@@ -236,32 +274,28 @@ class AppState:
                                   "w", encoding="utf-8") as f:
                             f.write(compiled[mode]["yaml"])
                     job["compiled"] += 1
-                    # sandbox test (needs the API; skipped gracefully without a key)
+                    # run on the platform (needs the API; skipped gracefully without a key).
+                    # No grading, no deletion — the session stays in the Console.
                     env_record = sessions.read_json_artifact(root, sid, environment_filename(b["id"])) or {}
                     try:
                         events_path = os.path.join(specs_dir, sessions.events_name(b["id"]))
-                        report, artifacts = self.run_test_fn(
+                        run_record = self.run_test_fn(
                             b, spec_md, env_record, event_log, compiled["test"]["dict"],
                             events_path=events_path)
-                        with open(os.path.join(specs_dir, sessions.test_report_name(b["id"])),
+                        with open(os.path.join(specs_dir, sessions.run_record_name(b["id"])),
                                   "w", encoding="utf-8") as f:
-                            json.dump(report, f, indent=2, ensure_ascii=False)
-                        odir = os.path.join(specs_dir, f"agent_{_safe(b['id'])}_outputs")
-                        if artifacts.get("output_files"):
-                            os.makedirs(odir, exist_ok=True)
-                            for nm, content in artifacts["output_files"].items():
-                                with open(os.path.join(odir, _safe(nm)), "w", encoding="utf-8") as f:
-                                    f.write(content if isinstance(content, str) else str(content))
-                        job["tested"] += 1
-                        job["reports"][b["id"]] = {
-                            "deploy_recommended": report.get("deploy_recommended"),
-                            "passed": report.get("passed"), "failed": report.get("failed"),
-                            "not_testable_in_sandbox": report.get("not_testable_in_sandbox")}
+                            json.dump(run_record, f, indent=2, ensure_ascii=False)
+                        job["ran"] += 1
+                        job["runs"][b["id"]] = {
+                            "agent_id": run_record.get("agent_id"),
+                            "agent_name": run_record.get("agent_name"),
+                            "agent_reused": run_record.get("agent_reused"),
+                            "sessions": run_record.get("sessions", [])}
                     except Exception as e:
                         # Compilation already succeeded and the envelopes are written;
-                        # a sandbox-test failure (no key, SDK/API drift, network) is
-                        # recorded per-bundle and never fails the whole job.
-                        job["reports"][b["id"]] = {"test_skipped": f"{type(e).__name__}: {e}"}
+                        # a run failure (no key, SDK/API drift, network) is recorded
+                        # per-bundle and never fails the whole job.
+                        job["runs"][b["id"]] = {"run_skipped": f"{type(e).__name__}: {e}"}
                 sessions.update_meta(root, sid, stage4_at=sessions._now())
                 job.update(state="done")
             except Exception as e:
@@ -269,9 +303,26 @@ class AppState:
 
         threading.Thread(target=run, daemon=True).start()
 
-
-def _safe(s):
-    return "".join(c if c.isalnum() else "_" for c in str(s))
+    # --- explicit platform cleanup (C2): never automatic -----------------
+    def cleanup_platform(self, sid):
+        """Gather the Trace-created ids from this session's run records and delete
+        them via the cleanup seam. Returns the removal summary."""
+        runs = sessions.list_runs(self.sessions_root, sid)
+        session_ids, file_ids, agent_ids = [], [], []
+        for r in runs:
+            for s in r.get("sessions", []):
+                if s.get("session_id"):
+                    session_ids.append(s["session_id"])
+            file_ids.extend(r.get("uploaded_file_ids", []) or [])
+            if r.get("agent_id"):
+                agent_ids.append(r["agent_id"])
+        # de-dup (agents are reused across rounds/bundles)
+        session_ids = list(dict.fromkeys(session_ids))
+        file_ids = list(dict.fromkeys(file_ids))
+        agent_ids = list(dict.fromkeys(agent_ids))
+        result = self.cleanup_fn(session_ids, file_ids, agent_ids)
+        return {"requested": {"sessions": session_ids, "files": file_ids, "agents": agent_ids},
+                **(result or {})}
 
 
 # --------------------------------------------------------------------------
@@ -360,7 +411,8 @@ def make_handler(state):
                 return self._load_fixture(body)
             m = re.match(r"^/api/sessions/([^/]+)/"
                          r"(dry-run|reconstruct|discovery-dry-run|discover|score|"
-                         r"reviewed-bundles|generate-specs|specs-dry-run|compile-test)$", p)
+                         r"reviewed-bundles|generate-specs|specs-dry-run|compile-test|"
+                         r"cleanup-platform)$", p)
             if m:
                 sid, action = m.group(1), m.group(2)
                 if action == "dry-run":
@@ -379,7 +431,9 @@ def make_handler(state):
                     return self._generate_specs(sid)
                 if action == "specs-dry-run":
                     return self._specs_dry_run(sid)
-                return self._compile_test(sid)
+                if action == "cleanup-platform":
+                    return self._cleanup_platform(sid)
+                return self._compile_test(sid, body)
             return self._json(404, {"error": "not_found"})
 
         def do_DELETE(self):
@@ -513,6 +567,8 @@ def make_handler(state):
                 return self._json(200, job or {"state": "idle"})
             if sub == "/agents":
                 return self._json(200, {"agents": sessions.list_agents(root, sid)})
+            if sub == "/stage4-bundles":
+                return self._json(200, {"bundles": state.stage4_bundles(sid)})
             if sub == "/compile-test/status":
                 job = state.stage4_jobs.get(sid)
                 return self._json(200, job or {"state": "idle"})
@@ -700,15 +756,23 @@ def make_handler(state):
             return self._json(202, {"state": "running", "session_id": sid})
 
         # --- Stage 4: compile + sandbox-test agents ---
-        def _compile_test(self, sid):
+        def _compile_test(self, sid, body=None):
             if not sessions.list_specs(root, sid):
                 return self._json(400, {"error": "no_specs"})
+            selected = (body or {}).get("bundle_ids")    # None => all approved
             with state.lock:
                 existing = state.stage4_jobs.get(sid)
                 if existing and existing.get("state") == "running":
                     return self._json(409, {"error": "already_running"})
-                state.start_stage4(sid)
+                state.start_stage4(sid, selected_ids=selected)
             return self._json(202, {"state": "running", "session_id": sid})
+
+        def _cleanup_platform(self, sid):
+            try:
+                result = state.cleanup_platform(sid)
+            except Exception as e:
+                return self._json(200, {"error": f"{type(e).__name__}: {e}"})
+            return self._json(200, result)
 
         # --- Review 2: environment capture (Stage 3) ---
         def _approved_bundles(self, sid):

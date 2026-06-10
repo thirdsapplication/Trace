@@ -178,6 +178,47 @@ class ManagedAgentsClient:
             system=envelope_dict["system"], tools=envelope_dict["tools"]))
         return _idof(a)
 
+    def _find_agent(self, name):
+        """The first existing agent with this (Trace-deterministic) name, or None."""
+        try:
+            res = _retry(lambda: self._agents_ns("agents").list())
+        except Exception:
+            return None
+        for a in _data(res):
+            if _attr(a, "name") == name:
+                return a
+        return None
+
+    def _try_update_agent(self, agent_id, envelope_dict):
+        """Best-effort in-place update of an existing agent's definition. Returns
+        True if the SDK supports it and the call succeeded, else False (reuse as-is).
+        This is a cheap metadata call — no model tokens."""
+        ns = self._agents_ns("agents")
+        update = getattr(ns, "update", None)
+        if not callable(update):
+            return False
+        try:
+            _retry(lambda: update(agent_id, model=envelope_dict["model"],
+                                  system=envelope_dict["system"], tools=envelope_dict["tools"]))
+            return True
+        except Exception:
+            return False
+
+    def create_or_reuse_agent(self, envelope_dict):
+        """C6: agents have Trace-deterministic names, so an existing agent with the
+        same name is REUSED (updated in place if the platform allows) rather than
+        creating a duplicate every round. Returns ``{id, name, reused}``."""
+        name = envelope_dict["name"]
+        existing = self._find_agent(name)
+        if existing is not None:
+            agent_id = _idof(existing)
+            self._try_update_agent(agent_id, envelope_dict)   # best-effort; reuse on failure
+            return {"id": agent_id, "name": name, "reused": True}
+        a = _retry(lambda: self._agents_ns("agents").create(
+            name=name, model=envelope_dict["model"],
+            system=envelope_dict["system"], tools=envelope_dict["tools"]))
+        return {"id": _idof(a), "name": name, "reused": False}
+
     def create_environment(self, defaults=None):
         d = defaults or config.ENVIRONMENT_DEFAULTS
         return _idof(_retry(lambda: self._agents_ns("environments").create(
@@ -236,12 +277,59 @@ class ManagedAgentsClient:
                 warnings.append({"file": name, "error": f"{type(exc).__name__}: {exc}"})
         return out, warnings
 
+    def list_output_files(self, session_id, exclude_ids=None):
+        """Names of the files the agent WROTE under the outputs path — a listing
+        only, NO download (manual-evaluation mode reads outputs in the Console).
+        Mounted inputs we uploaded are excluded; ``downloadable=False`` is honored."""
+        files = self._files()
+        res = _retry(lambda: files.list(scope_id=session_id, betas=[self._beta_version]))
+        return [name for _fid, name
+                in _select_downloadable(_data(res), exclude_ids, config.OUTPUTS_PATH)]
+
     def delete_session(self, session_id):
         try:
             self._agents_ns("sessions").delete(session_id)
         except Exception:
             pass
 
+    def delete_agent(self, agent_id):
+        self._agents_ns("agents").delete(agent_id)
+
     def list_sessions(self):
         res = _retry(lambda: self._agents_ns("sessions").list())
         return [_idof(s) for s in _data(res)]
+
+    # --- explicit, human-initiated cleanup (C2) --------------------------
+    def cleanup(self, session_ids=None, file_ids=None, agent_ids=None):
+        """Delete the given Trace-created sessions, files, and agents. NEVER called
+        automatically — only from the UI's 'Clean up platform' button. Resilient:
+        each delete is isolated and the result reports exactly what was removed and
+        what errored."""
+        removed = {"sessions": [], "files": [], "agents": []}
+        errors = []
+        for sid in session_ids or []:
+            try:
+                _retry(lambda sid=sid: self._agents_ns("sessions").delete(sid))
+                removed["sessions"].append(sid)
+            except Exception as exc:                  # noqa: BLE001
+                errors.append({"kind": "session", "id": sid, "error": f"{type(exc).__name__}: {exc}"})
+        for fid in file_ids or []:
+            try:
+                self._delete_file_raw(fid)
+                removed["files"].append(fid)
+            except Exception as exc:                  # noqa: BLE001
+                errors.append({"kind": "file", "id": fid, "error": f"{type(exc).__name__}: {exc}"})
+        for aid in agent_ids or []:
+            try:
+                _retry(lambda aid=aid: self._agents_ns("agents").delete(aid))
+                removed["agents"].append(aid)
+            except Exception as exc:                  # noqa: BLE001
+                errors.append({"kind": "agent", "id": aid, "error": f"{type(exc).__name__}: {exc}"})
+        return {"removed": removed, "errors": errors}
+
+    def _delete_file_raw(self, file_id):
+        """Delete one file, raising on failure (so cleanup can report it)."""
+        try:
+            self._files().delete(file_id, betas=[self._beta_version])
+        except TypeError:
+            self._files().delete(file_id)

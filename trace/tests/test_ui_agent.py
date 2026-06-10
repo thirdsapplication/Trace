@@ -37,11 +37,16 @@ class FakeKeystore:
 
 
 def fake_run_test(bundle, spec_md, env_record, event_log, test_dict, events_path=None):
-    report = {"bundle_id": bundle["id"], "criteria_total": 1, "passed": 1, "failed": 0,
-              "not_testable_in_sandbox": 0, "results": [{"criterion": "x", "verdict": "pass"}],
-              "zero_coaching": {"stalled": False, "asked_question": False},
-              "deploy_recommended": True, "sessions_run": 1, "retention_clean": True}
-    return report, {"output_files": {"SHEET.xlsx": "order_id\n1\n"}}
+    # a run POINTER (no grading): agent + session ids, Console link, status, outputs
+    return {"bundle_id": bundle["id"], "agent_id": "agent_x", "agent_name": "Order intake",
+            "agent_reused": False, "environment_id": "env_x",
+            "uploaded_file_ids": ["file_0"],
+            "sessions": [{"session_id": "sess_x",
+                          "console_url": "https://platform.claude.com/managed-agents",
+                          "console_hint": "Console -> Managed Agents -> Sessions",
+                          "status": "completed", "error": None,
+                          "output_files": ["result.csv"], "trigger": "go"}],
+            "events_file": "events_B1.json", "ran_at": "now"}
 
 
 class UIAgentTest(unittest.TestCase):
@@ -79,9 +84,11 @@ class UIAgentTest(unittest.TestCase):
     def tearDown(self):
         self.httpd.shutdown(); self.httpd.server_close(); self._tmp.cleanup()
 
-    def req(self, method, path):
+    def req(self, method, path, body=None):
         url = f"http://127.0.0.1:{self.port}{path}"
-        r = urllib.request.Request(url, method=method, headers={"Content-Type": "application/json"})
+        data = json.dumps(body).encode() if body is not None else None
+        r = urllib.request.Request(url, data=data, method=method,
+                                   headers={"Content-Type": "application/json"})
         try:
             with urllib.request.urlopen(r) as resp:
                 return resp.status, json.loads(resp.read() or b"null")
@@ -89,7 +96,8 @@ class UIAgentTest(unittest.TestCase):
             return e.code, json.loads(e.read() or b"null")
 
     def test_compile_test_end_to_end(self):
-        code, _ = self.req("POST", f"/api/sessions/{self.sid}/compile-test")
+        code, _ = self.req("POST", f"/api/sessions/{self.sid}/compile-test",
+                           {"bundle_ids": ["B1"]})
         self.assertEqual(code, 202)
         for _ in range(60):
             _, st = self.req("GET", f"/api/sessions/{self.sid}/compile-test/status")
@@ -98,7 +106,9 @@ class UIAgentTest(unittest.TestCase):
             time.sleep(0.05)
         self.assertEqual(st.get("state"), "done", st)
         self.assertEqual(st["compiled"], 1)
-        self.assertEqual(st["tested"], 1)
+        self.assertEqual(st["ran"], 1)
+        # the status carries the run POINTER, not a graded report
+        self.assertEqual(st["runs"]["B1"]["sessions"][0]["session_id"], "sess_x")
 
         code, data = self.req("GET", f"/api/sessions/{self.sid}/agents")
         self.assertEqual(code, 200)
@@ -107,21 +117,24 @@ class UIAgentTest(unittest.TestCase):
         self.assertIn("system:", agent["test_yaml"])
         self.assertIn("mcp_server_name", agent["live_yaml"])      # live has connectors
         self.assertNotIn("mcp_server_name", agent["test_yaml"])   # test has none
-        # test report present + recommends deploy
-        self.assertTrue(agent["test_report"]["deploy_recommended"])
+        # the run pointer is persisted and surfaced (no grading verdict)
+        self.assertEqual(agent["run"]["agent_id"], "agent_x")
+        self.assertEqual(agent["run"]["sessions"][0]["status"], "completed")
+        self.assertNotIn("deploy_recommended", agent["run"])
 
     def test_compile_test_without_specs_rejected(self):
         code, data = self.req("POST", "/api/sessions/no-such-session/compile-test")
         self.assertEqual(code, 400)
         self.assertEqual(data["error"], "no_specs")
 
-    def test_sandbox_test_failure_does_not_crash_job(self):
-        # a failing test run (API/SDK drift, no key) must still leave the envelopes
+    def test_run_failure_does_not_crash_job(self):
+        # a failing run (API/SDK drift, no key) must still leave the envelopes
         # compiled and the job 'done', recording the failure per bundle.
         def boom(*a, **k):
             raise AttributeError("'Anthropic' object has no attribute 'files'")
         self.state.run_test_fn = boom
-        code, _ = self.req("POST", f"/api/sessions/{self.sid}/compile-test")
+        code, _ = self.req("POST", f"/api/sessions/{self.sid}/compile-test",
+                           {"bundle_ids": ["B1"]})
         self.assertEqual(code, 202)
         for _ in range(60):
             _, st = self.req("GET", f"/api/sessions/{self.sid}/compile-test/status")
@@ -130,12 +143,42 @@ class UIAgentTest(unittest.TestCase):
             time.sleep(0.05)
         self.assertEqual(st["state"], "done")        # never a hard failure
         self.assertEqual(st["compiled"], 1)          # envelopes still produced
-        self.assertEqual(st["tested"], 0)
-        self.assertIn("test_skipped", st["reports"]["B1"])
+        self.assertEqual(st["ran"], 0)
+        self.assertIn("run_skipped", st["runs"]["B1"])
         # the compiled envelopes are present and readable
         _, data = self.req("GET", f"/api/sessions/{self.sid}/agents")
         agent = next(a for a in data["agents"] if a["bundle_id"] == "B1")
         self.assertIn("system:", agent["test_yaml"])
+
+    def test_stage4_bundles_defaults_to_artifact_bearing(self):
+        # B1 has an uploaded Review 2 artifact -> offered with has_artifacts True
+        code, data = self.req("GET", f"/api/sessions/{self.sid}/stage4-bundles")
+        self.assertEqual(code, 200)
+        b = next(x for x in data["bundles"] if x["id"] == "B1")
+        self.assertTrue(b["has_artifacts"])
+        self.assertGreaterEqual(b["artifact_count"], 1)
+
+    def test_cleanup_platform_collects_ids_from_runs_and_deletes(self):
+        # run first so a run_<id>.json exists, then clean up
+        captured = {}
+        def fake_cleanup(session_ids, file_ids, agent_ids):
+            captured["args"] = (session_ids, file_ids, agent_ids)
+            return {"removed": {"sessions": session_ids, "files": file_ids, "agents": agent_ids},
+                    "errors": []}
+        self.state.cleanup_fn = fake_cleanup
+        self.req("POST", f"/api/sessions/{self.sid}/compile-test", {"bundle_ids": ["B1"]})
+        for _ in range(60):
+            _, st = self.req("GET", f"/api/sessions/{self.sid}/compile-test/status")
+            if st["state"] in ("done", "error"):
+                break
+            time.sleep(0.05)
+        code, data = self.req("POST", f"/api/sessions/{self.sid}/cleanup-platform")
+        self.assertEqual(code, 200)
+        sess_ids, file_ids, agent_ids = captured["args"]
+        self.assertEqual(sess_ids, ["sess_x"])       # from the run pointer
+        self.assertEqual(file_ids, ["file_0"])
+        self.assertEqual(agent_ids, ["agent_x"])
+        self.assertEqual(data["removed"]["agents"], ["agent_x"])
 
 
 if __name__ == "__main__":

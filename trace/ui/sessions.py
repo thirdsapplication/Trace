@@ -149,8 +149,36 @@ def events_name(bid):
     return f"events_{_safe_id(bid)}.json"
 
 
+def run_record_name(bid):
+    return f"run_{_safe_id(bid)}.json"
+
+
+def _read_json(p):
+    try:
+        with open(p, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def list_runs(root, sid):
+    """Every run_<id>.json pointer record for this session (manual-eval mode)."""
+    d = path(root, sid, SPECS_DIR)
+    if not os.path.isdir(d):
+        return []
+    out = []
+    for fn in sorted(os.listdir(d)):
+        if re.match(r"^run_.+\.json$", fn):
+            rec = _read_json(os.path.join(d, fn))
+            if rec is not None:
+                out.append(rec)
+    return out
+
+
 def list_agents(root, sid):
-    """Return Stage-4 outputs per bundle: agent envelopes + test report (if any)."""
+    """Return Stage-4 outputs per bundle: agent envelopes + the run pointer (if any).
+    Grading is out of the flow in manual-evaluation mode, so ``run`` (not a graded
+    report) is what the UI shows."""
     d = path(root, sid, SPECS_DIR)
     if not os.path.isdir(d):
         return []
@@ -162,16 +190,9 @@ def list_agents(root, sid):
                 bundles.setdefault(m.group(1), {})[m.group(2) + "_yaml"] = f.read()
     out = []
     for bid, data in bundles.items():
-        rpath = os.path.join(d, f"test_report_{bid}.json")
-        report = None
-        if os.path.exists(rpath):
-            try:
-                with open(rpath, encoding="utf-8") as f:
-                    report = json.load(f)
-            except (OSError, json.JSONDecodeError):
-                report = None
+        run = _read_json(os.path.join(d, f"run_{bid}.json"))
         out.append({"bundle_id": bid, "test_yaml": data.get("test_yaml"),
-                    "live_yaml": data.get("live_yaml"), "test_report": report})
+                    "live_yaml": data.get("live_yaml"), "run": run})
     return out
 
 

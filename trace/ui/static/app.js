@@ -309,17 +309,17 @@ async function loadAndShow(tab) {
     return;
   }
 
-  if (tab === "agents") {      // Stage-4 envelopes + test reports
+  if (tab === "agents") {      // Stage-4 envelopes + run pointers
     const { ok, data } = await api("GET", `/api/sessions/${selectedSid}/agents`);
     let text;
     if (!ok || !data.agents.length) {
-      text = "No agents yet — generate specs, then Compile & test agents.";
+      text = "No agents yet — generate specs, then Compile & run.";
     } else {
       text = data.agents.map(a =>
         `===== ${a.bundle_id} — agent (test) =====\n${a.test_yaml || "(none)"}\n\n` +
         `===== ${a.bundle_id} — agent (live, NOT deployed) =====\n${a.live_yaml || "(none)"}\n\n` +
-        `===== ${a.bundle_id} — test_report =====\n` +
-        (a.test_report ? JSON.stringify(a.test_report, null, 2) : "(not run — needs API key)")
+        `===== ${a.bundle_id} — run (evaluate manually in the Console) =====\n` +
+        (a.run ? JSON.stringify(a.run, null, 2) : "(not run — needs API key)")
       ).join("\n\n\n");
     }
     cache[selectedSid][tab] = text;
@@ -871,16 +871,37 @@ async function saveEnv(bid) {
 }
 
 // ===========================================================================
-// Stage 4 — compile & test agent
+// Stage 4 — compile & run agent (manual evaluation)
 // ===========================================================================
 let stage4Timer = null;
 
-function enableStage4(on) { $("compileTestBtn").disabled = !on; }
+function enableStage4(on) {
+  $("compileTestBtn").disabled = !on;
+  if (on) loadStage4Bundles(); else $("stage4Bundles").innerHTML = "";
+}
+
+// Per-bundle checkboxes; default-check only bundles that have Review 2 artifacts.
+async function loadStage4Bundles() {
+  if (!selectedSid) return;
+  const { ok, data } = await api("GET", `/api/sessions/${selectedSid}/stage4-bundles`);
+  const el = $("stage4Bundles");
+  if (!ok || !data.bundles || !data.bundles.length) { el.innerHTML = ""; return; }
+  el.innerHTML = data.bundles.map(b => {
+    const note = b.has_artifacts
+      ? `<span class="muted">${b.artifact_count} file(s)</span>`
+      : `<span class="note">no environment files — agent may halt or improvise; run deliberately</span>`;
+    return `<label><input type="checkbox" class="b4" value="${ESC(b.id)}" ${b.has_artifacts ? "checked" : ""}>` +
+           `<b>${ESC(b.id)}</b> ${ESC(b.name)} ${note}</label>`;
+  }).join("");
+}
 
 $("compileTestBtn").onclick = async () => {
   if (!selectedSid) return;
-  $("stage4Msg").textContent = "compiling + testing…";
-  const { ok, status, data } = await api("POST", `/api/sessions/${selectedSid}/compile-test`);
+  const ids = Array.from(document.querySelectorAll("#stage4Bundles .b4:checked")).map(c => c.value);
+  if (!ids.length) { $("stage4Msg").innerHTML = `<span class="warn">select at least one bundle</span>`; return; }
+  $("stage4Msg").textContent = "compiling + running…";
+  const { ok, status, data } = await api(
+    "POST", `/api/sessions/${selectedSid}/compile-test`, { bundle_ids: ids });
   if (status === 400 && data && data.error === "no_specs") {
     $("stage4Msg").innerHTML = `<span class="err">no specs</span> — generate specs first.`; return;
   }
@@ -898,8 +919,8 @@ function pollStage4() {
     if (!data) return;
     if (data.state === "done") {
       clearInterval(stage4Timer); stage4Timer = null;
-      $("stage4Msg").innerHTML = `<span class="ok">done</span> — ${data.compiled} compiled, ${data.tested} sandbox-tested.`;
-      renderStage4Summary(data.reports || {});
+      $("stage4Msg").innerHTML = `<span class="ok">done</span> — ${data.compiled} compiled, ${data.ran} run.`;
+      renderStage4Summary(data.runs || {});
       setPill("results");
       delete cache[selectedSid];
       await loadAndShow("agents");
@@ -912,18 +933,42 @@ function pollStage4() {
   }, 800);
 }
 
-function renderStage4Summary(reports) {
+function renderStage4Summary(runs) {
   const el = $("stage4Summary");
-  const ids = Object.keys(reports);
+  const ids = Object.keys(runs);
   if (!ids.length) { el.innerHTML = ""; return; }
   el.innerHTML = ids.map(id => {
-    const r = reports[id];
-    if (r.test_skipped) return `<div class="ex-text">${id}: compiled (test skipped — ${ESC(r.test_skipped)})</div>`;
-    const verdict = r.deploy_recommended
-      ? `<span class="ok">deploy-recommended</span>` : `<span class="warn">not recommended</span>`;
-    return `<div class="ex-text">${id}: ${verdict} — ${r.passed}✓ / ${r.failed}✗ / ${r.not_testable_in_sandbox} n/a</div>`;
+    const r = runs[id];
+    if (r.run_skipped) return `<div class="run-line">${ESC(id)}: compiled (run skipped — ${ESC(r.run_skipped)})</div>`;
+    const reused = r.agent_reused ? "reused" : "new";
+    const head = `<div class="run-line">${ESC(id)}: agent <b>${ESC(r.agent_name || "")}</b> ` +
+                 `<span class="muted">(${ESC(r.agent_id || "")}, ${reused})</span></div>`;
+    const sess = (r.sessions || []).map(s => {
+      const cls = s.status === "completed" ? "ok" : "warn";
+      const files = (s.output_files || []).length ? ` · outputs: ${s.output_files.map(ESC).join(", ")}` : "";
+      const link = s.console_url
+        ? `<a href="${ESC(s.console_url)}" target="_blank" rel="noopener">open Console</a> — `
+        : "";
+      return `<div class="run-line">&nbsp;&nbsp;session <code>${ESC(s.session_id)}</code> ` +
+             `<span class="${cls}">${ESC(s.status)}</span> — ${link}${ESC(s.console_hint || "")}${files}</div>`;
+    }).join("");
+    return head + sess;
   }).join("");
 }
+
+$("cleanupBtn").onclick = async () => {
+  if (!selectedSid) return;
+  if (!confirm("Delete the sessions, files, and agents Trace created on the platform for this session? This removes them from the Console.")) return;
+  $("cleanupMsg").textContent = "cleaning up…";
+  const { ok, data } = await api("POST", `/api/sessions/${selectedSid}/cleanup-platform`);
+  if (!ok || (data && data.error)) {
+    $("cleanupMsg").innerHTML = `<span class="err">${ESC((data && data.error) || "failed")}</span>`; return;
+  }
+  const rm = data.removed || { sessions: [], files: [], agents: [] };
+  const errs = (data.errors || []).length ? ` · ${data.errors.length} error(s)` : "";
+  $("cleanupMsg").innerHTML = `<span class="ok">removed</span> — ` +
+    `${rm.sessions.length} session(s), ${rm.files.length} file(s), ${rm.agents.length} agent(s)${errs}`;
+};
 
 $("refreshPerms").onclick = refreshPermissions;
 $("refreshSessions").onclick = refreshSessions;

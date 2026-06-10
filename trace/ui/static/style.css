@@ -39,6 +39,12 @@ button.primary.stop { background: var(--err); border-color: var(--err); }
 button.secondary { background: #262b34; }
 button.link { background: none; border: none; color: var(--accent); padding: 4px 6px; }
 
+.bundle-select { margin: 6px 0 10px; display: flex; flex-direction: column; gap: 4px; }
+.bundle-select label { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+.bundle-select .note { color: var(--warn, #d6a13a); font-size: 11px; margin-left: 4px; }
+.run-line { font-family: var(--mono); font-size: 12px; margin: 3px 0; }
+.run-line a { color: var(--accent); }
+
 .help { color: var(--muted); font-size: 12px; margin: 8px 0 0; }
 .help code, code { background: #0f1115; padding: 1px 5px; border-radius: 4px; font-family: var(--mono); font-size: 12px; }
 .status-line { font-size: 13px; margin: 8px 0 0; min-height: 18px; }

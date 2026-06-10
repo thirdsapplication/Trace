@@ -129,19 +129,27 @@
         the spec <code>environment-incomplete</code> (it still generates).</p>
     </section>
 
-    <!-- STAGE 4 — compile & test agent --------------------------------- -->
+    <!-- STAGE 4 — compile & run agent (manual evaluation) -------------- -->
     <section class="panel">
-      <h2>Compile &amp; test agent <span class="muted">(Stage 4 — Managed Agents)</span></h2>
+      <h2>Compile &amp; run agent <span class="muted">(Stage 4 — Managed Agents)</span></h2>
+      <div id="stage4Bundles" class="bundle-select"></div>
       <div class="row">
-        <button id="compileTestBtn" class="primary" disabled>Compile &amp; test agents</button>
+        <button id="compileTestBtn" class="primary" disabled>Compile &amp; run selected</button>
         <span id="stage4Msg" class="status-line"></span>
       </div>
       <div id="stage4Summary"></div>
-      <p class="help">Wraps each approved bundle's spec into an agent envelope
-        (<code>agent_&lt;id&gt;.test.yaml</code> / <code>.live.yaml</code>) and runs a
-        sandbox test of the test-mode agent, graded against the spec's own acceptance
-        criteria. Live envelopes are emitted but never deployed. See the
-        <b>agents</b> results tab.</p>
+      <div class="row">
+        <button id="cleanupBtn" class="secondary">Clean up platform</button>
+        <span id="cleanupMsg" class="status-line"></span>
+      </div>
+      <p class="help">Wraps each selected bundle's spec into an agent envelope
+        (<code>agent_&lt;id&gt;.test.yaml</code> / <code>.live.yaml</code>), then
+        creates-or-reuses that agent on Managed Agents and runs <b>one session</b>.
+        <b>Evaluation is manual</b> — open the session in the Console (link/ID shown
+        below) and read the run. Nothing is graded and <b>nothing is deleted</b>; the
+        session stays in the Console. Default selection is bundles that have Review 2
+        files attached. <b>Clean up platform</b> deletes the sessions, files, and
+        agents Trace created — only when you press it.</p>
     </section>
 
     <!-- RESULTS -------------------------------------------------------- -->
