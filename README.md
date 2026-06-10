@@ -150,14 +150,14 @@ cat captures/event_log.json
 ### 6. Anywhere smoke test (no key, no Mac, no cost)
 
 ```bash
-# full automated suite (187 tests)
+# full automated suite (194 tests)
 python -m unittest discover -s trace/tests -t . -p "test_*.py"
 
 # preview the chunked prompt on the bundled sample (no model call)
 python -m trace.reconstruct.cli trace/samples/sample_raw_events.jsonl --dry-run --chunk-size 8 --overlap 2
 ```
 
-Expect `Ran 187 tests … OK`, and a printed system prompt + 3 rendered chunks.
+Expect `Ran 194 tests … OK`, and a printed system prompt + 3 rendered chunks.
 
 **Useful flags:**
 - UI: `python -m trace.ui.app --port 8765 --collector-port 8137 --sessions-root captures/sessions --no-open`
@@ -350,7 +350,7 @@ first chunk — capture and `--dry-run` are unaffected.
 python -m unittest discover -s trace/tests -t . -p "test_*.py"
 ```
 
-The suite (187 tests) covers redaction, keystroke coalescing, the raw writer,
+The suite (194 tests) covers redaction, keystroke coalescing, the raw writer,
 chunking, schema validation/normalization, fragment-stitch flagging, boundary
 de-duplication, contiguous-entry coalescing, document-open detection/coverage,
 the browser-capture collector path, the full reconstruction pipeline with a mock
@@ -360,10 +360,12 @@ Artifact Engine (verbatim example fetching, criteria assembly, divergence markin
 Review 2 environment capture (evidence-derived requests across two domains, per-kind
 extraction, the courier/annotator model — authoritative instruction, raw file always
 carried, non-load-bearing extraction, criteria targeting the user-designated
-location, completeness off uploads+instructions),
+location, completeness off uploads+instructions), self-contained spec bundles
+(byte-identical artifact export, spec-relative paths, move-and-resolve, mandatory
+preflight, filename-collision safety, on two domains),
 plus the test-UI backends for every stage (key store, sessions, capture lifecycle,
-reconstruct/discovery/review/spec guards) — so it runs without an API key,
-`pynput`, or a browser.
+reconstruct/discovery/review/environment/spec guards) — so it runs without an API
+key, `pynput`, or a browser.
 
 ## Local test UI (run the whole engine from a window)
 
@@ -494,6 +496,16 @@ assembles the three-layer **Artifact C** markdown spec so that the verbatim
 examples, every user-added criterion, and a "pause and request human input"
 criterion per checkpoint are guaranteed to appear exactly. Anti-bundles emit a
 short "handle manually — here's why" note instead; `reject` emits nothing.
+
+**Self-contained spec bundles.** The deliverable is `spec_<id>.md` **plus a sibling
+`spec_<id>_files/` directory** holding a byte-identical copy of every artifact
+attached in Review 2. All references inside the spec are **spec-relative**
+(`./spec_<id>_files/<file>`) — no path points into Trace's session storage — so the
+bundle stays valid when moved to any machine. Every spec opens with a **mandatory
+preflight** instructing the coding agent to open every attached file, echo back the
+structure relevant to each authoritative instruction, and **STOP rather than infer**
+if a file can't be opened or conflicts with its instruction. This closes the
+delivery gap where a spec referenced files that only existed inside Trace.
 
 ```bash
 # render the prompt + bundle + verbatim examples per approved bundle (free)

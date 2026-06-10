@@ -67,13 +67,27 @@ Review 2 is a **courier + annotator**, not the expert on the user's files:
 - **`status: complete` keys off uploads + instructions**, independent of extraction.
   `environment-incomplete` is reserved for a missing required upload or instruction.
 
-## Output: `spec_<id>.md` (FROZEN TEMPLATE)
-One markdown file per `approve_for_build` bundle, self-contained for pasting into
-Claude Code / Cursor. Anti-bundles instead get a `spec_<id>_manual.md`
-"handle manually — here's why" note (no build spec). Section structure:
+## Output: the spec bundle — `spec_<id>.md` + `spec_<id>_files/` (FROZEN TEMPLATE)
+The deliverable is a **self-contained bundle**: the markdown spec **plus** a sibling
+`spec_<id>_files/` directory holding a byte-identical copy of **every** artifact
+attached to the bundle in Review 2 (P1). Every artifact reference in the spec is
+**spec-relative** (`./spec_<id>_files/<file>`) — no path points into Trace's session
+storage (P2) — so the spec and its `_files/` directory remain valid when moved
+together to any machine. Filename collisions are disambiguated deterministically
+(P4). Anti-bundles instead get a `spec_<id>_manual.md` note (no build spec).
+
+Every spec opens with a **mandatory preflight** (P3), generated generically from the
+bundle's artifacts and their authoritative instructions, instructing the coding
+agent — before writing any code — to open every attached file, echo back the
+structure relevant to each instruction, confirm its understanding, and **STOP and
+report (not infer)** if any file can't be opened or conflicts with its instruction.
+A bundle with zero attached artifacts still exports a valid spec (the preflight says
+none are attached). Section structure:
 
 ```
 # Build spec: <name>
+## 0. Preflight — read the attached files first (lists every ./spec_<id>_files/… +
+   its authoritative instruction; stop-on-failure directive)
 ## 1. Intent
   <plain-language authority for what the agent should do, from the edited intent +
    preferred output; reclassified items include the carried-over judgment context>

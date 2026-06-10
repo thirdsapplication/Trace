@@ -136,7 +136,8 @@ class UIEnvironmentTest(unittest.TestCase):
         md = next(s["markdown"] for s in specs["specs"] if s["filename"] == "spec_B1.md")
         self.assertIn("Real uploaded artifacts", md)
         self.assertIn("Raw file (read live)", md)         # the raw file always travels
-        self.assertIn("(live-checked against the uploaded file)", md)
+        self.assertIn("(live-checked against the attached file)", md)
+        self.assertIn("spec_B1_files/ledger.csv", md)        # spec-relative path
 
 
 if __name__ == "__main__":

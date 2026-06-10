@@ -253,8 +253,7 @@ def render_artifact_for_prompt(a):
     """Render an artifact for the model: the user instruction is AUTHORITATIVE; the
     raw file is always referenced; auto-extraction appears only as a clearly-labeled,
     unverified aid (R1–R3)."""
-    lines = [f'- {a["role"].upper()} artifact — raw file: {artifact_basename(a)}'
-             f' (path: {a.get("file_ref")})']
+    lines = [f'- {a["role"].upper()} artifact — file: {artifact_basename(a)}']
     instr = (a.get("user_instruction") or "").strip()
     lines.append(f'    USER INSTRUCTION (authoritative): {instr or "(none given)"}')
     ex = a.get("extracted") or {}
@@ -276,25 +275,104 @@ def render_artifact_for_prompt(a):
     return "\n".join(lines)
 
 
-def instruction_criteria(record):
-    """Deterministic acceptance criteria that target the USER-DESIGNATED artifact and
-    location and are checkable LIVE against the real uploaded file (R4). They never
+# --------------------------------------------------------------------------
+# Self-contained spec bundle: export plan, preflight, spec-relative criteria
+# --------------------------------------------------------------------------
+def _safe_name(name):
+    name = "".join(c if (c.isalnum() or c in "._-") else "_" for c in (name or ""))
+    return name or "artifact.bin"
+
+
+def _dedupe_name(base, used):
+    if base not in used:
+        return base
+    stem, ext = os.path.splitext(base)
+    i = 2
+    while f"{stem}_{i}{ext}" in used:
+        i += 1
+    return f"{stem}_{i}{ext}"
+
+
+def build_export_plan(record, files_dirname):
+    """Plan the self-contained export of a bundle's real artifacts. One entry per
+    uploaded artifact, with a collision-safe export ``name`` (P4) and a
+    spec-relative ``rel`` path ``./<files_dirname>/<name>`` (P2) — never a session
+    path. ``src`` is the real file to copy at export time (P1)."""
+    entries, used = [], set()
+    for a in (record or {}).get("artifacts", []):
+        if not a.get("uploaded") or not a.get("file_ref"):
+            continue
+        base = _safe_name(os.path.basename(str(a["file_ref"])) or f'{a.get("role", "artifact")}.bin')
+        name = _dedupe_name(base, used)
+        used.add(name)
+        entries.append({
+            "src": a["file_ref"], "name": name, "rel": f"./{files_dirname}/{name}",
+            "files_dirname": files_dirname,
+            "role": a.get("role", "input"), "kind": a.get("kind", "unknown"),
+            "instruction": (a.get("user_instruction") or "").strip(),
+            "extraction_status": a.get("extraction_status"),
+            "extracted": a.get("extracted") or {},
+        })
+    return entries
+
+
+def _echo_hint(e):
+    """Generic, kind-derived instruction for what structure to echo back. Any
+    tab/section name comes from the user instruction at runtime, never a hardcoded
+    map."""
+    if e["kind"] == "spreadsheet":
+        tabs = [str(t) for t in (e["extracted"].get("tab_names") or [])
+                if t and not str(t).startswith("(")]
+        hint = "echo the header row plus two sample data rows of the tab your instruction names"
+        if tabs:
+            hint += (f" (tabs the auto-read saw: {', '.join(tabs)} — verify against the file, "
+                     f"this list is unverified)")
+        return hint
+    if e["kind"] in ("doc", "pdf"):
+        return "echo the field labels / sections it contains"
+    return "echo its structure (columns, fields, or sections)"
+
+
+def preflight_lines(entries):
+    """The mandatory preflight block (P3), generated generically from the bundle's
+    artifacts and their authoritative instructions. Placed before Intent."""
+    out = ["## 0. Preflight — read the attached files before writing any code", ""]
+    if not entries:
+        out += ["No real artifacts are attached to this workflow. Build from the Intent and",
+                "Observed Examples below, and ask the user for a real input/output file if the",
+                "exact format or layout matters before you write code."]
+        return out
+    files_dir = entries[0]["files_dirname"]
+    out += [f"Before building anything, you MUST (the files ship next to this spec in "
+            f"`{files_dir}/`):", "",
+            "1. Open every attached artifact:"]
+    for e in entries:
+        instr = e["instruction"] or "(no instruction provided)"
+        out.append(f'   - `{e["rel"]}` — {e["role"]} {e["kind"]}. '
+                   f'Instruction (authoritative): "{instr}". {_echo_hint(e)}.')
+    out += ["2. Echo back the structure you found for each, relevant to its instruction.",
+            "3. Confirm your understanding of the entry/usage format against each instruction.",
+            "4. **STOP and report — do not proceed on inference — if any artifact cannot be "
+            "opened, or its contents conflict with its instruction.**"]
+    return out
+
+
+def instruction_criteria(entries, answers):
+    """Acceptance criteria that target the USER-DESIGNATED artifact/location (by its
+    spec-relative path) and are checkable LIVE against the real file (R4). They never
     assert against an auto-extracted schema/location; extraction is not ground truth.
     """
     crit = []
-    for a in record.get("artifacts", []):
-        if not a.get("uploaded"):
-            continue
-        instr = (a.get("user_instruction") or "").strip()
-        name = artifact_basename(a)
+    for e in entries:
+        instr = e["instruction"]
         if instr:
-            crit.append(f'The agent must use the {a["role"]} artifact «{name}» exactly as the user '
-                        f'instructed — "{instr}" — reading the real uploaded file live at build/test '
-                        f'time (do not rely on any auto-extracted summary).')
+            crit.append(f'The agent must use the {e["role"]} artifact `{e["rel"]}` exactly as the user '
+                        f'instructed — "{instr}" — reading the real file live at build/test time '
+                        f'(do not rely on any auto-extracted summary).')
         else:
-            crit.append(f'The agent must read the {a["role"]} artifact «{name}» live from the real '
-                        f'uploaded file (its instruction was not provided).')
-    for q in record.get("answers", []):
+            crit.append(f'The agent must read the {e["role"]} artifact `{e["rel"]}` live from the real '
+                        f'file (its instruction was not provided).')
+    for q in (answers or []):
         if str(q.get("answer", "")).strip():
             crit.append(f"{q['question']} → {q['answer']}")
     return crit

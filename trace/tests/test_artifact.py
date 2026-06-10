@@ -250,7 +250,7 @@ class EnvironmentIntegrationTest(unittest.TestCase):
         # auto-read extraction is present but clearly labelled unverified, not authoritative
         self.assertIn("UNVERIFIED", md)
         # acceptance criteria are live-checked against the uploaded file, via the instruction
-        self.assertIn("(live-checked against the uploaded file)", md)
+        self.assertIn("(live-checked against the attached file)", md)
         # privacy boundary surfaced; not flagged incomplete
         self.assertIn("embeds real business documents", md)
         self.assertNotIn("environment-incomplete", md)

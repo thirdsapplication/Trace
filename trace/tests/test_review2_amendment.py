@@ -84,7 +84,8 @@ class InstructionAuthoritativeTest(unittest.TestCase):
         spec = _run(EVENTS_1, "B1", env)
         md = spec["markdown"]
         self.assertTrue(spec["built"])                  # never blocks
-        self.assertIn("/s/po.pdf", md)                  # raw file referenced
+        self.assertIn("spec_B1_files/po.pdf", md)       # raw file referenced (spec-relative)
+        self.assertNotIn("/s/po.pdf", md)               # never a session-storage path (P2)
         self.assertIn("Use this as the reference.", md)
         # complete because file + instruction present, despite failed extraction (R5)
         self.assertEqual(spec["environment_status"], "complete")

@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import threading
 import urllib.parse
 import webbrowser
@@ -31,7 +32,7 @@ from ..discovery.discover import load_event_log, render_event_log
 from ..discovery.prompt import SYSTEM_PROMPT as DISCOVERY_SYSTEM_PROMPT
 from ..artifact import environment as artifact_env
 from ..artifact import review as artifact_review
-from ..artifact.artifact import build_prompt_material, environment_filename
+from ..artifact.artifact import build_prompt_material, environment_filename, write_spec_bundle
 from ..artifact.artifact import generate_specs as _real_generate_specs
 from ..artifact.prompt import SYSTEM_PROMPT as ARTIFACT_SYSTEM_PROMPT
 from . import keystore, permissions, sessions
@@ -167,16 +168,12 @@ class AppState:
 
                 results, report = self.artifact_fn(reviewed_path, event_log_path)
                 specs_dir = sessions.path(self.sessions_root, sid, sessions.SPECS_DIR)
+                if os.path.isdir(specs_dir):    # clear stale specs + their _files/ bundles
+                    shutil.rmtree(specs_dir)
                 os.makedirs(specs_dir, exist_ok=True)
-                for fn in os.listdir(specs_dir):           # clear stale specs
-                    if fn.endswith(".md"):
-                        os.remove(os.path.join(specs_dir, fn))
                 built = 0
                 for r in results:
-                    if r.get("markdown") is None:
-                        continue
-                    with open(os.path.join(specs_dir, r["filename"]), "w", encoding="utf-8") as f:
-                        f.write(r["markdown"])
+                    write_spec_bundle(specs_dir, r)   # writes spec_<id>.md + spec_<id>_files/
                     if r.get("built"):
                         built += 1
                 sessions.update_meta(self.sessions_root, sid, specs_generated_at=sessions._now())

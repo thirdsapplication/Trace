@@ -13,7 +13,7 @@ import sys
 
 from . import environment, review
 from .artifact import (DEFAULT_MODEL, build_prompt_material, environment_filename,
-                       generate_specs, load_json)
+                       generate_specs, load_json, write_spec_bundle)
 from .prompt import SYSTEM_PROMPT
 
 
@@ -53,13 +53,16 @@ def main():
     os.makedirs(args.out, exist_ok=True)
     written = 0
     for r in results:
-        if r["markdown"] is None:
+        if r.get("markdown") is None:
             continue
-        with open(os.path.join(args.out, r["filename"]), "w", encoding="utf-8") as f:
-            f.write(r["markdown"])
+        missing = write_spec_bundle(args.out, r)   # spec_<id>.md + spec_<id>_files/
+        if missing:
+            print(f"  warning: {r['id']}: could not copy {missing} (preflight will catch it)",
+                  file=sys.stderr)
         written += 1
     built = sum(1 for r in results if r["built"])
-    print(f"Wrote {written} file(s) ({built} build spec(s)) -> {args.out}", file=sys.stderr)
+    print(f"Wrote {written} self-contained spec bundle(s) ({built} build spec(s)) -> {args.out}",
+          file=sys.stderr)
     print("Validation: " + str(report), file=sys.stderr)
 
 
