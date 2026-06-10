@@ -145,6 +145,10 @@ def test_report_name(bid):
     return f"test_report_{_safe_id(bid)}.json"
 
 
+def events_name(bid):
+    return f"events_{_safe_id(bid)}.json"
+
+
 def list_agents(root, sid):
     """Return Stage-4 outputs per bundle: agent envelopes + test report (if any)."""
     d = path(root, sid, SPECS_DIR)

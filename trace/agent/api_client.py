@@ -58,6 +58,50 @@ def _data(res):
     return getattr(res, "data", res)
 
 
+def _attr(obj, name):
+    """Read ``name`` from an SDK object or a dict, else None."""
+    v = getattr(obj, name, None)
+    if v is None and isinstance(obj, dict):
+        v = obj.get(name)
+    return v
+
+
+def _select_downloadable(file_objs, exclude_ids, outputs_path):
+    """Pick which session-scoped files to download as ``[(file_id, name)]``.
+
+    Mounted inputs are READ-ONLY copies that the platform refuses to download
+    ("file is not downloadable"); we therefore (1) drop any id we uploaded
+    ourselves, (2) drop anything the SDK marks ``downloadable=False``, and
+    (3) prefer files the agent wrote under the outputs path. Only when no file
+    is under that path do we fall back to the remaining agent-created files."""
+    exclude_ids = set(exclude_ids or ())
+    candidates = []
+    for f in file_objs:
+        fid = _idof(f)
+        if fid in exclude_ids:
+            continue
+        if _attr(f, "downloadable") is False:
+            continue
+        name = _attr(f, "filename") or fid
+        path = _attr(f, "path") or _attr(f, "mount_path") or name or ""
+        candidates.append((fid, name, str(path)))
+    under_outputs = [(fid, name) for fid, name, path in candidates
+                     if outputs_path and outputs_path in path]
+    if under_outputs:
+        return under_outputs
+    return [(fid, name) for fid, name, _ in candidates]
+
+
+def _content_text(content):
+    """Normalize a downloaded file body to text."""
+    data = getattr(content, "text", None)
+    if data is None:
+        read = getattr(content, "read", None)
+        raw = read() if callable(read) else getattr(content, "content", content)
+        data = raw.decode("utf-8", "replace") if isinstance(raw, (bytes, bytearray)) else str(raw)
+    return data
+
+
 def _event_dict(event):
     """Normalize a streamed event to ``{type, text, name}``."""
     et = getattr(event, "type", None) or (event.get("type") if isinstance(event, dict) else None)
@@ -173,24 +217,24 @@ class ManagedAgentsClient:
                     break
         return events
 
-    def download_outputs(self, session_id):
-        """List session-scoped files (the agent's WRITTEN copies — mounted files are
-        read-only) and download them as ``{filename: text}``."""
-        out = {}
+    def download_outputs(self, session_id, exclude_ids=None):
+        """Download the agent's WRITTEN files for a session as
+        ``({filename: text}, warnings)``.
+
+        ``exclude_ids`` are the file ids we uploaded/mounted ourselves — those are
+        read-only inputs the platform won't let us download, so they are filtered
+        out before any download is attempted. Each remaining download is isolated:
+        one un-downloadable file yields a per-file warning, never a failed run."""
+        out, warnings = {}, []
         files = self._files()
         res = _retry(lambda: files.list(scope_id=session_id, betas=[self._beta_version]))
-        for f in _data(res):
-            fid = _idof(f)
-            name = (getattr(f, "filename", None)
-                    or (f.get("filename") if isinstance(f, dict) else None) or fid)
-            content = _retry(lambda fid=fid: files.download(fid))
-            data = getattr(content, "text", None)
-            if data is None:
-                read = getattr(content, "read", None)
-                raw = read() if callable(read) else getattr(content, "content", content)
-                data = raw.decode("utf-8", "replace") if isinstance(raw, (bytes, bytearray)) else str(raw)
-            out[name] = data
-        return out
+        for fid, name in _select_downloadable(_data(res), exclude_ids, config.OUTPUTS_PATH):
+            try:
+                content = _retry(lambda fid=fid: files.download(fid))
+                out[name] = _content_text(content)
+            except Exception as exc:                  # noqa: BLE001
+                warnings.append({"file": name, "error": f"{type(exc).__name__}: {exc}"})
+        return out, warnings
 
     def delete_session(self, session_id):
         try:

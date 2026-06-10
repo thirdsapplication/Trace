@@ -10,10 +10,24 @@ coaching, P9). The run is graded against the spec's own acceptance criteria (P8)
 The ``client`` is injected so the whole flow runs offline against a stub.
 """
 
+import json
 import os
 
 from . import config, grader
 from .trigger import generate_triggers
+
+
+def _persist_events(events_path, bundle, records):
+    """Write the full, untruncated captured stream to disk so it survives any later
+    download failure. Best-effort: a write error must never crash the run."""
+    if not events_path:
+        return
+    try:
+        with open(events_path, "w", encoding="utf-8") as f:
+            json.dump({"bundle_id": bundle.get("id"), "instances": records},
+                      f, indent=2, ensure_ascii=False)
+    except OSError:
+        pass
 
 
 def _events_to_transcript(events):
@@ -49,10 +63,14 @@ def _detect_stalled(events, outputs):
 
 
 def run_test(bundle, spec_md, env_record, event_log, test_envelope_dict, client,
-             judge_fn=None, mount_path=None, max_sessions=None):
+             judge_fn=None, mount_path=None, max_sessions=None, events_path=None):
     """Run the sandbox test for one bundle. Returns ``(report, artifacts)`` where
     ``report`` is the ``test_report`` dict and ``artifacts`` carries downloaded output
-    files for the UI to save."""
+    files for the UI to save.
+
+    If ``events_path`` is given, the full captured event stream is written there the
+    instant it is collected — before any download is attempted — so the evidence
+    survives a download failure. The grader grades that real stream."""
     mount = mount_path or config.MOUNT_PATH
     max_sessions = max_sessions or config.DEFAULT_MAX_SESSIONS
 
@@ -73,27 +91,47 @@ def run_test(bundle, spec_md, env_record, event_log, test_envelope_dict, client,
     resources = [{"file_id": fid, "mount_path": f"{mount.rstrip('/')}/{name}"}
                  for name, fid in file_ids.items()]
     triggers = generate_triggers(bundle, env_record, mount, max_sessions)
-    instances, session_ids = [], []
+    instances, session_ids, records = [], [], []
     for t in triggers:
         sid = client.create_session(agent_id, environment_id, resources,
                                     title=f"Trace test — {bundle.get('id')}")
         session_ids.append(sid)
-        events, outputs = [], {}
+
+        # (a) collect the event stream; record whatever we got even if it errored
         try:
             events = client.send_trigger_and_collect(sid, t["message"])  # only the trigger
-            outputs = client.download_outputs(sid)
+            stream_ok = True
         except Exception as e:
-            # a timeout/error on one session is recorded, not fatal, and never skips
-            # the cleanup below
             events = [{"type": "client.error", "text": str(e), "name": None}]
+            stream_ok = False
+        # persist the real, untruncated stream to disk NOW — before any download —
+        # so a download failure can never lose it
+        rec = {"trigger": t["message"], "events": events, "download_warnings": []}
+        records.append(rec)
+        _persist_events(events_path, bundle, records)
+
+        # (b) download outputs in a SEPARATE failure domain: a download error is
+        # appended to the record, it never replaces the captured events. A broken
+        # stream means the session never really ran, so skip the download for it.
+        outputs, dl_warnings = {}, []
+        try:
+            if stream_ok:
+                res = client.download_outputs(sid, exclude_ids=uploaded_ids)
+                outputs, dl_warnings = res if isinstance(res, tuple) else (res, [])
+        except Exception as e:
+            events.append({"type": "client.download_error", "text": str(e), "name": None})
         finally:
             client.delete_session(sid)               # 7. retention: always clean up
+        rec["download_warnings"] = dl_warnings
+        _persist_events(events_path, bundle, records)   # re-persist with download result
+
         instances.append({
             "trigger": t["message"],
             "transcript": _events_to_transcript(events),
             "output_files": outputs,
             "asked_question": _detect_asked(events),
             "stalled": _detect_stalled(events, outputs),
+            "download_warnings": dl_warnings,
         })
 
     for fid in uploaded_ids:
@@ -119,8 +157,10 @@ def run_test(bundle, spec_md, env_record, event_log, test_envelope_dict, client,
         "bundle_id": bundle.get("id"),
         "sessions_run": len(instances),
         "retention_clean": retention_clean,
+        "download_warnings": [w for i in instances for w in i.get("download_warnings", [])],
         "instances": [{"trigger": i["trigger"], "stalled": i["stalled"],
                        "asked_question": i["asked_question"],
-                       "output_files": list(i["output_files"].keys())} for i in instances],
+                       "output_files": list(i["output_files"].keys()),
+                       "download_warnings": i.get("download_warnings", [])} for i in instances],
     })
     return report, {"output_files": combined["output_files"]}

@@ -153,14 +153,14 @@ cat captures/event_log.json
 ### 6. Anywhere smoke test (no key, no Mac, no cost)
 
 ```bash
-# full automated suite (228 tests)
+# full automated suite (231 tests)
 python -m unittest discover -s trace/tests -t . -p "test_*.py"
 
 # preview the chunked prompt on the bundled sample (no model call)
 python -m trace.reconstruct.cli trace/samples/sample_raw_events.jsonl --dry-run --chunk-size 8 --overlap 2
 ```
 
-Expect `Ran 228 tests … OK`, and a printed system prompt + 3 rendered chunks.
+Expect `Ran 231 tests … OK`, and a printed system prompt + 3 rendered chunks.
 
 **Useful flags:**
 - UI: `python -m trace.ui.app --port 8765 --collector-port 8137 --sessions-root captures/sessions --no-open`
@@ -361,7 +361,7 @@ first chunk — capture and `--dry-run` are unaffected.
 python -m unittest discover -s trace/tests -t . -p "test_*.py"
 ```
 
-The suite (228 tests) covers redaction, keystroke coalescing, the raw writer,
+The suite (231 tests) covers redaction, keystroke coalescing, the raw writer,
 chunking, schema validation/normalization, fragment-stitch flagging, boundary
 de-duplication, contiguous-entry coalescing, document-open detection/coverage,
 the browser-capture collector path, the full reconstruction pipeline with a mock
@@ -595,7 +595,12 @@ drop coding-agent wrapper lines, reword the preflight trigger). It emits both
 cloud environment, mounts the files, sends **only** a trigger generated from the
 bundle's observed instances (zero coaching — no steering messages), captures the
 event stream, downloads outputs, and **deletes the session and files** (nothing
-persists). A walled-off **grader** (own prompt, like the discovery Scorer) judges
+persists). The captured stream is written to `events_<id>.json` the instant it is
+collected — **before** any download is attempted — so a download failure can never
+lose the evidence. Only the agent's own files (those it writes under
+`/workspace/outputs/`) are downloaded; the read-only mounted inputs are excluded,
+and each file is fetched independently so one un-downloadable file is a warning, not
+a failed run. A walled-off **grader** (own prompt, like the discovery Scorer) judges
 the run against the **spec's own acceptance criteria** → `test_report_<id>.json`,
 per-criterion pass / fail / **not-testable-in-sandbox** (criteria needing live
 services are never silently passed). A failing criterion or a stall blocks the

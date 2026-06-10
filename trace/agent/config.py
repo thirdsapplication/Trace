@@ -59,6 +59,8 @@ FRAMING_TEST = (
     'below. The files the spec references are mounted in your workspace at {mount}. '
     'Those mounted files are READ-ONLY: write any modified or output files to a NEW '
     'path under {outputs}/ (do not attempt to modify the mounted originals). '
+    'Write EVERY file you create or modify under {outputs}/ — only files saved there '
+    'can be retrieved after the run; the mounted inputs cannot. '
     'When you receive a trigger for this workflow, carry it out per the spec. '
     'You have NO external connections in this test run: produce any outbound action '
     '(an email, a chat message, a post) as TEXT in your response instead of sending it.'

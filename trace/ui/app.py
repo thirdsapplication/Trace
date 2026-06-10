@@ -95,7 +95,8 @@ class AppState:
         self.lock = threading.Lock()
         os.makedirs(sessions_root, exist_ok=True)
 
-    def _default_run_test(self, bundle, spec_md, env_record, event_log, test_dict):
+    def _default_run_test(self, bundle, spec_md, env_record, event_log, test_dict,
+                          events_path=None):
         """Real Stage-4 sandbox run: requires a key; builds the beta-pinned client."""
         key = self.keystore.get_key()
         if not key:
@@ -104,7 +105,8 @@ class AppState:
         from ..agent.api_client import ManagedAgentsClient
         from ..agent.deployer import run_test as _run_test
         client = ManagedAgentsClient(api_key=key)
-        return _run_test(bundle, spec_md, env_record, event_log, test_dict, client)
+        return _run_test(bundle, spec_md, env_record, event_log, test_dict, client,
+                         events_path=events_path)
 
     # --- reconstruction job ----------------------------------------------
     def start_reconstruction(self, sid):
@@ -237,8 +239,10 @@ class AppState:
                     # sandbox test (needs the API; skipped gracefully without a key)
                     env_record = sessions.read_json_artifact(root, sid, environment_filename(b["id"])) or {}
                     try:
+                        events_path = os.path.join(specs_dir, sessions.events_name(b["id"]))
                         report, artifacts = self.run_test_fn(
-                            b, spec_md, env_record, event_log, compiled["test"]["dict"])
+                            b, spec_md, env_record, event_log, compiled["test"]["dict"],
+                            events_path=events_path)
                         with open(os.path.join(specs_dir, sessions.test_report_name(b["id"])),
                                   "w", encoding="utf-8") as f:
                             json.dump(report, f, indent=2, ensure_ascii=False)

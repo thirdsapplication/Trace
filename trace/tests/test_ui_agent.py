@@ -36,7 +36,7 @@ class FakeKeystore:
     def clear_key(self): self.key = None
 
 
-def fake_run_test(bundle, spec_md, env_record, event_log, test_dict):
+def fake_run_test(bundle, spec_md, env_record, event_log, test_dict, events_path=None):
     report = {"bundle_id": bundle["id"], "criteria_total": 1, "passed": 1, "failed": 0,
               "not_testable_in_sandbox": 0, "results": [{"criterion": "x", "verdict": "pass"}],
               "zero_coaching": {"stalled": False, "asked_question": False},

@@ -6,9 +6,12 @@ downloaded, session + files deleted (retention clean), and grading against the
 spec's own criteria — including the gate's ability to fail.
 """
 
+import json
+import os
+import tempfile
 import unittest
 
-from trace.agent import deployer
+from trace.agent import api_client, deployer
 from trace.agent.compiler import compile_agent
 from trace.tests.test_agent import BUNDLE, EVENT_LOG, SPEC_MD
 
@@ -70,10 +73,11 @@ class FakeClient:
             {"type": "session.status_idle", "text": "", "name": None},
         ]
 
-    def download_outputs(self, session_id):
+    def download_outputs(self, session_id, exclude_ids=None):
+        self.last_exclude_ids = exclude_ids
         if self.stall:
-            return {}
-        return {"SHEET.xlsx": "order_id,customer,total\nPO-1,Acme,30\n"}
+            return {}, []
+        return {"SHEET.xlsx": "order_id,customer,total\nPO-1,Acme,30\n"}, []
 
     def delete_session(self, sid):
         self.deleted_sessions.append(sid)
@@ -155,6 +159,73 @@ class DeployerTest(unittest.TestCase):
         self.assertEqual(client.deleted_sessions, client.sessions)   # cleaned up anyway
         self.assertEqual(sorted(client.deleted_files), sorted(client.uploaded))
         self.assertFalse(report["deploy_recommended"])               # stalled -> no deploy
+
+    def test_download_failure_after_stream_preserves_events_on_disk(self):
+        # (a) the stream is captured, then the download fails ("file is not
+        # downloadable"): the events must already be on disk, the error appended (not
+        # substituted), and the grade computed from the REAL stream.
+        client = FakeClient()
+        def boom_dl(session_id, exclude_ids=None):
+            raise RuntimeError("file is not downloadable")
+        client.download_outputs = boom_dl
+        with tempfile.TemporaryDirectory() as d:
+            ep = os.path.join(d, "events_B1.json")
+            report, _ = deployer.run_test(BUNDLE, SPEC_MD, ENV_RECORD, EVENT_LOG,
+                                          _compiled_test(), client, judge_fn=_pass_judge,
+                                          events_path=ep)
+            self.assertTrue(os.path.exists(ep))          # persisted before the crash
+            with open(ep, encoding="utf-8") as f:
+                saved = json.load(f)
+        inst = saved["instances"][0]
+        types = [e["type"] for e in inst["events"]]
+        self.assertIn("agent.message", types)            # the real stream survived...
+        self.assertIn("client.download_error", types)    # ...and the error was appended
+        # grade reflects the real stream: the agent produced text, criteria pass
+        self.assertGreaterEqual(report["passed"], 1)
+        self.assertFalse(report["zero_coaching"]["stalled"])
+
+    def test_download_excludes_our_uploaded_inputs(self):
+        # (b) the session-scoped listing mixes mounted-input copies (which the platform
+        # refuses to download) with agent-created files; only agent files under the
+        # outputs path are downloaded.
+        objs = [
+            {"id": "file_in",    "filename": "PO.pdf",     "path": "/workspace/files/PO.pdf"},
+            {"id": "file_out",   "filename": "result.csv", "path": "/workspace/outputs/result.csv"},
+            {"id": "file_nd",    "filename": "blocked.csv", "downloadable": False,
+             "path": "/workspace/outputs/blocked.csv"},
+            {"id": "file_other", "filename": "scratch.txt", "path": "/tmp/scratch.txt"},
+        ]
+        selected = api_client._select_downloadable(objs, {"file_in"}, "/workspace/outputs")
+        # mounted input excluded by id, non-downloadable dropped, scratch dropped in
+        # favor of the outputs-path file
+        self.assertEqual(selected, [("file_out", "result.csv")])
+
+    def test_download_per_file_fault_tolerance(self):
+        # (c) one un-downloadable file among several yields a per-file warning; the
+        # other files still download and the run completes.
+        client = api_client.ManagedAgentsClient.__new__(api_client.ManagedAgentsClient)
+        client._beta_version = "test"
+
+        class _Body:
+            def __init__(self, fid): self.text = f"content-{fid}"
+
+        class FakeFiles:
+            def list(self, scope_id=None, betas=None):
+                return [{"id": "a", "filename": "good1.csv", "path": "/workspace/outputs/good1.csv"},
+                        {"id": "b", "filename": "bad.csv",   "path": "/workspace/outputs/bad.csv"},
+                        {"id": "c", "filename": "good2.csv", "path": "/workspace/outputs/good2.csv"}]
+
+            def download(self, fid):
+                if fid == "b":
+                    raise RuntimeError("file is not downloadable")
+                return _Body(fid)
+
+        client._files = lambda: FakeFiles()
+        out, warnings = client.download_outputs("sess", exclude_ids=[])
+        self.assertEqual(set(out), {"good1.csv", "good2.csv"})
+        self.assertEqual(out["good1.csv"], "content-a")
+        self.assertEqual(len(warnings), 1)
+        self.assertEqual(warnings[0]["file"], "bad.csv")
 
     def test_multiple_instances_capped_one_message_each(self):
         env = {"artifacts": [{"role": "input", "uploaded": True, "file_ref": f"/s/in{i}.pdf",
