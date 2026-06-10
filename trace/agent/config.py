@@ -18,6 +18,10 @@ DEFAULT_MAX_SESSIONS = 3                 # cost guard: sessions per test run
 DEFAULT_SESSION_TIMEOUT = 240            # seconds per session
 DEFAULT_MAX_EVENTS = 500                 # events per session
 REQUEST_TIMEOUT = 120                    # per-HTTP-request read timeout (seconds)
+# Transient platform errors (503 overloaded / file storage temporarily unavailable,
+# 429, 5xx) are retried with exponential backoff before giving up.
+RETRY_ATTEMPTS = 5
+RETRY_BASE_DELAY = 1.5                   # seconds; doubles each attempt
 MOUNT_PATH = "/workspace/files"          # where the Test Deployer mounts artifacts
 # Mounted files are READ-ONLY copies; the agent must write outputs to a new path.
 # The framing makes this contractual and the Deployer retrieves session-scoped files.

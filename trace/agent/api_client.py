@@ -21,6 +21,35 @@ from . import config
 BETA_VERSION = config.BETA_VERSION
 
 
+_RETRYABLE_STATUS = {408, 409, 429, 500, 502, 503, 529}
+_RETRYABLE_TEXT = ("overloaded", "temporarily unavailable", "please retry", "try again",
+                   "rate limit", "timeout", "timed out", "connection")
+
+
+def _is_retryable(exc):
+    """True for transient platform errors worth retrying (503 overloaded / file
+    storage temporarily unavailable, 429, 5xx, connection blips)."""
+    sc = getattr(exc, "status_code", None) or getattr(exc, "status", None)
+    if sc in _RETRYABLE_STATUS:
+        return True
+    msg = str(exc).lower()
+    return any(k in msg for k in _RETRYABLE_TEXT)
+
+
+def _retry(fn, attempts=None, base=None, sleep=time.sleep):
+    """Run ``fn`` with exponential backoff on transient errors. Non-retryable errors
+    (auth, bad request) raise immediately; the last attempt's error propagates."""
+    attempts = attempts or config.RETRY_ATTEMPTS
+    base = base or config.RETRY_BASE_DELAY
+    for i in range(attempts):
+        try:
+            return fn()
+        except Exception as exc:                      # noqa: BLE001 (any SDK error)
+            if not _is_retryable(exc) or i == attempts - 1:
+                raise
+            sleep(base * (2 ** i))
+
+
 def _idof(obj):
     return getattr(obj, "id", obj.get("id") if isinstance(obj, dict) else None)
 
@@ -49,8 +78,10 @@ def _event_dict(event):
 class ManagedAgentsClient:
     def __init__(self, api_key=None, beta=BETA_VERSION):
         import anthropic
-        # per-request read timeout so a dead connection raises instead of blocking
-        self._client = anthropic.Anthropic(api_key=api_key, timeout=config.REQUEST_TIMEOUT)
+        # per-request read timeout so a dead connection raises instead of blocking;
+        # the SDK's own retry budget plus our _retry handle transient 503/overloaded.
+        self._client = anthropic.Anthropic(api_key=api_key, timeout=config.REQUEST_TIMEOUT,
+                                           max_retries=config.RETRY_ATTEMPTS)
         self._beta_version = beta
 
     # --- namespace probes (clear, localized errors on SDK drift) ---
@@ -76,7 +107,7 @@ class ManagedAgentsClient:
     # --- Files API ---
     def upload_file(self, path):
         # docs: client.beta.files.upload(file=Path(...)) -> file.id
-        return _idof(self._files().upload(file=Path(path)))
+        return _idof(_retry(lambda: self._files().upload(file=Path(path))))
 
     def delete_file(self, file_id):
         try:
@@ -91,30 +122,30 @@ class ManagedAgentsClient:
 
     def list_files(self):
         """Account-scoped file ids (for retention verification of uploads)."""
-        res = self._files().list(betas=[self._beta_version])
+        res = _retry(lambda: self._files().list(betas=[self._beta_version]))
         return [_idof(f) for f in _data(res)]
 
     # --- agents / environments / sessions ---
     def create_agent(self, envelope_dict):
         # Pass only the documented create params (name, model, system, tools);
         # description/mcp_* live in the YAML, not the create call.
-        a = self._agents_ns("agents").create(
+        a = _retry(lambda: self._agents_ns("agents").create(
             name=envelope_dict["name"], model=envelope_dict["model"],
-            system=envelope_dict["system"], tools=envelope_dict["tools"])
+            system=envelope_dict["system"], tools=envelope_dict["tools"]))
         return _idof(a)
 
     def create_environment(self, defaults=None):
         d = defaults or config.ENVIRONMENT_DEFAULTS
-        return _idof(self._agents_ns("environments").create(
-            name=d.get("name", "trace-test-env"), config=d.get("config", {})))
+        return _idof(_retry(lambda: self._agents_ns("environments").create(
+            name=d.get("name", "trace-test-env"), config=d.get("config", {}))))
 
     def create_session(self, agent_id, environment_id, resources, title=None):
         """``resources`` is a list of ``{file_id, mount_path}``."""
-        return _idof(self._agents_ns("sessions").create(
+        return _idof(_retry(lambda: self._agents_ns("sessions").create(
             agent=agent_id, environment_id=environment_id,
             title=title or "Trace test",
             resources=[{"type": "file", "file_id": r["file_id"], "mount_path": r["mount_path"]}
-                       for r in resources]))
+                       for r in resources])))
 
     def send_trigger_and_collect(self, session_id, trigger_text, timeout=None, max_events=None):
         """Send ONLY the trigger user.message and stream events until the agent
@@ -147,12 +178,12 @@ class ManagedAgentsClient:
         read-only) and download them as ``{filename: text}``."""
         out = {}
         files = self._files()
-        res = files.list(scope_id=session_id, betas=[self._beta_version])
+        res = _retry(lambda: files.list(scope_id=session_id, betas=[self._beta_version]))
         for f in _data(res):
             fid = _idof(f)
             name = (getattr(f, "filename", None)
                     or (f.get("filename") if isinstance(f, dict) else None) or fid)
-            content = files.download(fid)
+            content = _retry(lambda fid=fid: files.download(fid))
             data = getattr(content, "text", None)
             if data is None:
                 read = getattr(content, "read", None)
@@ -168,5 +199,5 @@ class ManagedAgentsClient:
             pass
 
     def list_sessions(self):
-        res = self._agents_ns("sessions").list()
+        res = _retry(lambda: self._agents_ns("sessions").list())
         return [_idof(s) for s in _data(res)]
