@@ -13,6 +13,7 @@ The Deployer depends only on this interface, so all of Stage 4 runs offline agai
 a stub client; real calls happen only in the explicit gate run.
 """
 
+import time
 from pathlib import Path
 
 from . import config
@@ -48,7 +49,8 @@ def _event_dict(event):
 class ManagedAgentsClient:
     def __init__(self, api_key=None, beta=BETA_VERSION):
         import anthropic
-        self._client = anthropic.Anthropic(api_key=api_key)
+        # per-request read timeout so a dead connection raises instead of blocking
+        self._client = anthropic.Anthropic(api_key=api_key, timeout=config.REQUEST_TIMEOUT)
         self._beta_version = beta
 
     # --- namespace probes (clear, localized errors on SDK drift) ---
@@ -114,18 +116,29 @@ class ManagedAgentsClient:
             resources=[{"type": "file", "file_id": r["file_id"], "mount_path": r["mount_path"]}
                        for r in resources]))
 
-    def send_trigger_and_collect(self, session_id, trigger_text):
-        """Send ONLY the trigger user.message and stream events to completion
-        (``session.status_idle``). Returns the normalized event list. Never sends a
-        second event — the zero-coaching rule (P9)."""
+    def send_trigger_and_collect(self, session_id, trigger_text, timeout=None, max_events=None):
+        """Send ONLY the trigger user.message and stream events until the agent
+        finishes (a terminal event such as ``session.status_idle``). Bounded by a
+        wall-clock and an event cap so it can never hang waiting on the platform.
+        Never sends a second event — the zero-coaching rule (P9)."""
+        timeout = timeout or config.DEFAULT_SESSION_TIMEOUT
+        max_events = max_events or config.DEFAULT_MAX_EVENTS
+        deadline = time.monotonic() + timeout
         sessions = self._agents_ns("sessions")
         events = []
         with sessions.events.stream(session_id) as stream:
             sessions.events.send(session_id, events=[
                 {"type": "user.message", "content": [{"type": "text", "text": trigger_text}]}])
             for event in stream:
-                events.append(_event_dict(event))
-                if events[-1]["type"] == "session.status_idle":
+                ev = _event_dict(event)
+                events.append(ev)
+                et = ev["type"] or ""
+                if any(k in et for k in ("idle", "completed", "failed", "ended", "done")):
+                    break
+                if len(events) >= max_events or time.monotonic() > deadline:
+                    events.append({"type": "client.timeout", "name": None,
+                                   "text": f"stopped after {timeout}s / {max_events} events "
+                                           "without a terminal event"})
                     break
         return events
 

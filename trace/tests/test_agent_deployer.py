@@ -142,6 +142,20 @@ class DeployerTest(unittest.TestCase):
                                       client, judge_fn=_pass_judge)
         self.assertFalse(report["retention_clean"])
 
+    def test_session_error_is_non_fatal_and_still_cleans_up(self):
+        # a hung/erroring session (e.g. the platform never sends a terminal event)
+        # is recorded, blocks deploy, and is still deleted — nothing leaks.
+        client = FakeClient()
+        def boom(session_id, message):
+            client.messages.append((session_id, message))
+            raise RuntimeError("stream hung")
+        client.send_trigger_and_collect = boom
+        report, _ = deployer.run_test(BUNDLE, SPEC_MD, ENV_RECORD, EVENT_LOG, _compiled_test(),
+                                      client, judge_fn=_pass_judge)
+        self.assertEqual(client.deleted_sessions, client.sessions)   # cleaned up anyway
+        self.assertEqual(sorted(client.deleted_files), sorted(client.uploaded))
+        self.assertFalse(report["deploy_recommended"])               # stalled -> no deploy
+
     def test_multiple_instances_capped_one_message_each(self):
         env = {"artifacts": [{"role": "input", "uploaded": True, "file_ref": f"/s/in{i}.pdf",
                               "user_instruction": ""} for i in range(5)]}

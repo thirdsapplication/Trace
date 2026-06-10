@@ -78,8 +78,16 @@ def run_test(bundle, spec_md, env_record, event_log, test_envelope_dict, client,
         sid = client.create_session(agent_id, environment_id, resources,
                                     title=f"Trace test — {bundle.get('id')}")
         session_ids.append(sid)
-        events = client.send_trigger_and_collect(sid, t["message"])  # only the trigger
-        outputs = client.download_outputs(sid)
+        events, outputs = [], {}
+        try:
+            events = client.send_trigger_and_collect(sid, t["message"])  # only the trigger
+            outputs = client.download_outputs(sid)
+        except Exception as e:
+            # a timeout/error on one session is recorded, not fatal, and never skips
+            # the cleanup below
+            events = [{"type": "client.error", "text": str(e), "name": None}]
+        finally:
+            client.delete_session(sid)               # 7. retention: always clean up
         instances.append({
             "trigger": t["message"],
             "transcript": _events_to_transcript(events),
@@ -87,7 +95,6 @@ def run_test(bundle, spec_md, env_record, event_log, test_envelope_dict, client,
             "asked_question": _detect_asked(events),
             "stalled": _detect_stalled(events, outputs),
         })
-        client.delete_session(sid)                   # 7. retention: nothing persists
 
     for fid in uploaded_ids:
         client.delete_file(fid)

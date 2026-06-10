@@ -12,6 +12,12 @@ AGENT_TOOLSET_TYPE = "agent_toolset_20260401"
 # --- pipeline defaults (overridable) ---------------------------------------
 DEFAULT_MODEL = "claude-sonnet-4-6"
 DEFAULT_MAX_SESSIONS = 3                 # cost guard: sessions per test run
+# Bound a sandbox run so it can never hang waiting on the platform: stop a session
+# after this wall-clock or event count and clean up anyway (a real run is usually
+# under a minute once the environment is warm).
+DEFAULT_SESSION_TIMEOUT = 240            # seconds per session
+DEFAULT_MAX_EVENTS = 500                 # events per session
+REQUEST_TIMEOUT = 120                    # per-HTTP-request read timeout (seconds)
 MOUNT_PATH = "/workspace/files"          # where the Test Deployer mounts artifacts
 # Mounted files are READ-ONLY copies; the agent must write outputs to a new path.
 # The framing makes this contractual and the Deployer retrieves session-scoped files.
