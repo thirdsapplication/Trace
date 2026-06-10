@@ -48,24 +48,26 @@ class FakeClient:
     def create_environment(self, defaults=None):
         return "env_1"
 
-    def create_session(self, agent_id, environment_id, file_ids, mount_path):
+    def create_session(self, agent_id, environment_id, resources, title=None):
         sid = f"sess_{len(self.sessions)}"
         self.sessions.append(sid)
+        self.last_resources = resources
         return sid
 
-    def send_message(self, session_id, message):
-        self.messages.append((session_id, message))
-
-    def get_events(self, session_id):
+    def send_trigger_and_collect(self, session_id, message):
+        self.messages.append((session_id, message))      # the only message, ever
         if self.stall:
-            return []
+            return [{"type": "session.status_idle", "text": "", "name": None}]
         if self.ask:
-            return [{"role": "assistant", "text": "Where is the file? I can't find it."}]
+            return [{"type": "agent.message", "text": "Where is the file? I can't find it.", "name": None},
+                    {"type": "session.status_idle", "text": "", "name": None}]
         return [
-            {"role": "assistant", "text": "Preflight: header row is "
-             "order_id | customer | total; sample rows read."},
-            {"role": "assistant", "text": "Appended exactly one row with the PO values."},
-            {"role": "assistant", "text": "Confirmation: order received."},
+            {"type": "agent.message", "text": "Preflight: header row is "
+             "order_id | customer | total; sample rows read.", "name": None},
+            {"type": "agent.tool_use", "text": "", "name": "write_file"},
+            {"type": "agent.message", "text": "Appended exactly one row with the PO values.", "name": None},
+            {"type": "agent.message", "text": "Confirmation: order received.", "name": None},
+            {"type": "session.status_idle", "text": "", "name": None},
         ]
 
     def download_outputs(self, session_id):

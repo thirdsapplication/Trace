@@ -13,18 +13,18 @@ AGENT_TOOLSET_TYPE = "agent_toolset_20260401"
 DEFAULT_MODEL = "claude-sonnet-4-6"
 DEFAULT_MAX_SESSIONS = 3                 # cost guard: sessions per test run
 MOUNT_PATH = "/workspace/files"          # where the Test Deployer mounts artifacts
+# Mounted files are READ-ONLY copies; the agent must write outputs to a new path.
+# The framing makes this contractual and the Deployer retrieves session-scoped files.
+OUTPUTS_PATH = "/workspace/outputs"
 
 # P5 — safe default: every outbound-write capability requires approval. Never
 # emit always_allow by default. Confirm the exact enum against current docs.
 APPROVAL_PERMISSION_POLICY = "require_approval"
 
-# Environment defaults for the sandbox (P6 / implementer notes): cloud, limited
-# networking, package install available so a missing library never confounds a test.
+# Environment defaults for the sandbox (documented shape: name + config).
 ENVIRONMENT_DEFAULTS = {
-    "type": "cloud",
-    "networking": "limited",
-    "package_install": True,
-    "preinstalled_packages": ["openpyxl", "pandas", "pypdf"],
+    "name": "trace-test-env",
+    "config": {"type": "cloud", "networking": {"type": "limited"}},
 }
 
 # --- P4 — observed application identity -> MCP server entry -----------------
@@ -47,6 +47,8 @@ APP_MCP_TABLE = {
 FRAMING_TEST = (
     'You are an automation agent. Your workflow is "{workflow}", defined by the spec '
     'below. The files the spec references are mounted in your workspace at {mount}. '
+    'Those mounted files are READ-ONLY: write any modified or output files to a NEW '
+    'path under {outputs}/ (do not attempt to modify the mounted originals). '
     'When you receive a trigger for this workflow, carry it out per the spec. '
     'You have NO external connections in this test run: produce any outbound action '
     '(an email, a chat message, a post) as TEXT in your response instead of sending it.'
@@ -54,6 +56,8 @@ FRAMING_TEST = (
 FRAMING_LIVE = (
     'You are an automation agent. Your workflow is "{workflow}", defined by the spec '
     'below. The files the spec references are mounted in your workspace at {mount}. '
+    'Those mounted files are READ-ONLY: write any modified or output files to a NEW '
+    'path under {outputs}/. '
     'When you receive a trigger for this workflow, carry it out per the spec. '
     'Real connections to the services below are available: perform outbound actions '
     'through those connected tools (do not just describe them).'

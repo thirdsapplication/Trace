@@ -77,6 +77,13 @@ class CompilerTest(unittest.TestCase):
     def test_framing_test_states_no_connections(self):
         self.assertIn("NO external connections", self.c["test"]["dict"]["system"])
 
+    def test_framing_instructs_writing_outputs_to_a_new_path(self):
+        # mounted files are read-only; the agent must write outputs elsewhere
+        for mode in ("test", "live"):
+            sysm = self.c[mode]["dict"]["system"]
+            self.assertIn(compiler.config.OUTPUTS_PATH, sysm)
+            self.assertIn("READ-ONLY", sysm)
+
     def test_live_envelope_connectors_and_approval_policy(self):
         d = self.c["live"]["dict"]
         mcp = [t for t in d["tools"] if t["type"] == "mcp_toolset"]

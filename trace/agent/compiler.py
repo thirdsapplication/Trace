@@ -134,7 +134,7 @@ def build_envelope(bundle, spec_md, event_log, mode, model=None,
     workflow = bundle.get("name") or bundle.get("id") or "this workflow"
 
     framing = (config.FRAMING_TEST if mode == "test" else config.FRAMING_LIVE).format(
-        workflow=workflow, mount=mount)
+        workflow=workflow, mount=mount, outputs=config.OUTPUTS_PATH)
     system = framing + "\n\n" + adapt_spec(spec_md, mount)
 
     name = f"{workflow} (test)" if mode == "test" else workflow

@@ -17,32 +17,35 @@ from .trigger import generate_triggers
 
 
 def _events_to_transcript(events):
+    """Render normalized events ({type, text, name}) to a transcript. Event types:
+    user.message (our trigger), agent.message (text blocks), agent.tool_use (.name),
+    session.status_idle (terminal)."""
     parts = []
     for e in events or []:
         if not isinstance(e, dict):
             continue
-        role = e.get("role") or e.get("type") or ""
-        text = e.get("text") or e.get("content") or ""
-        if isinstance(text, list):
-            text = " ".join(str(t.get("text", t) if isinstance(t, dict) else t) for t in text)
-        parts.append(f"[{role}] {text}".strip())
-    return "\n".join(p for p in parts if p)
+        et = e.get("type") or ""
+        if et == "agent.tool_use":
+            parts.append(f"[tool_use] {e.get('name', '')}".strip())
+        else:
+            text = (e.get("text") or "").strip()
+            if text:
+                parts.append(f"[{et}] {text}")
+    return "\n".join(parts)
 
 
 def _detect_asked(events):
-    """The agent asked the operator a question and produced no final result."""
-    asked = any(isinstance(e, dict) and (e.get("type") == "question"
-                or "?" in str(e.get("text", "")) and (e.get("role") in ("assistant", "agent")))
-                for e in (events or []))
-    return bool(asked)
+    """The agent posed a question to the operator (an agent.message containing '?')."""
+    return any(isinstance(e, dict) and e.get("type") == "agent.message"
+               and "?" in str(e.get("text", "")) for e in (events or []))
 
 
 def _detect_stalled(events, outputs):
-    """No assistant output and no produced files => the agent stalled."""
+    """No agent text output and no produced files => the agent stalled."""
     produced = bool(outputs)
-    any_assistant = any(isinstance(e, dict) and e.get("role") in ("assistant", "agent")
-                        and str(e.get("text", "")).strip() for e in (events or []))
-    return not produced and not any_assistant
+    any_agent_text = any(isinstance(e, dict) and e.get("type") == "agent.message"
+                         and str(e.get("text", "")).strip() for e in (events or []))
+    return not produced and not any_agent_text
 
 
 def run_test(bundle, spec_md, env_record, event_log, test_envelope_dict, client,
@@ -67,13 +70,15 @@ def run_test(bundle, spec_md, env_record, event_log, test_envelope_dict, client,
     environment_id = client.create_environment(config.ENVIRONMENT_DEFAULTS)
 
     # 3–6. one session per observed instance; send ONLY the trigger (P9)
+    resources = [{"file_id": fid, "mount_path": f"{mount.rstrip('/')}/{name}"}
+                 for name, fid in file_ids.items()]
     triggers = generate_triggers(bundle, env_record, mount, max_sessions)
     instances, session_ids = [], []
     for t in triggers:
-        sid = client.create_session(agent_id, environment_id, list(file_ids.values()), mount)
+        sid = client.create_session(agent_id, environment_id, resources,
+                                    title=f"Trace test — {bundle.get('id')}")
         session_ids.append(sid)
-        client.send_message(sid, t["message"])      # the only message ever sent
-        events = client.get_events(sid)
+        events = client.send_trigger_and_collect(sid, t["message"])  # only the trigger
         outputs = client.download_outputs(sid)
         instances.append({
             "trigger": t["message"],

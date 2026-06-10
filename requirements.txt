@@ -1,6 +1,8 @@
 # Trace Engine 1 dependencies.
 
 # Reconstruction (Engine 1b) — calls claude-haiku-4-5.
+# Stage 4 (Managed Agents) needs the agent surface (client.beta.agents/sessions);
+# if "Compile & test agents" reports no Managed Agents API, run: pip install -U anthropic
 anthropic>=0.40.0
 
 # Local capture (Engine 1a, macOS only). Not needed to run reconstruction or
