@@ -137,36 +137,64 @@ class BindAndVerifyTest(unittest.TestCase):
 
 
 class _FakeCreds:
-    def __init__(self):
-        self.created = []
+    def __init__(self, create_conflicts=False):
+        self.created, self.updated = [], []
+        self._conflict = create_conflicts          # raise 409 on create
 
-    def create(self, vault_ref, auth=None):
-        self.created.append((vault_ref, auth))
-        return {"id": f"cred-{len(self.created)}"}
+    def create(self, vault_ref, display_name=None, auth=None):
+        if self._conflict:
+            raise RuntimeError("409 credential already exists")
+        self.created.append({"vault_ref": vault_ref, "display_name": display_name, "auth": auth})
+        return {"id": f"cred-{len(self.created)}", "mcp_server_url": auth.get("mcp_server_url")}
+
+    def update(self, cred_id, vault_id=None, auth=None):
+        self.updated.append({"cred_id": cred_id, "vault_id": vault_id, "auth": auth})
+        return {"id": cred_id}
+
+    def list(self, vault_ref):
+        # one pre-existing credential keyed to the gmail server URL (for the 409 path)
+        from trace.agent import config
+        return [{"id": "cred-existing",
+                 "mcp_server_url": config.pipedream_mcp_url("trace-s1", "gmail")}]
+
+
+class _FakeVaults:
+    """A vaults namespace: records create kwargs, serves a controllable list, and exposes
+    a credentials sub-namespace."""
+    def __init__(self, existing=None, credentials=None):
+        self.created = []
+        self._existing = existing or []
+        self.credentials = credentials or _FakeCreds()
+
+    def create(self, display_name=None, metadata=None):
+        self.created.append({"display_name": display_name, "metadata": metadata})
+        return {"id": f"vlt-{len(self.created)}"}
+
+    def list(self):
+        return self._existing
 
 
 class RealBindCredentialTest(unittest.TestCase):
     """The verified vault credential shape: mcp_oauth + access_token, with the customer +
     app carried in the MCP server URL (NOT as credential keys)."""
 
-    def _client(self):
+    def _client(self, vaults=None):
         from trace.agent import connect_client, config
         c = connect_client.ConnectClient(api_key="sk-ant-test",
                                          pipedream_project="proj_test")
-        creds = _FakeCreds()
-
-        class _Vaults:
-            pass
-        vaults = _Vaults(); vaults.credentials = creds
+        vaults = vaults or _FakeVaults()
         c._vaults_ns = lambda: vaults
         c.mint_access_token = lambda: {"access_token": "pdtok_abc", "expires_in": 3600}
-        return c, creds, config
+        return c, vaults, config
 
     def test_credential_is_mcp_oauth_with_token_and_url_routing(self):
-        c, creds, config = self._client()
+        c, vaults, config = self._client()
         out = c.bind_connection("vlt-s1", "trace-s1", "gmail")
         self.assertTrue(out["binding_ref"])
-        _vault_ref, auth = creds.created[-1]
+        rec = vaults.credentials.created[-1]
+        self.assertEqual(rec["vault_ref"], "vlt-s1")                 # vault_id positional
+        self.assertTrue(rec["display_name"])                        # carries a display_name
+        auth = rec["auth"]
         self.assertEqual(auth["type"], "mcp_oauth")
         self.assertEqual(auth["access_token"], "pdtok_abc")          # Trace's own token
         # external_user_id + app live in the URL, never as credential keys
@@ -175,6 +203,43 @@ class RealBindCredentialTest(unittest.TestCase):
         self.assertIn("externalUserId=trace-s1", auth["mcp_server_url"])
         self.assertIn("app=gmail", auth["mcp_server_url"])
         self.assertTrue(auth["mcp_server_url"].startswith(config.PIPEDREAM_MCP_BASE))
+
+    def test_409_routes_to_update_by_credential_id(self):
+        c, vaults, _ = self._client(_FakeVaults(credentials=_FakeCreds(create_conflicts=True)))
+        out = c.bind_connection("vlt-s1", "trace-s1", "gmail")
+        self.assertTrue(out["binding_ref"])
+        upd = vaults.credentials.updated[-1]
+        self.assertEqual(upd["cred_id"], "cred-existing")            # resolved from the list
+        self.assertEqual(upd["vault_id"], "vlt-s1")
+        self.assertEqual(upd["auth"]["type"], "mcp_oauth")
+
+
+class EnsureVaultTest(unittest.TestCase):
+    """vaults.create takes display_name + metadata (no `name`); reuse keys on metadata."""
+
+    def _client(self, vaults):
+        from trace.agent import connect_client
+        c = connect_client.ConnectClient(pipedream_project="proj_test")
+        c._vaults_ns = lambda: vaults
+        return c
+
+    def test_creates_with_display_name_and_metadata(self):
+        vaults = _FakeVaults(existing=[])
+        out = self._client(vaults).ensure_vault("trace-s1")
+        self.assertTrue(out["created"])
+        rec = vaults.created[-1]
+        self.assertEqual(rec["metadata"], {"external_user_id": "trace-s1"})
+        self.assertIn("trace-s1", rec["display_name"])
+        # the crash was passing name=; ensure we never do
+        self.assertNotIn("name", rec)
+
+    def test_reuses_vault_matched_by_metadata(self):
+        existing = [{"id": "vlt-old", "metadata": {"external_user_id": "trace-s1"}}]
+        vaults = _FakeVaults(existing=existing)
+        out = self._client(vaults).ensure_vault("trace-s1")
+        self.assertFalse(out["created"])
+        self.assertEqual(out["vault_ref"], "vlt-old")
+        self.assertEqual(vaults.created, [])                         # no second create
 
 
 class TLSContextTest(unittest.TestCase):

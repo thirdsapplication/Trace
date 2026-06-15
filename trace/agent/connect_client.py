@@ -186,18 +186,41 @@ class ConnectClient:
                 for a in (out.get("accounts") or out.get("data") or [])]
 
     def ensure_vault(self, external_user_id):
-        """Find-or-create the customer's vault (idiom mirrors create_or_reuse_agent).
-        CONFIRM the vaults.create shape against current docs."""
-        name = f"trace-connect-{external_user_id}"
+        """Find-or-create the customer's vault. The vault is keyed to the customer via
+        ``metadata.external_user_id`` (the documented reuse mechanism); ``vaults.create``
+        takes ``display_name`` + ``metadata`` (there is no ``name`` param)."""
+        display_name = f"trace-connect-{external_user_id}"
         try:
             res = _retry(lambda: self._vaults_ns().list())
             for v in _data(res):
-                if _attr(v, "name") == name:
+                meta = _attr(v, "metadata") or {}
+                ext = meta.get("external_user_id") if isinstance(meta, dict) \
+                    else _attr(meta, "external_user_id")
+                if ext == external_user_id or _attr(v, "display_name") == display_name:
                     return {"vault_ref": _idof(v), "created": False}
         except Exception:
             pass
-        v = _retry(lambda: self._vaults_ns().create(name=name))
+        v = _retry(lambda: self._vaults_ns().create(
+            display_name=display_name, metadata={"external_user_id": external_user_id}))
         return {"vault_ref": _idof(v), "created": True}
+
+    def _find_credential(self, vault_ref, mcp_server_url):
+        """The id of an existing credential in ``vault_ref`` keyed to ``mcp_server_url``,
+        or None. The server URL may sit at the top level or under ``auth`` on the returned
+        credential, so check both."""
+        try:
+            res = _retry(lambda: self._vaults_ns().credentials.list(vault_ref))
+        except Exception:
+            return None
+        for c in _data(res):
+            url = _attr(c, "mcp_server_url")
+            if url is None:
+                auth = _attr(c, "auth") or {}
+                url = auth.get("mcp_server_url") if isinstance(auth, dict) \
+                    else _attr(auth, "mcp_server_url")
+            if url == mcp_server_url:
+                return _idof(c)
+        return None
 
     def bind_connection(self, vault_ref, external_user_id, app, account=None):
         """Write the Pipedream connection into the vault as an mcp_oauth credential keyed
@@ -209,15 +232,18 @@ class ConnectClient:
         tok = _retry(self.mint_access_token)
         expires_at = (time.strftime("%Y-%m-%dT%H:%M:%SZ",
                                     time.gmtime(time.time() + float(tok.get("expires_in") or 3600))))
-        auth = {"type": "mcp_oauth",
-                "mcp_server_url": config.pipedream_mcp_url(external_user_id, app),
-                "access_token": tok["access_token"],
-                "expires_at": expires_at}
+        mcp_server_url = config.pipedream_mcp_url(external_user_id, app)
+        auth = {"type": "mcp_oauth", "mcp_server_url": mcp_server_url,
+                "access_token": tok["access_token"], "expires_at": expires_at}
+        display_name = f"Trace {app}"
         try:
-            c = _retry(lambda: creds.create(vault_ref, auth=auth))
-        except Exception as exc:                                # 409 duplicate -> update
+            c = _retry(lambda: creds.create(vault_ref, display_name=display_name, auth=auth))
+        except Exception as exc:                                # 409 duplicate -> update by id
             if "409" in str(exc) or "exist" in str(exc).lower():
-                c = _retry(lambda: creds.update(vault_ref, auth=auth))
+                cred_id = self._find_credential(vault_ref, mcp_server_url)
+                if not cred_id:
+                    raise
+                c = _retry(lambda: creds.update(cred_id, vault_id=vault_ref, auth=auth))
             else:
                 raise
         return {"binding_ref": _idof(c) or f"{vault_ref}:{app}"}
