@@ -311,6 +311,41 @@ class ConnectUrlAppTest(unittest.TestCase):
         self.assertNotIn("app=gmail", url)
 
 
+class AccountEmailTest(unittest.TestCase):
+    """Pipedream has no plain `email` field; the email is read from a profile/credentials
+    block or the account name (Google connections are named with the email)."""
+
+    def test_extracts_from_name(self):
+        from trace.agent.connect_client import _account_email
+        self.assertEqual(_account_email({"id": "apn_1", "name": "worker@acme.com"}),
+                         "worker@acme.com")
+
+    def test_extracts_from_credentials_profile(self):
+        from trace.agent.connect_client import _account_email
+        acc = {"id": "apn_1", "name": "My Gmail",
+               "credentials": {"email": "worker@acme.com"}}
+        self.assertEqual(_account_email(acc), "worker@acme.com")
+
+    def test_none_when_no_email_anywhere(self):
+        from trace.agent.connect_client import _account_email
+        self.assertIsNone(_account_email({"id": "apn_1", "name": "My Gmail"}))
+
+    def test_get_account_requests_credentials_and_reads_name(self):
+        from trace.agent import connect_client
+        c = connect_client.ConnectClient(pipedream_project="proj_test")
+        calls = []
+
+        def fake_pd(method, path, body=None):
+            calls.append(path)
+            return {"data": [{"id": "apn_1", "name": "worker@acme.com"}]}
+        c._pd_request = fake_pd
+        c._access_token = lambda: "t"
+        acc = c.get_account("trace-s1", "gmail")
+        self.assertTrue(acc["connected"])
+        self.assertEqual(acc["identity_email"], "worker@acme.com")
+        self.assertIn("include_credentials=true", calls[0])     # credentials requested first
+
+
 class UIConnectTest(unittest.TestCase):
     def setUp(self):
         import tempfile

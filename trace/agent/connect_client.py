@@ -60,6 +60,28 @@ def _with_app(url, app):
     return urllib.parse.urlunparse(parts._replace(query=urllib.parse.urlencode(q)))
 
 
+def _account_email(acc):
+    """Best-effort extraction of the connected account's email from a Pipedream account
+    object. There is no standard ``email`` field — the email may sit under a profile/identity
+    block (returned only with credentials) or, for Google OAuth, in the account ``name``
+    (Pipedream labels the connection with the email). Returns a string or None."""
+    if not isinstance(acc, dict):
+        return None
+    # nested identity/profile/credentials blocks (present when credentials are included)
+    for outer in ("identity", "profile", "credentials", "oauth"):
+        block = acc.get(outer)
+        if isinstance(block, dict):
+            v = block.get("email") or block.get("email_address")
+            if isinstance(v, str) and "@" in v:
+                return v
+    # flat candidates, then the account name (Google connections are named with the email)
+    for key in ("email", "email_address", "external_id", "name"):
+        v = acc.get(key)
+        if isinstance(v, str) and "@" in v:
+            return v
+    return None
+
+
 class ConnectClient:
     def __init__(self, api_key=None, beta=BETA_VERSION,
                  pipedream_project=None, connect_base=None,
@@ -156,16 +178,27 @@ class ConnectClient:
         return {"token": token, "connect_url": _with_app(base, app)}
 
     def get_account(self, external_user_id, app):
-        """Look up the account this user connected for ``app``, including its identity
-        email (load-bearing for post-connect verification)."""
-        q = urllib.parse.urlencode({"external_user_id": external_user_id, "app": app})
-        out = _retry(lambda: self._pd_request("GET", f"/accounts?{q}"))
+        """Look up the account this user connected for ``app``, including its identity email
+        (load-bearing for post-connect verification). Pipedream's account object has no plain
+        ``email`` field, so we request credentials (where a profile/email can appear) and also
+        read the account ``name`` (Google connections are labelled with the email). The
+        credentialed lookup is best-effort: if the project can't return credentials (managed
+        OAuth), we fall back to the plain lookup."""
+        base = {"external_user_id": external_user_id, "app": app}
+        out = None
+        try:
+            q = urllib.parse.urlencode({**base, "include_credentials": "true"})
+            out = _retry(lambda: self._pd_request("GET", f"/accounts?{q}"))
+        except Exception:
+            out = None
+        if not (isinstance(out, dict) and (out.get("accounts") or out.get("data"))):
+            q = urllib.parse.urlencode(base)
+            out = _retry(lambda: self._pd_request("GET", f"/accounts?{q}"))
         accounts = out.get("accounts") or out.get("data") or []
         acc = accounts[0] if accounts else {}
         return {"connected": bool(acc),
                 "account_id": acc.get("id") or acc.get("account_id"),
-                "identity_email": (acc.get("identity") or {}).get("email")
-                or acc.get("email")}
+                "identity_email": _account_email(acc)}
 
     def list_apps(self):
         """List the apps available in the project (the slug-lookup endpoint). Used as a
