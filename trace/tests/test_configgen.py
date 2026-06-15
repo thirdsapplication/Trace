@@ -103,7 +103,10 @@ class ConfigGenTest(unittest.TestCase):
             self.assertIn(f"type: {config.AGENT_TOOLSET_TYPE}", test_yaml)
             self.assertIn("skills: []", test_yaml)
             self.assertIn("mcp_servers: []", test_yaml)         # test: no MCP
-            self.assertIn(config.PIPEDREAM_MCP["url"], live_yaml)
+            # live template carries the nominal Pipedream server (deploy bakes the
+            # per-customer, per-app URLs at create time).
+            self.assertIn(config.PIPEDREAM_MCP_BASE, live_yaml)
+            self.assertIn(config.PIPEDREAM_MCP_NAME, live_yaml)
             self.assertIn(f"type: {config.LIVE_PERMISSION_POLICY}", live_yaml)
 
     # 3 ---------------------------------------------------------------------

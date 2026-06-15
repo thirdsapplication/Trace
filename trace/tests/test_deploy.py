@@ -78,8 +78,18 @@ class DeployTest(unittest.TestCase):
         bundle, live = _live_dict()
         client = FakeDeployClient()
         rec = deploy.deploy_live(bundle, live, CONNECTION, client, trigger="on a new inbound PO")
-        # the LIVE config was deployed (it carries the Pipedream MCP server)
-        self.assertTrue(client.agents[0].get("mcp_servers"))
+        # the LIVE config was deployed with the customer's per-app Pipedream MCP server(s),
+        # baked at create time: the URL carries THIS customer's externalUserId + the app.
+        servers = client.agents[0].get("mcp_servers")
+        self.assertTrue(servers)
+        urls = " ".join(s["url"] for s in servers)
+        self.assertIn("externalUserId=trace-s1", urls)
+        self.assertIn("app=gmail", urls)
+        # and exactly one approval-required mcp_toolset per server
+        toolsets = [t for t in client.agents[0]["tools"] if t.get("type") == "mcp_toolset"]
+        self.assertEqual(len(toolsets), len(servers))
+        self.assertTrue(all(t["default_config"]["permission_policy"]["type"] == "always_ask"
+                            for t in toolsets))
         # the bound vault was injected at session creation (the single injection point)
         self.assertEqual(client.last_vault_ids, ["vlt-s1"])
         self.assertEqual(rec["vault_ref"], "vlt-s1")
@@ -131,6 +141,79 @@ class DeployTest(unittest.TestCase):
         import inspect
         src = inspect.getsource(deploy)
         self.assertNotIn("import anthropic", src)
+
+
+class _FakeEvents:
+    """Records events.send and serves a canned events.list (one pending held write,
+    one already-resolved by a tool_confirmation)."""
+    def __init__(self):
+        self.sent = []
+        self._events = [
+            {"type": "agent.mcp_tool_use", "tool_use_id": "sevt_1", "name": "send_email",
+             "summary": "reply to the customer"},
+            {"type": "agent.mcp_tool_use", "tool_use_id": "sevt_2", "name": "append_row",
+             "summary": "add a row"},
+            {"type": "user.tool_confirmation", "tool_use_id": "sevt_2", "result": "allow"},
+        ]
+
+    def list(self, session_id):
+        return list(self._events)
+
+    def send(self, session_id, events=None):
+        self.sent.append((session_id, events))
+        return {"ok": True}
+
+
+class RealClientApprovalTest(unittest.TestCase):
+    """The verified approval mechanism: held writes surface from the event stream and are
+    resolved by replying with ONE tool_confirmation event (no sessions.approvals API)."""
+
+    def _client(self):
+        from trace.agent import api_client
+        c = api_client.ManagedAgentsClient.__new__(api_client.ManagedAgentsClient)
+        c._beta_version = api_client.BETA_VERSION
+        events = _FakeEvents()
+
+        class _Sessions:
+            pass
+        sessions_ns = _Sessions(); sessions_ns.events = events
+
+        class _Beta:
+            pass
+        beta = _Beta(); beta.sessions = sessions_ns
+
+        class _Client:
+            pass
+        client = _Client(); client.beta = beta
+        c._client = client
+        return c, events
+
+    def test_pending_excludes_resolved(self):
+        c, _ = self._client()
+        pending = c.list_pending_approvals("live_sess_0")
+        ids = {p["action_id"] for p in pending}
+        self.assertEqual(ids, {"sevt_1"})            # sevt_2 already confirmed -> drained
+
+    def test_approve_sends_allow_tool_confirmation(self):
+        c, events = self._client()
+        c.approve_action("live_sess_0", "sevt_1")
+        _sid, evs = events.sent[-1]
+        self.assertEqual(evs[0]["type"], "tool_confirmation")
+        self.assertEqual(evs[0]["tool_use_id"], "sevt_1")
+        self.assertEqual(evs[0]["result"], "allow")
+
+    def test_reject_sends_deny_with_message(self):
+        c, events = self._client()
+        c.reject_action("live_sess_0", "sevt_1", message="wrong recipient")
+        _sid, evs = events.sent[-1]
+        self.assertEqual(evs[0]["result"], "deny")
+        self.assertEqual(evs[0]["message"], "wrong recipient")
+
+    def test_set_trigger_makes_no_platform_call(self):
+        c, _ = self._client()
+        # no triggers namespace exists; set_trigger must not touch the platform
+        self.assertEqual(c.set_trigger("agent_live", schedule="0 9 * * *"),
+                         {"mode": "schedule", "value": "0 9 * * *"})
 
 
 def _fake_deploy_fn(bundle, live_dict, connection_record, start):

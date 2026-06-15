@@ -227,12 +227,12 @@ class ManagedAgentsClient:
     def create_session(self, agent_id, environment_id, resources, title=None, vault_ids=None):
         """``resources`` is a list of ``{file_id, mount_path}``. ``vault_ids`` (Phase 6)
         attaches the customer's bound vault so the LIVE agent reaches their real apps;
-        omitted for sandbox runs. CONFIRM the vault_ids param against current docs."""
+        omitted for sandbox runs. vault_ids is settable at create ONLY (not via update)."""
         kw = dict(agent=agent_id, environment_id=environment_id, title=title or "Trace test",
                   resources=[{"type": "file", "file_id": r["file_id"], "mount_path": r["mount_path"]}
                              for r in resources])
         if vault_ids:
-            kw["vault_ids"] = list(vault_ids)              # confirm against current docs
+            kw["vault_ids"] = list(vault_ids)              # the single vault-injection point
         return _idof(_retry(lambda: self._agents_ns("sessions").create(**kw)))
 
     def send_trigger_and_collect(self, session_id, trigger_text, timeout=None, max_events=None):
@@ -302,37 +302,59 @@ class ManagedAgentsClient:
         res = _retry(lambda: self._agents_ns("sessions").list())
         return [_idof(s) for s in _data(res)]
 
-    # --- Phase 6: live deployment (trigger/schedule + approval-required outbound) ---
-    # CONFIRM every shape below against current docs — these are external BETA APIs.
+    # --- Phase 6: live deployment (start mode + approval-required outbound) ---
+    # There is NO Managed Agents triggers/scheduler API and NO sessions.approvals API.
+    # Start is owned by Trace (its own scheduler) or a Pipedream deployed trigger;
+    # approval is the permission_policy {always_ask} on the toolset, resolved by replying
+    # to the session with a single tool_confirmation event over the event stream.
     def set_trigger(self, agent_id, trigger=None, schedule=None):
-        """Start the LIVE agent on a trigger (e.g. a new matching inbound) or a schedule.
-        CONFIRM the triggers API shape against current docs."""
-        body = {"agent": agent_id}
-        if schedule:
-            body["schedule"] = schedule
-        elif trigger:
-            body["trigger"] = trigger
-        return _idof(_retry(lambda: self._agents_ns("triggers").create(**body)))
+        """Record how the LIVE agent starts. This makes NO platform call: a ``schedule``
+        is handed to Trace's own scheduler (which calls ``create_session`` on cadence) and
+        a ``trigger`` is registered as a Pipedream deployed trigger elsewhere. Returns the
+        start descriptor."""
+        return {"mode": "schedule" if schedule else "trigger",
+                "value": schedule or trigger}
 
     def list_pending_approvals(self, session_id):
-        """Outbound writes/sends the agent has proposed and is holding for approval
-        (the LIVE toolset is approval-required). Returns
-        ``[{action_id, kind, summary}]``. CONFIRM against current docs."""
-        res = _retry(lambda: self._agents_ns("sessions").approvals.list(session_id))
-        out = []
-        for a in _data(res):
-            out.append({"action_id": _idof(a),
-                        "kind": _attr(a, "kind") or _attr(a, "tool") or "write",
-                        "summary": _attr(a, "summary") or _attr(a, "description") or ""})
+        """Outbound writes/sends the agent is holding for approval. A held call surfaces as
+        the session going ``status_idle`` with ``stop_reason=requires_action`` and a pending
+        ``agent.mcp_tool_use`` carrying a ``tool_use_id``. Returns
+        ``[{action_id, kind, summary}]`` where ``action_id`` is that ``tool_use_id``."""
+        sessions = self._agents_ns("sessions")
+        res = _retry(lambda: sessions.events.list(session_id))
+        out, resolved = [], set()
+        for ev in _data(res):
+            et = _attr(ev, "type") or ""
+            tuid = _attr(ev, "tool_use_id")
+            if "tool_confirmation" in et and tuid:        # a prior allow/deny already resolved it
+                resolved.add(tuid)
+        for ev in _data(res):
+            et = _attr(ev, "type") or ""
+            if "mcp_tool_use" not in et:
+                continue
+            tuid = _attr(ev, "tool_use_id") or _idof(ev)
+            if not tuid or tuid in resolved:
+                continue
+            out.append({"action_id": tuid,
+                        "kind": _attr(ev, "kind") or _attr(ev, "name") or "write",
+                        "summary": _attr(ev, "summary") or _attr(ev, "name") or ""})
         return out
 
     def approve_action(self, session_id, action_id):
-        """Commit one held outbound action (one-tap approval). CONFIRM against docs."""
-        return _retry(lambda: self._agents_ns("sessions").approvals.approve(session_id, action_id))
+        """Commit one held outbound action: reply with a single ``tool_confirmation``
+        ``allow`` event for its ``tool_use_id``."""
+        return _retry(lambda: self._agents_ns("sessions").events.send(
+            session_id, events=[{"type": "tool_confirmation",
+                                 "tool_use_id": action_id, "result": "allow"}]))
 
-    def reject_action(self, session_id, action_id):
-        """Cancel one held outbound action. CONFIRM against docs."""
-        return _retry(lambda: self._agents_ns("sessions").approvals.reject(session_id, action_id))
+    def reject_action(self, session_id, action_id, message=None):
+        """Cancel one held outbound action: reply with a single ``tool_confirmation``
+        ``deny`` event (the optional ``message`` is delivered to the agent so it can
+        adjust)."""
+        event = {"type": "tool_confirmation", "tool_use_id": action_id, "result": "deny"}
+        if message:
+            event["message"] = message
+        return _retry(lambda: self._agents_ns("sessions").events.send(session_id, events=[event]))
 
     # --- explicit, human-initiated cleanup (C2) --------------------------
     def cleanup(self, session_ids=None, file_ids=None, agent_ids=None):

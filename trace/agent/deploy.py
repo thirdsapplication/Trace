@@ -13,11 +13,38 @@ live-agent / vault-injection / trigger-schedule / approval shapes are external B
 confirm against current docs before live use.
 """
 
+import copy
 import datetime
+
+from . import config
 
 
 def _now():
     return datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _usable_app_slugs(connection_record):
+    """The Pipedream app slugs this customer has a usable (verified) connection for."""
+    return [slug for slug, a in ((connection_record or {}).get("apps") or {}).items()
+            if a.get("usable")]
+
+
+def finalize_live_envelope(live_envelope_dict, connection_record):
+    """Bake the customer's per-app Pipedream MCP servers into the LIVE agent at create
+    time (the reference's "one customer, one workflow -> bake the URL"). The config-gen
+    template carries one nominal server; here it becomes one server per usable app, each
+    URL carrying this customer's ``externalUserId``, plus the matching approval-required
+    mcp_toolset entries. Returns a NEW dict (the template is not mutated)."""
+    env = copy.deepcopy(live_envelope_dict)
+    uid = (connection_record or {}).get("external_user_id")
+    slugs = _usable_app_slugs(connection_record)
+    if not slugs:                                   # no usable app -> leave the template as-is
+        return env
+    servers, toolsets = config.pipedream_mcp_servers(uid, slugs)
+    env["mcp_servers"] = servers
+    env["tools"] = [t for t in env.get("tools", []) if t.get("type") != config.MCP_TOOLSET_TYPE]
+    env["tools"].extend(toolsets)
+    return env
 
 
 def deploy_live(bundle, live_envelope_dict, connection_record, client,
@@ -27,6 +54,7 @@ def deploy_live(bundle, live_envelope_dict, connection_record, client,
     vault_ref = (connection_record or {}).get("vault_ref")
     external_user_id = (connection_record or {}).get("external_user_id")
 
+    live_envelope_dict = finalize_live_envelope(live_envelope_dict, connection_record)
     agent = client.create_or_reuse_agent(live_envelope_dict)
     agent_id = agent.get("id") if isinstance(agent, dict) else agent
     environment_id = client.create_environment()
@@ -35,6 +63,9 @@ def deploy_live(bundle, live_envelope_dict, connection_record, client,
         title=f"Trace live — {bundle.get('id')}",
         vault_ids=[vault_ref] if vault_ref else None)        # bound vault injected here
 
+    # Start mode is owned by Trace (no MA triggers API): a schedule feeds Trace's own
+    # scheduler; a trigger is registered as a Pipedream deployed trigger. set_trigger only
+    # records the descriptor — it makes no platform call and does not raise.
     start = {"mode": "schedule" if schedule else "trigger",
              "value": schedule or trigger or (bundle.get("trigger") or "on a new matching event")}
     try:

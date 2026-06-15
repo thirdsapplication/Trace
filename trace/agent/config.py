@@ -5,9 +5,16 @@ Nothing here references a fixture, sender, tab, SKU, or bundle id; the app→MCP
 keys on application identity, not on any workflow's content.
 """
 
+import os
+import urllib.parse
+
 # --- platform pins (also mirrored in api_client; keep in sync) -------------
+# All doc-confirmed against the Verified Platform Reference (June 2026 public beta).
 BETA_VERSION = "managed-agents-2026-04-01"
+FILES_BETA = "files-api-2025-04-14"
+SKILLS_BETA = "skills-2025-10-02"
 AGENT_TOOLSET_TYPE = "agent_toolset_20260401"
+MCP_TOOLSET_TYPE = "mcp_toolset"
 
 # --- pipeline defaults (overridable) ---------------------------------------
 DEFAULT_MODEL = "claude-sonnet-4-6"
@@ -37,18 +44,55 @@ APPROVAL_PERMISSION_POLICY = "require_approval"
 
 # --- Config Engine (Phase 1) -----------------------------------------------
 # The Config Engine writes the agent configuration directly (no markdown spec, no
-# per-app MCP table). Every live agent uses ONE Pipedream connection; outbound
-# writes/sends are approval-required.
-PIPEDREAM_MCP = {"name": "pipedream", "type": "url",
-                 "url": "https://mcp.pipedream.net/v2"}  # confirm path against current docs
-LIVE_PERMISSION_POLICY = "always_ask"   # approval-required; confirm enum against current docs
+# per-app MCP table). Every live agent reaches the worker's apps through Pipedream;
+# the per-customer, per-app MCP server URL is built by ``pipedream_mcp_url`` below.
+# Outbound writes/sends are approval-required.
+#
+# The MCP server is v3 (remote.mcp.pipedream.net); the Connect REST API is v1
+# (api.pipedream.com) — two DIFFERENT services, kept as separate constants on purpose.
+PIPEDREAM_MCP_BASE = "https://remote.mcp.pipedream.net/v3"
+PIPEDREAM_MCP_NAME = "pipedream"        # the mcp_server_name the live toolset references
+# Nested object (NOT a bare string); platform default elsewhere is always_allow.
+LIVE_PERMISSION_POLICY = "always_ask"   # -> permission_policy {"type": "always_ask"}
 
 # --- Phase 4: Connection Layer (Pipedream Connect + Managed Agents vault) ---
-# Pipedream Connect and the MA vault are external BETA APIs. CONFIRM EVERY SHAPE
-# BELOW AGAINST CURRENT DOCS before live use — they cannot be exercised here.
-PIPEDREAM_PROJECT = ""                  # Trace's single Pipedream project id (placeholder; confirm)
-PIPEDREAM_CONNECT_BASE = "https://api.pipedream.com/v1/connect"   # confirm path
-PIPEDREAM_CONNECT_VERSION = "connect-2026-06"                     # placeholder pin; confirm
+# Trace's single Pipedream project + its client-credentials app, sourced from the
+# environment so no secret is committed. The MA vault holds only Trace's own Pipedream
+# token (never a raw Google token).
+PIPEDREAM_PROJECT = os.environ.get("PIPEDREAM_PROJECT_ID", "")        # proj_xxxxxxx
+PIPEDREAM_CLIENT_ID = os.environ.get("PIPEDREAM_CLIENT_ID", "")
+PIPEDREAM_CLIENT_SECRET = os.environ.get("PIPEDREAM_CLIENT_SECRET", "")
+PIPEDREAM_ENVIRONMENT = os.environ.get("PIPEDREAM_ENVIRONMENT", "development")  # development|production
+PIPEDREAM_API_BASE = "https://api.pipedream.com/v1"   # Connect REST + OAuth (v1)
+PIPEDREAM_CONNECT_BASE = PIPEDREAM_API_BASE           # paths are project-scoped: /connect/{project_id}/...
+
+
+def pipedream_mcp_url(external_user_id, app, project=None, environment=None):
+    """The per-customer, per-app Pipedream MCP server URL. All routing rides in the
+    query string (MA injects only the bearer token, matched to the server by URL); one
+    app per URL. ``projectId``, ``environment``, ``externalUserId``, ``app`` are all
+    required."""
+    q = urllib.parse.urlencode({
+        "projectId": project or PIPEDREAM_PROJECT,
+        "environment": environment or PIPEDREAM_ENVIRONMENT,
+        "externalUserId": external_user_id or "",
+        "app": app,
+    })
+    return f"{PIPEDREAM_MCP_BASE}?{q}"
+
+
+def pipedream_mcp_servers(external_user_id, app_slugs):
+    """Build the LIVE agent's connection block for one customer: one ``mcp_servers``
+    entry per app (one app per URL) plus the matching approval-required ``mcp_toolset``
+    entries. Returns ``(servers, toolsets)``."""
+    servers, toolsets = [], []
+    for slug in app_slugs:
+        name = f"{PIPEDREAM_MCP_NAME}_{slug}"
+        servers.append({"name": name, "type": "url",
+                        "url": pipedream_mcp_url(external_user_id, slug)})
+        toolsets.append({"type": MCP_TOOLSET_TYPE, "mcp_server_name": name,
+                         "default_config": {"permission_policy": {"type": LIVE_PERMISSION_POLICY}}})
+    return servers, toolsets
 
 # Observed-app substring -> Pipedream app {slug, label}. Domain-neutral; same match
 # idiom as APP_MCP_TABLE. Apps with no row are surfaced as 'unmapped', never guessed.
@@ -89,10 +133,11 @@ def console_session_url(session_id=None, agent_id=None):
     session id is shown alongside so the user can locate it under Sessions."""
     return f"{CONSOLE_BASE}/managed-agents"
 
-# Environment defaults for the sandbox (documented shape: name + config).
+# Environment object (required; created once, its id passed on every sessions.create).
+# Networking is unrestricted so the LIVE agent can reach the Pipedream MCP server.
 ENVIRONMENT_DEFAULTS = {
     "name": "trace-test-env",
-    "config": {"type": "cloud", "networking": {"type": "limited"}},
+    "config": {"type": "cloud", "networking": {"type": "unrestricted"}},
 }
 
 # --- P4 — observed application identity -> MCP server entry -----------------

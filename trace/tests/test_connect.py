@@ -136,6 +136,47 @@ class BindAndVerifyTest(unittest.TestCase):
             self.assertNotIn(stmt, src)      # all platform calls go through the injected client
 
 
+class _FakeCreds:
+    def __init__(self):
+        self.created = []
+
+    def create(self, vault_ref, auth=None):
+        self.created.append((vault_ref, auth))
+        return {"id": f"cred-{len(self.created)}"}
+
+
+class RealBindCredentialTest(unittest.TestCase):
+    """The verified vault credential shape: mcp_oauth + access_token, with the customer +
+    app carried in the MCP server URL (NOT as credential keys)."""
+
+    def _client(self):
+        from trace.agent import connect_client, config
+        c = connect_client.ConnectClient(api_key="sk-ant-test",
+                                         pipedream_project="proj_test")
+        creds = _FakeCreds()
+
+        class _Vaults:
+            pass
+        vaults = _Vaults(); vaults.credentials = creds
+        c._vaults_ns = lambda: vaults
+        c.mint_access_token = lambda: {"access_token": "pdtok_abc", "expires_in": 3600}
+        return c, creds, config
+
+    def test_credential_is_mcp_oauth_with_token_and_url_routing(self):
+        c, creds, config = self._client()
+        out = c.bind_connection("vlt-s1", "trace-s1", "gmail")
+        self.assertTrue(out["binding_ref"])
+        _vault_ref, auth = creds.created[-1]
+        self.assertEqual(auth["type"], "mcp_oauth")
+        self.assertEqual(auth["access_token"], "pdtok_abc")          # Trace's own token
+        # external_user_id + app live in the URL, never as credential keys
+        self.assertNotIn("external_user_id", auth)
+        self.assertNotIn("app", auth)
+        self.assertIn("externalUserId=trace-s1", auth["mcp_server_url"])
+        self.assertIn("app=gmail", auth["mcp_server_url"])
+        self.assertTrue(auth["mcp_server_url"].startswith(config.PIPEDREAM_MCP_BASE))
+
+
 class UIConnectTest(unittest.TestCase):
     def setUp(self):
         import tempfile

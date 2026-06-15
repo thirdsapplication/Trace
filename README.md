@@ -225,7 +225,7 @@ trace/
     connect_client.py, connect.py       Phase 4 — Pipedream Connect + Managed Agents vault (read+bind), offline orchestration
     dryrun.py              Phase 5 — read real data (read-only) -> mount a COPY -> run -> plain replay -> feedback
     deploy.py              Phase 6 — create the LIVE agent over the connection; outbound held for approval
-    api_client.py          the ONE beta-pinned Managed Agents / Files API client (+ vault inject, approvals)
+    api_client.py          the ONE beta-pinned Managed Agents / Files API client (+ vault inject, tool_confirmation approval)
     config.py              platform pins, Pipedream + connect tables, defaults (editable)
     interview_cli.py, configgen_cli.py  dry-run-able CLIs for the engines
     compiler.py, trigger.py, deployer.py   dormant Stage-4 (markdown compile + manual-eval run)
@@ -410,9 +410,10 @@ injected stubs:
 
 Plus the test-UI backends and the full chain end to end (build → connect → dry run →
 deploy → approve → cleanup) — so it all runs without an API key, `pynput`, a browser, or
-the `anthropic` SDK. The external beta shapes (Managed Agents vault/triggers/approvals,
-Pipedream Connect/reads) are wrapped behind the version-pinned client modules and flagged
-**confirm against current docs**; they are the only parts not exercised here.
+the `anthropic` SDK. The external beta shapes (the Managed Agents vault + the
+`tool_confirmation` approval mechanism, Trace-side/Pipedream start, Pipedream Connect/reads)
+are doc-confirmed against the Verified Platform Reference and wrapped behind the
+version-pinned client modules; they are the only parts not exercised here (no live network).
 
 ## Local test UI (run the whole engine from a window)
 

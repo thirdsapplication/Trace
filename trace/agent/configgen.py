@@ -164,10 +164,15 @@ def _envelope(bundle, model_out, system_text, variant):
         "metadata": {"trace_bundle_id": bundle.get("id"), "variant": variant},
     }
     if variant == "live":
-        env["mcp_servers"] = [dict(config.PIPEDREAM_MCP)]
+        # Template only: a single nominal Pipedream server with a base URL (no
+        # externalUserId yet — unknown until deploy). The Deployer rewrites mcp_servers
+        # + mcp_toolset to the customer's per-app URLs at create time
+        # (config.pipedream_mcp_servers); the approval-required policy is fixed here.
+        env["mcp_servers"] = [{"name": config.PIPEDREAM_MCP_NAME, "type": "url",
+                               "url": config.PIPEDREAM_MCP_BASE}]
         env["tools"].append({
-            "type": "mcp_toolset",
-            "mcp_server_name": config.PIPEDREAM_MCP["name"],
+            "type": config.MCP_TOOLSET_TYPE,
+            "mcp_server_name": config.PIPEDREAM_MCP_NAME,
             "default_config": {"permission_policy": {"type": config.LIVE_PERMISSION_POLICY}},
         })
     return env
@@ -183,14 +188,18 @@ def validate_config_envelope(env, variant):
         raise ValueError("config envelope tools must be a non-empty list")
     if env["tools"][0].get("type") != config.AGENT_TOOLSET_TYPE:
         raise ValueError("first tool must be the agent toolset")
-    mcp_tools = [t for t in env["tools"] if t.get("type") == "mcp_toolset"]
+    mcp_tools = [t for t in env["tools"] if t.get("type") == config.MCP_TOOLSET_TYPE]
     if variant == "test":
         if env.get("mcp_servers") or mcp_tools:
             raise ValueError("test config must contain no MCP servers or mcp_toolset")
-    else:  # live: exactly the Pipedream server, approval-required
+    else:  # live: >=1 Pipedream MCP server, every mcp_toolset approval-required.
+        # The config-gen template carries one nominal server; the Deployer expands it to
+        # one server per app (config.pipedream_mcp_servers) once the customer is known.
         servers = env.get("mcp_servers") or []
-        if not (len(servers) == 1 and servers[0].get("name") == config.PIPEDREAM_MCP["name"]):
-            raise ValueError("live config must declare exactly the Pipedream MCP server")
+        if not servers:
+            raise ValueError("live config must declare at least one Pipedream MCP server")
+        if not all((s.get("name") or "").startswith(config.PIPEDREAM_MCP_NAME) for s in servers):
+            raise ValueError("live config MCP servers must be Pipedream servers")
         if not mcp_tools:
             raise ValueError("live config must include the Pipedream mcp_toolset")
         for t in mcp_tools:
