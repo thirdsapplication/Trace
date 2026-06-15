@@ -175,12 +175,12 @@
         grounding record. Answers become <b>authoritative</b> inputs to the config.</p>
     </section>
 
-    <!-- BUILD & TEST AGENTS (config + hidden logic gate) --------------- -->
+    <!-- BUILD AGENTS (config) ------------------------------------------ -->
     <section class="panel">
-      <h2>Build &amp; test agents <span class="muted">(config + sandbox logic gate)</span></h2>
+      <h2>Build agents <span class="muted">(config)</span></h2>
       <div id="buildBundles" class="bundle-select"></div>
       <div class="row">
-        <button id="buildBtn" class="primary" disabled>Build &amp; test selected</button>
+        <button id="buildBtn" class="primary" disabled>Build selected</button>
         <span id="buildMsg" class="status-line"></span>
       </div>
       <div id="buildSummary"></div>
@@ -190,11 +190,9 @@
       </div>
       <p class="help">Generates each agent's configuration directly
         (<code>agent_&lt;id&gt;.test.yaml</code> / <code>.live.yaml</code> +
-        <code>grounding_&lt;id&gt;.json</code>), then runs a <b>hidden logic gate</b>:
-        the test agent runs in a sealed sandbox and a grader checks its reasoning
-        before it can advance. Only agents that <b>pass</b> advance; the gate is not
-        shown to the worker. See the <b>agents</b> tab. <b>Clean up platform</b>
-        deletes the sandbox sessions and agents Trace created — only when you press it.</p>
+        <code>grounding_&lt;id&gt;.json</code>). See the <b>agents</b> tab.
+        <b>Clean up platform</b> deletes the sessions and agents Trace created —
+        only when you press it.</p>
     </section>
 
     <!-- CONNECT YOUR APPS (Phase 4 — Pipedream) ------------------------ -->
@@ -216,20 +214,6 @@
         used</b>.</p>
     </section>
 
-    <!-- DRY RUN (Phase 5 — real-data preview) -------------------------- -->
-    <section class="panel">
-      <h2>Dry run <span class="muted">(preview on a copy of your real data)</span></h2>
-      <div class="row">
-        <button id="dryrunBtn" class="primary" disabled>Run on my real data</button>
-        <span id="dryrunMsg" class="status-line"></span>
-      </div>
-      <div id="dryrunContainer"></div>
-      <p class="help">Here's what your agent would do — look right? Trace reads a copy of
-        your real data (read-only) and runs the agent on the <b>copy</b>; your real sheet
-        and inbox are never touched. Thumbs-down any line and say what it should have done
-        instead — Trace regenerates the agent and re-runs once (up to two rounds).</p>
-    </section>
-
     <!-- GO LIVE (Phase 6 — live deployment) ---------------------------- -->
     <section class="panel">
       <h2>Go live <span class="muted">(deploy over the connection; outbound held for approval)</span></h2>
@@ -246,9 +230,8 @@
       <div id="deployContainer"></div>
       <p class="help">Deploys the live agent over your connection. <b>Reads proceed; every
         outbound write or send is held for your one-tap approval</b> before it commits. Only
-        bundles that passed the gate, have a usable connection, and have a completed dry run
-        can go live. Managed Agents stores sessions server-side — delete them with
-        <b>Clean up platform</b> (in Build &amp; test).</p>
+        bundles that have a built config and a usable connection can go live. Managed Agents
+        stores sessions server-side — delete them with <b>Clean up platform</b> (in Build).</p>
     </section>
 
     <!-- RESULTS -------------------------------------------------------- -->

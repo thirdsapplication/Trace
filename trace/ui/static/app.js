@@ -346,19 +346,17 @@ async function loadAndShow(tab) {
   }
   if (cache[selectedSid][tab] !== undefined) { setView(cache[selectedSid][tab]); return; }
 
-  if (tab === "agents") {      // config envelopes + grounding + hidden-gate verdict
+  if (tab === "agents") {      // config envelopes + grounding
     const { ok, data } = await api("GET", `/api/sessions/${selectedSid}/agents`);
     let text;
     if (!ok || !data.agents.length) {
-      text = "No agents yet — run the interview, then Build & test agents.";
+      text = "No agents yet — run the interview, then Build agents.";
     } else {
       text = data.agents.map(a =>
         `===== ${a.bundle_id} — agent (test) =====\n${a.test_yaml || "(none)"}\n\n` +
         `===== ${a.bundle_id} — agent (live, NOT deployed) =====\n${a.live_yaml || "(none)"}\n\n` +
         `===== ${a.bundle_id} — grounding =====\n` +
-        (a.grounding ? JSON.stringify(a.grounding, null, 2) : "(none)") + "\n\n" +
-        `===== ${a.bundle_id} — logic gate (hidden; reasoning only) =====\n` +
-        (a.gate ? JSON.stringify(a.gate, null, 2) : "(not gated — needs API key)")
+        (a.grounding ? JSON.stringify(a.grounding, null, 2) : "(none)")
       ).join("\n\n\n");
     }
     cache[selectedSid][tab] = text;
@@ -567,7 +565,6 @@ async function refreshSessions() {
       enableInterview(!!art.reviewed);
       enableBuild(!!art.reviewed);
       enableConnect(!!art.reviewed);
-      enableDryrun(!!art.reviewed);
       enableDeploy(!!art.reviewed);
       reviewData = null; interviewState = null; $("buildSummary").innerHTML = "";
       $("reviewContainer").innerHTML = "";
@@ -729,7 +726,7 @@ async function saveReview() {
   const { ok, data } = await api("POST", `/api/sessions/${selectedSid}/reviewed-bundles`, body);
   if (ok) {
     reviewData.reviewed = data.reviewed;
-    enableInterview(true); enableBuild(true); enableConnect(true); enableDryrun(true); enableDeploy(true);
+    enableInterview(true); enableBuild(true); enableConnect(true); enableDeploy(true);
     delete cache[selectedSid];
     await refreshSessions();
   }
@@ -870,7 +867,7 @@ async function saveInterview(bid) {
 }
 
 // ===========================================================================
-// Build & test agents — config (Phase 1) + hidden logic gate (Phase 3)
+// Build agents — config (Phase 1)
 // ===========================================================================
 let buildTimer = null;
 
@@ -885,10 +882,7 @@ async function loadBuildBundles() {
   const el = $("buildBundles");
   if (!ok || !data.bundles || !data.bundles.length) { el.innerHTML = ""; return; }
   el.innerHTML = data.bundles.map(b => {
-    let chip = "";
-    if (b.built) chip = b.advanced
-      ? ` <span class="ok">gate: passed</span>`
-      : ` <span class="warn">gate: held</span>`;
+    const chip = b.built ? ` <span class="ok">built</span>` : "";
     return `<label><input type="checkbox" class="bld" value="${ESC(b.id)}" checked>` +
            `<b>${ESC(b.id)}</b> ${ESC(b.name)}${chip}</label>`;
   }).join("");
@@ -921,11 +915,8 @@ function pollBuild() {
     if (data.state === "done") {
       clearInterval(buildTimer); buildTimer = null;
       const errs = Object.keys(data.errors || {}).length;
-      const passed = Object.values(data.verdicts || {}).filter(Boolean).length;
-      $("buildMsg").innerHTML = `<span class="ok">done</span> — ${data.generated} built, ` +
-        `${passed}/${data.gated} passed the gate` +
+      $("buildMsg").innerHTML = `<span class="ok">done</span> — ${data.generated} built` +
         (errs ? ` · <span class="err">${errs} error(s)</span>` : "");
-      renderBuildSummary(data.verdicts || {});
       setPill("results");
       delete cache[selectedSid];
       loadBuildBundles();
@@ -937,17 +928,6 @@ function pollBuild() {
       setPill("idle");
     }
   }, 800);
-}
-
-function renderBuildSummary(verdicts) {
-  const el = $("buildSummary");
-  const ids = Object.keys(verdicts);
-  if (!ids.length) { el.innerHTML = ""; return; }
-  el.innerHTML = ids.map(id => {
-    const advanced = verdicts[id];
-    const badge = advanced ? `<span class="ok">passed</span>` : `<span class="warn">held</span>`;
-    return `<div class="run-line">${ESC(id)}: gate ${badge}</div>`;
-  }).join("");
 }
 
 $("cleanupBtn").onclick = async () => {
@@ -1065,86 +1045,6 @@ function pollConnect(onDone) {
 }
 
 // ===========================================================================
-// Phase 5 — Dry run + feedback (real-data preview on a copy)
-// ===========================================================================
-let dryrunTimer = null;
-
-function enableDryrun(on) {
-  $("dryrunBtn").disabled = !on;
-  if (on) loadDryrun(); else $("dryrunContainer").innerHTML = "";
-}
-
-async function loadDryrun() {
-  if (!selectedSid) return;
-  const { ok, data } = await api("GET", `/api/sessions/${selectedSid}/dryrun-bundles`);
-  const el = $("dryrunContainer");
-  if (!ok || !data.bundles || !data.bundles.length) {
-    el.innerHTML = `<div class="muted">No bundles ready — needs a passed logic gate and a usable connection.</div>`;
-    return;
-  }
-  el.innerHTML = data.bundles.map(b => {
-    const lines = (b.replay || []).map((line, i) =>
-      `<div class="run-line">${ESC(line)}
-         <button class="link dr-down" data-bid="${ESC(b.id)}" data-i="${i}">👎</button></div>`).join("");
-    const body = b.replay
-      ? `${lines}<div class="ex-text muted">trigger: ${ESC(b.trigger_source || "")}` +
-        (b.round ? ` · round ${b.round}` : "") + `</div>`
-      : `<div class="muted">not run yet</div>`;
-    return `<div class="review-item bundle" data-bid="${ESC(b.id)}">
-      <h4>${ESC(b.id)} — ${ESC(b.name)}</h4>${body}</div>`;
-  }).join("");
-  el.querySelectorAll(".dr-down").forEach(btn => btn.onclick = () => dryrunThumbsDown(btn.dataset.bid, btn.dataset.i));
-}
-
-$("dryrunBtn").onclick = async () => {
-  if (!selectedSid) return;
-  $("dryrunMsg").textContent = "running on a copy of your real data…";
-  const { ok, status, data } = await api("POST", `/api/sessions/${selectedSid}/dryrun`, {});
-  if (status === 400 && data && data.error === "not_eligible") {
-    $("dryrunMsg").innerHTML = `<span class="warn">not ready</span> — build (pass the gate) and connect a usable app first.`; return;
-  }
-  if (status === 400 && data && data.error === "no_api_key") {
-    $("dryrunMsg").innerHTML = `<span class="err">no API key</span> — add one in Settings.`; return;
-  }
-  if (!ok && status !== 202) { $("dryrunMsg").innerHTML = `<span class="err">${ESC((data && data.error) || "failed")}</span>`; return; }
-  setPill("reconstructing");
-  pollDryrun();
-};
-
-function pollDryrun() {
-  if (dryrunTimer) clearInterval(dryrunTimer);
-  dryrunTimer = setInterval(async () => {
-    const { data } = await api("GET", `/api/sessions/${selectedSid}/dryrun/status`);
-    if (!data) return;
-    if (data.state === "done") {
-      clearInterval(dryrunTimer); dryrunTimer = null;
-      const errs = Object.keys(data.errors || {}).length;
-      $("dryrunMsg").innerHTML = `<span class="ok">done</span> — ${data.ran} replay(s)` +
-        (errs ? ` · <span class="err">${errs} error(s)</span>` : "");
-      setPill("results");
-      loadDryrun();
-      delete cache[selectedSid];
-    } else if (data.state === "error") {
-      clearInterval(dryrunTimer); dryrunTimer = null;
-      $("dryrunMsg").innerHTML = `<span class="err">dry run failed</span> — ${ESC(data.error)}`;
-      setPill("idle");
-    }
-  }, 800);
-}
-
-async function dryrunThumbsDown(bid, lineIndex) {
-  const correction = prompt("What should it have done instead?");
-  if (!correction || !correction.trim()) return;
-  $("dryrunMsg").textContent = "regenerating + re-running…";
-  const { ok, data } = await api("POST", `/api/sessions/${selectedSid}/dryrun/feedback`,
-    { bundle_id: bid, correction: correction.trim(), line_index: Number(lineIndex) });
-  if (!ok) { $("dryrunMsg").innerHTML = `<span class="err">${ESC((data && data.error) || "failed")}</span>`; return; }
-  if (data.capped) { $("dryrunMsg").innerHTML = `<span class="warn">feedback capped</span> at ${data.rounds} rounds.`; return; }
-  setPill("reconstructing");
-  pollDryrun();
-}
-
-// ===========================================================================
 // Phase 6 — Go live (deploy over the connection; outbound held for approval)
 // ===========================================================================
 let deployTimer = null;
@@ -1163,7 +1063,7 @@ async function loadDeploy() {
   const { ok, data } = await api("GET", `/api/sessions/${selectedSid}/deploy-bundles`);
   const el = $("deployContainer");
   if (!ok || !data.bundles || !data.bundles.length) {
-    el.innerHTML = `<div class="muted">No bundles ready — needs a passed gate, a usable connection, and a completed dry run.</div>`;
+    el.innerHTML = `<div class="muted">No bundles ready — needs a built config and a usable connection.</div>`;
     return;
   }
   el.innerHTML = data.bundles.map(b => {
@@ -1190,7 +1090,7 @@ $("deployBtn").onclick = async () => {
   $("deployMsg").textContent = "deploying live…";
   const { ok, status, data } = await api("POST", `/api/sessions/${selectedSid}/deploy`, body);
   if (status === 400 && data && data.error === "not_eligible") {
-    $("deployMsg").innerHTML = `<span class="warn">not ready</span> — pass the gate, connect a usable app, and run a dry run first.`; return;
+    $("deployMsg").innerHTML = `<span class="warn">not ready</span> — build a config and connect a usable app first.`; return;
   }
   if (status === 400 && data && data.error === "no_api_key") {
     $("deployMsg").innerHTML = `<span class="err">no API key</span> — add one in Settings.`; return;

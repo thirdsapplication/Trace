@@ -150,10 +150,6 @@ def test_report_name(bid):
     return f"test_report_{_safe_id(bid)}.json"
 
 
-def events_name(bid):
-    return f"events_{_safe_id(bid)}.json"
-
-
 def run_record_name(bid):
     return f"run_{_safe_id(bid)}.json"
 
@@ -166,20 +162,8 @@ def grounding_name(bid):
     return f"grounding_{_safe_id(bid)}.json"
 
 
-def dryrun_record_name(bid):
-    return f"dryrun_{_safe_id(bid)}.json"
-
-
 def deploy_record_name(bid):
     return f"deploy_{_safe_id(bid)}.json"
-
-
-def feedback_name(bid):
-    return f"feedback_{_safe_id(bid)}.json"
-
-
-def gate_record_name(bid):
-    return f"gate_{_safe_id(bid)}.json"
 
 
 def _read_json(p):
@@ -204,18 +188,6 @@ def list_runs(root, sid):
     return out
 
 
-def list_gate_records(root, sid):
-    """Every gate_<id>.json verdict record (Phase 3 hidden gate)."""
-    d = path(root, sid, SPECS_DIR)
-    if not os.path.isdir(d):
-        return []
-    out = []
-    for fn in sorted(os.listdir(d)):
-        if re.match(r"^gate_.+\.json$", fn):
-            rec = _read_json(os.path.join(d, fn))
-            if rec is not None:
-                out.append(rec)
-    return out
 
 
 def list_deploy_records(root, sid):
@@ -248,12 +220,10 @@ def list_agents(root, sid):
     out = []
     for bid, data in bundles.items():
         grounding = _read_json(os.path.join(d, f"grounding_{bid}.json"))
-        gate = _read_json(os.path.join(d, f"gate_{bid}.json"))
-        dr = _read_json(os.path.join(d, f"dryrun_{bid}.json"))
         dep = _read_json(os.path.join(d, f"deploy_{bid}.json"))
         out.append({"bundle_id": bid, "test_yaml": data.get("test_yaml"),
                     "live_yaml": data.get("live_yaml"), "grounding": grounding,
-                    "gate": gate, "dryrun": dr, "deploy": dep})
+                    "deploy": dep})
     return out
 
 

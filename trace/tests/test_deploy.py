@@ -14,9 +14,8 @@ import urllib.request
 
 from trace.agent import configgen, deploy
 from trace.tests.test_configgen import _bundle, _load, _stub as _config_stub
-from trace.tests.test_ui_agent import EVENTS, REVIEWED, FakeKeystore, fake_config_fn, fake_gate_fn
+from trace.tests.test_ui_agent import EVENTS, REVIEWED, FakeKeystore, fake_config_fn
 from trace.tests.test_connect import StubConnectClient
-from trace.tests.test_dryrun import _fake_dryrun_fn
 from trace.ui import app, sessions
 
 CONNECTION = {"external_user_id": "trace-s1", "vault_ref": "vlt-s1",
@@ -234,9 +233,9 @@ class UIDeployTest(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.root = self._tmp.name
         self.state = app.AppState(self.root, key_store=FakeKeystore("sk-ant-test"),
-                                  config_fn=fake_config_fn, gate_fn=fake_gate_fn(advanced=True),
+                                  config_fn=fake_config_fn,
                                   connect_fn=lambda: StubConnectClient(identity_email="worker@acme.com"),
-                                  dryrun_fn=_fake_dryrun_fn, deploy_fn=_fake_deploy_fn)
+                                  deploy_fn=_fake_deploy_fn)
         self.httpd, _ = app.build_server(port=0, state=self.state)
         self.port = self.httpd.server_address[1]
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
@@ -274,10 +273,8 @@ class UIDeployTest(unittest.TestCase):
         self.req("POST", f"/api/sessions/{self.sid}/connection-identity", {"email": "worker@acme.com"})
         self.req("POST", f"/api/sessions/{self.sid}/connect/gmail/callback", {})
         self._await("connect")
-        self.req("POST", f"/api/sessions/{self.sid}/dryrun", {})
-        self._await("dryrun")
 
-    def test_not_eligible_until_gate_connection_and_dryrun(self):
+    def test_not_eligible_until_config_and_connection(self):
         code, data = self.req("POST", f"/api/sessions/{self.sid}/deploy", {})
         self.assertEqual(code, 400)
         self.assertEqual(data["error"], "not_eligible")

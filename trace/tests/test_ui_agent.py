@@ -61,26 +61,13 @@ def fake_config_fn(bundle, observed, answers, model_fn, unresolved=None, test_fe
                                     unresolved=unresolved, test_feedback=test_feedback)
 
 
-def fake_gate_fn(advanced=True):
-    """A hidden-gate stub returning a verdict record (ignores the real client/judge)."""
-    def gate(bundle, test_dict, criteria, event_log, events_path=None):
-        return {"bundle_id": bundle["id"],
-                "overall": "pass" if advanced else "fail",
-                "per_criterion": [{"criterion": (criteria[0] if criteria else "x"),
-                                   "verdict": "pass" if advanced else "fail", "reason": "stub"}],
-                "notes": "", "trigger": "an order arrived", "transcript": "did the work",
-                "session_id": "gate_sess_x", "status": "completed", "error": None,
-                "advanced": advanced, "graded_at": "now"}
-    return gate
-
-
 class UIChainTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.root = self._tmp.name
         self.ks = FakeKeystore("sk-ant-test")
         self.state = app.AppState(self.root, key_store=self.ks, interview_fn=fake_interview_fn,
-                                  config_fn=fake_config_fn, gate_fn=fake_gate_fn())
+                                  config_fn=fake_config_fn)
         self.httpd, _ = app.build_server(port=0, state=self.state)
         self.port = self.httpd.server_address[1]
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
@@ -132,13 +119,11 @@ class UIChainTest(unittest.TestCase):
         _, data = self.req("GET", f"/api/sessions/{self.sid}/interview-data")
         self.assertEqual(len(data["interviews"]["B1"]["questions"]), 2)
 
-    def test_full_chain_config_and_gate(self):
+    def test_full_chain_config(self):
         self._interview_and_answer({"q1": "Open_Orders"})                # q2 skipped
         st = self._build()
         self.assertEqual(st["state"], "done")
         self.assertEqual(st["generated"], 1)
-        self.assertEqual(st["gated"], 1)
-        self.assertTrue(st["verdicts"]["B1"])                            # gate advanced
 
         _, data = self.req("GET", f"/api/sessions/{self.sid}/agents")
         agent = next(a for a in data["agents"] if a["bundle_id"] == "B1")
@@ -150,51 +135,16 @@ class UIChainTest(unittest.TestCase):
         self.assertTrue(any(isinstance(i["source"], dict) and i["source"].get("type") == "user_answer"
                             for i in g["instructions"]))
         self.assertEqual(g["unresolved"], ["q2"])
-        # the hidden gate verdict is attached and advanced
-        self.assertTrue(agent["gate"]["advanced"])
-        self.assertEqual(agent["gate"]["overall"], "pass")
-
-    def test_held_agent_not_advanced(self):
-        self.state.gate_fn = fake_gate_fn(advanced=False)
-        self._interview_and_answer({"q1": "x"})
-        st = self._build()
-        self.assertEqual(st["state"], "done")
-        self.assertFalse(st["verdicts"]["B1"])                           # held
-        _, data = self.req("GET", f"/api/sessions/{self.sid}/build-bundles")
-        self.assertFalse(next(x for x in data["bundles"] if x["id"] == "B1")["advanced"])
 
     def test_build_bundles_status_before_and_after(self):
         _, data = self.req("GET", f"/api/sessions/{self.sid}/build-bundles")
         b = next(x for x in data["bundles"] if x["id"] == "B1")
         self.assertFalse(b["built"])
-        self.assertFalse(b["advanced"])
         self._interview_and_answer({"q1": "x"})
         self._build()
         _, data = self.req("GET", f"/api/sessions/{self.sid}/build-bundles")
         b = next(x for x in data["bundles"] if x["id"] == "B1")
         self.assertTrue(b["built"])
-        self.assertTrue(b["advanced"])
-
-    def test_gate_failure_recorded_not_fatal(self):
-        self._interview_and_answer({"q1": "x"})
-        self.state.gate_fn = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
-        st = self._build()
-        self.assertEqual(st["state"], "done")            # never a hard failure
-        self.assertEqual(st["generated"], 1)             # config still written
-        self.assertIn("B1", st["errors"])
-
-    def test_cleanup_harvests_gate_session(self):
-        captured = {}
-        def fake_cleanup(session_ids, file_ids, agent_ids):
-            captured["args"] = (session_ids, file_ids, agent_ids)
-            return {"removed": {"sessions": session_ids, "files": file_ids, "agents": agent_ids}, "errors": []}
-        self.state.cleanup_fn = fake_cleanup
-        self._interview_and_answer({"q1": "x"})
-        self._build()
-        code, data = self.req("POST", f"/api/sessions/{self.sid}/cleanup-platform")
-        self.assertEqual(code, 200)
-        sess_ids, _files, _agents = captured["args"]
-        self.assertIn("gate_sess_x", sess_ids)           # the kept gate session is reaped
 
 
 if __name__ == "__main__":

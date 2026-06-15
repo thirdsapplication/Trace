@@ -18,11 +18,7 @@ Interview                      (gap detector asks what capture couldn't see)   [
    ▼
 Config engine                  (workflow + events + answers -> agent YAML + grounding) [Phase 1]
    ▼
-Hidden logic gate              (sandbox the test config; a grader checks reasoning) [Phase 3]
-   ▼
 Connect                        (Pipedream OAuth -> a vault bound per customer)  [Phase 4]
-   ▼
-Dry run + feedback             (run on a COPY of real data; plain replay; one-line fixes) [Phase 5]
    ▼
 Go live                        (live agent over the connection; outbound held for approval) [Phase 6]
 ```
@@ -34,9 +30,8 @@ Stage 2 (`trace/discovery/`) proposes workflows — **bundles** (automatable) an
 operator lightly corrects them in the review surface (`reviewed_bundles.json`). From
 there the in-product chain (`trace/agent/`) asks a few **interview** questions about
 what the data couldn't reveal, writes each agent's **configuration** (Managed Agents
-YAML) directly with a **grounding** record, runs a hidden **logic gate** in a sealed
-sandbox, **connects** the worker's apps through one Pipedream connection, does a
-**dry run** on a copy of their real data with one-line feedback, and **deploys live**
+YAML) directly with a **grounding** record, **connects** the worker's apps through
+one Pipedream connection, and **deploys live**
 with every outbound write/send held for one-tap approval. See
 [Stage 2](#stage-2--discovery-engine) and [Stage 3](#stage-3--review--edit--artifact-engine).
 
@@ -119,7 +114,7 @@ Leave the terminal running; **Ctrl-C stops the whole app.** Then, in the browser
 3. **Capture:** **Start capture** (pill turns green, timer ticks, event count rises), do your scripted session, optionally **Pause/Resume**, then **Stop**.
 4. **Reconstruct:** **Preview (dry run)** first (free — shows exactly what Haiku gets), then **Reconstruct** (paid; watch the progress bar).
 5. **Discover + review:** **Discover** the day's workflows, then in **Review & edit** approve / edit / reclassify the proposals and **Save reviewed bundles**.
-6. **Build the agents (the in-product chain):** **Interview** (answer the gap questions) → **Build & test agents** (writes the config + runs the hidden logic gate) → **Connect your apps** (confirm your email + connect; flagged if an account doesn't match) → **Dry run** (a plain replay on a copy of your real data; thumbs-down to correct + re-run) → **Go live** (deploy over the connection; approve held outbound actions one tap at a time). **Clean up platform** (in Build & test) deletes everything Trace created on the platform.
+6. **Build the agents (the in-product chain):** **Interview** (answer the gap questions) → **Build agents** (writes the config) → **Connect your apps** (confirm your email + connect; flagged if an account doesn't match) → **Go live** (deploy over the connection; approve held outbound actions one tap at a time). **Clean up platform** (in Build) deletes everything Trace created on the platform.
 7. **Results:** read `event_log.json`; switch tabs to **review flags**, **agents (yaml + grounding)**, and **raw stream**; **copy/export**. Past runs are under **Session history**.
 
 macOS alternative to the command: double-click **`launch_ui.command`** at the repo root.
@@ -166,14 +161,14 @@ cat captures/event_log.json
 ### 6. Anywhere smoke test (no key, no Mac, no cost)
 
 ```bash
-# full automated suite (290 tests)
+# full automated suite (297 tests)
 python -m unittest discover -s trace/tests -t . -p "test_*.py"
 
 # preview the chunked prompt on the bundled sample (no model call)
 python -m trace.reconstruct.cli trace/samples/sample_raw_events.jsonl --dry-run --chunk-size 8 --overlap 2
 ```
 
-Expect `Ran 290 tests … OK`, and a printed system prompt + 3 rendered chunks.
+Expect `Ran 297 tests … OK`, and a printed system prompt + 3 rendered chunks.
 
 **Useful flags:**
 - UI: `python -m trace.ui.app --port 8765 --collector-port 8137 --sessions-root captures/sessions --no-open`
@@ -216,14 +211,11 @@ trace/
     prompt.py              the domain-neutral spec-writing prompt
     cli.py                 entry point + --dry-run
     reviewed_bundles.schema.json, environment.schema.json, ARTIFACT_SCHEMA.md
-  agent/                   the in-product chain — interview -> config -> gate -> connect -> dry run -> live
+  agent/                   the in-product chain — interview -> config -> connect -> live
     interview_prompt.py, interview.py   Phase 2 — gap detector: what capture couldn't reveal -> questions
     config_prompt.py, configgen.py      Phase 1 — write agent_<id>.{test,live}.yaml + grounding_<id>.json directly
     config.schema.json, CONFIG_SCHEMA.md  the model's content-JSON contract
-    replay_prompt.py, grader.py         Phase 5 plain replay / Phase 3 sandbox grader (walled off)
-    gate.py                Phase 3 — sandbox the TEST config + grade reasoning (hidden logic gate)
     connect_client.py, connect.py       Phase 4 — Pipedream Connect + Managed Agents vault (read+bind), offline orchestration
-    dryrun.py              Phase 5 — read real data (read-only) -> mount a COPY -> run -> plain replay -> feedback
     deploy.py              Phase 6 — create the LIVE agent over the connection; outbound held for approval
     api_client.py          the ONE beta-pinned Managed Agents / Files API client (+ vault inject, tool_confirmation approval)
     config.py              platform pins, Pipedream + connect tables, defaults (editable)
@@ -380,7 +372,7 @@ first chunk — capture and `--dry-run` are unaffected.
 python -m unittest discover -s trace/tests -t . -p "test_*.py"
 ```
 
-The suite (290 tests) covers the capture/reconstruct/discovery spine — redaction,
+The suite (297 tests) covers the capture/reconstruct/discovery spine — redaction,
 keystroke coalescing, the raw writer, chunking, schema validation/normalization,
 fragment-stitch flagging, boundary de-duplication, contiguous-entry coalescing,
 document-open detection, the browser-capture collector path, the full reconstruction
@@ -395,20 +387,14 @@ injected stubs:
 - **Phase 2 — interview:** triage normalization (enum coercion, runtime-discoverable drop,
   cost sort, cap 5), domain-neutrality, and the answers + skips flowing into the grounding
   as `user_answer` / `unresolved`.
-- **Phase 3 — logic gate:** unattended trigger→run→grade→verdict, behavioral pass,
-  fabrication→fail, `not_testable_here` never-failed, the deterministic overall safety-net,
-  trigger-from-instance, transcript completeness — the grader stays walled off.
 - **Phase 4 — connection:** the app union across domains, per-session `external_user_id`
   isolation, backend-driven vault create+bind, identity match→verified /
   mismatch→flagged-not-usable, and a guard that the orchestration imports no platform SDK.
-- **Phase 5 — dry run:** read-only snapshot + mounted COPY, held-out trigger + capture
-  fallback, replay-not-transcript, `real_source_untouched`, and feedback →
-  `user_test_feedback` regenerating the agent + re-running (capped).
 - **Phase 6 — live deploy:** the LIVE config deployed, the vault injected
   (`vault_ids=[ref]`), writes/sends held while reads proceed, one-tap approve/reject,
   per-customer isolation, and persisted + cleanup-harvestable for deletion.
 
-Plus the test-UI backends and the full chain end to end (build → connect → dry run →
+Plus the test-UI backends and the full chain end to end (build → connect →
 deploy → approve → cleanup) — so it all runs without an API key, `pynput`, a browser, or
 the `anthropic` SDK. The external beta shapes (the Managed Agents vault + the
 `tool_confirmation` approval mechanism, Trace-side/Pipedream start, Pipedream Connect/reads)

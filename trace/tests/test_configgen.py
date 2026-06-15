@@ -231,6 +231,36 @@ class GenerateConfigsFileTest(unittest.TestCase):
         self.assertIsNone(results[0]["test_yaml"])
 
 
+class FeedbackToConfigTest(unittest.TestCase):
+    """A worker correction flows into Phase-1 generation as a user_test_feedback source."""
+
+    def test_test_feedback_threads_into_grounding(self):
+        # a config stub that sources a step to the test feedback when present
+        CANNED = {
+            "description": "x", "role": "y", "tools_and_artifacts": ["Email"],
+            "steps": [{"text": "Enter the total exactly as on the order.",
+                       "source": {"type": "user_test_feedback", "note": "use the order total, not today's date"}}],
+            "working_rules": [], "requirements": [],
+        }
+        ev, ak = _load("marcy")
+        b = _bundle(ak["bundles"][0])
+        observed = configgen.make_engine_inputs(b, ev)[1]
+        compiled = configgen.compile_config(
+            b, observed, [], lambda s, u: json.dumps(CANNED),
+            test_feedback=[{"note": "use the order total, not today's date"}])
+        # the prompt material carried the feedback...
+        self.assertIn("test_feedback", configgen.build_prompt_material({}, [], [], [{"note": "x"}]))
+        # ...and the grounding records a user_test_feedback source (observed False)
+        fb = [i for i in compiled["grounding"]["instructions"]
+              if isinstance(i["source"], dict) and i["source"].get("type") == "user_test_feedback"]
+        self.assertTrue(fb)
+        self.assertFalse(fb[0]["observed"])
+
+    def test_no_test_feedback_is_additive_noop(self):
+        # omitting test_feedback leaves build_prompt_material output unchanged
+        self.assertNotIn("test_feedback", configgen.build_prompt_material({}, [], []))
+
+
 def _retag(out, bid):
     """Replace the bundle id in both yamls so two runs with different ids compare equal
     on everything structural."""
