@@ -192,39 +192,30 @@ class ManagedAgentsClient:
                 return a
         return None
 
-    def _update_agent(self, agent_id, envelope_dict):
-        """Update an existing agent IN PLACE so a redeploy reflects the rebuilt config
-        (model/system/tools/mcp_servers). Transient blips are retried; any real failure
-        is RAISED (surfaced in the deploy record) — we never silently keep stale config.
-        This is a cheap metadata call — no model tokens."""
-        ns = self._agents_ns("agents")
-        update = getattr(ns, "update", None)
-        if not callable(update):
-            raise RuntimeError(
-                "this anthropic SDK exposes no agents.update, so the existing agent "
-                "cannot be refreshed in place. Run `pip install -U anthropic`.")
-        _retry(lambda: update(agent_id, model=envelope_dict["model"],
-                              system=envelope_dict["system"], tools=envelope_dict["tools"],
-                              mcp_servers=envelope_dict.get("mcp_servers") or []))
-        return True
-
     def create_or_reuse_agent(self, envelope_dict):
-        """C6: agents have Trace-deterministic names, so an existing agent with the same
-        name is REUSED and **updated in place** (its config/tools refreshed to the rebuilt
-        envelope) rather than creating a duplicate every round. Update failures are
-        surfaced, not swallowed, so a redeploy never silently keeps stale config.
-        Returns ``{id, name, reused}``."""
+        """C6: agents have Trace-deterministic names. If one with this name already exists,
+        DELETE it and create it FRESH so a redeploy reflects the rebuilt config — Managed
+        Agents 'update' is a versioning op we don't drive, and an in-place update can't be
+        validated here. The delete is best-effort (swallowed) so deploy still proceeds; any
+        straggler/duplicate is swept by the name-based cleanup. Recreating ends a session
+        running on the old agent (acceptable for iterative redeploys).
+        Returns ``{id, name, reused, recreated}``."""
         name = envelope_dict["name"]
         existing = self._find_agent(name)
+        recreated = False
         if existing is not None:
-            agent_id = _idof(existing)
-            self._update_agent(agent_id, envelope_dict)
-            return {"id": agent_id, "name": name, "reused": True}
+            old_id = _idof(existing)
+            if old_id:
+                try:
+                    self.delete_agent(old_id)
+                except Exception:                     # noqa: BLE001 — don't block the redeploy
+                    pass
+                recreated = True
         a = _retry(lambda: self._agents_ns("agents").create(
             name=name, model=envelope_dict["model"],
             system=envelope_dict["system"], tools=envelope_dict["tools"],
             mcp_servers=envelope_dict.get("mcp_servers") or []))
-        return {"id": _idof(a), "name": name, "reused": False}
+        return {"id": _idof(a), "name": name, "reused": False, "recreated": recreated}
 
     def create_environment(self, defaults=None):
         d = defaults or config.ENVIRONMENT_DEFAULTS

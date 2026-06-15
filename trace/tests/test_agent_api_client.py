@@ -106,39 +106,44 @@ class AgentCreateForwardsMcpServersTest(unittest.TestCase):
         self.assertFalse(out["reused"])
         self.assertEqual(captured["mcp_servers"], self._ENV["mcp_servers"])
 
-    def test_reuse_branch_forwards_mcp_servers(self):
-        captured = {}
+    def test_reuse_deletes_then_recreates(self):
+        # an existing same-named agent is deleted and recreated fresh (so the redeploy
+        # reflects the rebuilt config), with mcp_servers forwarded to the new agent.
+        deleted, created = [], {}
 
         class NS:
             def list(self):
-                return [{"id": "agent_1", "name": "Order intake"}]   # existing -> update path
-            def update(self, agent_id, **kw):
-                captured.update(kw)
-                return {"id": agent_id}
+                return [{"id": "agent_old", "name": "Order intake"}]   # existing
+            def delete(self, agent_id, **kw):
+                deleted.append(agent_id)
+            def create(self, **kw):
+                created.update(kw)
+                return {"id": "agent_new"}
 
         out = self._client(NS()).create_or_reuse_agent(self._ENV)
-        self.assertTrue(out["reused"])
-        self.assertEqual(captured["mcp_servers"], self._ENV["mcp_servers"])
+        self.assertEqual(deleted, ["agent_old"])              # old agent removed
+        self.assertEqual(out["id"], "agent_new")
+        self.assertTrue(out["recreated"])
+        self.assertFalse(out["reused"])
+        self.assertEqual(created["mcp_servers"], self._ENV["mcp_servers"])
 
-    def test_reuse_update_failure_is_surfaced_not_swallowed(self):
-        # a redeploy must never silently keep stale config: an update failure raises.
+    def test_reuse_recreates_even_if_delete_fails(self):
+        # a failed delete must not block the redeploy: still create the fresh agent.
+        created = {}
+
         class NS:
             def list(self):
-                return [{"id": "agent_1", "name": "Order intake"}]
-            def update(self, agent_id, **kw):
-                raise RuntimeError("update rejected")
+                return [{"id": "agent_old", "name": "Order intake"}]
+            def delete(self, agent_id, **kw):
+                raise RuntimeError("delete failed")
+            def create(self, **kw):
+                created.update(kw)
+                return {"id": "agent_new"}
 
-        with self.assertRaises(Exception):
-            self._client(NS()).create_or_reuse_agent(self._ENV)
-
-    def test_reuse_without_update_method_is_surfaced(self):
-        # SDK with no agents.update -> we cannot refresh in place; raise (don't reuse stale).
-        class NS:
-            def list(self):
-                return [{"id": "agent_1", "name": "Order intake"}]
-
-        with self.assertRaises(Exception):
-            self._client(NS()).create_or_reuse_agent(self._ENV)
+        out = self._client(NS()).create_or_reuse_agent(self._ENV)
+        self.assertEqual(out["id"], "agent_new")
+        self.assertTrue(out["recreated"])
+        self.assertEqual(created["mcp_servers"], self._ENV["mcp_servers"])
 
 
 if __name__ == "__main__":
