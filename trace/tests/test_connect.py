@@ -137,29 +137,23 @@ class BindAndVerifyTest(unittest.TestCase):
 
 
 class _FakeCreds:
-    def __init__(self, create_conflicts=False, reject_nested=False, create_error=None):
+    def __init__(self, create_conflicts=False, create_error=None):
         self.created, self.updated = [], []
         self._conflict = create_conflicts          # raise 409 on create
-        self._reject_nested = reject_nested         # 400 when mcp_server_url is inside auth
         self._create_error = create_error           # raise this on every create
 
-    def create(self, vault_ref, display_name=None, auth=None, extra_body=None):
+    def create(self, vault_ref, display_name=None, auth=None):
         if self._create_error:
             raise self._create_error
         if self._conflict:
             raise RuntimeError("409 credential already exists")
-        if self._reject_nested and "mcp_server_url" in (auth or {}):
-            raise RuntimeError("Error code: 400 - auth.mcp_server_url: "
-                               "Extra inputs are not permitted")
-        rec = {"vault_ref": vault_ref, "display_name": display_name,
-               "auth": auth, "extra_body": extra_body}
+        rec = {"vault_ref": vault_ref, "display_name": display_name, "auth": auth}
         self.created.append(rec)
-        url = (auth or {}).get("mcp_server_url") or (extra_body or {}).get("mcp_server_url")
-        return {"id": f"cred-{len(self.created)}", "mcp_server_url": url}
+        return {"id": f"cred-{len(self.created)}", "mcp_server_url": (auth or {}).get("mcp_server_url")}
 
-    def update(self, cred_id, vault_id=None, auth=None, display_name=None, extra_body=None):
+    def update(self, cred_id, vault_id=None, auth=None, display_name=None):
         self.updated.append({"cred_id": cred_id, "vault_id": vault_id, "auth": auth,
-                             "display_name": display_name, "extra_body": extra_body})
+                             "display_name": display_name})
         return {"id": cred_id}
 
     def list(self, vault_ref):
@@ -215,7 +209,7 @@ class RealBindCredentialTest(unittest.TestCase):
         self.assertIn("app=gmail", auth["mcp_server_url"])
         self.assertTrue(auth["mcp_server_url"].startswith(config.PIPEDREAM_MCP_BASE))
 
-    def test_409_routes_to_update_by_credential_id(self):
+    def test_409_update_rotates_token_without_immutable_url(self):
         c, vaults, _ = self._client(_FakeVaults(credentials=_FakeCreds(create_conflicts=True)))
         out = c.bind_connection("vlt-s1", "trace-s1", "gmail")
         self.assertTrue(out["binding_ref"])
@@ -223,19 +217,10 @@ class RealBindCredentialTest(unittest.TestCase):
         self.assertEqual(upd["cred_id"], "cred-existing")            # resolved from the list
         self.assertEqual(upd["vault_id"], "vlt-s1")
         self.assertEqual(upd["auth"]["type"], "mcp_oauth")
+        self.assertEqual(upd["auth"]["access_token"], "pdtok_abc")   # token rotated
+        self.assertNotIn("mcp_server_url", upd["auth"])              # immutable: never on update
 
-    def test_falls_back_to_top_level_when_nested_rejected(self):
-        # the live beta server rejects mcp_server_url inside auth -> retry with it top-level
-        c, vaults, config = self._client(
-            _FakeVaults(credentials=_FakeCreds(reject_nested=True)))
-        out = c.bind_connection("vlt-s1", "trace-s1", "gmail")
-        self.assertTrue(out["binding_ref"])
-        rec = vaults.credentials.created[-1]
-        self.assertNotIn("mcp_server_url", rec["auth"])              # not in auth anymore
-        self.assertIn("externalUserId=trace-s1", rec["extra_body"]["mcp_server_url"])
-        self.assertEqual(rec["auth"]["type"], "mcp_oauth")
-
-    def test_non_placement_error_propagates(self):
+    def test_non_409_error_propagates(self):
         c, vaults, _ = self._client(
             _FakeVaults(credentials=_FakeCreds(create_error=RuntimeError("500 server error"))))
         with self.assertRaises(Exception):
