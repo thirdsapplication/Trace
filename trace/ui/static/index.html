@@ -46,6 +46,22 @@
       </div>
     </section>
 
+    <!-- PREFLIGHT ------------------------------------------------------ -->
+    <section class="panel">
+      <h2>Preflight <span class="muted">(check credentials before a live run)</span></h2>
+      <div class="row">
+        <button id="preflightBtn" class="secondary">Run preflight</button>
+        <span id="preflightMsg" class="status-line"></span>
+      </div>
+      <ul id="preflightChecks" class="checklist"></ul>
+      <p class="help">Confirms your API key works, your account has Managed Agents access,
+        and (if set) your three Pipedream values mint a token and reach the project — so the
+        live path's first failure is a clear diagnosis, not a buried mid-run error. Pipedream
+        shows <b>not configured</b> until you set <code>PIPEDREAM_PROJECT_ID</code>,
+        <code>PIPEDREAM_CLIENT_ID</code>, and <code>PIPEDREAM_CLIENT_SECRET</code>; the rest
+        of the pipeline runs without them.</p>
+    </section>
+
     <!-- CAPTURE -------------------------------------------------------- -->
     <section class="panel">
       <h2>Capture</h2>
@@ -163,11 +179,11 @@
       <p id="connectExpectation" class="help"></p>
       <div id="connectApps"></div>
       <p class="help">Trace connects each app through Pipedream — you never create a
-        Pipedream or Claude account. Tap <b>Connect</b>, then approve in Google's window
-        (the only step Trace can't absorb). Trace binds the credential into a vault for
-        you. A connected account that doesn't match your confirmed email is
-        <b>flagged and not used</b>. <i>This is a dev build: Google's window is
-        simulated by "Simulate Allow".</i></p>
+        Pipedream or Claude account. Tap <b>Connect</b> to open Google's authorization
+        window (the only step Trace can't absorb), approve there, then come back and tap
+        <b>Verify connection</b> — Trace binds the credential into a vault for you. A
+        connected account that doesn't match your confirmed email is <b>flagged and not
+        used</b>.</p>
     </section>
 
     <!-- DRY RUN (Phase 5 — real-data preview) -------------------------- -->

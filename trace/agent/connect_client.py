@@ -136,6 +136,15 @@ class ConnectClient:
                 "identity_email": (acc.get("identity") or {}).get("email")
                 or acc.get("email")}
 
+    def list_apps(self):
+        """List the apps available in the project (the slug-lookup endpoint). Used as a
+        cheap preflight: a successful call exercises minting the dev token AND reaching the
+        project. Returns ``[{slug, name}]``."""
+        out = _retry(lambda: self._pd_request("GET", "/apps"))
+        apps = out.get("apps") or out.get("data") or []
+        return [{"slug": a.get("name_slug") or a.get("slug") or a.get("app"),
+                 "name": a.get("name") or a.get("label")} for a in apps]
+
     def list_accounts(self, external_user_id):
         """All accounts connected for this customer (for display / isolation checks)."""
         q = urllib.parse.urlencode({"external_user_id": external_user_id})

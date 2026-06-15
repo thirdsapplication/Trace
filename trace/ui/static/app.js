@@ -59,6 +59,24 @@ $("testKey").onclick = async () => {
   else $("testKeyResult").innerHTML = `<span class="err">not accepted</span> — ${data ? data.detail : "error"}`;
 };
 
+$("preflightBtn").onclick = async () => {
+  $("preflightMsg").textContent = "checking…";
+  $("preflightChecks").innerHTML = "";
+  const { data } = await api("GET", "/api/preflight");
+  if (!data) { $("preflightMsg").innerHTML = `<span class="err">preflight failed</span>`; return; }
+  $("preflightMsg").innerHTML = data.ok
+    ? `<span class="ok">ready for a live run ✓</span>`
+    : `<span class="warn">some checks need attention</span>`;
+  $("preflightChecks").innerHTML = (data.checks || []).map(c => {
+    let mark, cls;
+    if (c.ok === true) { mark = "✓"; cls = "ok"; }
+    else if (c.ok === false) { mark = "✕"; cls = "err"; }
+    else { mark = "–"; cls = "warn"; }       // null -> not configured
+    return `<li><span class="mark ${cls}">${mark}</span><b>${ESC(c.name)}</b>
+            <span class="muted">${ESC(c.detail || "")}</span></li>`;
+  }).join("");
+};
+
 async function refreshPermissions() {
   const { data } = await api("GET", "/api/permissions");
   const ul = $("perms");
@@ -945,12 +963,12 @@ function renderConnectApps(rec, unmapped) {
       <div><b>${ESC(a.label || slug)}</b> — ${status}</div>
       <div class="step-row">
         <button class="link conn-start" data-slug="${ESC(slug)}">Connect</button>
-        <button class="link conn-allow" data-slug="${ESC(slug)}">Simulate Allow</button>
+        <button class="link conn-verify" data-slug="${ESC(slug)}">Verify connection</button>
       </div>${flag}</div>`;
   }).join("") + (unmapped.length
     ? `<div class="muted">Observed apps with no connector (skipped): ${unmapped.map(ESC).join(", ")}</div>` : "");
   el.querySelectorAll(".conn-start").forEach(b => b.onclick = () => connectStart(b.dataset.slug));
-  el.querySelectorAll(".conn-allow").forEach(b => b.onclick = () => connectAllow(b.dataset.slug));
+  el.querySelectorAll(".conn-verify").forEach(b => b.onclick = () => connectVerify(b.dataset.slug));
 }
 
 $("saveEmailBtn").onclick = async () => {
@@ -969,20 +987,30 @@ async function connectStart(slug) {
     $("connectMsg").innerHTML = `<span class="err">no API key</span> — add one in Settings.`; return; }
   if (!ok && status !== 202) { $("connectMsg").innerHTML = `<span class="err">${ESC((data && data.error) || "failed")}</span>`; return; }
   pollConnect(d => {
-    $("connectMsg").innerHTML = d.connect_url
-      ? `Connect window would open: <a href="${ESC(d.connect_url)}" target="_blank" rel="noopener">${ESC(d.connect_url)}</a> — then tap <b>Simulate Allow</b>.`
-      : `<span class="ok">ready</span> — tap Simulate Allow.`;
+    if (d.connect_url) {
+      window.open(d.connect_url, "_blank", "noopener");
+      $("connectMsg").innerHTML = `Authorize <b>${ESC(slug)}</b> in the window that opened — `
+        + `then come back and tap <b>Verify connection</b>. `
+        + `<span class="muted">(didn't open? <a href="${ESC(d.connect_url)}" target="_blank" rel="noopener">open it here</a>)</span>`;
+    } else {
+      $("connectMsg").innerHTML = `<span class="warn">no Connect URL returned</span> — check Preflight.`;
+    }
   });
 }
 
-async function connectAllow(slug) {
-  $("connectMsg").textContent = `binding ${slug}…`;
+async function connectVerify(slug) {
+  $("connectMsg").textContent = `verifying ${slug}…`;
   const { ok, status, data } = await api("POST", `/api/sessions/${selectedSid}/connect/${slug}/callback`, {});
   if (!ok && status !== 202) { $("connectMsg").innerHTML = `<span class="err">${ESC((data && data.error) || "failed")}</span>`; return; }
   pollConnect(d => {
-    $("connectMsg").innerHTML = d.verified === "yes"
-      ? `<span class="ok">${ESC(slug)} connected & verified</span>`
-      : `<span class="err">${ESC(slug)} FLAGGED</span> — ${ESC(d.flag || "not verified")}`;
+    if (d.verified === "yes") {
+      $("connectMsg").innerHTML = `<span class="ok">${ESC(slug)} connected & verified</span>`;
+    } else if (d.connected) {
+      $("connectMsg").innerHTML = `<span class="err">${ESC(slug)} FLAGGED</span> — ${ESC(d.flag || "not verified")}`;
+    } else {
+      $("connectMsg").innerHTML = `<span class="warn">${ESC(slug)} not connected yet</span> — `
+        + `tap <b>Connect</b> and finish Google's authorization first, then Verify.`;
+    }
     loadConnect();
   });
 }

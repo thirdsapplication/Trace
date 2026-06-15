@@ -302,6 +302,13 @@ class ManagedAgentsClient:
         res = _retry(lambda: self._agents_ns("sessions").list())
         return [_idof(s) for s in _data(res)]
 
+    def ping(self):
+        """Cheap connectivity + entitlement probe: list agents. Confirms the key works AND
+        that the account has Managed Agents beta access (a plain messages call does not).
+        Returns True or raises the underlying SDK error."""
+        _retry(lambda: self._agents_ns("agents").list())
+        return True
+
     # --- Phase 6: live deployment (start mode + approval-required outbound) ---
     # There is NO Managed Agents triggers/scheduler API and NO sessions.approvals API.
     # Start is owned by Trace (its own scheduler) or a Pipedream deployed trigger;

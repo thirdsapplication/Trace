@@ -541,8 +541,9 @@ class AppState:
         threading.Thread(target=run, daemon=True).start()
 
     def start_connect_callback(self, sid, slug):
-        """After the worker taps Allow (real or simulated): ensure+bind the vault, fetch
-        the account, and verify identity. Mismatches are flagged, never used silently."""
+        """After the worker authorizes in Google's window and taps Verify: ensure+bind the
+        vault, fetch the account, and verify identity. If no account exists yet (not
+        authorized), it comes back unconnected; mismatches are flagged, never used silently."""
         job = {"state": "running", "error": None, "slug": slug}
         self.connection_jobs[sid] = job
 
@@ -554,6 +555,7 @@ class AppState:
                 self._save_connection(sid, rec)
                 entry = rec["apps"].get(slug, {})
                 job.update(state="done", verified=entry.get("verified"),
+                           connected=entry.get("connected"),
                            usable=entry.get("usable"), flag=entry.get("flag"))
             except Exception as e:
                 job.update(state="error", error=str(e))
@@ -779,6 +781,8 @@ def make_handler(state):
                 return self._json(200, state.keystore.info())
             if p == "/api/permissions":
                 return self._json(200, permissions.check_all())
+            if p == "/api/preflight":
+                return self._json(200, _preflight(state))
             if p == "/api/sessions":
                 return self._json(200, {"sessions": sessions.list_sessions(root)})
             if p == "/api/fixtures":
@@ -1334,6 +1338,56 @@ def _test_key(state):
     except Exception as e:
         # never echo the key; surface the error type/message only
         return {"valid": False, "detail": f"{type(e).__name__}: {e}"}
+
+
+def _preflight(state):
+    """Confirm credentials/SDK/entitlements BEFORE driving the live pipeline, so the first
+    real failure is a diagnosis and not a buried mid-run error. Each check is isolated and
+    reports ``{name, ok, detail}`` where ``ok`` is True/False, or None for "not configured".
+    Secrets are NEVER echoed — only the error type/message."""
+    checks = []
+    key = state.keystore.get_key()
+
+    # 1. Anthropic key valid (cheap model call).
+    if not key:
+        checks.append({"name": "Anthropic API key", "ok": False,
+                       "detail": "No API key saved. Add one in Settings."})
+    else:
+        tk = _test_key(state)
+        checks.append({"name": "Anthropic API key", "ok": tk["valid"], "detail": tk["detail"]})
+
+    # 2. Managed Agents reachable + entitled (catches the beta-access gap a messages call misses).
+    if not key:
+        checks.append({"name": "Managed Agents access", "ok": False, "detail": "Needs an API key."})
+    else:
+        try:
+            from ..agent.api_client import ManagedAgentsClient
+            ManagedAgentsClient(api_key=key).ping()
+            checks.append({"name": "Managed Agents access", "ok": True,
+                           "detail": "Agents API reachable."})
+        except Exception as e:
+            checks.append({"name": "Managed Agents access", "ok": False,
+                           "detail": f"{type(e).__name__}: {e}"})
+
+    # 3/4. Pipedream: configured? then token mints + project reachable.
+    configured = all((agent_config.PIPEDREAM_PROJECT, agent_config.PIPEDREAM_CLIENT_ID,
+                      agent_config.PIPEDREAM_CLIENT_SECRET))
+    if not configured:
+        checks.append({"name": "Pipedream Connect", "ok": None,
+                       "detail": "Not configured — set PIPEDREAM_PROJECT_ID, "
+                                 "PIPEDREAM_CLIENT_ID, PIPEDREAM_CLIENT_SECRET to enable the "
+                                 "live path (connect / dry run / go live)."})
+    else:
+        try:
+            apps = state.connect_fn().list_apps()
+            checks.append({"name": "Pipedream Connect", "ok": True,
+                           "detail": f"Token minted; project reachable ({len(apps)} apps)."})
+        except Exception as e:
+            checks.append({"name": "Pipedream Connect", "ok": False,
+                           "detail": f"{type(e).__name__}: {e}"})
+
+    ok = all(c["ok"] for c in checks if c["ok"] is not None)
+    return {"ok": ok, "checks": checks}
 
 
 def build_server(host="127.0.0.1", port=8765, sessions_root="captures/sessions",
