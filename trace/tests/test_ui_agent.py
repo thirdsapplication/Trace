@@ -1,3 +1,5 @@
+"""Phase 2 UI chain: Review -> Interview -> Generate config -> Run (offline stubs)."""
+
 import json
 import os
 import tempfile
@@ -6,16 +8,9 @@ import time
 import unittest
 import urllib.request
 
+from trace.agent import configgen
 from trace.ui import app, sessions
 
-SPEC_MD = """# Build spec: Order intake
-## 0. Preflight — read the attached files before writing any code
-- `./spec_B1_files/PO.pdf` — input pdf. Instruction (authoritative): "the PO".
-## 1. Intent
-Append one row per task.
-## 3. Acceptance criteria
-- The agent appends exactly one row.  _(user-specified)_
-"""
 REVIEWED = {"bundles": [{"id": "B1", "classification": "bundle", "name": "Order intake",
                          "description": "Append one row per task.", "trigger": "A new task arrived.",
                          "steps": ["read", "enter"], "disposition": "approve_for_build",
@@ -27,6 +22,18 @@ REVIEWED = {"bundles": [{"id": "B1", "classification": "bundle", "name": "Order 
 EVENTS = [{"id": "e1", "app": "Gmail", "window": "Inbox", "action": "read_email", "detail": "x"},
           {"id": "e2", "app": "Google Sheets", "window": "Ledger", "action": "enter_data", "detail": "x"}]
 
+CONFIG_CONTENT = {
+    "description": "Order intake agent.",
+    "role": "You process inbound orders one at a time.",
+    "tools_and_artifacts": ["Email", "Spreadsheet"],
+    "steps": [{"text": "Open the order and read it.", "source": {"type": "events", "ids": ["e1"]}},
+              {"text": "Enter it into the destination tab.", "source": {"type": "user_answer", "q": "q1"}}],
+    "working_rules": [{"text": "Enter values exactly as on the source.",
+                       "source": {"type": "events", "ids": ["e2"]}}],
+    "requirements": [{"text": "Each order is fully processed before the next.",
+                      "source": {"type": "discovery"}}],
+}
+
 
 class FakeKeystore:
     def __init__(self, key=None): self.key = key
@@ -36,11 +43,26 @@ class FakeKeystore:
     def clear_key(self): self.key = None
 
 
+def fake_interview_fn(bundle, event_log, model_fn=None):
+    return {"questions": [
+        {"id": "q1", "unknown": "tab", "lens": "capture_blind_spot", "why_it_matters": "wrong tab",
+         "question": "Which tab do new records go in?", "suggested_answers": ["the main tab"],
+         "answer_type": "short_text", "cost_if_wrong": "high", "runtime_discoverable": False},
+        {"id": "q2", "unknown": "conflict", "lens": "undetermined_decision", "why_it_matters": "which wins",
+         "question": "If the source differs, which wins?", "suggested_answers": [],
+         "answer_type": "short_text", "cost_if_wrong": "medium", "runtime_discoverable": False},
+    ]}
+
+
+def fake_config_fn(bundle, observed, answers, model_fn, unresolved=None):
+    # real assembly, stub the model content -> exercises the actual configgen path
+    return configgen.compile_config(bundle, observed, answers,
+                                    lambda s, u: json.dumps(CONFIG_CONTENT), unresolved=unresolved)
+
+
 def fake_run_test(bundle, spec_md, env_record, event_log, test_dict, events_path=None):
-    # a run POINTER (no grading): agent + session ids, Console link, status, outputs
     return {"bundle_id": bundle["id"], "agent_id": "agent_x", "agent_name": "Order intake",
-            "agent_reused": False, "environment_id": "env_x",
-            "uploaded_file_ids": ["file_0"],
+            "agent_reused": False, "environment_id": "env_x", "uploaded_file_ids": ["file_0"],
             "sessions": [{"session_id": "sess_x",
                           "console_url": "https://platform.claude.com/managed-agents",
                           "console_hint": "Console -> Managed Agents -> Sessions",
@@ -49,13 +71,13 @@ def fake_run_test(bundle, spec_md, env_record, event_log, test_dict, events_path
             "events_file": "events_B1.json", "ran_at": "now"}
 
 
-class UIAgentTest(unittest.TestCase):
+class UIChainTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.root = self._tmp.name
         self.ks = FakeKeystore("sk-ant-test")
-        # default compile_agent_fn (pure), injected run_test_fn stub
-        self.state = app.AppState(self.root, key_store=self.ks, run_test_fn=fake_run_test)
+        self.state = app.AppState(self.root, key_store=self.ks, interview_fn=fake_interview_fn,
+                                  config_fn=fake_config_fn, run_test_fn=fake_run_test)
         self.httpd, _ = app.build_server(port=0, state=self.state)
         self.port = self.httpd.server_address[1]
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
@@ -64,22 +86,6 @@ class UIAgentTest(unittest.TestCase):
             json.dump(EVENTS, f)
         with open(sessions.path(self.root, self.sid, sessions.REVIEWED), "w") as f:
             json.dump(REVIEWED, f)
-        specs = sessions.path(self.root, self.sid, sessions.SPECS_DIR)
-        os.makedirs(specs, exist_ok=True)
-        with open(os.path.join(specs, "spec_B1.md"), "w") as f:
-            f.write(SPEC_MD)
-        # an environment record with an input artifact (real file)
-        af = os.path.join(self.root, "PO.pdf")
-        with open(af, "wb") as f:
-            f.write(b"%PDF-1.4 po")
-        env = {"bundle_id": "B1", "artifacts": [
-            {"role": "input", "kind": "pdf", "derived_from_event_ids": ["e1"],
-             "label_shown_to_user": "the PO", "user_instruction": "the PO", "uploaded": True,
-             "file_ref": af, "extraction_status": "failed", "extracted": None}],
-            "answers": [], "status": "complete"}
-        from trace.artifact.artifact import environment_filename
-        with open(sessions.path(self.root, self.sid, environment_filename("B1")), "w") as f:
-            json.dump(env, f)
 
     def tearDown(self):
         self.httpd.shutdown(); self.httpd.server_close(); self._tmp.cleanup()
@@ -95,90 +101,97 @@ class UIAgentTest(unittest.TestCase):
         except urllib.error.HTTPError as e:
             return e.code, json.loads(e.read() or b"null")
 
-    def test_compile_test_end_to_end(self):
-        code, _ = self.req("POST", f"/api/sessions/{self.sid}/compile-test",
-                           {"bundle_ids": ["B1"]})
-        self.assertEqual(code, 202)
-        for _ in range(60):
-            _, st = self.req("GET", f"/api/sessions/{self.sid}/compile-test/status")
+    def _await(self, action):
+        for _ in range(80):
+            _, st = self.req("GET", f"/api/sessions/{self.sid}/{action}/status")
             if st["state"] in ("done", "error"):
-                break
+                return st
             time.sleep(0.05)
-        self.assertEqual(st.get("state"), "done", st)
-        self.assertEqual(st["compiled"], 1)
-        self.assertEqual(st["ran"], 1)
-        # the status carries the run POINTER, not a graded report
-        self.assertEqual(st["runs"]["B1"]["sessions"][0]["session_id"], "sess_x")
+        return st
 
-        code, data = self.req("GET", f"/api/sessions/{self.sid}/agents")
+    def _interview_and_answer(self, answers):
+        code, _ = self.req("POST", f"/api/sessions/{self.sid}/interview", {})
+        self.assertEqual(code, 202)
+        self.assertEqual(self._await("interview")["state"], "done")
+        return self.req("POST", f"/api/sessions/{self.sid}/interview/B1", {"answers": answers})
+
+    def _generate_config(self):
+        code, _ = self.req("POST", f"/api/sessions/{self.sid}/generate-config", {"bundle_ids": ["B1"]})
+        self.assertEqual(code, 202)
+        return self._await("generate-config")
+
+    def test_interview_generate_and_skip(self):
+        code, rec = self._interview_and_answer({"q1": "Open_Orders"})    # q2 skipped
         self.assertEqual(code, 200)
-        agent = next(a for a in data["agents"] if a["bundle_id"] == "B1")
-        # both envelopes present and valid YAML
-        self.assertIn("system:", agent["test_yaml"])
-        self.assertIn("mcp_server_name", agent["live_yaml"])      # live has connectors
-        self.assertNotIn("mcp_server_name", agent["test_yaml"])   # test has none
-        # the run pointer is persisted and surfaced (no grading verdict)
-        self.assertEqual(agent["run"]["agent_id"], "agent_x")
-        self.assertEqual(agent["run"]["sessions"][0]["status"], "completed")
-        self.assertNotIn("deploy_recommended", agent["run"])
+        self.assertEqual(rec["status"], "incomplete")
+        self.assertEqual(rec["unresolved"], ["q2"])
+        self.assertEqual([a["q"] for a in rec["answers"]], ["q1"])
+        # interview-data reflects the saved record
+        _, data = self.req("GET", f"/api/sessions/{self.sid}/interview-data")
+        self.assertEqual(len(data["interviews"]["B1"]["questions"]), 2)
 
-    def test_compile_test_without_specs_rejected(self):
-        code, data = self.req("POST", "/api/sessions/no-such-session/compile-test")
-        self.assertEqual(code, 400)
-        self.assertEqual(data["error"], "no_specs")
+    def test_full_chain_to_run(self):
+        self._interview_and_answer({"q1": "Open_Orders"})                # q2 skipped
+        st = self._generate_config()
+        self.assertEqual(st["state"], "done")
+        self.assertEqual(st["generated"], 1)
 
-    def test_run_failure_does_not_crash_job(self):
-        # a failing run (API/SDK drift, no key) must still leave the envelopes
-        # compiled and the job 'done', recording the failure per bundle.
-        def boom(*a, **k):
-            raise AttributeError("'Anthropic' object has no attribute 'files'")
-        self.state.run_test_fn = boom
-        code, _ = self.req("POST", f"/api/sessions/{self.sid}/compile-test",
-                           {"bundle_ids": ["B1"]})
-        self.assertEqual(code, 202)
-        for _ in range(60):
-            _, st = self.req("GET", f"/api/sessions/{self.sid}/compile-test/status")
-            if st["state"] in ("done", "error"):
-                break
-            time.sleep(0.05)
-        self.assertEqual(st["state"], "done")        # never a hard failure
-        self.assertEqual(st["compiled"], 1)          # envelopes still produced
-        self.assertEqual(st["ran"], 0)
-        self.assertIn("run_skipped", st["runs"]["B1"])
-        # the compiled envelopes are present and readable
         _, data = self.req("GET", f"/api/sessions/{self.sid}/agents")
         agent = next(a for a in data["agents"] if a["bundle_id"] == "B1")
         self.assertIn("system:", agent["test_yaml"])
+        self.assertIn("mcp_server_name", agent["live_yaml"])     # live has Pipedream
+        self.assertNotIn("mcp_server_name", agent["test_yaml"])  # test has none
+        # grounding carries the answered question as a user_answer source + the skip
+        g = agent["grounding"]
+        self.assertTrue(any(isinstance(i["source"], dict) and i["source"].get("type") == "user_answer"
+                            for i in g["instructions"]))
+        self.assertEqual(g["unresolved"], ["q2"])
 
-    def test_stage4_bundles_defaults_to_artifact_bearing(self):
-        # B1 has an uploaded Review 2 artifact -> offered with has_artifacts True
-        code, data = self.req("GET", f"/api/sessions/{self.sid}/stage4-bundles")
-        self.assertEqual(code, 200)
-        b = next(x for x in data["bundles"] if x["id"] == "B1")
-        self.assertTrue(b["has_artifacts"])
-        self.assertGreaterEqual(b["artifact_count"], 1)
+        # Stage 4 runs the generated config
+        code, _ = self.req("POST", f"/api/sessions/{self.sid}/compile-test", {"bundle_ids": ["B1"]})
+        self.assertEqual(code, 202)
+        st = self._await("compile-test")
+        self.assertEqual(st["state"], "done")
+        self.assertEqual(st["ran"], 1)
+        self.assertEqual(st["runs"]["B1"]["sessions"][0]["session_id"], "sess_x")
 
-    def test_cleanup_platform_collects_ids_from_runs_and_deletes(self):
-        # run first so a run_<id>.json exists, then clean up
+    def test_run_without_config_rejected(self):
+        code, data = self.req("POST", f"/api/sessions/{self.sid}/compile-test", {"bundle_ids": ["B1"]})
+        self.assertEqual(code, 400)
+        self.assertEqual(data["error"], "no_config")
+
+    def test_stage4_bundles_default_to_config_ready(self):
+        # before config generation: offered but not config_ready (unchecked by default)
+        _, data = self.req("GET", f"/api/sessions/{self.sid}/stage4-bundles")
+        self.assertFalse(next(x for x in data["bundles"] if x["id"] == "B1")["config_ready"])
+        self._interview_and_answer({"q1": "x"})
+        self._generate_config()
+        _, data = self.req("GET", f"/api/sessions/{self.sid}/stage4-bundles")
+        self.assertTrue(next(x for x in data["bundles"] if x["id"] == "B1")["config_ready"])
+
+    def test_run_failure_recorded_not_fatal(self):
+        self._interview_and_answer({"q1": "x"})
+        self._generate_config()
+        self.state.run_test_fn = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
+        self.req("POST", f"/api/sessions/{self.sid}/compile-test", {"bundle_ids": ["B1"]})
+        st = self._await("compile-test")
+        self.assertEqual(st["state"], "done")
+        self.assertEqual(st["ran"], 0)
+        self.assertIn("run_skipped", st["runs"]["B1"])
+
+    def test_cleanup_platform_collects_ids(self):
         captured = {}
         def fake_cleanup(session_ids, file_ids, agent_ids):
             captured["args"] = (session_ids, file_ids, agent_ids)
-            return {"removed": {"sessions": session_ids, "files": file_ids, "agents": agent_ids},
-                    "errors": []}
+            return {"removed": {"sessions": session_ids, "files": file_ids, "agents": agent_ids}, "errors": []}
         self.state.cleanup_fn = fake_cleanup
+        self._interview_and_answer({"q1": "x"})
+        self._generate_config()
         self.req("POST", f"/api/sessions/{self.sid}/compile-test", {"bundle_ids": ["B1"]})
-        for _ in range(60):
-            _, st = self.req("GET", f"/api/sessions/{self.sid}/compile-test/status")
-            if st["state"] in ("done", "error"):
-                break
-            time.sleep(0.05)
+        self._await("compile-test")
         code, data = self.req("POST", f"/api/sessions/{self.sid}/cleanup-platform")
         self.assertEqual(code, 200)
-        sess_ids, file_ids, agent_ids = captured["args"]
-        self.assertEqual(sess_ids, ["sess_x"])       # from the run pointer
-        self.assertEqual(file_ids, ["file_0"])
-        self.assertEqual(agent_ids, ["agent_x"])
-        self.assertEqual(data["removed"]["agents"], ["agent_x"])
+        self.assertEqual(captured["args"], (["sess_x"], ["file_0"], ["agent_x"]))
 
 
 if __name__ == "__main__":

@@ -104,8 +104,6 @@
       <div class="row">
         <button id="loadReviewBtn" class="secondary" disabled>Load discovery for review</button>
         <button id="saveReviewBtn" class="primary" disabled>Save reviewed bundles</button>
-        <button id="genSpecBtn" class="primary" disabled>Generate specs</button>
-        <button id="specDryRun" class="secondary" disabled>Spec dry run · free</button>
         <span id="reviewMsg" class="status-line"></span>
       </div>
       <div id="reviewContainer"></div>
@@ -115,26 +113,42 @@
         preferred output. Only <code>approve_for_build</code> bundles become specs.</p>
     </section>
 
-    <!-- ENVIRONMENT CAPTURE (Review 2) --------------------------------- -->
+    <!-- INTERVIEW (gap detection) -------------------------------------- -->
     <section class="panel">
-      <h2>Environment capture <span class="muted">(Review 2 — real files &amp; facts)</span></h2>
+      <h2>Interview <span class="muted">(what the data couldn't reveal)</span></h2>
       <div class="row">
-        <button id="loadEnvBtn" class="secondary" disabled>Load environment capture</button>
-        <span id="envMsg" class="status-line"></span>
+        <button id="generateQBtn" class="primary" disabled>Generate questions</button>
+        <button id="intDryRun" class="secondary" disabled>Dry run · free</button>
+        <span id="interviewMsg" class="status-line"></span>
       </div>
-      <div id="envContainer"></div>
-      <p class="help">For each approved workflow, upload one real example of each
-        input/output file it touches and answer the few derived questions. The
-        generated spec then carries the real schema and format; missing files flag
-        the spec <code>environment-incomplete</code> (it still generates).</p>
+      <div id="interviewContainer"></div>
+      <p class="help">For each approved workflow, Trace asks a few short, triaged
+        questions about what capture couldn't see (the destination tab, one-vs-many
+        layout) or couldn't decide (conflict rules). Answer one line each, or skip —
+        skips fall back to reading the live environment and are flagged in the
+        grounding record. Answers become <b>authoritative</b> inputs to the config.</p>
     </section>
 
-    <!-- STAGE 4 — compile & run agent (manual evaluation) -------------- -->
+    <!-- GENERATE CONFIG ------------------------------------------------- -->
     <section class="panel">
-      <h2>Compile &amp; run agent <span class="muted">(Stage 4 — Managed Agents)</span></h2>
+      <h2>Generate config <span class="muted">(workflow + events + answers → agent YAML)</span></h2>
+      <div id="configBundles" class="bundle-select"></div>
+      <div class="row">
+        <button id="genConfigBtn" class="primary" disabled>Generate config for selected</button>
+        <span id="configMsg" class="status-line"></span>
+      </div>
+      <p class="help">Writes each agent's configuration directly
+        (<code>agent_&lt;id&gt;.test.yaml</code> / <code>.live.yaml</code>) plus a
+        <code>grounding_&lt;id&gt;.json</code> that footnotes every instruction to its
+        source. See the <b>agents</b> results tab.</p>
+    </section>
+
+    <!-- STAGE 4 — run agent (manual evaluation) ------------------------ -->
+    <section class="panel">
+      <h2>Run agent <span class="muted">(Stage 4 — Managed Agents)</span></h2>
       <div id="stage4Bundles" class="bundle-select"></div>
       <div class="row">
-        <button id="compileTestBtn" class="primary" disabled>Compile &amp; run selected</button>
+        <button id="compileTestBtn" class="primary" disabled>Run selected</button>
         <span id="stage4Msg" class="status-line"></span>
       </div>
       <div id="stage4Summary"></div>
@@ -142,13 +156,12 @@
         <button id="cleanupBtn" class="secondary">Clean up platform</button>
         <span id="cleanupMsg" class="status-line"></span>
       </div>
-      <p class="help">Wraps each selected bundle's spec into an agent envelope
-        (<code>agent_&lt;id&gt;.test.yaml</code> / <code>.live.yaml</code>), then
-        creates-or-reuses that agent on Managed Agents and runs <b>one session</b>.
+      <p class="help">Takes each selected bundle's generated <code>agent_&lt;id&gt;.test.yaml</code>,
+        creates-or-reuses that agent on Managed Agents, and runs <b>one session</b>.
         <b>Evaluation is manual</b> — open the session in the Console (link/ID shown
         below) and read the run. Nothing is graded and <b>nothing is deleted</b>; the
-        session stays in the Console. Default selection is bundles that have Review 2
-        files attached. <b>Clean up platform</b> deletes the sessions, files, and
+        session stays in the Console. Default selection is bundles whose config has
+        been generated. <b>Clean up platform</b> deletes the sessions, files, and
         agents Trace created — only when you press it.</p>
     </section>
 
@@ -159,13 +172,11 @@
         <button class="tab active" data-tab="event_log">event_log.json</button>
         <button class="tab" data-tab="discovery">discovery.json</button>
         <button class="tab" data-tab="reviewed">reviewed_bundles</button>
-        <button class="tab" data-tab="specs">specs (.md)</button>
-        <button class="tab" data-tab="agents">agents (yaml + report)</button>
+        <button class="tab" data-tab="agents">agents (yaml + grounding)</button>
         <button class="tab" data-tab="validation">review flags</button>
         <button class="tab" data-tab="raw">raw stream</button>
         <button class="tab" data-tab="dryrun">recon dry-run</button>
         <button class="tab" data-tab="discdryrun">discovery dry-run</button>
-        <button class="tab" data-tab="specdryrun">spec dry-run</button>
         <span class="spacer"></span>
         <button id="copyBtn" class="link">copy</button>
         <button id="exportBtn" class="link">export</button>

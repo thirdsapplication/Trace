@@ -153,6 +153,14 @@ def run_record_name(bid):
     return f"run_{_safe_id(bid)}.json"
 
 
+def interview_filename(bid):
+    return f"interview_{_safe_id(bid)}.json"
+
+
+def grounding_name(bid):
+    return f"grounding_{_safe_id(bid)}.json"
+
+
 def _read_json(p):
     try:
         with open(p, encoding="utf-8") as f:
@@ -191,8 +199,9 @@ def list_agents(root, sid):
     out = []
     for bid, data in bundles.items():
         run = _read_json(os.path.join(d, f"run_{bid}.json"))
+        grounding = _read_json(os.path.join(d, f"grounding_{bid}.json"))
         out.append({"bundle_id": bid, "test_yaml": data.get("test_yaml"),
-                    "live_yaml": data.get("live_yaml"), "run": run})
+                    "live_yaml": data.get("live_yaml"), "grounding": grounding, "run": run})
     return out
 
 

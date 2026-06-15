@@ -1,0 +1,164 @@
+"""Phase 2 — Structured Interview gap detector (offline, stub model_fn, two domains).
+
+Covers the triage normalization (enum coercion, runtime-discoverable drop, cap+sort,
+re-id), domain-neutrality across the Marcy and recruiter fixtures, and the load-bearing
+end-to-end feed: an interview record's answers + skips flow into the Phase-1 config
+engine's grounding (source: user_answer; top-level unresolved).
+"""
+
+import json
+import os
+import tempfile
+import unittest
+
+from trace.agent import configgen, interview
+from trace.agent.interview_prompt import SYSTEM_PROMPT
+from trace.tests.test_configgen import _bundle, _load, _stub as _config_stub
+
+
+# 6 raw questions: mixed cost order, one missing id, one bogus lens/cost, one
+# runtime_discoverable (drop), one empty question (drop).
+CANNED_QUESTIONS = {"questions": [
+    {"id": "x", "unknown": "tab", "lens": "capture_blind_spot",
+     "why_it_matters": "wrong tab is irreversible", "question": "Which tab do new records go in?",
+     "suggested_answers": ["the main tab", ""], "answer_type": "short_text",
+     "cost_if_wrong": "low", "runtime_discoverable": False},
+    {"unknown": "layout", "lens": "capture_blind_spot", "why_it_matters": "the layout bug",
+     "question": "One row, or one row per item?", "cost_if_wrong": "high",
+     "runtime_discoverable": False},
+    {"id": "q?", "unknown": "conflict", "lens": "bogus", "why_it_matters": "which wins",
+     "question": "If the source differs from the existing rows, which wins?",
+     "cost_if_wrong": "weird", "runtime_discoverable": False},
+    {"unknown": "columns", "lens": "capture_blind_spot", "why_it_matters": "readable live",
+     "question": "What are the column names?", "cost_if_wrong": "high",
+     "runtime_discoverable": True},                       # dropped (runtime-discoverable)
+    {"unknown": "dupes", "lens": "undetermined_decision", "why_it_matters": "dup handling",
+     "question": "What counts as a duplicate?", "cost_if_wrong": "medium",
+     "runtime_discoverable": False},
+    {"unknown": "empty", "question": "  ", "cost_if_wrong": "high"},   # dropped (no question)
+]}
+
+
+def _stub(out=CANNED_QUESTIONS):
+    return lambda system, user: json.dumps(out)
+
+
+class InterviewEngineTest(unittest.TestCase):
+    def _questions(self, domain="marcy"):
+        event_log, ak = _load(domain)
+        bundle = _bundle(ak["bundles"][0])
+        return interview.generate_questions(bundle, event_log, model_fn=_stub())["questions"]
+
+    def test_normalization_drops_and_caps_and_sorts(self):
+        qs = self._questions()
+        # 6 raw -> drop runtime_discoverable + empty -> 4 kept
+        self.assertEqual(len(qs), 4)
+        self.assertLessEqual(len(qs), 5)
+        self.assertEqual([q["cost_if_wrong"] for q in qs], ["high", "medium", "medium", "low"])
+        self.assertEqual([q["id"] for q in qs], ["q1", "q2", "q3", "q4"])
+        # the runtime-discoverable 'column names' question is gone
+        self.assertFalse(any("column names" in q["question"] for q in qs))
+
+    def test_enum_coercion_and_shape(self):
+        qs = self._questions()
+        for q in qs:
+            self.assertIn(q["lens"], ("capture_blind_spot", "undetermined_decision"))
+            self.assertIn(q["cost_if_wrong"], ("high", "medium", "low"))
+            self.assertEqual(q["answer_type"], "short_text")
+            self.assertFalse(q["runtime_discoverable"])
+            self.assertTrue(q["question"].strip())
+            self.assertIsInstance(q["suggested_answers"], list)
+        # the bogus-lens question was coerced to undetermined_decision
+        conflict = next(q for q in qs if "which wins" in q["question"])
+        self.assertEqual(conflict["lens"], "undetermined_decision")
+        self.assertEqual(conflict["cost_if_wrong"], "medium")
+        # empty suggested answers are dropped
+        tab = next(q for q in qs if "tab" in q["question"])
+        self.assertEqual(tab["suggested_answers"], ["the main tab"])
+
+    def test_domain_neutral(self):
+        # same stub -> identical normalized questions on both domains (no domain
+        # string leaks into code); prompt material differs (different observed events)
+        m = self._questions("marcy")
+        r = self._questions("recruiter")
+        self.assertEqual(m, r)
+        ev_m, ak_m = _load("marcy")
+        ev_r, ak_r = _load("recruiter")
+        wf_m, obs_m, _ = configgen.make_engine_inputs(_bundle(ak_m["bundles"][0]), ev_m)
+        wf_r, obs_r, _ = configgen.make_engine_inputs(_bundle(ak_r["bundles"][0]), ev_r)
+        self.assertNotEqual(interview.build_prompt_material(wf_m, obs_m),
+                            interview.build_prompt_material(wf_r, obs_r))
+
+    def test_defensive_parse_fenced(self):
+        ev, ak = _load("marcy")
+        b = _bundle(ak["bundles"][0])
+        fenced = lambda s, u: "```json\n" + json.dumps(CANNED_QUESTIONS) + "\n```\ntrailing"
+        qs = interview.generate_questions(b, ev, model_fn=fenced)["questions"]
+        self.assertEqual(len(qs), 4)
+
+    def test_empty_questions_ok(self):
+        ev, ak = _load("marcy")
+        b = _bundle(ak["bundles"][0])
+        qs = interview.generate_questions(b, ev, model_fn=lambda s, u: '{"questions": []}')["questions"]
+        self.assertEqual(qs, [])
+
+    def test_system_prompt_domain_neutral(self):
+        low = SYSTEM_PROMPT.lower()
+        for term in ("marcy", "recruiter", "gmail", "riverbend", "po-1001"):
+            self.assertNotIn(term, low)
+
+
+class InterviewToConfigFeedTest(unittest.TestCase):
+    """The load-bearing pipe: interview answers + skips -> Phase-1 grounding."""
+
+    def _write(self, domain, answers, unresolved):
+        event_log, ak = _load(domain)
+        b = _bundle(ak["bundles"][0])
+        b.update({"classification": "bundle", "disposition": "approve_for_build"})
+        d = tempfile.mkdtemp()
+        with open(os.path.join(d, "reviewed_bundles.json"), "w") as f:
+            json.dump({"bundles": [b], "anti_bundles": [], "notes": ""}, f)
+        with open(os.path.join(d, "event_log.json"), "w") as f:
+            json.dump(event_log, f)
+        safe = "".join(c if c.isalnum() else "_" for c in b["id"])
+        with open(os.path.join(d, f"interview_{safe}.json"), "w") as f:
+            json.dump({"bundle_id": b["id"], "questions": [], "answers": answers,
+                       "unresolved": unresolved, "status": "incomplete"}, f)
+        return d, b["id"]
+
+    def test_answers_and_unresolved_reach_grounding(self):
+        for domain in ("marcy", "recruiter"):
+            answers = [{"q": "q1", "question": "Which tab?", "answer": "Open_Orders"},
+                       {"q": "q2", "question": "Conflict?", "answer": "Follow the source."}]
+            d, bid = self._write(domain, answers, ["q3"])
+            results, _ = configgen.generate_configs(
+                os.path.join(d, "reviewed_bundles.json"),
+                os.path.join(d, "event_log.json"), model_fn=_config_stub())
+            g = next(r["grounding"] for r in results if r["built"])
+            # the config CANNED sources a step to user_answer q1 -> flows through verbatim
+            ua = [i for i in g["instructions"]
+                  if isinstance(i["source"], dict) and i["source"].get("type") == "user_answer"]
+            self.assertTrue(ua)
+            self.assertFalse(ua[0]["observed"])
+            self.assertIn(ua[0]["source"]["q"], ("q1", "q2"))
+            # the skipped question is flagged top-level
+            self.assertEqual(g["unresolved"], ["q3"])
+
+    def test_missing_interview_file_no_unresolved_key(self):
+        event_log, ak = _load("marcy")
+        b = _bundle(ak["bundles"][0])
+        b.update({"classification": "bundle", "disposition": "approve_for_build"})
+        d = tempfile.mkdtemp()
+        with open(os.path.join(d, "reviewed_bundles.json"), "w") as f:
+            json.dump({"bundles": [b], "anti_bundles": [], "notes": ""}, f)
+        with open(os.path.join(d, "event_log.json"), "w") as f:
+            json.dump(event_log, f)
+        results, _ = configgen.generate_configs(
+            os.path.join(d, "reviewed_bundles.json"),
+            os.path.join(d, "event_log.json"), model_fn=_config_stub())
+        g = next(r["grounding"] for r in results if r["built"])
+        self.assertNotIn("unresolved", g)        # additive extension stays non-breaking
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -22,6 +22,8 @@ import urllib.parse
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import yaml
+
 from ..capture.controller import CaptureController
 from ..reconstruct import chunking
 from ..reconstruct.prompt import SYSTEM_PROMPT
@@ -30,19 +32,42 @@ from ..discovery import scorer as discovery_scorer
 from ..discovery.discover import discover as _real_discover
 from ..discovery.discover import load_event_log, render_event_log
 from ..discovery.prompt import SYSTEM_PROMPT as DISCOVERY_SYSTEM_PROMPT
-from ..artifact import environment as artifact_env
 from ..artifact import review as artifact_review
-from ..artifact.artifact import build_prompt_material, environment_filename, write_spec_bundle
+from ..artifact.artifact import build_prompt_material, write_spec_bundle
 from ..artifact.artifact import generate_specs as _real_generate_specs
 from ..artifact.artifact import _spec_filename
 from ..artifact.prompt import SYSTEM_PROMPT as ARTIFACT_SYSTEM_PROMPT
-from ..agent import compiler as agent_compiler
+from ..agent import configgen as agent_configgen
+from ..agent import interview as agent_interview
 from . import keystore, permissions, sessions
 
 
-def _compile_agent(bundle, spec_md, event_log):
-    """Default Stage-4 compiler seam (pure, no network)."""
-    return agent_compiler.compile_agent(bundle, spec_md, event_log)
+def _write_json(path, obj):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2, ensure_ascii=False)
+
+
+def _write_text(path, text):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+def _interview_record(bid, questions, answers):
+    """Assemble an interview record, computing unresolved + status server-side.
+    A question is unresolved iff it has no non-empty answer; zero questions is a
+    degenerate 'complete'."""
+    answered = {a["q"] for a in answers if str(a.get("answer", "")).strip()}
+    unresolved = [q["id"] for q in questions if q["id"] not in answered]
+    if not questions:
+        status = "complete"
+    elif unresolved == [q["id"] for q in questions] and not answers:
+        status = "unstarted"
+    elif unresolved:
+        status = "incomplete"
+    else:
+        status = "complete"
+    return {"bundle_id": bid, "questions": questions, "answers": answers,
+            "unresolved": unresolved, "status": status}
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 DISCOVERY_FIXTURES_DIR = os.path.join(
@@ -74,14 +99,17 @@ class AppState:
     def __init__(self, sessions_root, collector_port=8137,
                  reconstruct_fn=None, controller_factory=None, key_store=None,
                  discovery_fn=None, score_fn=None, artifact_fn=None,
-                 compile_agent_fn=None, run_test_fn=None, cleanup_fn=None):
+                 interview_fn=None, config_fn=None, run_test_fn=None, cleanup_fn=None):
         self.sessions_root = sessions_root
         self.collector_port = collector_port
         self.reconstruct_fn = reconstruct_fn or _real_reconstruct
         self.discovery_fn = discovery_fn or _real_discover
         self.score_fn = score_fn or discovery_scorer.score
         self.artifact_fn = artifact_fn or _real_generate_specs
-        self.compile_agent_fn = compile_agent_fn or _compile_agent
+        # Phase 2: the interview (gap detector) and the Phase-1 config engine, both
+        # injectable so the chain runs offline against stubs.
+        self.interview_fn = interview_fn or agent_interview.generate_questions
+        self.config_fn = config_fn or agent_configgen.compile_config
         self.run_test_fn = run_test_fn or self._default_run_test
         self.cleanup_fn = cleanup_fn or self._default_cleanup
         self.controller_factory = controller_factory or (
@@ -92,7 +120,9 @@ class AppState:
         self.recon_jobs = {}         # sid -> {state, current, total, error, flags, errors}
         self.discover_jobs = {}      # sid -> {state, error, bundles, anti_bundles}
         self.spec_jobs = {}          # sid -> {state, error, built, notes}
-        self.stage4_jobs = {}        # sid -> {state, error, compiled, ran, runs}
+        self.interview_jobs = {}     # sid -> {state, error, generated}
+        self.config_jobs = {}        # sid -> {state, error, generated, errors}
+        self.stage4_jobs = {}        # sid -> {state, error, ran, runs}
         self.lock = threading.Lock()
         os.makedirs(sessions_root, exist_ok=True)
 
@@ -222,21 +252,35 @@ class AppState:
 
     # --- Stage 4: compile + run agents (manual-evaluation mode) ----------
     def stage4_bundles(self, sid):
-        """Approved bundles the UI offers for compile-and-run, each tagged with
-        whether it has Review 2 artifacts (drives the default checkbox state)."""
+        """Approved bundles the UI offers to run, each tagged with whether its config
+        has been generated (drives the default checkbox state)."""
         root = self.sessions_root
         approved, _ = self._approved_for_stage4(sid)
+        specs_dir = sessions.path(root, sid, sessions.SPECS_DIR)
         out = []
         for b in approved:
-            specs_dir = sessions.path(root, sid, sessions.SPECS_DIR)
-            spec_ready = os.path.exists(os.path.join(specs_dir, _spec_filename(b["id"], True)))
-            env = sessions.read_json_artifact(root, sid, environment_filename(b["id"])) or {}
-            n = len([a for a in env.get("artifacts", [])
-                     if a.get("uploaded") and a.get("file_ref")])
+            config_ready = os.path.exists(
+                os.path.join(specs_dir, sessions.agent_yaml_name(b["id"], "test")))
             out.append({"id": b["id"], "name": b.get("name") or b["id"],
-                        "has_artifacts": n > 0, "artifact_count": n,
-                        "spec_ready": spec_ready})
+                        "config_ready": config_ready, "has_artifacts": config_ready,
+                        "artifact_count": 0})
         return out
+
+    def _build_model_fn(self):
+        """A Sonnet caller from the saved key, for the interview + config engines.
+        Raises ``no_api_key`` when no key is saved. The ``anthropic`` client is built
+        lazily on first call, so injected stubs that never call it run without the SDK."""
+        key = self.keystore.get_key()
+        if not key:
+            raise RuntimeError("no_api_key")
+        os.environ["ANTHROPIC_API_KEY"] = key
+        holder = {}
+
+        def call(system, user):
+            if "fn" not in holder:
+                holder["fn"] = agent_configgen._default_model_fn(agent_configgen.DEFAULT_MODEL)
+            return holder["fn"](system, user)
+        return call
 
     def _approved_for_stage4(self, sid):
         root = self.sessions_root
@@ -249,42 +293,127 @@ class AppState:
                     if b.get("disposition") == "approve_for_build"]
         return approved, event_log
 
+    # --- Phase 2: structured interview (gap detector) --------------------
+    def start_interview(self, sid, selected_ids=None):
+        root = self.sessions_root
+        job = {"state": "running", "error": None, "generated": 0}
+        self.interview_jobs[sid] = job
+
+        def run():
+            try:
+                approved, event_log = self._approved_for_stage4(sid)
+                if selected_ids is not None:
+                    approved = [b for b in approved if b["id"] in set(selected_ids)]
+                model_fn = self._build_model_fn() if approved else None
+                for b in approved:
+                    questions = self.interview_fn(b, event_log, model_fn=model_fn)["questions"]
+                    # preserve any prior answer whose question id still maps
+                    prior = sessions.read_json_artifact(
+                        root, sid, sessions.interview_filename(b["id"])) or {}
+                    qids = {q["id"] for q in questions}
+                    answers = [a for a in (prior.get("answers") or [])
+                               if a.get("q") in qids and str(a.get("answer", "")).strip()]
+                    rec = _interview_record(b["id"], questions, answers)
+                    _write_json(sessions.path(root, sid, sessions.interview_filename(b["id"])), rec)
+                    job["generated"] += 1
+                sessions.update_meta(root, sid, interview_at=sessions._now())
+                job.update(state="done")
+            except Exception as e:
+                job.update(state="error", error=str(e))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def interview_data(self, sid):
+        approved, _ = self._approved_for_stage4(sid)
+        out = {}
+        for b in approved:
+            rec = sessions.read_json_artifact(self.sessions_root, sid,
+                                              sessions.interview_filename(b["id"]))
+            out[b["id"]] = rec or {"bundle_id": b["id"], "questions": [], "answers": [],
+                                   "unresolved": [], "status": "unstarted"}
+        return {"approved_ids": [b["id"] for b in approved], "interviews": out}
+
+    def save_interview(self, sid, bid, answers_map):
+        """Persist the worker's answers for one bundle. ``answers_map`` is {qid: text};
+        blank/missing => skipped. Recomputes unresolved + status server-side."""
+        rec = sessions.read_json_artifact(self.sessions_root, sid,
+                                          sessions.interview_filename(bid))
+        if rec is None:
+            return None
+        questions = rec.get("questions", [])
+        answers = []
+        for q in questions:
+            text = str((answers_map or {}).get(q["id"], "") or "").strip()
+            if text:
+                answers.append({"q": q["id"], "question": q.get("question", ""), "answer": text})
+        rec = _interview_record(bid, questions, answers)
+        _write_json(sessions.path(self.sessions_root, sid, sessions.interview_filename(bid)), rec)
+        return rec
+
+    # --- Phase 1 config generation, wired into the chain -----------------
+    def start_configgen(self, sid, selected_ids=None):
+        root = self.sessions_root
+        specs_dir = sessions.path(root, sid, sessions.SPECS_DIR)
+        job = {"state": "running", "error": None, "generated": 0, "errors": {}}
+        self.config_jobs[sid] = job
+
+        def run():
+            try:
+                approved, event_log = self._approved_for_stage4(sid)
+                if selected_ids is not None:
+                    approved = [b for b in approved if b["id"] in set(selected_ids)]
+                os.makedirs(specs_dir, exist_ok=True)
+                model_fn = self._build_model_fn() if approved else None
+                for b in approved:
+                    try:
+                        _, observed, _ = agent_configgen.make_engine_inputs(b, event_log)
+                        answers = agent_configgen._load_answers(
+                            sessions.session_dir(root, sid), b["id"])
+                        unresolved = agent_configgen._load_unresolved(
+                            sessions.session_dir(root, sid), b["id"])
+                        compiled = self.config_fn(b, observed, answers, model_fn,
+                                                  unresolved=unresolved)
+                        for mode in ("test", "live"):
+                            _write_text(os.path.join(specs_dir, sessions.agent_yaml_name(b["id"], mode)),
+                                        compiled[mode]["yaml"])
+                        _write_json(os.path.join(specs_dir, sessions.grounding_name(b["id"])),
+                                    compiled["grounding"])
+                        job["generated"] += 1
+                    except Exception as e:
+                        job["errors"][b["id"]] = f"{type(e).__name__}: {e}"
+                sessions.update_meta(root, sid, config_at=sessions._now())
+                job.update(state="done")
+            except Exception as e:
+                job.update(state="error", error=str(e))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    # --- Stage 4: run the generated test config (manual evaluation) ------
     def start_stage4(self, sid, selected_ids=None):
         root = self.sessions_root
         specs_dir = sessions.path(root, sid, sessions.SPECS_DIR)
-        job = {"state": "running", "error": None, "compiled": 0, "ran": 0, "runs": {}}
+        job = {"state": "running", "error": None, "ran": 0, "runs": {}}
         self.stage4_jobs[sid] = job
 
         def run():
             try:
                 approved, event_log = self._approved_for_stage4(sid)
-                # C5 — only the user-selected bundles are compiled-and-run
                 if selected_ids is not None:
                     approved = [b for b in approved if b["id"] in set(selected_ids)]
                 os.makedirs(specs_dir, exist_ok=True)
                 for b in approved:
-                    spec_path = os.path.join(specs_dir, _spec_filename(b["id"], True))
-                    if not os.path.exists(spec_path):
+                    yaml_path = os.path.join(specs_dir, sessions.agent_yaml_name(b["id"], "test"))
+                    if not os.path.exists(yaml_path):
+                        job["runs"][b["id"]] = {"run_skipped": "no config — generate config first"}
                         continue
-                    with open(spec_path, encoding="utf-8") as f:
-                        spec_md = f.read()
-                    compiled = self.compile_agent_fn(b, spec_md, event_log)   # pure, offline
-                    for mode in ("test", "live"):
-                        with open(os.path.join(specs_dir, sessions.agent_yaml_name(b["id"], mode)),
-                                  "w", encoding="utf-8") as f:
-                            f.write(compiled[mode]["yaml"])
-                    job["compiled"] += 1
-                    # run on the platform (needs the API; skipped gracefully without a key).
-                    # No grading, no deletion — the session stays in the Console.
-                    env_record = sessions.read_json_artifact(root, sid, environment_filename(b["id"])) or {}
+                    with open(yaml_path, encoding="utf-8") as f:
+                        test_dict = yaml.safe_load(f.read())
                     try:
                         events_path = os.path.join(specs_dir, sessions.events_name(b["id"]))
                         run_record = self.run_test_fn(
-                            b, spec_md, env_record, event_log, compiled["test"]["dict"],
-                            events_path=events_path)
-                        with open(os.path.join(specs_dir, sessions.run_record_name(b["id"])),
-                                  "w", encoding="utf-8") as f:
-                            json.dump(run_record, f, indent=2, ensure_ascii=False)
+                            b, "", {}, event_log, test_dict, events_path=events_path)
+                        _write_json(os.path.join(specs_dir, sessions.run_record_name(b["id"])),
+                                    run_record)
                         job["ran"] += 1
                         job["runs"][b["id"]] = {
                             "agent_id": run_record.get("agent_id"),
@@ -292,9 +421,6 @@ class AppState:
                             "agent_reused": run_record.get("agent_reused"),
                             "sessions": run_record.get("sessions", [])}
                     except Exception as e:
-                        # Compilation already succeeded and the envelopes are written;
-                        # a run failure (no key, SDK/API drift, network) is recorded
-                        # per-bundle and never fails the whole job.
                         job["runs"][b["id"]] = {"run_skipped": f"{type(e).__name__}: {e}"}
                 sessions.update_meta(root, sid, stage4_at=sessions._now())
                 job.update(state="done")
@@ -387,14 +513,11 @@ def make_handler(state):
 
         def do_POST(self):
             p = self.path.split("?", 1)[0]
-            # environment file upload: raw bytes, handled before JSON parsing
-            mu = re.match(r"^/api/sessions/([^/]+)/environment/([^/]+)/upload$", p)
-            if mu:
-                return self._upload_environment(mu.group(1), mu.group(2))
             body = self._body()
-            me = re.match(r"^/api/sessions/([^/]+)/environment/([^/]+)$", p)
-            if me:
-                return self._save_environment(me.group(1), me.group(2), body)
+            # save one bundle's interview answers
+            mi = re.match(r"^/api/sessions/([^/]+)/interview/([^/]+)$", p)
+            if mi:
+                return self._save_interview(mi.group(1), mi.group(2), body)
             if p == "/api/settings/key":
                 return self._save_key(body)
             if p == "/api/settings/test-key":
@@ -411,7 +534,8 @@ def make_handler(state):
                 return self._load_fixture(body)
             m = re.match(r"^/api/sessions/([^/]+)/"
                          r"(dry-run|reconstruct|discovery-dry-run|discover|score|"
-                         r"reviewed-bundles|generate-specs|specs-dry-run|compile-test|"
+                         r"reviewed-bundles|generate-specs|specs-dry-run|interview|"
+                         r"interview-dry-run|generate-config|compile-test|"
                          r"cleanup-platform)$", p)
             if m:
                 sid, action = m.group(1), m.group(2)
@@ -431,6 +555,12 @@ def make_handler(state):
                     return self._generate_specs(sid)
                 if action == "specs-dry-run":
                     return self._specs_dry_run(sid)
+                if action == "interview":
+                    return self._interview(sid, body)
+                if action == "interview-dry-run":
+                    return self._interview_dry_run(sid)
+                if action == "generate-config":
+                    return self._generate_config(sid, body)
                 if action == "cleanup-platform":
                     return self._cleanup_platform(sid)
                 return self._compile_test(sid, body)
@@ -572,11 +702,12 @@ def make_handler(state):
             if sub == "/compile-test/status":
                 job = state.stage4_jobs.get(sid)
                 return self._json(200, job or {"state": "idle"})
-            if sub == "/environment-data":
-                return self._environment_data(sid)
-            me = re.match(r"^/environment/([^/]+)$", sub)
-            if me:
-                return self._json(200, self._load_or_seed_env(sid, me.group(1)) or {"error": "n/a"})
+            if sub == "/interview-data":
+                return self._json(200, state.interview_data(sid))
+            if sub == "/interview/status":
+                return self._json(200, state.interview_jobs.get(sid) or {"state": "idle"})
+            if sub == "/generate-config/status":
+                return self._json(200, state.config_jobs.get(sid) or {"state": "idle"})
             return self._json(404, {"error": "not_found"})
 
         # --- reconstruction ---
@@ -755,10 +886,10 @@ def make_handler(state):
                 state.start_spec_generation(sid)
             return self._json(202, {"state": "running", "session_id": sid})
 
-        # --- Stage 4: compile + sandbox-test agents ---
+        # --- Stage 4: run the generated test config ---
         def _compile_test(self, sid, body=None):
-            if not sessions.list_specs(root, sid):
-                return self._json(400, {"error": "no_specs"})
+            if not any(a.get("test_yaml") for a in sessions.list_agents(root, sid)):
+                return self._json(400, {"error": "no_config"})
             selected = (body or {}).get("bundle_ids")    # None => all approved
             with state.lock:
                 existing = state.stage4_jobs.get(sid)
@@ -774,71 +905,49 @@ def make_handler(state):
                 return self._json(200, {"error": f"{type(e).__name__}: {e}"})
             return self._json(200, result)
 
-        # --- Review 2: environment capture (Stage 3) ---
-        def _approved_bundles(self, sid):
-            reviewed = sessions.read_json_artifact(root, sid, sessions.REVIEWED)
-            event_log = sessions.read_json_artifact(root, sid, sessions.EVENT_LOG) or []
-            if reviewed is None:
-                return None, event_log
-            rep = artifact_review.ReviewReport()
-            reviewed = artifact_review.validate_reviewed(
-                reviewed, set(artifact_review.event_index(event_log)), rep)
-            return [b for b in reviewed["bundles"]
-                    if b.get("disposition") == "approve_for_build"], event_log
+        # --- Phase 2: structured interview ---
+        def _interview(self, sid, body=None):
+            if not sessions.artifacts(root, sid)["reviewed"]:
+                return self._json(400, {"error": "not_reviewed"})
+            approved, _ = state._approved_for_stage4(sid)
+            if approved and not state.keystore.get_key():
+                return self._json(400, {"error": "no_api_key"})
+            selected = (body or {}).get("bundle_ids")
+            with state.lock:
+                existing = state.interview_jobs.get(sid)
+                if existing and existing.get("state") == "running":
+                    return self._json(409, {"error": "already_running"})
+                state.start_interview(sid, selected_ids=selected)
+            return self._json(202, {"state": "running", "session_id": sid})
 
-        def _load_or_seed_env(self, sid, bid):
-            """Load a bundle's saved environment record, or seed it from the reviewed
-            bundle + event log (requests derived, nothing uploaded)."""
-            saved = sessions.read_json_artifact(root, sid, environment_filename(bid))
-            if saved is not None:
-                return artifact_env.validate_environment(saved)
-            approved, event_log = self._approved_bundles(sid)
-            if approved is None:
-                return None
-            b = next((x for x in approved if x["id"] == bid), None)
-            return artifact_env.seed_environment(b, event_log) if b else None
+        def _interview_dry_run(self, sid):
+            approved, event_log = state._approved_for_stage4(sid)
+            return self._json(200, {
+                "system_prompt": agent_interview.SYSTEM_PROMPT,
+                "bundles": [{"id": b["id"], "material": agent_interview.build_prompt_material(
+                    *agent_configgen.make_engine_inputs(b, event_log)[:2])} for b in approved],
+            })
 
-        def _save_env_record(self, sid, rec):
-            with open(sessions.path(root, sid, environment_filename(rec["bundle_id"])),
-                      "w", encoding="utf-8") as f:
-                json.dump(rec, f, indent=2, ensure_ascii=False)
-
-        def _environment_data(self, sid):
-            approved, event_log = self._approved_bundles(sid)
-            if approved is None:
-                return self._json(404, {"error": "not_reviewed"})
-            envs = {b["id"]: self._load_or_seed_env(sid, b["id"]) for b in approved}
-            return self._json(200, {"approved_ids": [b["id"] for b in approved],
-                                    "environments": envs})
-
-        def _save_environment(self, sid, bid, body):
-            rec = artifact_env.validate_environment(body or {})
-            rec["bundle_id"] = bid
-            self._save_env_record(sid, rec)
-            return self._json(200, rec)
-
-        def _upload_environment(self, sid, bid):
-            qs = urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
-            try:
-                artifact_idx = int(qs.get("artifact", ["-1"])[0])
-            except ValueError:
-                artifact_idx = -1
-            filename = qs.get("filename", ["upload.bin"])[0]
-            length = int(self.headers.get("Content-Length", 0) or 0)
-            data = self.rfile.read(length) if length else b""
-
-            rec = self._load_or_seed_env(sid, bid)
+        def _save_interview(self, sid, bid, body):
+            rec = state.save_interview(sid, bid, (body or {}).get("answers") or {})
             if rec is None:
-                return self._json(404, {"error": "not_reviewed"})
-            updir = os.path.join(sessions.session_dir(root, sid), "env", bid)
-            os.makedirs(updir, exist_ok=True)
-            safe = "".join(c if (c.isalnum() or c in "._-") else "_" for c in filename) or "upload.bin"
-            fpath = os.path.join(updir, safe)
-            with open(fpath, "wb") as f:
-                f.write(data)
-            artifact_env.attach_upload(rec, artifact_idx, fpath, filename)
-            self._save_env_record(sid, rec)
+                return self._json(404, {"error": "no_interview"})
             return self._json(200, rec)
+
+        # --- Phase 1 config generation, wired into the chain ---
+        def _generate_config(self, sid, body=None):
+            if not sessions.artifacts(root, sid)["reviewed"]:
+                return self._json(400, {"error": "not_reviewed"})
+            approved, _ = state._approved_for_stage4(sid)
+            if approved and not state.keystore.get_key():
+                return self._json(400, {"error": "no_api_key"})
+            selected = (body or {}).get("bundle_ids")
+            with state.lock:
+                existing = state.config_jobs.get(sid)
+                if existing and existing.get("state") == "running":
+                    return self._json(409, {"error": "already_running"})
+                state.start_configgen(sid, selected_ids=selected)
+            return self._json(202, {"state": "running", "session_id": sid})
 
     return Handler
 

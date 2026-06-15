@@ -229,23 +229,31 @@ def _grounding_entry(prefix, i, item, used):
     return {"key": key, "text": item["text"], "source": source, "observed": observed}
 
 
-def build_grounding(bundle_id, steps, working_rules, requirements):
+def build_grounding(bundle_id, steps, working_rules, requirements, unresolved=None):
     """One entry per step/working-rule/requirement, keyed by a deterministic slug,
-    recording its source and whether it was directly observed (events-sourced)."""
+    recording its source and whether it was directly observed (events-sourced).
+    ``unresolved`` (Phase 2: interview questions the worker skipped) is recorded as a
+    top-level list when non-empty — the agent falls back to reading the live
+    environment for those, and the gap is auditable."""
     used, instructions = set(), []
     for prefix, items in (("step_", steps), ("rule_", working_rules), ("req_", requirements)):
         for i, item in enumerate(items):
             instructions.append(_grounding_entry(prefix, i, item, used))
-    return {"bundle_id": bundle_id, "instructions": instructions}
+    record = {"bundle_id": bundle_id, "instructions": instructions}
+    if unresolved:
+        record["unresolved"] = list(unresolved)
+    return record
 
 
 # --------------------------------------------------------------------------
 # Per-bundle compile + the engine over a reviewed file
 # --------------------------------------------------------------------------
-def compile_config(bundle, observed_events, user_answers, model_fn, model=DEFAULT_MODEL):
+def compile_config(bundle, observed_events, user_answers, model_fn, model=DEFAULT_MODEL,
+                   unresolved=None):
     """Run the model once and assemble the configs + grounding for one bundle.
     Returns ``{test, live, grounding, content}``. ``model_fn`` is required (callers
-    that want the default should construct it; tests inject a stub)."""
+    that want the default should construct it; tests inject a stub). ``unresolved``
+    (skipped interview questions) is recorded in the grounding record."""
     workflow_description = {
         "name": bundle.get("name", ""), "description": bundle.get("description", ""),
         "trigger": bundle.get("trigger", ""), "steps": list(bundle.get("steps", []) or []),
@@ -259,28 +267,49 @@ def compile_config(bundle, observed_events, user_answers, model_fn, model=DEFAUL
     requirements = _items(model_out, "requirements")
     system_text = assemble_system_text(model_out, working_rules)
     envelopes = build_envelopes(bundle, model_out, system_text)
-    grounding = build_grounding(bundle.get("id"), steps, working_rules, requirements)
+    grounding = build_grounding(bundle.get("id"), steps, working_rules, requirements,
+                                unresolved=unresolved)
     return {"test": envelopes["test"], "live": envelopes["live"],
             "grounding": grounding, "content": model_out}
 
 
-def _load_answers(answers_dir, bundle_id):
-    """Load ``interview_<id>.json`` (Phase 2 writes these) as a list, or ``[]``.
-    Defensive: a missing or malformed file yields ``[]``."""
+def _interview_path(answers_dir, bundle_id):
     if not answers_dir:
-        return []
+        return None
     safe = "".join(c if c.isalnum() else "_" for c in str(bundle_id))
     p = os.path.join(answers_dir, f"interview_{safe}.json")
-    if not os.path.exists(p):
-        return []
+    return p if os.path.exists(p) else None
+
+
+def _read_interview(answers_dir, bundle_id):
+    p = _interview_path(answers_dir, bundle_id)
+    if not p:
+        return None
     try:
         with open(p, encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, dict):
-            data = data.get("answers", [])
-        return data if isinstance(data, list) else []
+            return json.load(f)
     except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _load_answers(answers_dir, bundle_id):
+    """Load the worker's interview answers (Phase 2 writes ``interview_<id>.json``) as
+    a list, or ``[]``. Defensive: a missing or malformed file yields ``[]``."""
+    data = _read_interview(answers_dir, bundle_id)
+    if data is None:
         return []
+    if isinstance(data, dict):
+        data = data.get("answers", [])
+    return data if isinstance(data, list) else []
+
+
+def _load_unresolved(answers_dir, bundle_id):
+    """The ids of interview questions the worker skipped, or ``[]``."""
+    data = _read_interview(answers_dir, bundle_id)
+    if isinstance(data, dict):
+        u = data.get("unresolved", [])
+        return u if isinstance(u, list) else []
+    return []
 
 
 def generate_configs(reviewed_path, event_log_path, model=DEFAULT_MODEL, model_fn=None,
@@ -312,7 +341,9 @@ def generate_configs(reviewed_path, event_log_path, model=DEFAULT_MODEL, model_f
             continue
         _, observed_events, _ = make_engine_inputs(b, event_log)
         user_answers = _load_answers(answers_dir, b["id"])
-        compiled = compile_config(b, observed_events, user_answers, model_fn, model)
+        unresolved = _load_unresolved(answers_dir, b["id"])
+        compiled = compile_config(b, observed_events, user_answers, model_fn, model,
+                                  unresolved=unresolved)
         results.append({"id": b["id"], "built": True,
                         "test_yaml": compiled["test"]["yaml"],
                         "live_yaml": compiled["live"]["yaml"],

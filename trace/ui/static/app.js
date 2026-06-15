@@ -263,7 +263,7 @@ function pollRecon() {
 // ===========================================================================
 const ENDPOINTS = { event_log: "event_log", validation: "validation", raw: "raw",
                     discovery: "discovery", reviewed: "reviewed-bundles" };
-const LOCAL_TABS = { dryrun: 1, discdryrun: 1, specdryrun: 1 };  // client-side, no GET
+const LOCAL_TABS = { dryrun: 1, discdryrun: 1 };  // client-side, no GET
 
 document.querySelectorAll(".tab").forEach(t => {
   t.onclick = () => switchTab(t.dataset.tab);
@@ -290,34 +290,19 @@ async function loadAndShow(tab) {
     setView(cache[selectedSid].discdryrun || "Click discovery “Preview (dry run)” to render what Sonnet would be sent.");
     return;
   }
-  if (tab === "specdryrun") {
-    setView(cache[selectedSid].specdryrun || "Click “Spec dry run” to render what the Artifact Engine would be sent.");
-    return;
-  }
   if (cache[selectedSid][tab] !== undefined) { setView(cache[selectedSid][tab]); return; }
 
-  if (tab === "specs") {       // markdown artifacts, not JSON
-    const { ok, data } = await api("GET", `/api/sessions/${selectedSid}/specs`);
-    let text;
-    if (!ok || !data.specs.length) {
-      text = "No specs yet — review bundles, then Generate specs.";
-    } else {
-      text = data.specs.map(s => `===== ${s.filename} =====\n\n${s.markdown}`).join("\n\n\n");
-    }
-    cache[selectedSid][tab] = text;
-    setView(text);
-    return;
-  }
-
-  if (tab === "agents") {      // Stage-4 envelopes + run pointers
+  if (tab === "agents") {      // config envelopes + grounding + run pointer
     const { ok, data } = await api("GET", `/api/sessions/${selectedSid}/agents`);
     let text;
     if (!ok || !data.agents.length) {
-      text = "No agents yet — generate specs, then Compile & run.";
+      text = "No agents yet — run the interview, then Generate config.";
     } else {
       text = data.agents.map(a =>
         `===== ${a.bundle_id} — agent (test) =====\n${a.test_yaml || "(none)"}\n\n` +
         `===== ${a.bundle_id} — agent (live, NOT deployed) =====\n${a.live_yaml || "(none)"}\n\n` +
+        `===== ${a.bundle_id} — grounding =====\n` +
+        (a.grounding ? JSON.stringify(a.grounding, null, 2) : "(none)") + "\n\n" +
         `===== ${a.bundle_id} — run (evaluate manually in the Console) =====\n` +
         (a.run ? JSON.stringify(a.run, null, 2) : "(not run — needs API key)")
       ).join("\n\n\n");
@@ -525,11 +510,12 @@ async function refreshSessions() {
       scoreAvailable = !!(meta.data && meta.data.answer_key_path);
       $("scoreBtn").disabled = !(scoreAvailable && art.discovery);
       enableReviewButtons(!!art.discovery, false);
-      enableEnvButton(!!art.reviewed);
-      enableStage4((art.specs || 0) > 0);
-      reviewData = null; envState = null; $("stage4Summary").innerHTML = "";
+      enableInterview(!!art.reviewed);
+      enableConfig(!!art.reviewed);
+      enableStage4(!!art.reviewed);
+      reviewData = null; interviewState = null; $("stage4Summary").innerHTML = "";
       $("reviewContainer").innerHTML = "";
-      $("envContainer").innerHTML = "";
+      $("interviewContainer").innerHTML = "";
       $("discoverTarget").textContent = art.event_log ? `target: ${selectedSid}` : "";
       $("scorecardView").classList.add("hidden");
       await loadAndShow("event_log");
@@ -542,15 +528,12 @@ async function refreshSessions() {
 // Stage 3 — Review / edit + spec generation
 // ===========================================================================
 let reviewData = null;        // {reviewed, examples_by_id}
-let specTimer = null;
 const ESC = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, c =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
 function enableReviewButtons(canLoad, loaded) {
   $("loadReviewBtn").disabled = !canLoad;
   $("saveReviewBtn").disabled = !loaded;
-  $("genSpecBtn").disabled = !loaded;
-  $("specDryRun").disabled = !loaded;
 }
 
 $("loadReviewBtn").onclick = async () => {
@@ -690,7 +673,7 @@ async function saveReview() {
   const { ok, data } = await api("POST", `/api/sessions/${selectedSid}/reviewed-bundles`, body);
   if (ok) {
     reviewData.reviewed = data.reviewed;
-    enableEnvButton(true);   // reviewed bundles exist -> can run environment capture
+    enableInterview(true); enableConfig(true); enableStage4(true);
     delete cache[selectedSid];
     await refreshSessions();
   }
@@ -705,169 +688,189 @@ $("saveReviewBtn").onclick = async () => {
     : `<span class="err">save failed</span>`;
 };
 
-$("specDryRun").onclick = async () => {
-  $("reviewMsg").textContent = "saving + rendering…";
-  await saveReview();
-  const { ok, data } = await api("POST", `/api/sessions/${selectedSid}/specs-dry-run`);
-  if (!ok) { $("reviewMsg").innerHTML = `<span class="err">${(data && data.error) || "failed"}</span>`; return; }
-  cache[selectedSid] = cache[selectedSid] || {};
-  cache[selectedSid].specdryrun =
-    `// SPEC DRY RUN — ${data.approved_count} approved bundle(s), one model call each. No cost.\n\n` +
-    `===== SYSTEM PROMPT =====\n${data.system_prompt}\n\n` +
-    data.bundles.map(b => `===== BUNDLE ${b.id} =====\n${b.material}`).join("\n\n");
-  $("reviewMsg").textContent = "";
-  switchTab("specdryrun");
-};
+// ===========================================================================
+// Phase 2 — Structured interview (gap detector)
+// ===========================================================================
+let interviewState = null;   // {approved_ids, interviews}
+let interviewTimer = null;
 
-$("genSpecBtn").onclick = async () => {
-  $("reviewMsg").textContent = "saving + generating…";
-  await saveReview();
-  const { ok, status, data } = await api("POST", `/api/sessions/${selectedSid}/generate-specs`);
+function enableInterview(on) {
+  $("generateQBtn").disabled = !on;
+  $("intDryRun").disabled = !on;
+  if (on) loadInterview(); else $("interviewContainer").innerHTML = "";
+}
+
+async function loadInterview() {
+  if (!selectedSid) return;
+  const { ok, data } = await api("GET", `/api/sessions/${selectedSid}/interview-data`);
+  if (!ok) return;
+  interviewState = data;
+  renderInterview();
+}
+
+$("generateQBtn").onclick = async () => {
+  if (!selectedSid) return;
+  $("interviewMsg").textContent = "generating questions…";
+  const { ok, status, data } = await api("POST", `/api/sessions/${selectedSid}/interview`, {});
   if (status === 400 && data && data.error === "no_api_key") {
-    $("reviewMsg").innerHTML = `<span class="err">no API key</span> — add one in Settings (only the build path needs it).`; return;
+    $("interviewMsg").innerHTML = `<span class="err">no API key</span> — add one in Settings.`; return;
+  }
+  if (status === 400 && data && data.error === "not_reviewed") {
+    $("interviewMsg").innerHTML = `<span class="err">save reviewed bundles first</span>`; return;
   }
   if (!ok && status !== 202) {
-    $("reviewMsg").innerHTML = `<span class="err">${(data && data.error) || "failed"}</span>`; return;
+    $("interviewMsg").innerHTML = `<span class="err">${(data && data.error) || "failed"}</span>`; return;
   }
   setPill("reconstructing");
-  pollSpecs();
+  pollInterview();
 };
 
-function pollSpecs() {
-  if (specTimer) clearInterval(specTimer);
-  specTimer = setInterval(async () => {
-    const { data } = await api("GET", `/api/sessions/${selectedSid}/generate-specs/status`);
+function pollInterview() {
+  if (interviewTimer) clearInterval(interviewTimer);
+  interviewTimer = setInterval(async () => {
+    const { data } = await api("GET", `/api/sessions/${selectedSid}/interview/status`);
     if (!data) return;
     if (data.state === "done") {
-      clearInterval(specTimer); specTimer = null;
-      $("reviewMsg").innerHTML = `<span class="ok">done</span> — ${data.built} build spec(s) generated.`;
+      clearInterval(interviewTimer); interviewTimer = null;
+      $("interviewMsg").innerHTML = `<span class="ok">done</span> — questions for ${data.generated} bundle(s).`;
       setPill("results");
-      if (data.built > 0) enableStage4(true);    // specs exist -> can compile & test agents
-      delete cache[selectedSid];
-      await loadAndShow("specs");
+      await loadInterview();
       await refreshSessions();
     } else if (data.state === "error") {
-      clearInterval(specTimer); specTimer = null;
+      clearInterval(interviewTimer); interviewTimer = null;
       const e = data.error === "no_api_key" ? "no API key (add one in Settings)" : data.error;
-      $("reviewMsg").innerHTML = `<span class="err">spec generation failed</span> — ${e}`;
+      $("interviewMsg").innerHTML = `<span class="err">interview failed</span> — ${e}`;
       setPill("idle");
     }
   }, 800);
 }
 
-// ===========================================================================
-// Review 2 — environment capture
-// ===========================================================================
-let envState = null;   // {approved_ids, environments}
-
-function enableEnvButton(on) { $("loadEnvBtn").disabled = !on; }
-
-$("loadEnvBtn").onclick = async () => {
+$("intDryRun").onclick = async () => {
   if (!selectedSid) return;
-  $("envMsg").textContent = "loading…";
-  const { ok, data } = await api("GET", `/api/sessions/${selectedSid}/environment-data`);
-  if (!ok) {
-    $("envMsg").innerHTML = `<span class="err">${(data && data.error) || "failed"}</span>` +
-      (data && data.error === "not_reviewed" ? " — save reviewed bundles first." : "");
-    return;
-  }
-  envState = data;
-  renderEnv();
-  $("envMsg").textContent = "upload the real files, answer the questions, then Save.";
+  const { ok, data } = await api("POST", `/api/sessions/${selectedSid}/interview-dry-run`, {});
+  if (!ok) { $("interviewMsg").innerHTML = `<span class="err">${(data && data.error) || "failed"}</span>`; return; }
+  cache[selectedSid] = cache[selectedSid] || {};
+  alert("Gap Detector — system prompt + per-bundle material (no model call):\n\n" +
+    data.bundles.map(b => `===== ${b.id} =====\n${b.material}`).join("\n\n").slice(0, 4000));
 };
 
-function envArtifactRow(bid, idx, a) {
-  const ex = a.extracted || {};
-  let preview = "";
-  if (a.uploaded && (a.extraction_status === "ok" || a.extraction_status === "partial")) {
-    const bits = [`format ${ex.format || "?"}`];
-    if (ex.headers && ex.headers.length) bits.push(`columns: ${ex.headers.join(", ")}`);
-    if (ex.tab_names && ex.tab_names.length) bits.push(`sheets: ${ex.tab_names.join(", ")}`);
-    if (ex.field_layout && ex.field_layout.length) bits.push(`fields: ${ex.field_layout.map(f => f.label).join(", ")}`);
-    preview = `<div class="ex-text">auto-read (unverified): ${ESC(bits.join(" · "))}</div>`;
-  } else if (a.uploaded) {
-    preview = `<div class="ex-text">auto-read: ${ESC(a.extraction_status || "none")} — the raw file + your instruction are what's used</div>`;
-  }
-  return `
-  <div class="field" style="flex-direction:column">
-    <div><b>${ESC(a.role)}</b> · ${ESC(a.kind)} <span class="muted">— ${ESC(a.label_shown_to_user)}</span>
-      <span class="muted">(from ${ESC((a.derived_from_event_ids || []).join(", "))})</span></div>
+function questionRow(bid, q, answer) {
+  const chips = (q.suggested_answers || []).map(s =>
+    `<button class="link int-chip" data-bid="${ESC(bid)}" data-q="${ESC(q.id)}">${ESC(s)}</button>`).join(" ");
+  return `<div class="field" style="flex-direction:column">
+    <div><b>${ESC(q.question)}</b>
+      <span class="muted">[${ESC(q.lens)} · ${ESC(q.cost_if_wrong)} cost]</span></div>
+    <div class="muted">${ESC(q.why_it_matters)}</div>
     <div class="step-row">
-      <input type="file" data-bid="${ESC(bid)}" data-idx="${idx}" class="env-file"/>
-      ${a.uploaded ? '<span class="ok">uploaded ✓</span>' : '<span class="warn">file needed</span>'}
+      <input type="text" class="int-answer" data-bid="${ESC(bid)}" data-q="${ESC(q.id)}"
+        placeholder="one line — or leave blank to skip" value="${ESC(answer)}"/>
     </div>
-    <textarea class="env-instr" data-bid="${ESC(bid)}" data-aidx="${idx}"
-      placeholder="Instruction (authoritative): what is this file & how to use it? name a tab/section if relevant">${ESC(a.user_instruction || "")}</textarea>
-    ${preview}
+    ${chips ? `<div class="muted">suggestions: ${chips}</div>` : ""}
   </div>`;
 }
 
-function renderEnv() {
-  const c = $("envContainer");
-  c.innerHTML = (envState.approved_ids || []).map(bid => {
-    const rec = envState.environments[bid] || { artifacts: [], answers: [] };
-    const arts = (rec.artifacts || []).map((a, i) => envArtifactRow(bid, i, a)).join("");
-    const qs = (rec.answers || []).map((q, i) => `
-      <div class="field"><label>${ESC(q.question)}</label>
-        <input type="text" class="env-answer" data-bid="${ESC(bid)}" data-qi="${i}" value="${ESC(q.answer)}"/></div>`).join("")
-      || `<div class="muted">no questions yet — upload files to derive them</div>`;
+function renderInterview() {
+  const c = $("interviewContainer");
+  c.innerHTML = (interviewState.approved_ids || []).map(bid => {
+    const rec = interviewState.interviews[bid] || { questions: [], answers: [], status: "unstarted" };
+    const ansById = {};
+    (rec.answers || []).forEach(a => { ansById[a.q] = a.answer; });
+    const qs = (rec.questions || []).map(q => questionRow(bid, q, ansById[q.id] || "")).join("")
+      || `<div class="muted">no questions — capture already settled this workflow</div>`;
     const cls = rec.status === "complete" ? "ok" : "warn";
     return `<div class="review-item bundle" data-bid="${ESC(bid)}">
-      <h4>${ESC(bid)} — environment <span class="${cls}">${ESC(rec.status || "incomplete")}</span></h4>
-      <div class="review-sub">required artifacts (upload one real example each)</div>
-      ${arts || '<div class="muted">no artifacts required</div>'}
-      <div class="review-sub">questions</div>
+      <h4>${ESC(bid)} — interview <span class="${cls}">${ESC(rec.status || "unstarted")}</span></h4>
       ${qs}
-      <button class="link env-save" data-bid="${ESC(bid)}">save instructions &amp; answers</button>
+      <button class="link int-save" data-bid="${ESC(bid)}">save answers</button>
     </div>`;
   }).join("");
 
-  c.querySelectorAll(".env-file").forEach(inp => {
-    inp.onchange = () => uploadEnvFile(inp.dataset.bid, parseInt(inp.dataset.idx, 10), inp.files[0]);
+  c.querySelectorAll(".int-chip").forEach(btn => {
+    btn.onclick = () => {
+      const inp = c.querySelector(`.int-answer[data-bid="${btn.dataset.bid}"][data-q="${btn.dataset.q}"]`);
+      if (inp) inp.value = btn.textContent;
+    };
   });
-  c.querySelectorAll(".env-save").forEach(btn => {
-    btn.onclick = () => saveEnv(btn.dataset.bid);
+  c.querySelectorAll(".int-save").forEach(btn => {
+    btn.onclick = () => saveInterview(btn.dataset.bid);
   });
 }
 
-// scrape the DOM (instructions + answers) into the in-memory record for a bundle
-function scrapeEnv(bid) {
-  const rec = envState.environments[bid];
-  $("envContainer").querySelectorAll(`.env-instr[data-bid="${bid}"]`).forEach(t => {
-    const i = parseInt(t.dataset.aidx, 10);
-    if (rec.artifacts[i]) rec.artifacts[i].user_instruction = t.value;
+async function saveInterview(bid) {
+  const answers = {};
+  $("interviewContainer").querySelectorAll(`.int-answer[data-bid="${bid}"]`).forEach(inp => {
+    if (inp.value.trim()) answers[inp.dataset.q] = inp.value.trim();
   });
-  $("envContainer").querySelectorAll(`.env-answer[data-bid="${bid}"]`).forEach(inp => {
-    const qi = parseInt(inp.dataset.qi, 10);
-    if (rec.answers[qi]) rec.answers[qi].answer = inp.value;
-  });
-  return rec;
-}
-
-async function uploadEnvFile(bid, idx, file) {
-  if (!file) return;
-  // persist any typed instructions first so the upload (server re-reads the record) keeps them
-  await api("POST", `/api/sessions/${selectedSid}/environment/${bid}`, scrapeEnv(bid));
-  $("envMsg").textContent = `uploading ${file.name}…`;
-  const buf = await file.arrayBuffer();
-  const url = `/api/sessions/${selectedSid}/environment/${bid}/upload`
-    + `?artifact=${idx}&filename=${encodeURIComponent(file.name)}`;
-  const res = await fetch(url, { method: "POST", body: buf });
-  const rec = await res.json();
-  envState.environments[bid] = rec;
-  renderEnv();
-  $("envMsg").innerHTML = res.ok
-    ? `<span class="ok">file carried</span> ${ESC(file.name)} (auto-read: ${ESC(rec.artifacts[idx].extraction_status || "?")})`
-    : `<span class="err">upload failed</span>`;
+  const { ok, data } = await api("POST", `/api/sessions/${selectedSid}/interview/${bid}`, { answers });
+  if (ok) {
+    interviewState.interviews[bid] = data;
+    renderInterview();
+    $("interviewMsg").innerHTML = `<span class="ok">saved ${ESC(bid)}</span> — status ${ESC(data.status)}` +
+      (data.unresolved.length ? `, ${data.unresolved.length} skipped` : "");
+  } else {
+    $("interviewMsg").innerHTML = `<span class="err">save failed</span>`;
+  }
   await refreshSessions();
 }
 
-async function saveEnv(bid) {
-  const { ok, data } = await api("POST", `/api/sessions/${selectedSid}/environment/${bid}`, scrapeEnv(bid));
-  if (ok) { envState.environments[bid] = data; renderEnv(); }
-  $("envMsg").innerHTML = ok ? `<span class="ok">saved</span> — status ${data.status}`
-    : `<span class="err">save failed</span>`;
-  await refreshSessions();
+// ===========================================================================
+// Generate config (Phase 1 engine, wired into the chain)
+// ===========================================================================
+let configTimer = null;
+
+function enableConfig(on) {
+  $("genConfigBtn").disabled = !on;
+  if (on) loadConfigBundles(); else $("configBundles").innerHTML = "";
+}
+
+async function loadConfigBundles() {
+  if (!selectedSid) return;
+  const { ok, data } = await api("GET", `/api/sessions/${selectedSid}/stage4-bundles`);
+  const el = $("configBundles");
+  if (!ok || !data.bundles || !data.bundles.length) { el.innerHTML = ""; return; }
+  el.innerHTML = data.bundles.map(b =>
+    `<label><input type="checkbox" class="cfg" value="${ESC(b.id)}" checked>` +
+    `<b>${ESC(b.id)}</b> ${ESC(b.name)}` +
+    (b.config_ready ? ` <span class="muted">config ready</span>` : "") + `</label>`).join("");
+}
+
+$("genConfigBtn").onclick = async () => {
+  if (!selectedSid) return;
+  const ids = Array.from(document.querySelectorAll("#configBundles .cfg:checked")).map(c => c.value);
+  if (!ids.length) { $("configMsg").innerHTML = `<span class="warn">select at least one bundle</span>`; return; }
+  $("configMsg").textContent = "generating config…";
+  const { ok, status, data } = await api("POST", `/api/sessions/${selectedSid}/generate-config`, { bundle_ids: ids });
+  if (status === 400 && data && data.error === "no_api_key") {
+    $("configMsg").innerHTML = `<span class="err">no API key</span> — add one in Settings.`; return;
+  }
+  if (!ok && status !== 202) {
+    $("configMsg").innerHTML = `<span class="err">${(data && data.error) || "failed"}</span>`; return;
+  }
+  setPill("reconstructing");
+  pollConfig();
+};
+
+function pollConfig() {
+  if (configTimer) clearInterval(configTimer);
+  configTimer = setInterval(async () => {
+    const { data } = await api("GET", `/api/sessions/${selectedSid}/generate-config/status`);
+    if (!data) return;
+    if (data.state === "done") {
+      clearInterval(configTimer); configTimer = null;
+      const errs = Object.keys(data.errors || {}).length;
+      $("configMsg").innerHTML = `<span class="ok">done</span> — ${data.generated} config(s)` +
+        (errs ? ` · <span class="err">${errs} error(s)</span>` : "");
+      setPill("results");
+      delete cache[selectedSid];
+      enableStage4(true);
+      await loadAndShow("agents");
+      await refreshSessions();
+    } else if (data.state === "error") {
+      clearInterval(configTimer); configTimer = null;
+      $("configMsg").innerHTML = `<span class="err">config generation failed</span> — ${data.error}`;
+      setPill("idle");
+    }
+  }, 800);
 }
 
 // ===========================================================================
@@ -880,17 +883,17 @@ function enableStage4(on) {
   if (on) loadStage4Bundles(); else $("stage4Bundles").innerHTML = "";
 }
 
-// Per-bundle checkboxes; default-check only bundles that have Review 2 artifacts.
+// Per-bundle checkboxes; default-check bundles whose config has been generated.
 async function loadStage4Bundles() {
   if (!selectedSid) return;
   const { ok, data } = await api("GET", `/api/sessions/${selectedSid}/stage4-bundles`);
   const el = $("stage4Bundles");
   if (!ok || !data.bundles || !data.bundles.length) { el.innerHTML = ""; return; }
   el.innerHTML = data.bundles.map(b => {
-    const note = b.has_artifacts
-      ? `<span class="muted">${b.artifact_count} file(s)</span>`
-      : `<span class="note">no environment files — agent may halt or improvise; run deliberately</span>`;
-    return `<label><input type="checkbox" class="b4" value="${ESC(b.id)}" ${b.has_artifacts ? "checked" : ""}>` +
+    const note = b.config_ready
+      ? `<span class="muted">config ready</span>`
+      : `<span class="note">no config yet — generate config first</span>`;
+    return `<label><input type="checkbox" class="b4" value="${ESC(b.id)}" ${b.config_ready ? "checked" : ""}>` +
            `<b>${ESC(b.id)}</b> ${ESC(b.name)} ${note}</label>`;
   }).join("");
 }
@@ -899,11 +902,11 @@ $("compileTestBtn").onclick = async () => {
   if (!selectedSid) return;
   const ids = Array.from(document.querySelectorAll("#stage4Bundles .b4:checked")).map(c => c.value);
   if (!ids.length) { $("stage4Msg").innerHTML = `<span class="warn">select at least one bundle</span>`; return; }
-  $("stage4Msg").textContent = "compiling + running…";
+  $("stage4Msg").textContent = "running…";
   const { ok, status, data } = await api(
     "POST", `/api/sessions/${selectedSid}/compile-test`, { bundle_ids: ids });
-  if (status === 400 && data && data.error === "no_specs") {
-    $("stage4Msg").innerHTML = `<span class="err">no specs</span> — generate specs first.`; return;
+  if (status === 400 && data && data.error === "no_config") {
+    $("stage4Msg").innerHTML = `<span class="err">no config</span> — generate config first.`; return;
   }
   if (!ok && status !== 202) {
     $("stage4Msg").innerHTML = `<span class="err">${(data && data.error) || "failed"}</span>`; return;
@@ -919,7 +922,7 @@ function pollStage4() {
     if (!data) return;
     if (data.state === "done") {
       clearInterval(stage4Timer); stage4Timer = null;
-      $("stage4Msg").innerHTML = `<span class="ok">done</span> — ${data.compiled} compiled, ${data.ran} run.`;
+      $("stage4Msg").innerHTML = `<span class="ok">done</span> — ${data.ran} run.`;
       renderStage4Summary(data.runs || {});
       setPill("results");
       delete cache[selectedSid];
