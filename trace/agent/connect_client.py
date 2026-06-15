@@ -48,6 +48,18 @@ def _ssl_context():
 _SSL_CONTEXT = _ssl_context()
 
 
+def _with_app(url, app):
+    """Return ``url`` guaranteed to carry an ``app={slug}`` query param. The Pipedream
+    hosted connect page rejects a URL without it ("Please include the app in the Connect
+    URL"), and Pipedream's returned ``connect_link_url`` omits it. Any existing ``app`` is
+    left untouched; the token and other params are preserved."""
+    parts = urllib.parse.urlparse(url)
+    q = dict(urllib.parse.parse_qsl(parts.query))
+    if not q.get("app"):
+        q["app"] = app
+    return urllib.parse.urlunparse(parts._replace(query=urllib.parse.urlencode(q)))
+
+
 class ConnectClient:
     def __init__(self, api_key=None, beta=BETA_VERSION,
                  pipedream_project=None, connect_base=None,
@@ -133,15 +145,15 @@ class ConnectClient:
     def create_connect_token(self, external_user_id, app):
         """Create a Connect token for this user and return ``{token, connect_url}`` — the
         UI opens ``connect_url`` (the hosted Connect page) in a browser tab. The token
-        (``ctok_…``) is single-use, 4h."""
+        (``ctok_…``) is single-use, 4h. The hosted page REQUIRES the app slug in the URL, so
+        it is always appended even when Pipedream returns a link without it."""
         out = _retry(lambda: self._pd_request("POST", "/tokens",
                                               {"external_user_id": external_user_id}))
         token = out.get("token") or out.get("connect_token")
-        connect_url = (out.get("connect_link_url") or out.get("connect_url")
-                       or (f"https://pipedream.com/_static/connect.html?"
-                           f"token={urllib.parse.quote(token or '')}&connectLink=true"
-                           f"&app={urllib.parse.quote(app)}"))
-        return {"token": token, "connect_url": connect_url}
+        base = (out.get("connect_link_url") or out.get("connect_url")
+                or (f"https://pipedream.com/_static/connect.html?"
+                    f"token={urllib.parse.quote(token or '')}&connectLink=true"))
+        return {"token": token, "connect_url": _with_app(base, app)}
 
     def get_account(self, external_user_id, app):
         """Look up the account this user connected for ``app``, including its identity

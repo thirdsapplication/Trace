@@ -211,6 +211,41 @@ class TLSContextTest(unittest.TestCase):
         self.assertIsInstance(captured["context"], ssl.SSLContext)
 
 
+class ConnectUrlAppTest(unittest.TestCase):
+    """The hosted Pipedream connect page requires app={slug} in the URL; ensure it is
+    always present whether Pipedream returns a link, omits one, or includes its own app."""
+
+    def _client(self, pd_return):
+        from trace.agent import connect_client
+        c = connect_client.ConnectClient(client_id="c", client_secret="s",
+                                         pipedream_project="proj_x")
+        c._pd_request = lambda method, path, body=None: pd_return
+        c.mint_access_token = lambda: {"access_token": "t", "expires_in": 3600}
+        return c
+
+    def test_appended_when_pipedream_link_omits_app(self):
+        c = self._client({"token": "ctok_1",
+                          "connect_link_url": "https://pipedream.com/_static/connect.html"
+                                              "?token=ctok_1&connectLink=true"})
+        url = c.create_connect_token("trace-s1", "gmail")["connect_url"]
+        self.assertIn("app=gmail", url)
+        self.assertIn("token=ctok_1", url)               # token preserved
+
+    def test_appended_on_hosted_fallback(self):
+        c = self._client({"token": "ctok_2"})            # no link returned
+        url = c.create_connect_token("trace-s1", "gmail")["connect_url"]
+        self.assertIn("app=gmail", url)
+        self.assertIn("connect.html", url)
+
+    def test_existing_app_not_duplicated(self):
+        c = self._client({"token": "ctok_3",
+                          "connect_url": "https://pipedream.com/_static/connect.html"
+                                         "?token=ctok_3&app=slack"})
+        url = c.create_connect_token("trace-s1", "gmail")["connect_url"]
+        self.assertIn("app=slack", url)                  # Pipedream's own app respected
+        self.assertNotIn("app=gmail", url)
+
+
 class UIConnectTest(unittest.TestCase):
     def setUp(self):
         import tempfile
