@@ -41,6 +41,34 @@ APPROVAL_PERMISSION_POLICY = "require_approval"
 PIPEDREAM_MCP = {"name": "pipedream", "type": "url",
                  "url": "https://mcp.pipedream.net/v2"}  # confirm path against current docs
 LIVE_PERMISSION_POLICY = "always_ask"   # approval-required; confirm enum against current docs
+
+# --- Phase 4: Connection Layer (Pipedream Connect + Managed Agents vault) ---
+# Pipedream Connect and the MA vault are external BETA APIs. CONFIRM EVERY SHAPE
+# BELOW AGAINST CURRENT DOCS before live use — they cannot be exercised here.
+PIPEDREAM_PROJECT = ""                  # Trace's single Pipedream project id (placeholder; confirm)
+PIPEDREAM_CONNECT_BASE = "https://api.pipedream.com/v1/connect"   # confirm path
+PIPEDREAM_CONNECT_VERSION = "connect-2026-06"                     # placeholder pin; confirm
+
+# Observed-app substring -> Pipedream app {slug, label}. Domain-neutral; same match
+# idiom as APP_MCP_TABLE. Apps with no row are surfaced as 'unmapped', never guessed.
+# The exact Pipedream slugs are placeholders — confirm against the Pipedream app registry.
+CONNECT_APP_TABLE = {
+    "gmail":         {"slug": "gmail",           "label": "Gmail"},
+    "google sheets": {"slug": "google_sheets",   "label": "Google Sheets"},
+    "sheets":        {"slug": "google_sheets",   "label": "Google Sheets"},
+    "google drive":  {"slug": "google_drive",    "label": "Google Drive"},
+    "drive":         {"slug": "google_drive",    "label": "Google Drive"},
+    "google docs":   {"slug": "google_docs",     "label": "Google Docs"},
+    "docs":          {"slug": "google_docs",     "label": "Google Docs"},
+    "slack":         {"slug": "slack",           "label": "Slack"},
+    "outlook":       {"slug": "outlook",         "label": "Outlook"},
+    "calendar":      {"slug": "google_calendar", "label": "Google Calendar"},
+}
+
+# Worker-facing expectation copy shown BEFORE Google's OAuth window (spec step 2).
+CONNECT_EXPECTATION_COPY = ("Google will ask you to pick your account, then approve "
+                            "access — two taps. You won't create any new accounts.")
+
 # Canonical, domain-neutral working rule the generator must always include; appended
 # deterministically if the model omits it (so the agent always matches existing work).
 MATCH_EXAMPLES_RULE = ("Before producing the work product, look at the examples of this "

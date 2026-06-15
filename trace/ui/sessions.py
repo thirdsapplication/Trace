@@ -24,7 +24,12 @@ DISCOVERY = "discovery.json"
 SCORECARD = "scorecard.json"
 REVIEWED = "reviewed_bundles.json"
 SPECS_DIR = "specs"
+CONNECTION = "connection.json"      # Phase 4: per-session (per-customer) connection record
 META = "meta.json"
+
+
+def connection_filename():
+    return CONNECTION
 
 
 def _now():

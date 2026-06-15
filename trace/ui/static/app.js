@@ -512,6 +512,7 @@ async function refreshSessions() {
       enableReviewButtons(!!art.discovery, false);
       enableInterview(!!art.reviewed);
       enableBuild(!!art.reviewed);
+      enableConnect(!!art.reviewed);
       reviewData = null; interviewState = null; $("buildSummary").innerHTML = "";
       $("reviewContainer").innerHTML = "";
       $("interviewContainer").innerHTML = "";
@@ -672,7 +673,7 @@ async function saveReview() {
   const { ok, data } = await api("POST", `/api/sessions/${selectedSid}/reviewed-bundles`, body);
   if (ok) {
     reviewData.reviewed = data.reviewed;
-    enableInterview(true); enableBuild(true);
+    enableInterview(true); enableBuild(true); enableConnect(true);
     delete cache[selectedSid];
     await refreshSessions();
   }
@@ -906,6 +907,96 @@ $("cleanupBtn").onclick = async () => {
   $("cleanupMsg").innerHTML = `<span class="ok">removed</span> — ` +
     `${rm.sessions.length} session(s), ${rm.files.length} file(s), ${rm.agents.length} agent(s)${errs}`;
 };
+
+// ===========================================================================
+// Phase 4 — Connect your apps (Pipedream Connect + MA vault)
+// ===========================================================================
+let connectTimer = null;
+
+function enableConnect(on) {
+  $("saveEmailBtn").disabled = !on;
+  if (on) loadConnect(); else { $("connectApps").innerHTML = ""; $("connectExpectation").textContent = ""; }
+}
+
+async function loadConnect() {
+  if (!selectedSid) return;
+  const { ok, data } = await api("GET", `/api/sessions/${selectedSid}/connection-data`);
+  if (!ok) return;
+  $("connectExpectation").textContent = data.expectation || "";
+  const rec = data.record || { apps: {}, expected_identity: "" };
+  if (!$("workerEmail").value) $("workerEmail").value = rec.expected_identity || "";
+  renderConnectApps(rec, data.unmapped || []);
+}
+
+function renderConnectApps(rec, unmapped) {
+  const el = $("connectApps");
+  const slugs = Object.keys(rec.apps || {});
+  if (!slugs.length) { el.innerHTML = `<div class="muted">No connectable apps in the approved bundles yet.</div>`; return; }
+  el.innerHTML = slugs.map(slug => {
+    const a = rec.apps[slug];
+    let status;
+    if (!a.connected) status = `<span class="muted">not connected</span>`;
+    else if (a.verified === "yes") status = `<span class="ok">connected ✓ (${ESC((a.account || {}).identity_email || "")})</span>`;
+    else status = `<span class="err">connected — FLAGGED ⚠ not used</span>`;
+    const flag = (a.flag && a.verified !== "yes") ? `<div class="ex-text err">${ESC(a.flag)}</div>` : "";
+    return `<div class="field" style="flex-direction:column">
+      <div><b>${ESC(a.label || slug)}</b> — ${status}</div>
+      <div class="step-row">
+        <button class="link conn-start" data-slug="${ESC(slug)}">Connect</button>
+        <button class="link conn-allow" data-slug="${ESC(slug)}">Simulate Allow</button>
+      </div>${flag}</div>`;
+  }).join("") + (unmapped.length
+    ? `<div class="muted">Observed apps with no connector (skipped): ${unmapped.map(ESC).join(", ")}</div>` : "");
+  el.querySelectorAll(".conn-start").forEach(b => b.onclick = () => connectStart(b.dataset.slug));
+  el.querySelectorAll(".conn-allow").forEach(b => b.onclick = () => connectAllow(b.dataset.slug));
+}
+
+$("saveEmailBtn").onclick = async () => {
+  if (!selectedSid) return;
+  const email = $("workerEmail").value.trim();
+  if (!email) { $("connectMsg").innerHTML = `<span class="warn">enter your work email</span>`; return; }
+  const { ok, data } = await api("POST", `/api/sessions/${selectedSid}/connection-identity`, { email });
+  $("connectMsg").innerHTML = ok ? `<span class="ok">email confirmed</span>`
+    : `<span class="err">${ESC((data && data.error) || "failed")}</span>`;
+};
+
+async function connectStart(slug) {
+  $("connectMsg").textContent = `opening Connect for ${slug}…`;
+  const { ok, status, data } = await api("POST", `/api/sessions/${selectedSid}/connect/${slug}`, {});
+  if (status === 400 && data && data.error === "no_api_key") {
+    $("connectMsg").innerHTML = `<span class="err">no API key</span> — add one in Settings.`; return; }
+  if (!ok && status !== 202) { $("connectMsg").innerHTML = `<span class="err">${ESC((data && data.error) || "failed")}</span>`; return; }
+  pollConnect(d => {
+    $("connectMsg").innerHTML = d.connect_url
+      ? `Connect window would open: <a href="${ESC(d.connect_url)}" target="_blank" rel="noopener">${ESC(d.connect_url)}</a> — then tap <b>Simulate Allow</b>.`
+      : `<span class="ok">ready</span> — tap Simulate Allow.`;
+  });
+}
+
+async function connectAllow(slug) {
+  $("connectMsg").textContent = `binding ${slug}…`;
+  const { ok, status, data } = await api("POST", `/api/sessions/${selectedSid}/connect/${slug}/callback`, {});
+  if (!ok && status !== 202) { $("connectMsg").innerHTML = `<span class="err">${ESC((data && data.error) || "failed")}</span>`; return; }
+  pollConnect(d => {
+    $("connectMsg").innerHTML = d.verified === "yes"
+      ? `<span class="ok">${ESC(slug)} connected & verified</span>`
+      : `<span class="err">${ESC(slug)} FLAGGED</span> — ${ESC(d.flag || "not verified")}`;
+    loadConnect();
+  });
+}
+
+function pollConnect(onDone) {
+  if (connectTimer) clearInterval(connectTimer);
+  connectTimer = setInterval(async () => {
+    const { data } = await api("GET", `/api/sessions/${selectedSid}/connect/status`);
+    if (!data) return;
+    if (data.state === "done") { clearInterval(connectTimer); connectTimer = null; onDone(data); }
+    else if (data.state === "error") {
+      clearInterval(connectTimer); connectTimer = null;
+      $("connectMsg").innerHTML = `<span class="err">connection failed</span> — ${ESC(data.error)}`;
+    }
+  }, 600);
+}
 
 $("refreshPerms").onclick = refreshPermissions;
 $("refreshSessions").onclick = refreshSessions;

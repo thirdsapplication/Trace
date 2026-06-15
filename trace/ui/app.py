@@ -40,6 +40,8 @@ from ..agent import configgen as agent_configgen
 from ..agent import interview as agent_interview
 from ..agent import gate as agent_gate
 from ..agent import grader as agent_grader
+from ..agent import connect as agent_connect
+from ..agent import config as agent_config
 from . import keystore, permissions, sessions
 
 
@@ -100,7 +102,8 @@ class AppState:
     def __init__(self, sessions_root, collector_port=8137,
                  reconstruct_fn=None, controller_factory=None, key_store=None,
                  discovery_fn=None, score_fn=None, artifact_fn=None,
-                 interview_fn=None, config_fn=None, gate_fn=None, cleanup_fn=None):
+                 interview_fn=None, config_fn=None, gate_fn=None, cleanup_fn=None,
+                 connect_fn=None):
         self.sessions_root = sessions_root
         self.collector_port = collector_port
         self.reconstruct_fn = reconstruct_fn or _real_reconstruct
@@ -114,6 +117,9 @@ class AppState:
         self.config_fn = config_fn or agent_configgen.compile_config
         self.gate_fn = gate_fn or self._default_gate
         self.cleanup_fn = cleanup_fn or self._default_cleanup
+        # Phase 4: the connection layer. ``connect_fn`` returns a ConnectClient object
+        # (orchestration calls several methods on it); tests inject a stub.
+        self.connect_fn = connect_fn or self._default_connect_client
         self.controller_factory = controller_factory or (
             lambda out: CaptureController(out, collector_port=collector_port))
         self.keystore = key_store or keystore
@@ -124,6 +130,7 @@ class AppState:
         self.spec_jobs = {}          # sid -> {state, error, built, notes}
         self.interview_jobs = {}     # sid -> {state, error, generated}
         self.build_jobs = {}         # sid -> {state, error, generated, gated, verdicts, errors}
+        self.connection_jobs = {}    # sid -> {state, error, slug, connect_url, verified, flag}
         self.lock = threading.Lock()
         os.makedirs(sessions_root, exist_ok=True)
 
@@ -150,6 +157,16 @@ class AppState:
         from ..agent.api_client import ManagedAgentsClient
         client = ManagedAgentsClient(api_key=key)
         return client.cleanup(session_ids=session_ids, file_ids=file_ids, agent_ids=agent_ids)
+
+    def _default_connect_client(self):
+        """Real connection client (Pipedream Connect + MA vault). Requires a key;
+        every platform shape inside is flagged confirm-against-docs."""
+        key = self.keystore.get_key()
+        if not key:
+            raise RuntimeError("no_api_key")
+        os.environ["ANTHROPIC_API_KEY"] = key
+        from ..agent.connect_client import ConnectClient
+        return ConnectClient(api_key=key)
 
     # --- reconstruction job ----------------------------------------------
     def start_reconstruction(self, sid):
@@ -425,6 +442,72 @@ class AppState:
         return {"requested": {"sessions": session_ids, "files": file_ids, "agents": agent_ids},
                 **(result or {})}
 
+    # --- Phase 4: connection layer (Pipedream Connect + MA vault) ---------
+    def _load_connection(self, sid):
+        """Load the per-session connection record, or seed one with a per-session
+        external_user_id and the current app union."""
+        root = self.sessions_root
+        rec = sessions.read_json_artifact(root, sid, sessions.CONNECTION)
+        approved, event_log = self._approved_for_stage4(sid)
+        union, unmapped = agent_connect.app_union(approved, event_log)
+        if rec is None:
+            rec = agent_connect.new_record(f"trace-{sid}", union)
+        rec = agent_connect.merge_union(rec, union, unmapped)
+        return rec, union
+
+    def _save_connection(self, sid, rec):
+        _write_json(sessions.path(self.sessions_root, sid, sessions.CONNECTION), rec)
+
+    def connection_data(self, sid):
+        rec, union = self._load_connection(sid)
+        self._save_connection(sid, rec)
+        return {"record": rec, "union": union, "unmapped": rec.get("unmapped", []),
+                "expectation": agent_config.CONNECT_EXPECTATION_COPY}
+
+    def set_expected_identity(self, sid, email):
+        rec, _ = self._load_connection(sid)
+        rec["expected_identity"] = str(email or "").strip()
+        self._save_connection(sid, rec)
+        return rec
+
+    def start_connect(self, sid, slug):
+        """Open the (simulated in dev) Connect flow for one app; the job carries the
+        connect_url the worker would open."""
+        job = {"state": "running", "error": None, "slug": slug, "connect_url": None}
+        self.connection_jobs[sid] = job
+
+        def run():
+            try:
+                rec, _ = self._load_connection(sid)
+                client = self.connect_fn()
+                tok = agent_connect.connect_app(client, rec, slug)
+                self._save_connection(sid, rec)
+                job.update(state="done", connect_url=tok.get("connect_url"))
+            except Exception as e:
+                job.update(state="error", error=str(e))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def start_connect_callback(self, sid, slug):
+        """After the worker taps Allow (real or simulated): ensure+bind the vault, fetch
+        the account, and verify identity. Mismatches are flagged, never used silently."""
+        job = {"state": "running", "error": None, "slug": slug}
+        self.connection_jobs[sid] = job
+
+        def run():
+            try:
+                rec, _ = self._load_connection(sid)
+                client = self.connect_fn()
+                agent_connect.bind_and_verify(client, rec, slug, rec.get("expected_identity", ""))
+                self._save_connection(sid, rec)
+                entry = rec["apps"].get(slug, {})
+                job.update(state="done", verified=entry.get("verified"),
+                           usable=entry.get("usable"), flag=entry.get("flag"))
+            except Exception as e:
+                job.update(state="error", error=str(e))
+
+        threading.Thread(target=run, daemon=True).start()
+
 
 # --------------------------------------------------------------------------
 # Request handling
@@ -493,6 +576,12 @@ def make_handler(state):
             mi = re.match(r"^/api/sessions/([^/]+)/interview/([^/]+)$", p)
             if mi:
                 return self._save_interview(mi.group(1), mi.group(2), body)
+            mcb = re.match(r"^/api/sessions/([^/]+)/connect/([^/]+)/callback$", p)
+            if mcb:
+                return self._connect_callback(mcb.group(1), mcb.group(2))
+            mc = re.match(r"^/api/sessions/([^/]+)/connect/([^/]+)$", p)
+            if mc:
+                return self._connect_start(mc.group(1), mc.group(2))
             if p == "/api/settings/key":
                 return self._save_key(body)
             if p == "/api/settings/test-key":
@@ -510,7 +599,7 @@ def make_handler(state):
             m = re.match(r"^/api/sessions/([^/]+)/"
                          r"(dry-run|reconstruct|discovery-dry-run|discover|score|"
                          r"reviewed-bundles|generate-specs|specs-dry-run|interview|"
-                         r"interview-dry-run|build|"
+                         r"interview-dry-run|build|connection-identity|"
                          r"cleanup-platform)$", p)
             if m:
                 sid, action = m.group(1), m.group(2)
@@ -536,6 +625,8 @@ def make_handler(state):
                     return self._interview_dry_run(sid)
                 if action == "cleanup-platform":
                     return self._cleanup_platform(sid)
+                if action == "connection-identity":
+                    return self._set_identity(sid, body)
                 return self._build(sid, body)
             return self._json(404, {"error": "not_found"})
 
@@ -678,6 +769,10 @@ def make_handler(state):
                 return self._json(200, state.interview_data(sid))
             if sub == "/interview/status":
                 return self._json(200, state.interview_jobs.get(sid) or {"state": "idle"})
+            if sub == "/connection-data":
+                return self._json(200, state.connection_data(sid))
+            if sub == "/connect/status":
+                return self._json(200, state.connection_jobs.get(sid) or {"state": "idle"})
             return self._json(404, {"error": "not_found"})
 
         # --- reconstruction ---
@@ -877,6 +972,35 @@ def make_handler(state):
             except Exception as e:
                 return self._json(200, {"error": f"{type(e).__name__}: {e}"})
             return self._json(200, result)
+
+        # --- Phase 4: connection layer ---
+        def _set_identity(self, sid, body):
+            email = (body or {}).get("email", "")
+            if not str(email).strip():
+                return self._json(400, {"error": "empty_email"})
+            return self._json(200, state.set_expected_identity(sid, email))
+
+        def _connect_start(self, sid, slug):
+            if not sessions.artifacts(root, sid)["reviewed"]:
+                return self._json(400, {"error": "not_reviewed"})
+            if not state.keystore.get_key():
+                return self._json(400, {"error": "no_api_key"})
+            with state.lock:
+                existing = state.connection_jobs.get(sid)
+                if existing and existing.get("state") == "running":
+                    return self._json(409, {"error": "already_running"})
+                state.start_connect(sid, slug)
+            return self._json(202, {"state": "running", "session_id": sid})
+
+        def _connect_callback(self, sid, slug):
+            if not state.keystore.get_key():
+                return self._json(400, {"error": "no_api_key"})
+            with state.lock:
+                existing = state.connection_jobs.get(sid)
+                if existing and existing.get("state") == "running":
+                    return self._json(409, {"error": "already_running"})
+                state.start_connect_callback(sid, slug)
+            return self._json(202, {"state": "running", "session_id": sid})
 
         # --- Phase 2: structured interview ---
         def _interview(self, sid, body=None):

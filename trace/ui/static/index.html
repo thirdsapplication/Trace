@@ -151,6 +151,25 @@
         deletes the sandbox sessions and agents Trace created — only when you press it.</p>
     </section>
 
+    <!-- CONNECT YOUR APPS (Phase 4 — Pipedream) ------------------------ -->
+    <section class="panel">
+      <h2>Connect your apps <span class="muted">(Pipedream — two OAuth taps)</span></h2>
+      <div class="row">
+        <label for="workerEmail">Your work email</label>
+        <input type="text" id="workerEmail" placeholder="the account your agents will act as"/>
+        <button id="saveEmailBtn" class="secondary" disabled>Confirm email</button>
+        <span id="connectMsg" class="status-line"></span>
+      </div>
+      <p id="connectExpectation" class="help"></p>
+      <div id="connectApps"></div>
+      <p class="help">Trace connects each app through Pipedream — you never create a
+        Pipedream or Claude account. Tap <b>Connect</b>, then approve in Google's window
+        (the only step Trace can't absorb). Trace binds the credential into a vault for
+        you. A connected account that doesn't match your confirmed email is
+        <b>flagged and not used</b>. <i>This is a dev build: Google's window is
+        simulated by "Simulate Allow".</i></p>
+    </section>
+
     <!-- RESULTS -------------------------------------------------------- -->
     <section class="panel">
       <h2>Results <span id="resultsSid" class="muted"></span></h2>
