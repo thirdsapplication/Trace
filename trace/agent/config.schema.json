@@ -1,0 +1,37 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Trace Config Generator content output",
+  "description": "The JSON the Config Generator model returns. CONTENT ONLY — all structural YAML fields (model, mcp_servers, tools, skills, permission policy, metadata) are produced by code, never by the model.",
+  "type": "object",
+  "required": ["description", "role", "tools_and_artifacts", "steps", "working_rules", "requirements"],
+  "additionalProperties": false,
+  "properties": {
+    "description": {"type": "string", "description": "one sentence for a listing"},
+    "role": {"type": "string", "description": "one or two sentences naming the job"},
+    "tools_and_artifacts": {"type": "array", "items": {"type": "string"}},
+    "steps": {"type": "array", "items": {"$ref": "#/$defs/instruction"}},
+    "working_rules": {"type": "array", "items": {"$ref": "#/$defs/instruction"}},
+    "requirements": {"type": "array", "items": {"$ref": "#/$defs/instruction"}}
+  },
+  "$defs": {
+    "instruction": {
+      "type": "object",
+      "required": ["text", "source"],
+      "properties": {
+        "text": {"type": "string"},
+        "source": {"$ref": "#/$defs/source"}
+      }
+    },
+    "source": {
+      "oneOf": [
+        {"type": "object", "required": ["type", "ids"],
+         "properties": {"type": {"const": "events"},
+                        "ids": {"type": "array", "items": {"type": "string"}}}},
+        {"type": "object", "required": ["type"],
+         "properties": {"type": {"const": "discovery"}}},
+        {"type": "object", "required": ["type", "q"],
+         "properties": {"type": {"const": "user_answer"}, "q": {"type": "string"}}}
+      ]
+    }
+  }
+}

@@ -34,6 +34,18 @@ OUTPUTS_PATH = "/workspace/outputs"
 # emit always_allow by default. Confirm the exact enum against current docs.
 APPROVAL_PERMISSION_POLICY = "require_approval"
 
+# --- Config Engine (Phase 1) -----------------------------------------------
+# The Config Engine writes the agent configuration directly (no markdown spec, no
+# per-app MCP table). Every live agent uses ONE Pipedream connection; outbound
+# writes/sends are approval-required.
+PIPEDREAM_MCP = {"name": "pipedream", "type": "url",
+                 "url": "https://mcp.pipedream.net/v2"}  # confirm path against current docs
+LIVE_PERMISSION_POLICY = "always_ask"   # approval-required; confirm enum against current docs
+# Canonical, domain-neutral working rule the generator must always include; appended
+# deterministically if the model omits it (so the agent always matches existing work).
+MATCH_EXAMPLES_RULE = ("Before producing the work product, look at the examples of this "
+                       "work already present in the live environment and match their format.")
+
 # --- Console (manual-evaluation mode) --------------------------------------
 # The run result is a POINTER to the live session, read by the user in the Console.
 # The exact deep-link path to a single session is not finalized in the beta docs,
