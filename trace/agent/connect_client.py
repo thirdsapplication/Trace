@@ -96,6 +96,7 @@ class ConnectClient:
         self._environment = environment or config.PIPEDREAM_ENVIRONMENT
         self._pd_token = None                       # cached Pipedream dev token
         self._pd_token_exp = 0.0                    # epoch seconds
+        self._cred_shape = None                     # learned mcp_server_url placement (0 nested / 1 top-level)
 
     # --- Managed Agents vault side (lazy SDK; verified surface, see docstring) ---
     def _ma(self):
@@ -255,6 +256,52 @@ class ConnectClient:
                 return _idof(c)
         return None
 
+    @staticmethod
+    def _is_url_placement_error(exc):
+        """True for the server's structural rejection of mcp_server_url's placement (beta
+        drift): we should retry with the URL in a different spot, not give up."""
+        m = str(exc).lower()
+        return "mcp_server_url" in m and any(
+            k in m for k in ("not permitted", "extra", "unexpected", "unknown"))
+
+    def _write_credential(self, creds, vault_ref, display_name, mcp_server_url,
+                          token, expires_at, update_id=None):
+        """Create (or update, if ``update_id``) the mcp_oauth credential, trying the
+        candidate placements of ``mcp_server_url`` in order. The documented/SDK shape nests
+        it in ``auth``; the live beta server has been observed to reject that, so we fall
+        back to passing it at the credential top level (via ``extra_body``). Only the
+        specific placement 400 advances to the next shape; everything else propagates."""
+        base_auth = {"type": "mcp_oauth", "access_token": token, "expires_at": expires_at}
+
+        def shapes():
+            # 1) nested in auth (current docs + SDK)
+            yield (dict(base_auth, mcp_server_url=mcp_server_url), None)
+            # 2) top-level on the credential body (the only other valid place)
+            yield (dict(base_auth), {"mcp_server_url": mcp_server_url})
+
+        # prefer a placement that already worked this session
+        ordered = list(shapes())
+        if self._cred_shape == 1:
+            ordered = ordered[1:] + ordered[:1]
+
+        last = None
+        for idx, (auth, extra_body) in enumerate(ordered):
+            kw = {"auth": auth, "display_name": display_name}
+            if extra_body:
+                kw["extra_body"] = extra_body
+            try:
+                if update_id is not None:
+                    c = _retry(lambda kw=kw: creds.update(update_id, vault_id=vault_ref, **kw))
+                else:
+                    c = _retry(lambda kw=kw: creds.create(vault_ref, **kw))
+                self._cred_shape = 1 if extra_body else 0
+                return c
+            except Exception as exc:                            # noqa: BLE001
+                last = exc
+                if not self._is_url_placement_error(exc):
+                    raise
+        raise last
+
     def bind_connection(self, vault_ref, external_user_id, app, account=None):
         """Write the Pipedream connection into the vault as an mcp_oauth credential keyed
         to this customer's per-app MCP server URL. The bearer is Trace's project-scoped
@@ -266,17 +313,17 @@ class ConnectClient:
         expires_at = (time.strftime("%Y-%m-%dT%H:%M:%SZ",
                                     time.gmtime(time.time() + float(tok.get("expires_in") or 3600))))
         mcp_server_url = config.pipedream_mcp_url(external_user_id, app)
-        auth = {"type": "mcp_oauth", "mcp_server_url": mcp_server_url,
-                "access_token": tok["access_token"], "expires_at": expires_at}
         display_name = f"Trace {app}"
         try:
-            c = _retry(lambda: creds.create(vault_ref, display_name=display_name, auth=auth))
+            c = self._write_credential(creds, vault_ref, display_name, mcp_server_url,
+                                       tok["access_token"], expires_at)
         except Exception as exc:                                # 409 duplicate -> update by id
             if "409" in str(exc) or "exist" in str(exc).lower():
                 cred_id = self._find_credential(vault_ref, mcp_server_url)
                 if not cred_id:
                     raise
-                c = _retry(lambda: creds.update(cred_id, vault_id=vault_ref, auth=auth))
+                c = self._write_credential(creds, vault_ref, display_name, mcp_server_url,
+                                           tok["access_token"], expires_at, update_id=cred_id)
             else:
                 raise
         return {"binding_ref": _idof(c) or f"{vault_ref}:{app}"}
