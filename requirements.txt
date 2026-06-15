@@ -19,3 +19,7 @@ keyring>=24.0 ; sys_platform == "darwin"
 
 # Stage 4 (Agent Compiler) — emit/validate Managed Agents agent-definition YAML.
 PyYAML>=6.0
+
+# CA bundle for the stdlib Pipedream Connect HTTPS calls (connect_client.py), so TLS
+# verification doesn't depend on the OS cert store. Also pulled in transitively by anthropic.
+certifi>=2024.0

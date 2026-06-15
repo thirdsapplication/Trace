@@ -52,7 +52,8 @@ async function refreshPipedream() {
   if (data.client_id_tail) $("pdClientId").placeholder = data.client_id_tail;
   if (data.environment) $("pdEnv").value = data.environment;
   if (data.configured) {
-    el.innerHTML = `<span class="ok">✓ Pipedream configured</span> (${data.environment}, ${data.backend})`;
+    el.innerHTML = `<span class="ok">✓ Pipedream saved</span> (${data.environment}, ${data.backend})`
+      + ` — <span class="muted">run Preflight to confirm it's reachable</span>`;
   } else {
     const have = [];
     if (data.project_id) have.push("project");

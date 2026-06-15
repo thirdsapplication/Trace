@@ -21,6 +21,7 @@ Phase 4 runs offline against a stub (see ``trace/tests/test_connect.py``).
 """
 
 import json
+import ssl
 import time
 import urllib.parse
 import urllib.request
@@ -29,6 +30,22 @@ from . import config
 from .api_client import _retry, _idof, _data, _attr
 
 BETA_VERSION = config.BETA_VERSION
+
+
+def _ssl_context():
+    """A TLS context that trusts certifi's CA bundle (the same roots the Anthropic SDK
+    uses), so the stdlib Pipedream HTTPS calls don't depend on the OS cert store being
+    wired up — the usual cause of ``CERTIFICATE_VERIFY_FAILED: unable to get local issuer
+    certificate`` on python.org/macOS installs. Falls back to the system store if certifi
+    is somehow absent."""
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return ssl.create_default_context()
+
+
+_SSL_CONTEXT = _ssl_context()
 
 
 class ConnectClient:
@@ -81,7 +98,8 @@ class ConnectClient:
                            "client_secret": self._client_secret}).encode("utf-8")
         req = urllib.request.Request(url, data=body, method="POST",
                                      headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=config.REQUEST_TIMEOUT) as resp:
+        with urllib.request.urlopen(req, timeout=config.REQUEST_TIMEOUT,
+                                    context=_SSL_CONTEXT) as resp:
             out = json.loads(resp.read() or b"{}")
         return {"access_token": out.get("access_token"),
                 "expires_in": out.get("expires_in") or 3600}
@@ -107,7 +125,8 @@ class ConnectClient:
             "Authorization": f"Bearer {self._access_token()}",
             "x-pd-environment": self._environment,
         })
-        with urllib.request.urlopen(req, timeout=config.REQUEST_TIMEOUT) as resp:
+        with urllib.request.urlopen(req, timeout=config.REQUEST_TIMEOUT,
+                                    context=_SSL_CONTEXT) as resp:
             raw = resp.read()
         return json.loads(raw) if raw else {}
 

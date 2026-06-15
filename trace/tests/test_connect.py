@@ -177,6 +177,40 @@ class RealBindCredentialTest(unittest.TestCase):
         self.assertTrue(auth["mcp_server_url"].startswith(config.PIPEDREAM_MCP_BASE))
 
 
+class TLSContextTest(unittest.TestCase):
+    """The stdlib Pipedream HTTPS calls must always supply a certifi-backed CA bundle, so
+    they don't fail with CERTIFICATE_VERIFY_FAILED on installs whose OS cert store is bare."""
+
+    def test_ssl_context_is_real(self):
+        import ssl
+        from trace.agent import connect_client
+        self.assertIsInstance(connect_client._ssl_context(), ssl.SSLContext)
+        self.assertIsInstance(connect_client._SSL_CONTEXT, ssl.SSLContext)
+
+    def test_mint_passes_ssl_context(self):
+        import ssl
+        from trace.agent import connect_client
+
+        class _Resp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self): return b'{"access_token":"t","expires_in":3600}'
+
+        captured = {}
+
+        def fake_urlopen(req, timeout=None, context=None):
+            captured["context"] = context
+            return _Resp()
+
+        orig = connect_client.urllib.request.urlopen
+        connect_client.urllib.request.urlopen = fake_urlopen
+        try:
+            connect_client.ConnectClient(client_id="c", client_secret="s").mint_access_token()
+        finally:
+            connect_client.urllib.request.urlopen = orig
+        self.assertIsInstance(captured["context"], ssl.SSLContext)
+
+
 class UIConnectTest(unittest.TestCase):
     def setUp(self):
         import tempfile

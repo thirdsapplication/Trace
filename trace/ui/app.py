@@ -17,6 +17,7 @@ import json
 import os
 import re
 import shutil
+import ssl
 import threading
 import urllib.parse
 import webbrowser
@@ -1435,8 +1436,12 @@ def _preflight(state):
             checks.append({"name": "Pipedream Connect", "ok": True,
                            "detail": f"Token minted; project reachable ({len(apps)} apps)."})
         except Exception as e:
-            checks.append({"name": "Pipedream Connect", "ok": False,
-                           "detail": f"{type(e).__name__}: {e}"})
+            detail = f"{type(e).__name__}: {e}"
+            if "CERTIFICATE_VERIFY_FAILED" in str(e) or isinstance(e, ssl.SSLCertVerificationError):
+                detail += (" — TLS cert verification failed: run `pip install -U certifi` "
+                           "(and on macOS the 'Install Certificates.command' for your "
+                           "Python), then retry.")
+            checks.append({"name": "Pipedream Connect", "ok": False, "detail": detail})
 
     ok = all(c["ok"] for c in checks if c["ok"] is not None)
     return {"ok": ok, "checks": checks}

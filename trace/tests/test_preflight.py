@@ -94,6 +94,17 @@ class PreflightTest(unittest.TestCase):
         c = _check(app._preflight(_state()), "Managed Agents access")
         self.assertTrue(c["ok"])                         # _FakeMA.ping() -> True
 
+    def test_ssl_failure_gives_certifi_remedy(self):
+        import ssl
+        config.PIPEDREAM_PROJECT = "proj_x"
+        config.PIPEDREAM_CLIENT_ID = "cid"
+        config.PIPEDREAM_CLIENT_SECRET = "csec"
+        err = ssl.SSLCertVerificationError("CERTIFICATE_VERIFY_FAILED")
+        boom = lambda: _FakeConnect(error=err)
+        c = _check(app._preflight(_state(connect_fn=boom)), "Pipedream Connect")
+        self.assertFalse(c["ok"])
+        self.assertIn("certifi", c["detail"].lower())    # actionable remedy
+
 
 class PingTest(unittest.TestCase):
     def test_ping_lists_agents(self):
