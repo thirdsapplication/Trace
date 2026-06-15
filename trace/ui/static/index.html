@@ -31,6 +31,36 @@
       <p id="keyStatus" class="status-line"></p>
       <p id="testKeyResult" class="status-line"></p>
 
+      <h3>Pipedream Connect <span class="muted">(for the live path)</span></h3>
+      <div class="row">
+        <label for="pdProject">Project ID</label>
+        <input id="pdProject" type="text" placeholder="proj_…" autocomplete="off" />
+      </div>
+      <div class="row">
+        <label for="pdClientId">Client ID</label>
+        <input id="pdClientId" type="text" placeholder="OAuth client id" autocomplete="off" />
+      </div>
+      <div class="row">
+        <label for="pdClientSecret">Client secret</label>
+        <input id="pdClientSecret" type="password" placeholder="stored once; leave blank to keep" autocomplete="off" />
+      </div>
+      <div class="row">
+        <label for="pdEnv">Environment</label>
+        <select id="pdEnv">
+          <option value="development">development</option>
+          <option value="production">production</option>
+        </select>
+        <button id="savePd" class="secondary">Save Pipedream</button>
+      </div>
+      <p id="pdStatus" class="status-line"></p>
+      <p class="help">Trace's own Pipedream Connect project + client-credentials app — one
+        account fronts all customers; your users never see it. From your Pipedream dashboard:
+        the <b>Project ID</b> (<code>proj_…</code>) on the project's settings page, and a
+        <b>Client ID/Secret</b> from Settings → API / OAuth Clients. The secret is stored
+        securely (macOS Keychain when available) and never shown again. Until these are set,
+        the connect / dry-run / go-live steps stay disabled; the rest of the pipeline runs
+        without them.</p>
+
       <div class="subgrid">
         <div>
           <h3>macOS permissions <button id="refreshPerms" class="link">refresh</button></h3>

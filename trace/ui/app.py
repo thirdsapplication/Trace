@@ -100,6 +100,28 @@ _CONTENT_TYPES = {".html": "text/html", ".js": "application/javascript",
                   ".css": "text/css", ".json": "application/json"}
 
 
+def _apply_pipedream_settings(key_store):
+    """Push stored Pipedream Connect settings into ``agent_config`` so every consumer
+    (ConnectClient defaults, ``config.pipedream_mcp_url`` at deploy, preflight) sees them
+    without environment variables. No-op if the store doesn't support them (e.g. a test
+    stub) or none are saved."""
+    getpd = getattr(key_store, "get_pipedream", None)
+    if not callable(getpd):
+        return
+    try:
+        pd = getpd() or {}
+    except Exception:
+        return
+    if pd.get("project_id"):
+        agent_config.PIPEDREAM_PROJECT = pd["project_id"]
+    if pd.get("client_id"):
+        agent_config.PIPEDREAM_CLIENT_ID = pd["client_id"]
+    if pd.get("client_secret"):
+        agent_config.PIPEDREAM_CLIENT_SECRET = pd["client_secret"]
+    if pd.get("environment"):
+        agent_config.PIPEDREAM_ENVIRONMENT = pd["environment"]
+
+
 class AppState:
     def __init__(self, sessions_root, collector_port=8137,
                  reconstruct_fn=None, controller_factory=None, key_store=None,
@@ -133,6 +155,10 @@ class AppState:
         self.keystore = key_store or keystore
         self.controller = None       # current CaptureController (one session at a time)
         self.current_sid = None
+        # Load any stored Pipedream Connect settings into the agent config so every
+        # consumer (ConnectClient defaults, config.pipedream_mcp_url at deploy, preflight)
+        # sees them without env vars.
+        _apply_pipedream_settings(self.keystore)
         self.recon_jobs = {}         # sid -> {state, current, total, error, flags, errors}
         self.discover_jobs = {}      # sid -> {state, error, bundles, anti_bundles}
         self.spec_jobs = {}          # sid -> {state, error, built, notes}
@@ -779,6 +805,9 @@ def make_handler(state):
                 return self._status()
             if p == "/api/settings":
                 return self._json(200, state.keystore.info())
+            if p == "/api/settings/pipedream":
+                pinfo = getattr(state.keystore, "pipedream_info", None)
+                return self._json(200, pinfo() if callable(pinfo) else {"configured": False})
             if p == "/api/permissions":
                 return self._json(200, permissions.check_all())
             if p == "/api/preflight":
@@ -815,6 +844,8 @@ def make_handler(state):
                 return self._deploy_resolve(mdr.group(1), mdr.group(2), mdr.group(3), body)
             if p == "/api/settings/key":
                 return self._save_key(body)
+            if p == "/api/settings/pipedream":
+                return self._save_pipedream(body)
             if p == "/api/settings/test-key":
                 return self._json(200, _test_key(state))
             if p == "/api/capture/start":
@@ -866,9 +897,17 @@ def make_handler(state):
             return self._json(404, {"error": "not_found"})
 
         def do_DELETE(self):
-            if self.path.split("?", 1)[0] == "/api/settings/key":
+            dp = self.path.split("?", 1)[0]
+            if dp == "/api/settings/key":
                 state.keystore.clear_key()
                 return self._json(200, {"saved": False})
+            if dp == "/api/settings/pipedream":
+                clear = getattr(state.keystore, "clear_pipedream", None)
+                if callable(clear):
+                    clear()
+                _apply_pipedream_settings(state.keystore)
+                pinfo = getattr(state.keystore, "pipedream_info", None)
+                return self._json(200, pinfo() if callable(pinfo) else {"configured": False})
             return self._json(404, {"error": "not_found"})
 
         # --- static ---
@@ -889,6 +928,19 @@ def make_handler(state):
             except ValueError:
                 return self._json(400, {"error": "empty_key"})
             return self._json(200, {**state.keystore.info(), "backend": backend})
+
+        def _save_pipedream(self, body):
+            """Save Trace's Pipedream Connect settings (project id / client id / secret /
+            environment), then push them into the agent config so the live path picks them
+            up immediately. The secret is stored securely and never echoed back."""
+            save = getattr(state.keystore, "save_pipedream", None)
+            if not callable(save):
+                return self._json(400, {"error": "unsupported"})
+            b = body or {}
+            save(project_id=b.get("project_id"), client_id=b.get("client_id"),
+                 client_secret=b.get("client_secret"), environment=b.get("environment"))
+            _apply_pipedream_settings(state.keystore)
+            return self._json(200, state.keystore.pipedream_info())
 
         # --- capture ---
         def _status(self):

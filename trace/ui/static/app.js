@@ -43,6 +43,41 @@ async function refreshSettings() {
   }
 }
 
+async function refreshPipedream() {
+  const { data } = await api("GET", "/api/settings/pipedream");
+  const el = $("pdStatus");
+  if (!el) return;
+  if (!data) { el.textContent = ""; return; }
+  if (data.project_id) $("pdProject").placeholder = data.project_id;
+  if (data.client_id_tail) $("pdClientId").placeholder = data.client_id_tail;
+  if (data.environment) $("pdEnv").value = data.environment;
+  if (data.configured) {
+    el.innerHTML = `<span class="ok">✓ Pipedream configured</span> (${data.environment}, ${data.backend})`;
+  } else {
+    const have = [];
+    if (data.project_id) have.push("project");
+    if (data.client_id_tail) have.push("client id");
+    if (data.has_secret) have.push("secret");
+    el.innerHTML = `<span class="warn">Pipedream not configured</span>` +
+      (have.length ? ` — have ${have.join(", ")}; still need the rest` : ` — needed for the live path`);
+  }
+}
+
+$("savePd").onclick = async () => {
+  const body = {
+    project_id: $("pdProject").value.trim(),
+    client_id: $("pdClientId").value.trim(),
+    client_secret: $("pdClientSecret").value,        // not trimmed: secrets can have edges
+    environment: $("pdEnv").value,
+  };
+  $("pdStatus").textContent = "saving…";
+  const { ok, data } = await api("POST", "/api/settings/pipedream", body);
+  $("pdClientSecret").value = "";                    // never keep the secret in the DOM
+  $("pdProject").value = ""; $("pdClientId").value = "";
+  if (ok) await refreshPipedream();
+  else $("pdStatus").innerHTML = `<span class="err">${(data && data.error) || "save failed"}</span>`;
+};
+
 $("saveKey").onclick = async () => {
   const key = $("apiKey").value.trim();
   if (!key) { $("keyStatus").innerHTML = `<span class="err">enter a key first</span>`; return; }
@@ -1202,8 +1237,8 @@ $("refreshSessions").onclick = refreshSessions;
 // Boot
 // ===========================================================================
 (async function init() {
-  await Promise.all([refreshSettings(), refreshPermissions(), refreshSessions(),
-                     loadFixtures(), pollStatus()]);
+  await Promise.all([refreshSettings(), refreshPipedream(), refreshPermissions(),
+                     refreshSessions(), loadFixtures(), pollStatus()]);
   // If a capture is already running (e.g. page reloaded), resume polling.
   if (capturing) startPolling();
 })();
