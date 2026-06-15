@@ -35,10 +35,11 @@ from ..discovery.prompt import SYSTEM_PROMPT as DISCOVERY_SYSTEM_PROMPT
 from ..artifact import review as artifact_review
 from ..artifact.artifact import build_prompt_material, write_spec_bundle
 from ..artifact.artifact import generate_specs as _real_generate_specs
-from ..artifact.artifact import _spec_filename
 from ..artifact.prompt import SYSTEM_PROMPT as ARTIFACT_SYSTEM_PROMPT
 from ..agent import configgen as agent_configgen
 from ..agent import interview as agent_interview
+from ..agent import gate as agent_gate
+from ..agent import grader as agent_grader
 from . import keystore, permissions, sessions
 
 
@@ -99,18 +100,19 @@ class AppState:
     def __init__(self, sessions_root, collector_port=8137,
                  reconstruct_fn=None, controller_factory=None, key_store=None,
                  discovery_fn=None, score_fn=None, artifact_fn=None,
-                 interview_fn=None, config_fn=None, run_test_fn=None, cleanup_fn=None):
+                 interview_fn=None, config_fn=None, gate_fn=None, cleanup_fn=None):
         self.sessions_root = sessions_root
         self.collector_port = collector_port
         self.reconstruct_fn = reconstruct_fn or _real_reconstruct
         self.discovery_fn = discovery_fn or _real_discover
         self.score_fn = score_fn or discovery_scorer.score
         self.artifact_fn = artifact_fn or _real_generate_specs
-        # Phase 2: the interview (gap detector) and the Phase-1 config engine, both
-        # injectable so the chain runs offline against stubs.
+        # Phase 2: the interview (gap detector) + the Phase-1 config engine.
+        # Phase 3: the hidden logic gate (sandbox run + walled-off grader). All
+        # injectable so the build chain runs offline against stubs.
         self.interview_fn = interview_fn or agent_interview.generate_questions
         self.config_fn = config_fn or agent_configgen.compile_config
-        self.run_test_fn = run_test_fn or self._default_run_test
+        self.gate_fn = gate_fn or self._default_gate
         self.cleanup_fn = cleanup_fn or self._default_cleanup
         self.controller_factory = controller_factory or (
             lambda out: CaptureController(out, collector_port=collector_port))
@@ -121,24 +123,22 @@ class AppState:
         self.discover_jobs = {}      # sid -> {state, error, bundles, anti_bundles}
         self.spec_jobs = {}          # sid -> {state, error, built, notes}
         self.interview_jobs = {}     # sid -> {state, error, generated}
-        self.config_jobs = {}        # sid -> {state, error, generated, errors}
-        self.stage4_jobs = {}        # sid -> {state, error, ran, runs}
+        self.build_jobs = {}         # sid -> {state, error, generated, gated, verdicts, errors}
         self.lock = threading.Lock()
         os.makedirs(sessions_root, exist_ok=True)
 
-    def _default_run_test(self, bundle, spec_md, env_record, event_log, test_dict,
-                          events_path=None):
-        """Real manual-evaluation run: requires a key; builds the beta-pinned client.
-        Returns a run-pointer record (no grading, no deletion)."""
+    def _default_gate(self, bundle, test_dict, criteria, event_log, events_path=None):
+        """Real hidden gate: requires a key; builds the beta-pinned client + the
+        walled-off Sonnet grader, runs the sandbox session, and grades the transcript.
+        Returns a verdict record (advanced iff overall==pass and the run completed)."""
         key = self.keystore.get_key()
         if not key:
             raise RuntimeError("no_api_key")
         os.environ["ANTHROPIC_API_KEY"] = key
         from ..agent.api_client import ManagedAgentsClient
-        from ..agent.deployer import run_test as _run_test
         client = ManagedAgentsClient(api_key=key)
-        return _run_test(bundle, spec_md, env_record, event_log, test_dict, client,
-                         events_path=events_path)
+        return agent_gate.run_gate(bundle, test_dict, criteria, event_log, client,
+                                   judge_fn=agent_grader._default_judge(), events_path=events_path)
 
     def _default_cleanup(self, session_ids, file_ids, agent_ids):
         """Real, human-initiated platform cleanup: requires a key; builds the client
@@ -250,20 +250,19 @@ class AppState:
 
         threading.Thread(target=run, daemon=True).start()
 
-    # --- Stage 4: compile + run agents (manual-evaluation mode) ----------
-    def stage4_bundles(self, sid):
-        """Approved bundles the UI offers to run, each tagged with whether its config
-        has been generated (drives the default checkbox state)."""
+    # --- Build & test: config + hidden gate ------------------------------
+    def build_bundles(self, sid):
+        """Approved bundles the UI offers to build, each tagged with whether it has
+        been built (config generated) and whether the hidden gate advanced it."""
         root = self.sessions_root
         approved, _ = self._approved_for_stage4(sid)
         specs_dir = sessions.path(root, sid, sessions.SPECS_DIR)
         out = []
         for b in approved:
-            config_ready = os.path.exists(
-                os.path.join(specs_dir, sessions.agent_yaml_name(b["id"], "test")))
+            built = os.path.exists(os.path.join(specs_dir, sessions.agent_yaml_name(b["id"], "test")))
+            gate = sessions._read_json(os.path.join(specs_dir, sessions.gate_record_name(b["id"]))) or {}
             out.append({"id": b["id"], "name": b.get("name") or b["id"],
-                        "config_ready": config_ready, "has_artifacts": config_ready,
-                        "artifact_count": 0})
+                        "built": built, "advanced": bool(gate.get("advanced"))})
         return out
 
     def _build_model_fn(self):
@@ -350,12 +349,15 @@ class AppState:
         _write_json(sessions.path(self.sessions_root, sid, sessions.interview_filename(bid)), rec)
         return rec
 
-    # --- Phase 1 config generation, wired into the chain -----------------
-    def start_configgen(self, sid, selected_ids=None):
+    # --- Build & test agents: config (Phase 1) + hidden gate (Phase 3) ---
+    def start_build(self, sid, selected_ids=None):
+        """For each selected approved bundle: generate the config (Phase 1), then run
+        the hidden logic gate (Phase 3) and record its verdict. One 'building…' flow."""
         root = self.sessions_root
         specs_dir = sessions.path(root, sid, sessions.SPECS_DIR)
-        job = {"state": "running", "error": None, "generated": 0, "errors": {}}
-        self.config_jobs[sid] = job
+        job = {"state": "running", "error": None, "generated": 0, "gated": 0,
+               "verdicts": {}, "errors": {}}
+        self.build_jobs[sid] = job
 
         def run():
             try:
@@ -365,64 +367,33 @@ class AppState:
                 os.makedirs(specs_dir, exist_ok=True)
                 model_fn = self._build_model_fn() if approved else None
                 for b in approved:
+                    bid = b["id"]
                     try:
+                        # (1) generate the configuration directly (Phase 1)
                         _, observed, _ = agent_configgen.make_engine_inputs(b, event_log)
-                        answers = agent_configgen._load_answers(
-                            sessions.session_dir(root, sid), b["id"])
-                        unresolved = agent_configgen._load_unresolved(
-                            sessions.session_dir(root, sid), b["id"])
+                        sdir = sessions.session_dir(root, sid)
+                        answers = agent_configgen._load_answers(sdir, bid)
+                        unresolved = agent_configgen._load_unresolved(sdir, bid)
                         compiled = self.config_fn(b, observed, answers, model_fn,
                                                   unresolved=unresolved)
                         for mode in ("test", "live"):
-                            _write_text(os.path.join(specs_dir, sessions.agent_yaml_name(b["id"], mode)),
+                            _write_text(os.path.join(specs_dir, sessions.agent_yaml_name(bid, mode)),
                                         compiled[mode]["yaml"])
-                        _write_json(os.path.join(specs_dir, sessions.grounding_name(b["id"])),
+                        _write_json(os.path.join(specs_dir, sessions.grounding_name(bid)),
                                     compiled["grounding"])
                         job["generated"] += 1
+
+                        # (2) hidden logic gate: sandbox the TEST variant + grade (Phase 3)
+                        criteria = agent_grader.criteria_from_grounding(compiled["grounding"])
+                        events_path = os.path.join(specs_dir, sessions.events_name(bid))
+                        verdict = self.gate_fn(b, compiled["test"]["dict"], criteria,
+                                               event_log, events_path=events_path)
+                        _write_json(os.path.join(specs_dir, sessions.gate_record_name(bid)), verdict)
+                        job["gated"] += 1
+                        job["verdicts"][bid] = bool(verdict.get("advanced"))
                     except Exception as e:
-                        job["errors"][b["id"]] = f"{type(e).__name__}: {e}"
-                sessions.update_meta(root, sid, config_at=sessions._now())
-                job.update(state="done")
-            except Exception as e:
-                job.update(state="error", error=str(e))
-
-        threading.Thread(target=run, daemon=True).start()
-
-    # --- Stage 4: run the generated test config (manual evaluation) ------
-    def start_stage4(self, sid, selected_ids=None):
-        root = self.sessions_root
-        specs_dir = sessions.path(root, sid, sessions.SPECS_DIR)
-        job = {"state": "running", "error": None, "ran": 0, "runs": {}}
-        self.stage4_jobs[sid] = job
-
-        def run():
-            try:
-                approved, event_log = self._approved_for_stage4(sid)
-                if selected_ids is not None:
-                    approved = [b for b in approved if b["id"] in set(selected_ids)]
-                os.makedirs(specs_dir, exist_ok=True)
-                for b in approved:
-                    yaml_path = os.path.join(specs_dir, sessions.agent_yaml_name(b["id"], "test"))
-                    if not os.path.exists(yaml_path):
-                        job["runs"][b["id"]] = {"run_skipped": "no config — generate config first"}
-                        continue
-                    with open(yaml_path, encoding="utf-8") as f:
-                        test_dict = yaml.safe_load(f.read())
-                    try:
-                        events_path = os.path.join(specs_dir, sessions.events_name(b["id"]))
-                        run_record = self.run_test_fn(
-                            b, "", {}, event_log, test_dict, events_path=events_path)
-                        _write_json(os.path.join(specs_dir, sessions.run_record_name(b["id"])),
-                                    run_record)
-                        job["ran"] += 1
-                        job["runs"][b["id"]] = {
-                            "agent_id": run_record.get("agent_id"),
-                            "agent_name": run_record.get("agent_name"),
-                            "agent_reused": run_record.get("agent_reused"),
-                            "sessions": run_record.get("sessions", [])}
-                    except Exception as e:
-                        job["runs"][b["id"]] = {"run_skipped": f"{type(e).__name__}: {e}"}
-                sessions.update_meta(root, sid, stage4_at=sessions._now())
+                        job["errors"][bid] = f"{type(e).__name__}: {e}"
+                sessions.update_meta(root, sid, build_at=sessions._now())
                 job.update(state="done")
             except Exception as e:
                 job.update(state="error", error=str(e))
@@ -431,11 +402,15 @@ class AppState:
 
     # --- explicit platform cleanup (C2): never automatic -----------------
     def cleanup_platform(self, sid):
-        """Gather the Trace-created ids from this session's run records and delete
-        them via the cleanup seam. Returns the removal summary."""
-        runs = sessions.list_runs(self.sessions_root, sid)
+        """Gather the Trace-created ids from this session's gate + run records and
+        delete them via the cleanup seam. Returns the removal summary."""
         session_ids, file_ids, agent_ids = [], [], []
-        for r in runs:
+        # gate records (Phase 3): the kept hidden-gate sessions
+        for g in sessions.list_gate_records(self.sessions_root, sid):
+            if g.get("session_id"):
+                session_ids.append(g["session_id"])
+        # any manual-eval run records (dormant path)
+        for r in sessions.list_runs(self.sessions_root, sid):
             for s in r.get("sessions", []):
                 if s.get("session_id"):
                     session_ids.append(s["session_id"])
@@ -535,7 +510,7 @@ def make_handler(state):
             m = re.match(r"^/api/sessions/([^/]+)/"
                          r"(dry-run|reconstruct|discovery-dry-run|discover|score|"
                          r"reviewed-bundles|generate-specs|specs-dry-run|interview|"
-                         r"interview-dry-run|generate-config|compile-test|"
+                         r"interview-dry-run|build|"
                          r"cleanup-platform)$", p)
             if m:
                 sid, action = m.group(1), m.group(2)
@@ -559,11 +534,9 @@ def make_handler(state):
                     return self._interview(sid, body)
                 if action == "interview-dry-run":
                     return self._interview_dry_run(sid)
-                if action == "generate-config":
-                    return self._generate_config(sid, body)
                 if action == "cleanup-platform":
                     return self._cleanup_platform(sid)
-                return self._compile_test(sid, body)
+                return self._build(sid, body)
             return self._json(404, {"error": "not_found"})
 
         def do_DELETE(self):
@@ -697,17 +670,14 @@ def make_handler(state):
                 return self._json(200, job or {"state": "idle"})
             if sub == "/agents":
                 return self._json(200, {"agents": sessions.list_agents(root, sid)})
-            if sub == "/stage4-bundles":
-                return self._json(200, {"bundles": state.stage4_bundles(sid)})
-            if sub == "/compile-test/status":
-                job = state.stage4_jobs.get(sid)
-                return self._json(200, job or {"state": "idle"})
+            if sub == "/build-bundles":
+                return self._json(200, {"bundles": state.build_bundles(sid)})
+            if sub == "/build/status":
+                return self._json(200, state.build_jobs.get(sid) or {"state": "idle"})
             if sub == "/interview-data":
                 return self._json(200, state.interview_data(sid))
             if sub == "/interview/status":
                 return self._json(200, state.interview_jobs.get(sid) or {"state": "idle"})
-            if sub == "/generate-config/status":
-                return self._json(200, state.config_jobs.get(sid) or {"state": "idle"})
             return self._json(404, {"error": "not_found"})
 
         # --- reconstruction ---
@@ -886,16 +856,19 @@ def make_handler(state):
                 state.start_spec_generation(sid)
             return self._json(202, {"state": "running", "session_id": sid})
 
-        # --- Stage 4: run the generated test config ---
-        def _compile_test(self, sid, body=None):
-            if not any(a.get("test_yaml") for a in sessions.list_agents(root, sid)):
-                return self._json(400, {"error": "no_config"})
+        # --- Build & test agents: config (Phase 1) + hidden gate (Phase 3) ---
+        def _build(self, sid, body=None):
+            if not sessions.artifacts(root, sid)["reviewed"]:
+                return self._json(400, {"error": "not_reviewed"})
+            approved, _ = state._approved_for_stage4(sid)
+            if approved and not state.keystore.get_key():
+                return self._json(400, {"error": "no_api_key"})
             selected = (body or {}).get("bundle_ids")    # None => all approved
             with state.lock:
-                existing = state.stage4_jobs.get(sid)
+                existing = state.build_jobs.get(sid)
                 if existing and existing.get("state") == "running":
                     return self._json(409, {"error": "already_running"})
-                state.start_stage4(sid, selected_ids=selected)
+                state.start_build(sid, selected_ids=selected)
             return self._json(202, {"state": "running", "session_id": sid})
 
         def _cleanup_platform(self, sid):
@@ -933,21 +906,6 @@ def make_handler(state):
             if rec is None:
                 return self._json(404, {"error": "no_interview"})
             return self._json(200, rec)
-
-        # --- Phase 1 config generation, wired into the chain ---
-        def _generate_config(self, sid, body=None):
-            if not sessions.artifacts(root, sid)["reviewed"]:
-                return self._json(400, {"error": "not_reviewed"})
-            approved, _ = state._approved_for_stage4(sid)
-            if approved and not state.keystore.get_key():
-                return self._json(400, {"error": "no_api_key"})
-            selected = (body or {}).get("bundle_ids")
-            with state.lock:
-                existing = state.config_jobs.get(sid)
-                if existing and existing.get("state") == "running":
-                    return self._json(409, {"error": "already_running"})
-                state.start_configgen(sid, selected_ids=selected)
-            return self._json(202, {"state": "running", "session_id": sid})
 
     return Handler
 

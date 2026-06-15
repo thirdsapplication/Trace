@@ -152,38 +152,60 @@ class TriggerTest(unittest.TestCase):
         self.assertEqual(len(trigger.generate_triggers(BUNDLE, {"artifacts": []})), 1)
 
 
+GROUNDING = {"bundle_id": "B1", "instructions": [
+    {"key": "step_1_open", "text": "Open the item.", "source": {"type": "events", "ids": ["e1"]}},
+    {"key": "req_1_enter", "text": "The order values are entered into the destination.", "source": {"type": "discovery"}},
+    {"key": "req_2_reply", "text": "A confirmation reply is produced.", "source": {"type": "discovery"}},
+    {"key": "req_3_format", "text": "The rows match the destination file's column format.", "source": {"type": "discovery"}},
+]}
+
+
+def _grade_judge(per):
+    """A stub judge_fn(acceptance_criteria, transcript) -> JSON text."""
+    import json
+    return lambda criteria, transcript: json.dumps(per)
+
+
 class GraderTest(unittest.TestCase):
-    def test_parses_criteria_stripping_tags(self):
-        crit = grader.parse_acceptance_criteria(SPEC_MD)
-        self.assertEqual(len(crit), 3)
-        self.assertTrue(all("_(" not in c for c in crit))
-        self.assertIn("UNIQUE_CRIT_MARKER: the appended row count equals one.", crit)
+    def test_criteria_from_grounding_requirements_only(self):
+        crit = grader.criteria_from_grounding(GROUNDING)
+        self.assertEqual(len(crit), 3)                      # the three req_* entries
+        self.assertNotIn("Open the item.", crit)            # steps excluded by default
+        self.assertEqual(len(grader.criteria_from_grounding(GROUNDING, keys=("req_", "step_"))), 4)
 
     def test_grade_pass_and_not_testable(self):
-        crit = grader.parse_acceptance_criteria(SPEC_MD)
+        crit = grader.criteria_from_grounding(GROUNDING)
+        per = {"per_criterion": [
+            {"criterion": crit[0], "verdict": "pass", "reason": "ok"},
+            {"criterion": crit[1], "verdict": "pass", "reason": "ok"},
+            {"criterion": crit[2], "verdict": "not_testable_here", "reason": "needs real file"}],
+            "overall": "pass", "notes": ""}
+        rep = grader.grade(crit, "transcript text", judge_fn=_grade_judge(per))
+        self.assertEqual(rep["overall"], "pass")            # not_testable_here never fails
+        self.assertEqual(sum(1 for r in rep["per_criterion"] if r["verdict"] == "not_testable_here"), 1)
 
-        def judge(c, transcript, outputs):
-            if "external thread" in c:
-                return {"verdict": "not_testable_in_sandbox", "evidence": "needs live email"}
-            return {"verdict": "pass", "evidence": "ok"}
+    def test_failing_criterion_forces_overall_fail(self):
+        # the model claims overall pass, but a per-criterion fail must override it
+        per = {"per_criterion": [{"criterion": "x", "verdict": "fail", "reason": "contradicted"}],
+               "overall": "pass", "notes": ""}
+        rep = grader.grade(["x"], "t", judge_fn=_grade_judge(per))
+        self.assertEqual(rep["overall"], "fail")            # safety-net; gate can fail
 
-        rep = grader.grade(crit, {"transcript": "appended one row", "output_files": {}}, judge)
-        self.assertEqual(rep["failed"], 0)
-        self.assertEqual(rep["not_testable_in_sandbox"], 1)      # never silently passed
-        self.assertTrue(rep["deploy_recommended"])
+    def test_inconclusive_is_non_blocking(self):
+        per = {"per_criterion": [{"criterion": "x", "verdict": "inconclusive", "reason": "no evidence"}],
+               "overall": "fail", "notes": ""}
+        rep = grader.grade(["x"], "t", judge_fn=_grade_judge(per))
+        self.assertEqual(rep["overall"], "pass")            # inconclusive doesn't fail overall
 
-    def test_failing_criterion_blocks_deploy(self):
-        crit = grader.parse_acceptance_criteria(SPEC_MD)
-        rep = grader.grade(crit, {"transcript": "x", "output_files": {}},
-                           judge_fn=lambda c, t, o: {"verdict": "fail", "evidence": "contradicted"})
-        self.assertGreater(rep["failed"], 0)
-        self.assertFalse(rep["deploy_recommended"])              # gate can fail
-
-    def test_stall_blocks_deploy(self):
-        crit = grader.parse_acceptance_criteria(SPEC_MD)
-        rep = grader.grade(crit, {"transcript": "", "output_files": {}, "stalled": True},
-                           judge_fn=lambda c, t, o: {"verdict": "pass", "evidence": "ok"})
-        self.assertFalse(rep["deploy_recommended"])
+    def test_parse_grade_handles_fenced_and_unparseable(self):
+        import json
+        per = {"per_criterion": [{"criterion": "x", "verdict": "pass", "reason": "ok"}],
+               "overall": "pass", "notes": ""}
+        fenced = lambda c, t: "```json\n" + json.dumps(per) + "\n```"
+        self.assertEqual(grader.grade(["x"], "t", judge_fn=fenced)["overall"], "pass")
+        bad = grader.grade(["x"], "t", judge_fn=lambda c, t: "totally not json")
+        self.assertEqual(bad["overall"], "fail")            # fail-safe
+        self.assertIn("unparseable", bad["notes"])
 
 
 if __name__ == "__main__":

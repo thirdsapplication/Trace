@@ -1,114 +1,135 @@
-"""P8 — grader (walled off from the Compiler, like the discovery Scorer).
+"""Phase 3 — the Sandbox Grader (walled off from the engine, like the discovery Scorer).
 
-Reads ONLY the spec's acceptance criteria and the sandbox run's outputs, and shares
-no prompt text or code with the Compiler. Produces a per-criterion verdict
-(pass | fail | not_testable_in_sandbox) with evidence. Criteria that require a live
-external service to verify are marked not-testable, never silently passed (P8). The
-gate is demonstrably capable of failing (a contradicted criterion -> fail ->
-no deploy recommendation).
+Reads ONLY the agent's acceptance criteria and a rendered sandbox transcript, and
+shares no prompt text or code with the config engine / gate. One model call grades
+all criteria at once, returning a per-criterion verdict
+(pass | fail | not_testable_here | inconclusive) plus an overall.
+
+Walled off on purpose: this module imports only ``re``, ``json``, and (lazily)
+``anthropic`` — never ``gate``, ``configgen``, ``deployer`` or ``compiler`` — so the
+thing being graded can never reach into the grader.
 """
 
+import json
 import re
 
-# Grader's OWN prompt — deliberately not imported from anywhere the Compiler touches.
-GRADER_SYSTEM = (
-    "You grade whether an automation agent's SANDBOX run satisfied ONE acceptance "
-    "criterion. The run had NO external connections; any outbound action (sending an "
-    "email, posting a message) appears as TEXT in the transcript rather than really "
-    "happening. Rules:\n"
-    "- If verifying the criterion would require a live external service (e.g. an email "
-    "actually delivered, a message actually posted, a row written to a live system), "
-    "answer NOT_TESTABLE.\n"
-    "- Otherwise answer PASS if the transcript and output files clearly satisfy it, or "
-    "FAIL if they contradict it or omit it.\n"
-    "Answer with one word — PASS, FAIL, or NOT_TESTABLE — then a one-line reason."
-)
+# The grader's OWN prompt — verbatim Phase 3 spec; not imported from anywhere the
+# engine touches.
+GRADER_SYSTEM = """You are the Trace Sandbox Grader. An automation agent has just run in a sealed
+sandbox: it had NO real connections, could not touch any real data, and when
+it 'sent' or 'wrote' something it only emitted text describing the action. You
+judge whether it performed the workflow correctly, by its acceptance criteria.
+
+You receive:
+- acceptance_criteria: the agent's own checklist of must-hold conditions.
+- transcript: the full record of what the agent did and emitted in the run.
+
+Judge BEHAVIORALLY. Base every verdict on what the agent actually did and
+emitted — the values it extracted, the actions it took, the text it produced.
+Do NOT pass a criterion merely because the agent restated it: the criteria are
+also written into the agent's own instructions, so repeating them proves
+nothing.
+
+This is a sandbox with no real environment. For any criterion that requires
+the real environment to judge (e.g. whether output matched a real file's
+columns/format/layout), mark it 'not_testable_here' rather than guessing.
+If the transcript is incomplete or you cannot find evidence for a criterion
+that should be testable, mark it 'inconclusive'.
+
+Output ONLY this JSON:
+{ "per_criterion": [
+    {"criterion":"...","verdict":"pass|fail|not_testable_here|inconclusive",
+     "reason":"one line citing the transcript"} ],
+  "overall":"pass|fail",            // pass only if no criterion failed
+  "notes":"brief" }"""
+
+_VERDICTS = ("pass", "fail", "not_testable_here", "inconclusive")
 
 
-def parse_acceptance_criteria(spec_md):
-    """Extract the acceptance-criteria bullet list from a spec's section 3, stripping
-    the trailing italic provenance tags (e.g. ``_(user-specified)_``)."""
-    crit, in_sec = [], False
-    for ln in (spec_md or "").splitlines():
-        s = ln.strip()
-        if re.match(r"^##\s*3\.", s):
-            in_sec = True
+def criteria_from_grounding(grounding, keys=("req_",)):
+    """The agent's acceptance criteria — its must-hold conditions. By default the
+    requirements (grounding instructions whose key starts with ``req_``); ``keys`` can
+    widen this (e.g. add ``step_``) without touching the grader's contract."""
+    out = []
+    for inst in (grounding or {}).get("instructions", []) or []:
+        key = str(inst.get("key", ""))
+        text = str(inst.get("text", "") or "").strip()
+        if text and any(key.startswith(k) for k in keys):
+            out.append(text)
+    return out
+
+
+def _parse_grade(text):
+    """Defensive parse of the grader's JSON (mirrors configgen._parse_json_object):
+    strip code fences, then json.loads, then an outermost ``{...}`` slice. Returns a
+    dict, or ``{}`` when nothing parses."""
+    if not text:
+        return {}
+    t = text.strip()
+    m = re.match(r"^```(?:json)?\s*(.*?)\s*```$", t, re.DOTALL)
+    if m:
+        t = m.group(1).strip()
+    try:
+        d = json.loads(t)
+        return d if isinstance(d, dict) else {}
+    except json.JSONDecodeError:
+        s, e = t.find("{"), t.rfind("}")
+        if s == -1 or e <= s:
+            return {}
+        try:
+            d = json.loads(t[s:e + 1])
+            return d if isinstance(d, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+
+
+def _normalize_per_criterion(raw):
+    out = []
+    for it in (raw or []):
+        if not isinstance(it, dict):
             continue
-        if in_sec and s.startswith("## "):
-            break
-        if in_sec and s.startswith("- "):
-            text = re.sub(r"\s*_\([^)]*\)_\s*$", "", s[2:]).strip()
-            if text and not text.startswith("_("):
-                crit.append(text)
-    return crit
-
-
-def _parse_verdict(text):
-    head = (text or "").strip().upper()
-    first = head.split("\n", 1)[0]
-    if "NOT_TESTABLE" in first or "NOT TESTABLE" in first:
-        v = "not_testable_in_sandbox"
-    elif first.startswith("FAIL"):
-        v = "fail"
-    elif first.startswith("PASS"):
-        v = "pass"
-    else:
-        v = "not_testable_in_sandbox"
-    return {"verdict": v, "evidence": (text or "").strip()[:400]}
+        v = str(it.get("verdict", "")).strip().lower()
+        if v not in _VERDICTS:
+            v = "inconclusive"                 # coerce anything unexpected to non-blocking
+        out.append({"criterion": str(it.get("criterion", "") or "").strip(),
+                    "verdict": v,
+                    "reason": str(it.get("reason", "") or "").strip()[:400]})
+    return out
 
 
 def _default_judge(model="claude-sonnet-4-6"):
     import anthropic
     client = anthropic.Anthropic()
 
-    def judge(criterion, transcript, output_files):
-        files = "\n\n".join(f"--- OUTPUT FILE {n} ---\n{str(c)[:3000]}"
-                            for n, c in (output_files or {}).items()) or "(no output files)"
-        prompt = (f"ACCEPTANCE CRITERION:\n{criterion}\n\n"
-                  f"AGENT RUN TRANSCRIPT:\n{(transcript or '')[:9000]}\n\n"
-                  f"OUTPUT FILES:\n{files}")
-        resp = client.messages.create(model=model, max_tokens=150, temperature=0,
+    def judge(acceptance_criteria, transcript):
+        user = json.dumps({"acceptance_criteria": list(acceptance_criteria or []),
+                           "transcript": transcript or ""}, ensure_ascii=False)
+        resp = client.messages.create(model=model, max_tokens=1500, temperature=0,
                                       system=GRADER_SYSTEM,
-                                      messages=[{"role": "user", "content": prompt}])
-        text = "".join(b.text for b in resp.content if getattr(b, "type", None) == "text")
-        return _parse_verdict(text)
+                                      messages=[{"role": "user", "content": user}])
+        return "".join(b.text for b in resp.content if getattr(b, "type", None) == "text")
 
     return judge
 
 
-def grade(criteria, run_outputs, judge_fn=None):
-    """Grade a run's outputs against the criteria. ``run_outputs`` =
-    ``{transcript, output_files, stalled, asked_question}``. ``judge_fn(criterion,
-    transcript, output_files) -> {verdict, evidence}`` is injectable for offline tests."""
+def grade(acceptance_criteria, transcript, judge_fn=None):
+    """Grade a sandbox run. ``judge_fn(acceptance_criteria, transcript) -> raw_text`` is
+    injectable for offline tests. Returns ``{per_criterion, overall, notes}``.
+
+    Safety nets (never trust the model blindly): ``overall`` is recomputed to ``fail``
+    if ANY criterion failed; a wholly unparseable grader response is treated as
+    ``overall='fail'`` (a broken grader must never silently advance an agent).
+    ``not_testable_here`` and ``inconclusive`` are NON-blocking."""
     if judge_fn is None:
         judge_fn = _default_judge()
-    transcript = run_outputs.get("transcript", "")
-    outputs = run_outputs.get("output_files", {})
+    parsed = _parse_grade(judge_fn(acceptance_criteria, transcript))
 
-    results = []
-    for c in criteria:
-        r = judge_fn(c, transcript, outputs)
-        results.append({"criterion": c, "verdict": r.get("verdict", "not_testable_in_sandbox"),
-                        "evidence": r.get("evidence", "")})
+    if "per_criterion" not in parsed:
+        return {"per_criterion": [], "overall": "fail",
+                "notes": "grader output unparseable"}
 
-    passed = sum(1 for r in results if r["verdict"] == "pass")
-    failed = sum(1 for r in results if r["verdict"] == "fail")
-    not_testable = sum(1 for r in results if r["verdict"] == "not_testable_in_sandbox")
-    stalled = bool(run_outputs.get("stalled"))
-    asked = bool(run_outputs.get("asked_question"))
-
-    return {
-        "criteria_total": len(criteria),
-        "passed": passed,
-        "failed": failed,
-        "not_testable_in_sandbox": not_testable,
-        "results": results,
-        "zero_coaching": {
-            "stalled": stalled,
-            "asked_question": asked,
-            "note": "Only the trigger message was sent; no corrective/steering messages.",
-        },
-        # a contradicted (failing) criterion, a stall, or no passing evidence blocks the
-        # recommendation — the gate must be able to fail.
-        "deploy_recommended": (failed == 0 and passed > 0 and not stalled),
-    }
+    per_criterion = _normalize_per_criterion(parsed.get("per_criterion"))
+    any_fail = any(r["verdict"] == "fail" for r in per_criterion)
+    overall = "fail" if any_fail else "pass"        # deterministic; ignore model's overall
+    return {"per_criterion": per_criterion, "overall": overall,
+            "notes": str(parsed.get("notes", "") or "").strip()[:400]}

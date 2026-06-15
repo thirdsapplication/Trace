@@ -161,6 +161,10 @@ def grounding_name(bid):
     return f"grounding_{_safe_id(bid)}.json"
 
 
+def gate_record_name(bid):
+    return f"gate_{_safe_id(bid)}.json"
+
+
 def _read_json(p):
     try:
         with open(p, encoding="utf-8") as f:
@@ -183,6 +187,20 @@ def list_runs(root, sid):
     return out
 
 
+def list_gate_records(root, sid):
+    """Every gate_<id>.json verdict record (Phase 3 hidden gate)."""
+    d = path(root, sid, SPECS_DIR)
+    if not os.path.isdir(d):
+        return []
+    out = []
+    for fn in sorted(os.listdir(d)):
+        if re.match(r"^gate_.+\.json$", fn):
+            rec = _read_json(os.path.join(d, fn))
+            if rec is not None:
+                out.append(rec)
+    return out
+
+
 def list_agents(root, sid):
     """Return Stage-4 outputs per bundle: agent envelopes + the run pointer (if any).
     Grading is out of the flow in manual-evaluation mode, so ``run`` (not a graded
@@ -198,10 +216,10 @@ def list_agents(root, sid):
                 bundles.setdefault(m.group(1), {})[m.group(2) + "_yaml"] = f.read()
     out = []
     for bid, data in bundles.items():
-        run = _read_json(os.path.join(d, f"run_{bid}.json"))
         grounding = _read_json(os.path.join(d, f"grounding_{bid}.json"))
+        gate = _read_json(os.path.join(d, f"gate_{bid}.json"))
         out.append({"bundle_id": bid, "test_yaml": data.get("test_yaml"),
-                    "live_yaml": data.get("live_yaml"), "grounding": grounding, "run": run})
+                    "live_yaml": data.get("live_yaml"), "grounding": grounding, "gate": gate})
     return out
 
 

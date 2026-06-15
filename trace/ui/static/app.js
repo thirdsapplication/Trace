@@ -292,19 +292,19 @@ async function loadAndShow(tab) {
   }
   if (cache[selectedSid][tab] !== undefined) { setView(cache[selectedSid][tab]); return; }
 
-  if (tab === "agents") {      // config envelopes + grounding + run pointer
+  if (tab === "agents") {      // config envelopes + grounding + hidden-gate verdict
     const { ok, data } = await api("GET", `/api/sessions/${selectedSid}/agents`);
     let text;
     if (!ok || !data.agents.length) {
-      text = "No agents yet — run the interview, then Generate config.";
+      text = "No agents yet — run the interview, then Build & test agents.";
     } else {
       text = data.agents.map(a =>
         `===== ${a.bundle_id} — agent (test) =====\n${a.test_yaml || "(none)"}\n\n` +
         `===== ${a.bundle_id} — agent (live, NOT deployed) =====\n${a.live_yaml || "(none)"}\n\n` +
         `===== ${a.bundle_id} — grounding =====\n` +
         (a.grounding ? JSON.stringify(a.grounding, null, 2) : "(none)") + "\n\n" +
-        `===== ${a.bundle_id} — run (evaluate manually in the Console) =====\n` +
-        (a.run ? JSON.stringify(a.run, null, 2) : "(not run — needs API key)")
+        `===== ${a.bundle_id} — logic gate (hidden; reasoning only) =====\n` +
+        (a.gate ? JSON.stringify(a.gate, null, 2) : "(not gated — needs API key)")
       ).join("\n\n\n");
     }
     cache[selectedSid][tab] = text;
@@ -511,9 +511,8 @@ async function refreshSessions() {
       $("scoreBtn").disabled = !(scoreAvailable && art.discovery);
       enableReviewButtons(!!art.discovery, false);
       enableInterview(!!art.reviewed);
-      enableConfig(!!art.reviewed);
-      enableStage4(!!art.reviewed);
-      reviewData = null; interviewState = null; $("stage4Summary").innerHTML = "";
+      enableBuild(!!art.reviewed);
+      reviewData = null; interviewState = null; $("buildSummary").innerHTML = "";
       $("reviewContainer").innerHTML = "";
       $("interviewContainer").innerHTML = "";
       $("discoverTarget").textContent = art.event_log ? `target: ${selectedSid}` : "";
@@ -673,7 +672,7 @@ async function saveReview() {
   const { ok, data } = await api("POST", `/api/sessions/${selectedSid}/reviewed-bundles`, body);
   if (ok) {
     reviewData.reviewed = data.reviewed;
-    enableInterview(true); enableConfig(true); enableStage4(true);
+    enableInterview(true); enableBuild(true);
     delete cache[selectedSid];
     await refreshSessions();
   }
@@ -814,148 +813,83 @@ async function saveInterview(bid) {
 }
 
 // ===========================================================================
-// Generate config (Phase 1 engine, wired into the chain)
+// Build & test agents — config (Phase 1) + hidden logic gate (Phase 3)
 // ===========================================================================
-let configTimer = null;
+let buildTimer = null;
 
-function enableConfig(on) {
-  $("genConfigBtn").disabled = !on;
-  if (on) loadConfigBundles(); else $("configBundles").innerHTML = "";
+function enableBuild(on) {
+  $("buildBtn").disabled = !on;
+  if (on) loadBuildBundles(); else $("buildBundles").innerHTML = "";
 }
 
-async function loadConfigBundles() {
+async function loadBuildBundles() {
   if (!selectedSid) return;
-  const { ok, data } = await api("GET", `/api/sessions/${selectedSid}/stage4-bundles`);
-  const el = $("configBundles");
-  if (!ok || !data.bundles || !data.bundles.length) { el.innerHTML = ""; return; }
-  el.innerHTML = data.bundles.map(b =>
-    `<label><input type="checkbox" class="cfg" value="${ESC(b.id)}" checked>` +
-    `<b>${ESC(b.id)}</b> ${ESC(b.name)}` +
-    (b.config_ready ? ` <span class="muted">config ready</span>` : "") + `</label>`).join("");
-}
-
-$("genConfigBtn").onclick = async () => {
-  if (!selectedSid) return;
-  const ids = Array.from(document.querySelectorAll("#configBundles .cfg:checked")).map(c => c.value);
-  if (!ids.length) { $("configMsg").innerHTML = `<span class="warn">select at least one bundle</span>`; return; }
-  $("configMsg").textContent = "generating config…";
-  const { ok, status, data } = await api("POST", `/api/sessions/${selectedSid}/generate-config`, { bundle_ids: ids });
-  if (status === 400 && data && data.error === "no_api_key") {
-    $("configMsg").innerHTML = `<span class="err">no API key</span> — add one in Settings.`; return;
-  }
-  if (!ok && status !== 202) {
-    $("configMsg").innerHTML = `<span class="err">${(data && data.error) || "failed"}</span>`; return;
-  }
-  setPill("reconstructing");
-  pollConfig();
-};
-
-function pollConfig() {
-  if (configTimer) clearInterval(configTimer);
-  configTimer = setInterval(async () => {
-    const { data } = await api("GET", `/api/sessions/${selectedSid}/generate-config/status`);
-    if (!data) return;
-    if (data.state === "done") {
-      clearInterval(configTimer); configTimer = null;
-      const errs = Object.keys(data.errors || {}).length;
-      $("configMsg").innerHTML = `<span class="ok">done</span> — ${data.generated} config(s)` +
-        (errs ? ` · <span class="err">${errs} error(s)</span>` : "");
-      setPill("results");
-      delete cache[selectedSid];
-      enableStage4(true);
-      await loadAndShow("agents");
-      await refreshSessions();
-    } else if (data.state === "error") {
-      clearInterval(configTimer); configTimer = null;
-      $("configMsg").innerHTML = `<span class="err">config generation failed</span> — ${data.error}`;
-      setPill("idle");
-    }
-  }, 800);
-}
-
-// ===========================================================================
-// Stage 4 — compile & run agent (manual evaluation)
-// ===========================================================================
-let stage4Timer = null;
-
-function enableStage4(on) {
-  $("compileTestBtn").disabled = !on;
-  if (on) loadStage4Bundles(); else $("stage4Bundles").innerHTML = "";
-}
-
-// Per-bundle checkboxes; default-check bundles whose config has been generated.
-async function loadStage4Bundles() {
-  if (!selectedSid) return;
-  const { ok, data } = await api("GET", `/api/sessions/${selectedSid}/stage4-bundles`);
-  const el = $("stage4Bundles");
+  const { ok, data } = await api("GET", `/api/sessions/${selectedSid}/build-bundles`);
+  const el = $("buildBundles");
   if (!ok || !data.bundles || !data.bundles.length) { el.innerHTML = ""; return; }
   el.innerHTML = data.bundles.map(b => {
-    const note = b.config_ready
-      ? `<span class="muted">config ready</span>`
-      : `<span class="note">no config yet — generate config first</span>`;
-    return `<label><input type="checkbox" class="b4" value="${ESC(b.id)}" ${b.config_ready ? "checked" : ""}>` +
-           `<b>${ESC(b.id)}</b> ${ESC(b.name)} ${note}</label>`;
+    let chip = "";
+    if (b.built) chip = b.advanced
+      ? ` <span class="ok">gate: passed</span>`
+      : ` <span class="warn">gate: held</span>`;
+    return `<label><input type="checkbox" class="bld" value="${ESC(b.id)}" checked>` +
+           `<b>${ESC(b.id)}</b> ${ESC(b.name)}${chip}</label>`;
   }).join("");
 }
 
-$("compileTestBtn").onclick = async () => {
+$("buildBtn").onclick = async () => {
   if (!selectedSid) return;
-  const ids = Array.from(document.querySelectorAll("#stage4Bundles .b4:checked")).map(c => c.value);
-  if (!ids.length) { $("stage4Msg").innerHTML = `<span class="warn">select at least one bundle</span>`; return; }
-  $("stage4Msg").textContent = "running…";
-  const { ok, status, data } = await api(
-    "POST", `/api/sessions/${selectedSid}/compile-test`, { bundle_ids: ids });
-  if (status === 400 && data && data.error === "no_config") {
-    $("stage4Msg").innerHTML = `<span class="err">no config</span> — generate config first.`; return;
+  const ids = Array.from(document.querySelectorAll("#buildBundles .bld:checked")).map(c => c.value);
+  if (!ids.length) { $("buildMsg").innerHTML = `<span class="warn">select at least one bundle</span>`; return; }
+  $("buildMsg").textContent = "building…";
+  const { ok, status, data } = await api("POST", `/api/sessions/${selectedSid}/build`, { bundle_ids: ids });
+  if (status === 400 && data && data.error === "no_api_key") {
+    $("buildMsg").innerHTML = `<span class="err">no API key</span> — add one in Settings.`; return;
+  }
+  if (status === 400 && data && data.error === "not_reviewed") {
+    $("buildMsg").innerHTML = `<span class="err">save reviewed bundles first</span>`; return;
   }
   if (!ok && status !== 202) {
-    $("stage4Msg").innerHTML = `<span class="err">${(data && data.error) || "failed"}</span>`; return;
+    $("buildMsg").innerHTML = `<span class="err">${(data && data.error) || "failed"}</span>`; return;
   }
   setPill("reconstructing");
-  pollStage4();
+  pollBuild();
 };
 
-function pollStage4() {
-  if (stage4Timer) clearInterval(stage4Timer);
-  stage4Timer = setInterval(async () => {
-    const { data } = await api("GET", `/api/sessions/${selectedSid}/compile-test/status`);
+function pollBuild() {
+  if (buildTimer) clearInterval(buildTimer);
+  buildTimer = setInterval(async () => {
+    const { data } = await api("GET", `/api/sessions/${selectedSid}/build/status`);
     if (!data) return;
     if (data.state === "done") {
-      clearInterval(stage4Timer); stage4Timer = null;
-      $("stage4Msg").innerHTML = `<span class="ok">done</span> — ${data.ran} run.`;
-      renderStage4Summary(data.runs || {});
+      clearInterval(buildTimer); buildTimer = null;
+      const errs = Object.keys(data.errors || {}).length;
+      const passed = Object.values(data.verdicts || {}).filter(Boolean).length;
+      $("buildMsg").innerHTML = `<span class="ok">done</span> — ${data.generated} built, ` +
+        `${passed}/${data.gated} passed the gate` +
+        (errs ? ` · <span class="err">${errs} error(s)</span>` : "");
+      renderBuildSummary(data.verdicts || {});
       setPill("results");
       delete cache[selectedSid];
+      loadBuildBundles();
       await loadAndShow("agents");
       await refreshSessions();
     } else if (data.state === "error") {
-      clearInterval(stage4Timer); stage4Timer = null;
-      $("stage4Msg").innerHTML = `<span class="err">stage 4 failed</span> — ${data.error}`;
+      clearInterval(buildTimer); buildTimer = null;
+      $("buildMsg").innerHTML = `<span class="err">build failed</span> — ${data.error}`;
       setPill("idle");
     }
   }, 800);
 }
 
-function renderStage4Summary(runs) {
-  const el = $("stage4Summary");
-  const ids = Object.keys(runs);
+function renderBuildSummary(verdicts) {
+  const el = $("buildSummary");
+  const ids = Object.keys(verdicts);
   if (!ids.length) { el.innerHTML = ""; return; }
   el.innerHTML = ids.map(id => {
-    const r = runs[id];
-    if (r.run_skipped) return `<div class="run-line">${ESC(id)}: compiled (run skipped — ${ESC(r.run_skipped)})</div>`;
-    const reused = r.agent_reused ? "reused" : "new";
-    const head = `<div class="run-line">${ESC(id)}: agent <b>${ESC(r.agent_name || "")}</b> ` +
-                 `<span class="muted">(${ESC(r.agent_id || "")}, ${reused})</span></div>`;
-    const sess = (r.sessions || []).map(s => {
-      const cls = s.status === "completed" ? "ok" : "warn";
-      const files = (s.output_files || []).length ? ` · outputs: ${s.output_files.map(ESC).join(", ")}` : "";
-      const link = s.console_url
-        ? `<a href="${ESC(s.console_url)}" target="_blank" rel="noopener">open Console</a> — `
-        : "";
-      return `<div class="run-line">&nbsp;&nbsp;session <code>${ESC(s.session_id)}</code> ` +
-             `<span class="${cls}">${ESC(s.status)}</span> — ${link}${ESC(s.console_hint || "")}${files}</div>`;
-    }).join("");
-    return head + sess;
+    const advanced = verdicts[id];
+    const badge = advanced ? `<span class="ok">passed</span>` : `<span class="warn">held</span>`;
+    return `<div class="run-line">${ESC(id)}: gate ${badge}</div>`;
   }).join("");
 }
 
