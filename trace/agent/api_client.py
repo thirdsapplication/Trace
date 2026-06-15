@@ -192,31 +192,33 @@ class ManagedAgentsClient:
                 return a
         return None
 
-    def _try_update_agent(self, agent_id, envelope_dict):
-        """Best-effort in-place update of an existing agent's definition. Returns
-        True if the SDK supports it and the call succeeded, else False (reuse as-is).
+    def _update_agent(self, agent_id, envelope_dict):
+        """Update an existing agent IN PLACE so a redeploy reflects the rebuilt config
+        (model/system/tools/mcp_servers). Transient blips are retried; any real failure
+        is RAISED (surfaced in the deploy record) — we never silently keep stale config.
         This is a cheap metadata call — no model tokens."""
         ns = self._agents_ns("agents")
         update = getattr(ns, "update", None)
         if not callable(update):
-            return False
-        try:
-            _retry(lambda: update(agent_id, model=envelope_dict["model"],
-                                  system=envelope_dict["system"], tools=envelope_dict["tools"],
-                                  mcp_servers=envelope_dict.get("mcp_servers") or []))
-            return True
-        except Exception:
-            return False
+            raise RuntimeError(
+                "this anthropic SDK exposes no agents.update, so the existing agent "
+                "cannot be refreshed in place. Run `pip install -U anthropic`.")
+        _retry(lambda: update(agent_id, model=envelope_dict["model"],
+                              system=envelope_dict["system"], tools=envelope_dict["tools"],
+                              mcp_servers=envelope_dict.get("mcp_servers") or []))
+        return True
 
     def create_or_reuse_agent(self, envelope_dict):
-        """C6: agents have Trace-deterministic names, so an existing agent with the
-        same name is REUSED (updated in place if the platform allows) rather than
-        creating a duplicate every round. Returns ``{id, name, reused}``."""
+        """C6: agents have Trace-deterministic names, so an existing agent with the same
+        name is REUSED and **updated in place** (its config/tools refreshed to the rebuilt
+        envelope) rather than creating a duplicate every round. Update failures are
+        surfaced, not swallowed, so a redeploy never silently keeps stale config.
+        Returns ``{id, name, reused}``."""
         name = envelope_dict["name"]
         existing = self._find_agent(name)
         if existing is not None:
             agent_id = _idof(existing)
-            self._try_update_agent(agent_id, envelope_dict)   # best-effort; reuse on failure
+            self._update_agent(agent_id, envelope_dict)
             return {"id": agent_id, "name": name, "reused": True}
         a = _retry(lambda: self._agents_ns("agents").create(
             name=name, model=envelope_dict["model"],
@@ -369,11 +371,35 @@ class ManagedAgentsClient:
         return _retry(lambda: self._agents_ns("sessions").events.send(session_id, events=[event]))
 
     # --- explicit, human-initiated cleanup (C2) --------------------------
-    def cleanup(self, session_ids=None, file_ids=None, agent_ids=None):
+    def _agent_ids_by_name(self, names):
+        """Ids of every existing agent whose name is in ``names`` — used to sweep
+        Trace-created agents (current + orphaned stale/duplicate ones from earlier
+        rounds) that share this session's workflow names."""
+        names = set(n for n in (names or []) if n)
+        if not names:
+            return []
+        try:
+            res = _retry(lambda: self._agents_ns("agents").list())
+        except Exception:
+            return []
+        out = []
+        for a in _data(res):
+            if _attr(a, "name") in names:
+                aid = _idof(a)
+                if aid:
+                    out.append(aid)
+        return out
+
+    def cleanup(self, session_ids=None, file_ids=None, agent_ids=None, agent_names=None):
         """Delete the given Trace-created sessions, files, and agents. NEVER called
-        automatically — only from the UI's 'Clean up platform' button. Resilient:
-        each delete is isolated and the result reports exactly what was removed and
-        what errored."""
+        automatically — only from the UI's 'Clean up platform' button. ``agent_names``
+        additionally sweeps any agents the platform still has under this session's
+        workflow names (orphaned/stale duplicates not in the records). Resilient: each
+        delete is isolated and the result reports exactly what was removed and errored."""
+        agent_ids = list(agent_ids or [])
+        for aid in self._agent_ids_by_name(agent_names):
+            if aid not in agent_ids:
+                agent_ids.append(aid)
         removed = {"sessions": [], "files": [], "agents": []}
         errors = []
         for sid in session_ids or []:

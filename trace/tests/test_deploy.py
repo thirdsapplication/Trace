@@ -303,8 +303,9 @@ class UIDeployTest(unittest.TestCase):
 
     def test_cleanup_harvests_live_session(self):
         captured = {}
-        def fake_cleanup(session_ids, file_ids, agent_ids):
+        def fake_cleanup(session_ids, file_ids, agent_ids, agent_names=None):
             captured["args"] = (session_ids, file_ids, agent_ids)
+            captured["agent_names"] = agent_names
             return {"removed": {"sessions": session_ids, "files": file_ids, "agents": agent_ids}, "errors": []}
         self.state.cleanup_fn = fake_cleanup
         self._full_chain()
@@ -314,6 +315,8 @@ class UIDeployTest(unittest.TestCase):
         sess_ids, _f, agent_ids = captured["args"]
         self.assertIn("live_sess_0", sess_ids)            # the live session is harvested
         self.assertIn("agent_live", agent_ids)
+        # the session's workflow names are passed so cleanup can sweep stale duplicates
+        self.assertIn("Order intake", captured["agent_names"])
 
 
 if __name__ == "__main__":

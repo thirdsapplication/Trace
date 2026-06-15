@@ -120,6 +120,26 @@ class AgentCreateForwardsMcpServersTest(unittest.TestCase):
         self.assertTrue(out["reused"])
         self.assertEqual(captured["mcp_servers"], self._ENV["mcp_servers"])
 
+    def test_reuse_update_failure_is_surfaced_not_swallowed(self):
+        # a redeploy must never silently keep stale config: an update failure raises.
+        class NS:
+            def list(self):
+                return [{"id": "agent_1", "name": "Order intake"}]
+            def update(self, agent_id, **kw):
+                raise RuntimeError("update rejected")
+
+        with self.assertRaises(Exception):
+            self._client(NS()).create_or_reuse_agent(self._ENV)
+
+    def test_reuse_without_update_method_is_surfaced(self):
+        # SDK with no agents.update -> we cannot refresh in place; raise (don't reuse stale).
+        class NS:
+            def list(self):
+                return [{"id": "agent_1", "name": "Order intake"}]
+
+        with self.assertRaises(Exception):
+            self._client(NS()).create_or_reuse_agent(self._ENV)
+
 
 if __name__ == "__main__":
     unittest.main()

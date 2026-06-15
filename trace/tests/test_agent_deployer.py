@@ -210,6 +210,27 @@ class DeployerTest(unittest.TestCase):
         self.assertEqual(res["removed"]["sessions"], ["s1", "s2"])
         self.assertEqual(res["errors"], [])
 
+    def test_cleanup_sweeps_orphans_by_name(self):
+        # stale/duplicate agents under this session's workflow names are swept too,
+        # even when they aren't in the recorded ids.
+        client = api_client.ManagedAgentsClient.__new__(api_client.ManagedAgentsClient)
+        client._beta_version = "test"
+        deleted = []
+
+        class AgentsNs:
+            def list(self):
+                return [{"id": "a_old", "name": "Order intake"},     # stale duplicate
+                        {"id": "a_keep", "name": "Someone else's agent"}]
+            def delete(self, _id, **kw):
+                deleted.append(_id)
+
+        client._agents_ns = lambda name: AgentsNs()
+        res = client.cleanup(agent_ids=["a_live"], agent_names=["Order intake"])
+        self.assertIn("a_live", deleted)                 # the recorded id
+        self.assertIn("a_old", deleted)                  # the swept orphan
+        self.assertNotIn("a_keep", deleted)              # an unrelated agent is untouched
+        self.assertEqual(set(res["removed"]["agents"]), {"a_live", "a_old"})
+
 
 if __name__ == "__main__":
     unittest.main()

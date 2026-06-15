@@ -162,16 +162,18 @@ class AppState:
         self.lock = threading.Lock()
         os.makedirs(sessions_root, exist_ok=True)
 
-    def _default_cleanup(self, session_ids, file_ids, agent_ids):
-        """Real, human-initiated platform cleanup: requires a key; builds the client
-        and deletes exactly the Trace-created ids it is given."""
+    def _default_cleanup(self, session_ids, file_ids, agent_ids, agent_names=None):
+        """Real, human-initiated platform cleanup: requires a key; builds the client and
+        deletes the Trace-created ids it is given, plus any agents the platform still has
+        under this session's workflow names (``agent_names`` — sweeps orphaned/stale ones)."""
         key = self.keystore.get_key()
         if not key:
             raise RuntimeError("no_api_key")
         os.environ["ANTHROPIC_API_KEY"] = key
         from ..agent.api_client import ManagedAgentsClient
         client = ManagedAgentsClient(api_key=key)
-        return client.cleanup(session_ids=session_ids, file_ids=file_ids, agent_ids=agent_ids)
+        return client.cleanup(session_ids=session_ids, file_ids=file_ids,
+                              agent_ids=agent_ids, agent_names=agent_names)
 
     def _default_connect_client(self):
         """Real connection client (Pipedream Connect + MA vault). Requires a key;
@@ -442,8 +444,15 @@ class AppState:
     # --- explicit platform cleanup (C2): never automatic -----------------
     def cleanup_platform(self, sid):
         """Gather the Trace-created ids from this session's run + deploy records and
-        delete them via the cleanup seam. Returns the removal summary."""
+        delete them via the cleanup seam, plus sweep any agents still on the platform
+        under this session's workflow names (orphaned/stale duplicates from earlier
+        rounds — e.g. test-era agents). Returns the removal summary."""
         session_ids, file_ids, agent_ids = [], [], []
+        # the agent names Trace uses for this session's bundles (matches configgen's
+        # _envelope: name -> bundle name/id), so the sweep can reach stale duplicates.
+        approved, _ = self._approved_for_stage4(sid)
+        agent_names = list(dict.fromkeys(
+            str(b.get("name") or b.get("id") or "Agent").strip() for b in approved))
         # live deploy records (Phase 6): the live sessions + agents
         for d in sessions.list_deploy_records(self.sessions_root, sid):
             if d.get("session_id"):
@@ -462,8 +471,9 @@ class AppState:
         session_ids = list(dict.fromkeys(session_ids))
         file_ids = list(dict.fromkeys(file_ids))
         agent_ids = list(dict.fromkeys(agent_ids))
-        result = self.cleanup_fn(session_ids, file_ids, agent_ids)
-        return {"requested": {"sessions": session_ids, "files": file_ids, "agents": agent_ids},
+        result = self.cleanup_fn(session_ids, file_ids, agent_ids, agent_names=agent_names)
+        return {"requested": {"sessions": session_ids, "files": file_ids,
+                              "agents": agent_ids, "agent_names": agent_names},
                 **(result or {})}
 
     # --- Phase 4: connection layer (Pipedream Connect + MA vault) ---------
