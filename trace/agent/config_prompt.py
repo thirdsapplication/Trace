@@ -20,6 +20,10 @@ You will receive a JSON object with:
 - user_answers: the worker's one-line answers about things that could not be
   observed (may be empty). These are AUTHORITATIVE. When a user_answer
   conflicts with anything you would infer from the events, follow the answer.
+- test_feedback: the worker's one-line corrections after watching a dry run of a
+  PREVIOUS version of this agent on their real data (may be empty). These are
+  AUTHORITATIVE corrections — fold each one into the step or working rule it
+  concerns so the regenerated agent does the right thing.
 
 Write the agent's instructions as STRUCTURED CONTENT (schema below). The
 instructions, once assembled, will read in this fixed order: a role line; the
@@ -35,10 +39,13 @@ Rules for the content you write:
   format (e.g. the existing rows already in the destination sheet).
 - Fold any user_answers that express a rule (e.g. a conflict-resolution rule,
   a destination, a one-vs-many layout) into the steps or working rules.
+- Fold any test_feedback corrections into the step or working rule they concern.
 - Requirements are must-hold conditions; they double as the agent's guardrails.
 - Do NOT invent any step, value, or rule that has no source.
 - Every step, working rule, and requirement MUST carry a source tag:
-  {type:'events', ids:[...]} or {type:'discovery'} or {type:'user_answer', q:'..'}.
+  {type:'events', ids:[...]} or {type:'discovery'} or {type:'user_answer', q:'..'}
+  or {type:'user_test_feedback', note:'..'} (for content folded in from a
+  test_feedback correction).
 
 Output ONLY this JSON, nothing else:
 {

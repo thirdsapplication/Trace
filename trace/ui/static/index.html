@@ -170,6 +170,20 @@
         simulated by "Simulate Allow".</i></p>
     </section>
 
+    <!-- DRY RUN (Phase 5 — real-data preview) -------------------------- -->
+    <section class="panel">
+      <h2>Dry run <span class="muted">(preview on a copy of your real data)</span></h2>
+      <div class="row">
+        <button id="dryrunBtn" class="primary" disabled>Run on my real data</button>
+        <span id="dryrunMsg" class="status-line"></span>
+      </div>
+      <div id="dryrunContainer"></div>
+      <p class="help">Here's what your agent would do — look right? Trace reads a copy of
+        your real data (read-only) and runs the agent on the <b>copy</b>; your real sheet
+        and inbox are never touched. Thumbs-down any line and say what it should have done
+        instead — Trace regenerates the agent and re-runs once (up to two rounds).</p>
+    </section>
+
     <!-- RESULTS -------------------------------------------------------- -->
     <section class="panel">
       <h2>Results <span id="resultsSid" class="muted"></span></h2>

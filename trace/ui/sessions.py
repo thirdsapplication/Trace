@@ -166,6 +166,14 @@ def grounding_name(bid):
     return f"grounding_{_safe_id(bid)}.json"
 
 
+def dryrun_record_name(bid):
+    return f"dryrun_{_safe_id(bid)}.json"
+
+
+def feedback_name(bid):
+    return f"feedback_{_safe_id(bid)}.json"
+
+
 def gate_record_name(bid):
     return f"gate_{_safe_id(bid)}.json"
 
@@ -223,8 +231,10 @@ def list_agents(root, sid):
     for bid, data in bundles.items():
         grounding = _read_json(os.path.join(d, f"grounding_{bid}.json"))
         gate = _read_json(os.path.join(d, f"gate_{bid}.json"))
+        dr = _read_json(os.path.join(d, f"dryrun_{bid}.json"))
         out.append({"bundle_id": bid, "test_yaml": data.get("test_yaml"),
-                    "live_yaml": data.get("live_yaml"), "grounding": grounding, "gate": gate})
+                    "live_yaml": data.get("live_yaml"), "grounding": grounding,
+                    "gate": gate, "dryrun": dr})
     return out
 
 

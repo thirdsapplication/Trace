@@ -15,6 +15,7 @@ DEFAULT_MODEL = "claude-sonnet-4-6"
 # so we keep each run cheap — one session per bundle, a single session's tokens —
 # and never fan out. Recent rounds burned credits running many sessions.
 DEFAULT_MAX_SESSIONS = 1                 # cost guard: sessions per run
+DRYRUN_MAX_ROUNDS = 2                     # Phase 5: cap on dry-run feedback rounds (~$0.50/run)
 # Bound a sandbox run so it can never hang waiting on the platform: stop a session
 # after this wall-clock or event count and clean up anyway (a real run is usually
 # under a minute once the environment is warm).

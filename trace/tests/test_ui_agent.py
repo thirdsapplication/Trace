@@ -54,10 +54,11 @@ def fake_interview_fn(bundle, event_log, model_fn=None):
     ]}
 
 
-def fake_config_fn(bundle, observed, answers, model_fn, unresolved=None):
+def fake_config_fn(bundle, observed, answers, model_fn, unresolved=None, test_feedback=None):
     # real assembly, stub the model content -> exercises the actual configgen path
     return configgen.compile_config(bundle, observed, answers,
-                                    lambda s, u: json.dumps(CONFIG_CONTENT), unresolved=unresolved)
+                                    lambda s, u: json.dumps(CONFIG_CONTENT),
+                                    unresolved=unresolved, test_feedback=test_feedback)
 
 
 def fake_gate_fn(advanced=True):

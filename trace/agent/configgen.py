@@ -84,13 +84,17 @@ def make_engine_inputs(bundle, event_log, user_answers=None):
     return workflow_description, observed_events, list(user_answers or [])
 
 
-def build_prompt_material(workflow_description, observed_events, user_answers):
-    """The model's USER message: the three inputs as one JSON object (also what the
-    CLI ``--dry-run`` prints)."""
-    return json.dumps({"workflow_description": workflow_description,
-                       "observed_events": observed_events,
-                       "user_answers": list(user_answers or [])},
-                      ensure_ascii=False, indent=2)
+def build_prompt_material(workflow_description, observed_events, user_answers,
+                          test_feedback=None):
+    """The model's USER message: the inputs as one JSON object (also what the CLI
+    ``--dry-run`` prints). ``test_feedback`` (Phase 5: dry-run corrections) is included
+    only when present, so existing callers/output are unchanged."""
+    obj = {"workflow_description": workflow_description,
+           "observed_events": observed_events,
+           "user_answers": list(user_answers or [])}
+    if test_feedback:
+        obj["test_feedback"] = list(test_feedback)
+    return json.dumps(obj, ensure_ascii=False, indent=2)
 
 
 # --------------------------------------------------------------------------
@@ -249,17 +253,19 @@ def build_grounding(bundle_id, steps, working_rules, requirements, unresolved=No
 # Per-bundle compile + the engine over a reviewed file
 # --------------------------------------------------------------------------
 def compile_config(bundle, observed_events, user_answers, model_fn, model=DEFAULT_MODEL,
-                   unresolved=None):
+                   unresolved=None, test_feedback=None):
     """Run the model once and assemble the configs + grounding for one bundle.
     Returns ``{test, live, grounding, content}``. ``model_fn`` is required (callers
     that want the default should construct it; tests inject a stub). ``unresolved``
-    (skipped interview questions) is recorded in the grounding record."""
+    (skipped interview questions) is recorded in the grounding record.
+    ``test_feedback`` (Phase 5: dry-run corrections) is AUTHORITATIVE and folded in."""
     workflow_description = {
         "name": bundle.get("name", ""), "description": bundle.get("description", ""),
         "trigger": bundle.get("trigger", ""), "steps": list(bundle.get("steps", []) or []),
         "evidence_event_ids": list(bundle.get("evidence_event_ids", []) or []),
     }
-    user_msg = build_prompt_material(workflow_description, observed_events, user_answers)
+    user_msg = build_prompt_material(workflow_description, observed_events, user_answers,
+                                     test_feedback)
     model_out = _parse_json_object(model_fn(SYSTEM_PROMPT, user_msg))
 
     working_rules = final_working_rules(model_out)
@@ -312,6 +318,25 @@ def _load_unresolved(answers_dir, bundle_id):
     return []
 
 
+def _load_test_feedback(answers_dir, bundle_id):
+    """Load the worker's dry-run corrections (Phase 5 writes ``feedback_<id>.json``) as
+    a list, or ``[]``. Defensive: a missing/malformed file yields ``[]``."""
+    if not answers_dir:
+        return []
+    safe = "".join(c if c.isalnum() else "_" for c in str(bundle_id))
+    p = os.path.join(answers_dir, f"feedback_{safe}.json")
+    if not os.path.exists(p):
+        return []
+    try:
+        with open(p, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            data = data.get("corrections", [])
+        return data if isinstance(data, list) else []
+    except (OSError, json.JSONDecodeError):
+        return []
+
+
 def generate_configs(reviewed_path, event_log_path, model=DEFAULT_MODEL, model_fn=None,
                      answers_dir=None):
     """Generate configs for every approved bundle in ``reviewed_path``. Returns
@@ -342,8 +367,9 @@ def generate_configs(reviewed_path, event_log_path, model=DEFAULT_MODEL, model_f
         _, observed_events, _ = make_engine_inputs(b, event_log)
         user_answers = _load_answers(answers_dir, b["id"])
         unresolved = _load_unresolved(answers_dir, b["id"])
+        test_feedback = _load_test_feedback(answers_dir, b["id"])
         compiled = compile_config(b, observed_events, user_answers, model_fn, model,
-                                  unresolved=unresolved)
+                                  unresolved=unresolved, test_feedback=test_feedback)
         results.append({"id": b["id"], "built": True,
                         "test_yaml": compiled["test"]["yaml"],
                         "live_yaml": compiled["live"]["yaml"],

@@ -513,6 +513,7 @@ async function refreshSessions() {
       enableInterview(!!art.reviewed);
       enableBuild(!!art.reviewed);
       enableConnect(!!art.reviewed);
+      enableDryrun(!!art.reviewed);
       reviewData = null; interviewState = null; $("buildSummary").innerHTML = "";
       $("reviewContainer").innerHTML = "";
       $("interviewContainer").innerHTML = "";
@@ -673,7 +674,7 @@ async function saveReview() {
   const { ok, data } = await api("POST", `/api/sessions/${selectedSid}/reviewed-bundles`, body);
   if (ok) {
     reviewData.reviewed = data.reviewed;
-    enableInterview(true); enableBuild(true); enableConnect(true);
+    enableInterview(true); enableBuild(true); enableConnect(true); enableDryrun(true);
     delete cache[selectedSid];
     await refreshSessions();
   }
@@ -996,6 +997,86 @@ function pollConnect(onDone) {
       $("connectMsg").innerHTML = `<span class="err">connection failed</span> — ${ESC(data.error)}`;
     }
   }, 600);
+}
+
+// ===========================================================================
+// Phase 5 — Dry run + feedback (real-data preview on a copy)
+// ===========================================================================
+let dryrunTimer = null;
+
+function enableDryrun(on) {
+  $("dryrunBtn").disabled = !on;
+  if (on) loadDryrun(); else $("dryrunContainer").innerHTML = "";
+}
+
+async function loadDryrun() {
+  if (!selectedSid) return;
+  const { ok, data } = await api("GET", `/api/sessions/${selectedSid}/dryrun-bundles`);
+  const el = $("dryrunContainer");
+  if (!ok || !data.bundles || !data.bundles.length) {
+    el.innerHTML = `<div class="muted">No bundles ready — needs a passed logic gate and a usable connection.</div>`;
+    return;
+  }
+  el.innerHTML = data.bundles.map(b => {
+    const lines = (b.replay || []).map((line, i) =>
+      `<div class="run-line">${ESC(line)}
+         <button class="link dr-down" data-bid="${ESC(b.id)}" data-i="${i}">👎</button></div>`).join("");
+    const body = b.replay
+      ? `${lines}<div class="ex-text muted">trigger: ${ESC(b.trigger_source || "")}` +
+        (b.round ? ` · round ${b.round}` : "") + `</div>`
+      : `<div class="muted">not run yet</div>`;
+    return `<div class="review-item bundle" data-bid="${ESC(b.id)}">
+      <h4>${ESC(b.id)} — ${ESC(b.name)}</h4>${body}</div>`;
+  }).join("");
+  el.querySelectorAll(".dr-down").forEach(btn => btn.onclick = () => dryrunThumbsDown(btn.dataset.bid, btn.dataset.i));
+}
+
+$("dryrunBtn").onclick = async () => {
+  if (!selectedSid) return;
+  $("dryrunMsg").textContent = "running on a copy of your real data…";
+  const { ok, status, data } = await api("POST", `/api/sessions/${selectedSid}/dryrun`, {});
+  if (status === 400 && data && data.error === "not_eligible") {
+    $("dryrunMsg").innerHTML = `<span class="warn">not ready</span> — build (pass the gate) and connect a usable app first.`; return;
+  }
+  if (status === 400 && data && data.error === "no_api_key") {
+    $("dryrunMsg").innerHTML = `<span class="err">no API key</span> — add one in Settings.`; return;
+  }
+  if (!ok && status !== 202) { $("dryrunMsg").innerHTML = `<span class="err">${ESC((data && data.error) || "failed")}</span>`; return; }
+  setPill("reconstructing");
+  pollDryrun();
+};
+
+function pollDryrun() {
+  if (dryrunTimer) clearInterval(dryrunTimer);
+  dryrunTimer = setInterval(async () => {
+    const { data } = await api("GET", `/api/sessions/${selectedSid}/dryrun/status`);
+    if (!data) return;
+    if (data.state === "done") {
+      clearInterval(dryrunTimer); dryrunTimer = null;
+      const errs = Object.keys(data.errors || {}).length;
+      $("dryrunMsg").innerHTML = `<span class="ok">done</span> — ${data.ran} replay(s)` +
+        (errs ? ` · <span class="err">${errs} error(s)</span>` : "");
+      setPill("results");
+      loadDryrun();
+      delete cache[selectedSid];
+    } else if (data.state === "error") {
+      clearInterval(dryrunTimer); dryrunTimer = null;
+      $("dryrunMsg").innerHTML = `<span class="err">dry run failed</span> — ${ESC(data.error)}`;
+      setPill("idle");
+    }
+  }, 800);
+}
+
+async function dryrunThumbsDown(bid, lineIndex) {
+  const correction = prompt("What should it have done instead?");
+  if (!correction || !correction.trim()) return;
+  $("dryrunMsg").textContent = "regenerating + re-running…";
+  const { ok, data } = await api("POST", `/api/sessions/${selectedSid}/dryrun/feedback`,
+    { bundle_id: bid, correction: correction.trim(), line_index: Number(lineIndex) });
+  if (!ok) { $("dryrunMsg").innerHTML = `<span class="err">${ESC((data && data.error) || "failed")}</span>`; return; }
+  if (data.capped) { $("dryrunMsg").innerHTML = `<span class="warn">feedback capped</span> at ${data.rounds} rounds.`; return; }
+  setPill("reconstructing");
+  pollDryrun();
 }
 
 $("refreshPerms").onclick = refreshPermissions;

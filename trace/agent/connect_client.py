@@ -131,3 +131,23 @@ class ConnectClient:
             else:
                 raise
         return {"binding_ref": _idof(c) or f"{vault_ref}:{app}"}
+
+    # --- Phase 5: READ-ONLY reads through the bound connection (confirm against docs) ---
+    def read_destination(self, external_user_id, app, binding_ref):
+        """READ-ONLY snapshot of the destination artifact (e.g. the target sheet — its
+        real columns + existing rows). Returns ``{kind, columns, rows, raw}``. NEVER
+        writes. CONFIRM the Pipedream read-proxy endpoint + response shape against docs."""
+        out = _retry(lambda: self._pd_request("GET", f"/proxy/{app}/destination"
+                                              f"?external_user_id={external_user_id}"))
+        return {"kind": out.get("kind"), "columns": out.get("columns") or [],
+                "rows": out.get("rows") or [], "raw": out.get("raw")}
+
+    def read_recent_trigger(self, external_user_id, app, binding_ref, limit=1):
+        """READ-ONLY: the most recent trigger instances (e.g. recent inbound emails) — a
+        held-out test instance. Returns ``[{detail, raw}]``. NEVER writes. CONFIRM the
+        endpoint + shape against current Pipedream docs."""
+        out = _retry(lambda: self._pd_request(
+            "GET", f"/proxy/{app}/recent?external_user_id={external_user_id}&limit={limit}"))
+        items = out.get("items") or out.get("data") or []
+        return [{"detail": i.get("detail") or i.get("snippet") or "", "raw": i}
+                for i in items[:limit]]
