@@ -184,6 +184,27 @@
         instead — Trace regenerates the agent and re-runs once (up to two rounds).</p>
     </section>
 
+    <!-- GO LIVE (Phase 6 — live deployment) ---------------------------- -->
+    <section class="panel">
+      <h2>Go live <span class="muted">(deploy over the connection; outbound held for approval)</span></h2>
+      <div class="row">
+        <label for="startMode">Start on</label>
+        <select id="startMode">
+          <option value="trigger">a new matching event (trigger)</option>
+          <option value="schedule">a schedule</option>
+        </select>
+        <input type="text" id="scheduleInput" placeholder="cron, e.g. 0 9 * * *" style="display:none"/>
+        <button id="deployBtn" class="primary" disabled>Deploy live</button>
+        <span id="deployMsg" class="status-line"></span>
+      </div>
+      <div id="deployContainer"></div>
+      <p class="help">Deploys the live agent over your connection. <b>Reads proceed; every
+        outbound write or send is held for your one-tap approval</b> before it commits. Only
+        bundles that passed the gate, have a usable connection, and have a completed dry run
+        can go live. Managed Agents stores sessions server-side — delete them with
+        <b>Clean up platform</b> (in Build &amp; test).</p>
+    </section>
+
     <!-- RESULTS -------------------------------------------------------- -->
     <section class="panel">
       <h2>Results <span id="resultsSid" class="muted"></span></h2>

@@ -514,6 +514,7 @@ async function refreshSessions() {
       enableBuild(!!art.reviewed);
       enableConnect(!!art.reviewed);
       enableDryrun(!!art.reviewed);
+      enableDeploy(!!art.reviewed);
       reviewData = null; interviewState = null; $("buildSummary").innerHTML = "";
       $("reviewContainer").innerHTML = "";
       $("interviewContainer").innerHTML = "";
@@ -674,7 +675,7 @@ async function saveReview() {
   const { ok, data } = await api("POST", `/api/sessions/${selectedSid}/reviewed-bundles`, body);
   if (ok) {
     reviewData.reviewed = data.reviewed;
-    enableInterview(true); enableBuild(true); enableConnect(true); enableDryrun(true);
+    enableInterview(true); enableBuild(true); enableConnect(true); enableDryrun(true); enableDeploy(true);
     delete cache[selectedSid];
     await refreshSessions();
   }
@@ -1077,6 +1078,93 @@ async function dryrunThumbsDown(bid, lineIndex) {
   if (data.capped) { $("dryrunMsg").innerHTML = `<span class="warn">feedback capped</span> at ${data.rounds} rounds.`; return; }
   setPill("reconstructing");
   pollDryrun();
+}
+
+// ===========================================================================
+// Phase 6 — Go live (deploy over the connection; outbound held for approval)
+// ===========================================================================
+let deployTimer = null;
+
+$("startMode").onchange = () => {
+  $("scheduleInput").style.display = $("startMode").value === "schedule" ? "" : "none";
+};
+
+function enableDeploy(on) {
+  $("deployBtn").disabled = !on;
+  if (on) loadDeploy(); else $("deployContainer").innerHTML = "";
+}
+
+async function loadDeploy() {
+  if (!selectedSid) return;
+  const { ok, data } = await api("GET", `/api/sessions/${selectedSid}/deploy-bundles`);
+  const el = $("deployContainer");
+  if (!ok || !data.bundles || !data.bundles.length) {
+    el.innerHTML = `<div class="muted">No bundles ready — needs a passed gate, a usable connection, and a completed dry run.</div>`;
+    return;
+  }
+  el.innerHTML = data.bundles.map(b => {
+    const status = b.status === "live" ? `<span class="ok">live ✓</span>`
+      : b.status ? `<span class="warn">${ESC(b.status)}</span>` : `<span class="muted">not deployed</span>`;
+    const start = b.start ? ` <span class="muted">on ${ESC(b.start.mode)}: ${ESC(b.start.value || "")}</span>` : "";
+    const held = (b.held_actions || []).map(a => {
+      if (a.status !== "held") return `<div class="run-line">&nbsp;&nbsp;${ESC(a.summary)} — <span class="${a.status === "approved" ? "ok" : "muted"}">${ESC(a.status)}</span></div>`;
+      return `<div class="run-line">&nbsp;&nbsp;<b>hold:</b> ${ESC(a.summary)} (${ESC(a.kind)})
+        <button class="link dep-ok" data-bid="${ESC(b.id)}" data-a="${ESC(a.action_id)}">Approve</button>
+        <button class="link dep-no" data-bid="${ESC(b.id)}" data-a="${ESC(a.action_id)}">Reject</button></div>`;
+    }).join("") || (b.status ? `<div class="run-line muted">&nbsp;&nbsp;no outbound actions held</div>` : "");
+    return `<div class="review-item bundle" data-bid="${ESC(b.id)}">
+      <h4>${ESC(b.id)} — ${ESC(b.name)} ${status}${start}</h4>${held}</div>`;
+  }).join("");
+  el.querySelectorAll(".dep-ok").forEach(btn => btn.onclick = () => deployResolve(btn.dataset.bid, btn.dataset.a, "approve"));
+  el.querySelectorAll(".dep-no").forEach(btn => btn.onclick = () => deployResolve(btn.dataset.bid, btn.dataset.a, "reject"));
+}
+
+$("deployBtn").onclick = async () => {
+  if (!selectedSid) return;
+  const mode = $("startMode").value;
+  const body = mode === "schedule" ? { schedule: $("scheduleInput").value.trim() } : { trigger: "on a new matching event" };
+  $("deployMsg").textContent = "deploying live…";
+  const { ok, status, data } = await api("POST", `/api/sessions/${selectedSid}/deploy`, body);
+  if (status === 400 && data && data.error === "not_eligible") {
+    $("deployMsg").innerHTML = `<span class="warn">not ready</span> — pass the gate, connect a usable app, and run a dry run first.`; return;
+  }
+  if (status === 400 && data && data.error === "no_api_key") {
+    $("deployMsg").innerHTML = `<span class="err">no API key</span> — add one in Settings.`; return;
+  }
+  if (!ok && status !== 202) { $("deployMsg").innerHTML = `<span class="err">${ESC((data && data.error) || "failed")}</span>`; return; }
+  setPill("reconstructing");
+  pollDeploy();
+};
+
+function pollDeploy() {
+  if (deployTimer) clearInterval(deployTimer);
+  deployTimer = setInterval(async () => {
+    const { data } = await api("GET", `/api/sessions/${selectedSid}/deploy/status`);
+    if (!data) return;
+    if (data.state === "done") {
+      clearInterval(deployTimer); deployTimer = null;
+      const errs = Object.keys(data.errors || {}).length;
+      $("deployMsg").innerHTML = `<span class="ok">live</span> — ${data.deployed} deployed` +
+        (errs ? ` · <span class="err">${errs} error(s)</span>` : "");
+      setPill("results");
+      loadDeploy();
+      delete cache[selectedSid];
+    } else if (data.state === "error") {
+      clearInterval(deployTimer); deployTimer = null;
+      $("deployMsg").innerHTML = `<span class="err">deploy failed</span> — ${ESC(data.error)}`;
+      setPill("idle");
+    }
+  }, 800);
+}
+
+async function deployResolve(bid, actionId, decision) {
+  const { ok, data } = await api("POST", `/api/sessions/${selectedSid}/deploy/${bid}/${decision}`,
+    { action_id: actionId });
+  if (!ok || (data && data.error)) {
+    $("deployMsg").innerHTML = `<span class="err">${ESC((data && data.error) || "failed")}</span>`; return;
+  }
+  $("deployMsg").innerHTML = `<span class="ok">${ESC(data.status)}</span> — ${ESC(actionId)}`;
+  loadDeploy();
 }
 
 $("refreshPerms").onclick = refreshPermissions;

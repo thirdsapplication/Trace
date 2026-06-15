@@ -43,6 +43,7 @@ from ..agent import grader as agent_grader
 from ..agent import connect as agent_connect
 from ..agent import config as agent_config
 from ..agent import dryrun as agent_dryrun
+from ..agent import deploy as agent_deploy
 from . import keystore, permissions, sessions
 
 
@@ -104,7 +105,7 @@ class AppState:
                  reconstruct_fn=None, controller_factory=None, key_store=None,
                  discovery_fn=None, score_fn=None, artifact_fn=None,
                  interview_fn=None, config_fn=None, gate_fn=None, cleanup_fn=None,
-                 connect_fn=None, dryrun_fn=None):
+                 connect_fn=None, dryrun_fn=None, deploy_fn=None):
         self.sessions_root = sessions_root
         self.collector_port = collector_port
         self.reconstruct_fn = reconstruct_fn or _real_reconstruct
@@ -124,6 +125,9 @@ class AppState:
         # Phase 5: the real-data dry run. ``dryrun_fn`` runs one bundle's dry run and
         # returns its record (plain replay); tests inject a stub.
         self.dryrun_fn = dryrun_fn or self._default_dryrun
+        # Phase 6: live deployment. ``deploy_fn`` deploys one bundle's LIVE agent over the
+        # bound connection and returns its live record; tests inject a stub.
+        self.deploy_fn = deploy_fn or self._default_deploy
         self.controller_factory = controller_factory or (
             lambda out: CaptureController(out, collector_port=collector_port))
         self.keystore = key_store or keystore
@@ -136,6 +140,7 @@ class AppState:
         self.build_jobs = {}         # sid -> {state, error, generated, gated, verdicts, errors}
         self.connection_jobs = {}    # sid -> {state, error, slug, connect_url, verified, flag}
         self.dryrun_jobs = {}        # sid -> {state, error, ran, replays, errors}
+        self.deploy_jobs = {}        # sid -> {state, error, deployed, errors}
         self.lock = threading.Lock()
         os.makedirs(sessions_root, exist_ok=True)
 
@@ -188,6 +193,26 @@ class AppState:
         return agent_dryrun.dry_run(bundle, test_dict, connection_record, event_log,
                                     save_dir, reader, client, self._build_model_fn(),
                                     round=round)
+
+    def _default_deploy(self, bundle, live_dict, connection_record, start):
+        """Real live deploy for one bundle: creates the LIVE agent over the bound
+        connection (vault injected) and starts it on its trigger/schedule. Requires a key."""
+        key = self.keystore.get_key()
+        if not key:
+            raise RuntimeError("no_api_key")
+        os.environ["ANTHROPIC_API_KEY"] = key
+        from ..agent.api_client import ManagedAgentsClient
+        client = ManagedAgentsClient(api_key=key)
+        return agent_deploy.deploy_live(bundle, live_dict, connection_record, client,
+                                        trigger=start.get("trigger"), schedule=start.get("schedule"))
+
+    def _live_client(self):
+        key = self.keystore.get_key()
+        if not key:
+            raise RuntimeError("no_api_key")
+        os.environ["ANTHROPIC_API_KEY"] = key
+        from ..agent.api_client import ManagedAgentsClient
+        return ManagedAgentsClient(api_key=key)
 
     # --- reconstruction job ----------------------------------------------
     def start_reconstruction(self, sid):
@@ -447,6 +472,12 @@ class AppState:
         for g in sessions.list_gate_records(self.sessions_root, sid):
             if g.get("session_id"):
                 session_ids.append(g["session_id"])
+        # live deploy records (Phase 6): the live sessions + agents
+        for d in sessions.list_deploy_records(self.sessions_root, sid):
+            if d.get("session_id"):
+                session_ids.append(d["session_id"])
+            if d.get("agent_id"):
+                agent_ids.append(d["agent_id"])
         # any manual-eval run records (dormant path)
         for r in sessions.list_runs(self.sessions_root, sid):
             for s in r.get("sessions", []):
@@ -619,6 +650,85 @@ class AppState:
         self.start_dryrun(sid, selected_ids=[bid])      # regenerate + re-run once
         return {"capped": False, "rounds": len(rec["corrections"])}
 
+    # --- Phase 6: live deployment ----------------------------------------
+    def _deploy_eligible(self, sid):
+        """Approved bundles that passed the gate, have a usable connection, AND have a
+        completed dry run — the 'test twice before live' gate."""
+        root = self.sessions_root
+        approved, event_log = self._approved_for_stage4(sid)
+        specs_dir = sessions.path(root, sid, sessions.SPECS_DIR)
+        conn = sessions.read_json_artifact(root, sid, sessions.CONNECTION) or {}
+        any_usable = any(a.get("usable") for a in conn.get("apps", {}).values())
+        out = []
+        for b in approved:
+            gate = sessions._read_json(os.path.join(specs_dir, sessions.gate_record_name(b["id"]))) or {}
+            dr = sessions._read_json(os.path.join(specs_dir, sessions.dryrun_record_name(b["id"])))
+            if gate.get("advanced") and any_usable and dr is not None:
+                out.append(b)
+        return out, event_log, conn
+
+    def deploy_bundles(self, sid):
+        eligible, _, _ = self._deploy_eligible(sid)
+        specs_dir = sessions.path(self.sessions_root, sid, sessions.SPECS_DIR)
+        out = []
+        for b in eligible:
+            dep = sessions._read_json(os.path.join(specs_dir, sessions.deploy_record_name(b["id"]))) or {}
+            out.append({"id": b["id"], "name": b.get("name") or b["id"],
+                        "status": dep.get("status"), "start": dep.get("start"),
+                        "held_actions": dep.get("held_actions", [])})
+        return out
+
+    def start_deploy(self, sid, selected_ids=None, start=None):
+        root = self.sessions_root
+        specs_dir = sessions.path(root, sid, sessions.SPECS_DIR)
+        start = start or {}
+        job = {"state": "running", "error": None, "deployed": 0, "errors": {}}
+        self.deploy_jobs[sid] = job
+
+        def run():
+            try:
+                eligible, _, conn = self._deploy_eligible(sid)
+                if selected_ids is not None:
+                    eligible = [b for b in eligible if b["id"] in set(selected_ids)]
+                for b in eligible:
+                    bid = b["id"]
+                    try:
+                        with open(os.path.join(specs_dir, sessions.agent_yaml_name(bid, "live")),
+                                  encoding="utf-8") as f:
+                            live_dict = yaml.safe_load(f.read())
+                        rec = self.deploy_fn(b, live_dict, conn, start)
+                        _write_json(os.path.join(specs_dir, sessions.deploy_record_name(bid)), rec)
+                        job["deployed"] += 1
+                    except Exception as e:
+                        job["errors"][bid] = f"{type(e).__name__}: {e}"
+                sessions.update_meta(root, sid, deploy_at=sessions._now())
+                job.update(state="done")
+            except Exception as e:
+                job.update(state="error", error=str(e))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def deploy_resolve(self, sid, bid, action_id, decision):
+        """One-tap approve/reject of a held outbound action. Updates the live record and
+        best-effort commits/cancels on the platform."""
+        specs_dir = sessions.path(self.sessions_root, sid, sessions.SPECS_DIR)
+        p = os.path.join(specs_dir, sessions.deploy_record_name(bid))
+        rec = sessions._read_json(p)
+        if rec is None:
+            return {"error": "no_live_record"}
+        new_status = "approved" if decision == "approve" else "rejected"
+        for a in rec.get("held_actions", []):
+            if a.get("action_id") == action_id:
+                a["status"] = new_status
+        _write_json(p, rec)
+        try:                                              # best-effort platform commit
+            client = self._live_client()
+            (agent_deploy.approve if decision == "approve" else agent_deploy.reject)(
+                client, rec.get("session_id"), action_id)
+        except Exception:
+            pass
+        return {"action_id": action_id, "status": new_status}
+
 
 # --------------------------------------------------------------------------
 # Request handling
@@ -696,6 +806,9 @@ def make_handler(state):
             mdf = re.match(r"^/api/sessions/([^/]+)/dryrun/feedback$", p)
             if mdf:
                 return self._dryrun_feedback(mdf.group(1), body)
+            mdr = re.match(r"^/api/sessions/([^/]+)/deploy/([^/]+)/(approve|reject)$", p)
+            if mdr:
+                return self._deploy_resolve(mdr.group(1), mdr.group(2), mdr.group(3), body)
             if p == "/api/settings/key":
                 return self._save_key(body)
             if p == "/api/settings/test-key":
@@ -713,7 +826,7 @@ def make_handler(state):
             m = re.match(r"^/api/sessions/([^/]+)/"
                          r"(dry-run|reconstruct|discovery-dry-run|discover|score|"
                          r"reviewed-bundles|generate-specs|specs-dry-run|interview|"
-                         r"interview-dry-run|build|connection-identity|dryrun|"
+                         r"interview-dry-run|build|connection-identity|dryrun|deploy|"
                          r"cleanup-platform)$", p)
             if m:
                 sid, action = m.group(1), m.group(2)
@@ -743,6 +856,8 @@ def make_handler(state):
                     return self._set_identity(sid, body)
                 if action == "dryrun":
                     return self._dryrun(sid, body)
+                if action == "deploy":
+                    return self._deploy(sid, body)
                 return self._build(sid, body)
             return self._json(404, {"error": "not_found"})
 
@@ -893,6 +1008,10 @@ def make_handler(state):
                 return self._json(200, {"bundles": state.dryrun_bundles(sid)})
             if sub == "/dryrun/status":
                 return self._json(200, state.dryrun_jobs.get(sid) or {"state": "idle"})
+            if sub == "/deploy-bundles":
+                return self._json(200, {"bundles": state.deploy_bundles(sid)})
+            if sub == "/deploy/status":
+                return self._json(200, state.deploy_jobs.get(sid) or {"state": "idle"})
             return self._json(404, {"error": "not_found"})
 
         # --- reconstruction ---
@@ -1146,6 +1265,28 @@ def make_handler(state):
                 return self._json(400, {"error": "no_api_key"})
             return self._json(200, state.dryrun_feedback(sid, bid, correction,
                                                          (body or {}).get("line_index")))
+
+        # --- Phase 6: live deployment ---
+        def _deploy(self, sid, body=None):
+            eligible, _, _ = state._deploy_eligible(sid)
+            if not eligible:
+                return self._json(400, {"error": "not_eligible"})
+            if not state.keystore.get_key():
+                return self._json(400, {"error": "no_api_key"})
+            b = body or {}
+            start = {"trigger": b.get("trigger"), "schedule": b.get("schedule")}
+            with state.lock:
+                existing = state.deploy_jobs.get(sid)
+                if existing and existing.get("state") == "running":
+                    return self._json(409, {"error": "already_running"})
+                state.start_deploy(sid, selected_ids=b.get("bundle_ids"), start=start)
+            return self._json(202, {"state": "running", "session_id": sid})
+
+        def _deploy_resolve(self, sid, bid, decision, body):
+            action_id = (body or {}).get("action_id")
+            if not action_id:
+                return self._json(400, {"error": "missing_action_id"})
+            return self._json(200, state.deploy_resolve(sid, bid, action_id, decision))
 
         # --- Phase 2: structured interview ---
         def _interview(self, sid, body=None):

@@ -170,6 +170,10 @@ def dryrun_record_name(bid):
     return f"dryrun_{_safe_id(bid)}.json"
 
 
+def deploy_record_name(bid):
+    return f"deploy_{_safe_id(bid)}.json"
+
+
 def feedback_name(bid):
     return f"feedback_{_safe_id(bid)}.json"
 
@@ -214,6 +218,20 @@ def list_gate_records(root, sid):
     return out
 
 
+def list_deploy_records(root, sid):
+    """Every deploy_<id>.json live-session record (Phase 6)."""
+    d = path(root, sid, SPECS_DIR)
+    if not os.path.isdir(d):
+        return []
+    out = []
+    for fn in sorted(os.listdir(d)):
+        if re.match(r"^deploy_.+\.json$", fn):
+            rec = _read_json(os.path.join(d, fn))
+            if rec is not None:
+                out.append(rec)
+    return out
+
+
 def list_agents(root, sid):
     """Return Stage-4 outputs per bundle: agent envelopes + the run pointer (if any).
     Grading is out of the flow in manual-evaluation mode, so ``run`` (not a graded
@@ -232,9 +250,10 @@ def list_agents(root, sid):
         grounding = _read_json(os.path.join(d, f"grounding_{bid}.json"))
         gate = _read_json(os.path.join(d, f"gate_{bid}.json"))
         dr = _read_json(os.path.join(d, f"dryrun_{bid}.json"))
+        dep = _read_json(os.path.join(d, f"deploy_{bid}.json"))
         out.append({"bundle_id": bid, "test_yaml": data.get("test_yaml"),
                     "live_yaml": data.get("live_yaml"), "grounding": grounding,
-                    "gate": gate, "dryrun": dr})
+                    "gate": gate, "dryrun": dr, "deploy": dep})
     return out
 
 
