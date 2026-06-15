@@ -158,7 +158,7 @@ def get_pipedream():
         "project_id": _get(_PD["project_id"]) or "",
         "client_id": _get(_PD["client_id"]) or "",
         "client_secret": _get(_PD["client_secret"]) or "",
-        "environment": _get(_PD["environment"]) or "development",
+        "environment": _get(_PD["environment"]) or "production",
     }
 
 

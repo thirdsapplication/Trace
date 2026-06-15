@@ -61,7 +61,7 @@ LIVE_PERMISSION_POLICY = "always_ask"   # -> permission_policy {"type": "always_
 PIPEDREAM_PROJECT = os.environ.get("PIPEDREAM_PROJECT_ID", "")        # proj_xxxxxxx
 PIPEDREAM_CLIENT_ID = os.environ.get("PIPEDREAM_CLIENT_ID", "")
 PIPEDREAM_CLIENT_SECRET = os.environ.get("PIPEDREAM_CLIENT_SECRET", "")
-PIPEDREAM_ENVIRONMENT = os.environ.get("PIPEDREAM_ENVIRONMENT", "development")  # development|production
+PIPEDREAM_ENVIRONMENT = os.environ.get("PIPEDREAM_ENVIRONMENT", "production")  # development|production
 PIPEDREAM_API_BASE = "https://api.pipedream.com/v1"   # Connect REST + OAuth (v1)
 PIPEDREAM_CONNECT_BASE = PIPEDREAM_API_BASE           # paths are project-scoped: /connect/{project_id}/...
 
