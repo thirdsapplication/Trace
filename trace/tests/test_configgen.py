@@ -81,7 +81,6 @@ class ConfigGenTest(unittest.TestCase):
     # 1 + 2 -----------------------------------------------------------------
     def test_no_markdown_anywhere(self):
         out = _compile("marcy")
-        self.assertIn("test", out)
         self.assertIn("live", out)
         self.assertIn("grounding", out)
         self.assertNotIn("markdown", out)
@@ -97,12 +96,10 @@ class ConfigGenTest(unittest.TestCase):
 
     def test_structural_fields_present_in_both_domains(self):
         for dom in ("marcy", "recruiter"):
-            out = _compile(dom)
-            test_yaml, live_yaml = out["test"]["yaml"], out["live"]["yaml"]
-            self.assertIn(f"model: {config.DEFAULT_MODEL}", test_yaml)
-            self.assertIn(f"type: {config.AGENT_TOOLSET_TYPE}", test_yaml)
-            self.assertIn("skills: []", test_yaml)
-            self.assertIn("mcp_servers: []", test_yaml)         # test: no MCP
+            live_yaml = _compile(dom)["live"]["yaml"]
+            self.assertIn(f"model: {config.DEFAULT_MODEL}", live_yaml)
+            self.assertIn(f"type: {config.AGENT_TOOLSET_TYPE}", live_yaml)
+            self.assertIn("skills: []", live_yaml)
             # live template carries the nominal Pipedream server (deploy bakes the
             # per-customer, per-app URLs at create time).
             self.assertIn(config.PIPEDREAM_MCP_BASE, live_yaml)
@@ -110,17 +107,14 @@ class ConfigGenTest(unittest.TestCase):
             self.assertIn(f"type: {config.LIVE_PERMISSION_POLICY}", live_yaml)
 
     # 3 ---------------------------------------------------------------------
-    def test_test_vs_live_toolsets(self):
+    def test_live_toolset(self):
         out = _compile("recruiter")
-        self.assertNotIn("mcp_toolset", out["test"]["yaml"])
-        self.assertNotIn("pipedream", out["test"]["yaml"])
         self.assertIn("mcp_toolset", out["live"]["yaml"])
-        self.assertEqual(out["test"]["dict"]["mcp_servers"], [])
         self.assertEqual(len(out["live"]["dict"]["mcp_servers"]), 1)
 
     # 4 ---------------------------------------------------------------------
     def test_system_text_fixed_order(self):
-        env = configgen.compiler.validate_yaml(_compile("marcy")["test"]["yaml"])
+        env = configgen.compiler.validate_yaml(_compile("marcy")["live"]["yaml"])
         sys_text = env["system"]
         for marker in ("You work with:", "Steps:", "How to do the work:", "Requirements:"):
             self.assertIn(marker, sys_text)
@@ -134,7 +128,7 @@ class ConfigGenTest(unittest.TestCase):
     # 5 ---------------------------------------------------------------------
     def test_canonical_rule_appended_when_missing(self):
         out = _compile("marcy", model_out=CANNED)            # CANNED has no match rule
-        self.assertIn(config.MATCH_EXAMPLES_RULE, out["test"]["yaml"])
+        self.assertIn(config.MATCH_EXAMPLES_RULE, out["live"]["yaml"])
         keys = [i["key"] for i in out["grounding"]["instructions"]]
         self.assertIn("rule_match_existing_examples", keys)
         entry = next(i for i in out["grounding"]["instructions"]
@@ -147,8 +141,8 @@ class ConfigGenTest(unittest.TestCase):
         # the model supplied its own match rule -> the canonical one is NOT appended
         keys = [i["key"] for i in out["grounding"]["instructions"]]
         self.assertNotIn("rule_match_existing_examples", keys)
-        self.assertNotIn(config.MATCH_EXAMPLES_RULE, out["test"]["yaml"])
-        self.assertIn("Match the existing rows already in the destination", out["test"]["yaml"])
+        self.assertNotIn(config.MATCH_EXAMPLES_RULE, out["live"]["yaml"])
+        self.assertIn("Match the existing rows already in the destination", out["live"]["yaml"])
 
     # 6 ---------------------------------------------------------------------
     def test_grounding_complete_and_well_formed(self):
@@ -171,22 +165,19 @@ class ConfigGenTest(unittest.TestCase):
     def test_empty_user_answers_runs_on_both_domains(self):
         for dom in ("marcy", "recruiter"):
             out = _compile(dom, answers=[])
-            self.assertTrue(out["test"]["yaml"])
             self.assertTrue(out["live"]["yaml"])
 
     # 8 ---------------------------------------------------------------------
     def test_determinism(self):
         a = _compile("marcy")
         b = _compile("marcy")
-        self.assertEqual(a["test"]["yaml"], b["test"]["yaml"])
         self.assertEqual(a["live"]["yaml"], b["live"]["yaml"])
         self.assertEqual(json.dumps(a["grounding"], sort_keys=True),
                          json.dumps(b["grounding"], sort_keys=True))
 
-    def test_live_envelope_validates_test_has_no_mcp(self):
+    def test_live_envelope_validates(self):
         out = _compile("recruiter")
-        configgen.validate_config_envelope(out["test"]["dict"], "test")
-        configgen.validate_config_envelope(out["live"]["dict"], "live")
+        configgen.validate_config_envelope(out["live"]["dict"])
 
 
 class GenerateConfigsFileTest(unittest.TestCase):
@@ -215,7 +206,7 @@ class GenerateConfigsFileTest(unittest.TestCase):
         built = [r for r in results if r["built"]]
         self.assertEqual(len(built), 1)
         r = built[0]
-        self.assertTrue(r["test_yaml"] and r["live_yaml"])
+        self.assertTrue(r["live_yaml"])
         self.assertIsNotNone(r["grounding"])
         for r in results:
             self.assertNotIn("markdown", r)
@@ -228,7 +219,7 @@ class GenerateConfigsFileTest(unittest.TestCase):
 
         results, _ = configgen.generate_configs(rp, ep, model_fn=boom)
         self.assertTrue(all(not r["built"] for r in results))
-        self.assertIsNone(results[0]["test_yaml"])
+        self.assertIsNone(results[0]["live_yaml"])
 
 
 class FeedbackToConfigTest(unittest.TestCase):
@@ -262,11 +253,9 @@ class FeedbackToConfigTest(unittest.TestCase):
 
 
 def _retag(out, bid):
-    """Replace the bundle id in both yamls so two runs with different ids compare equal
+    """Replace the bundle id in the live yaml so two runs with different ids compare equal
     on everything structural."""
-    test = out["test"]["yaml"].replace(out["test"]["dict"]["metadata"]["trace_bundle_id"] or "", bid)
-    live = out["live"]["yaml"].replace(out["live"]["dict"]["metadata"]["trace_bundle_id"] or "", bid)
-    return (test, live)
+    return out["live"]["yaml"].replace(out["live"]["dict"]["metadata"]["trace_bundle_id"] or "", bid)
 
 
 if __name__ == "__main__":

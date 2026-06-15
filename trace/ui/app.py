@@ -311,7 +311,7 @@ class AppState:
         specs_dir = sessions.path(root, sid, sessions.SPECS_DIR)
         out = []
         for b in approved:
-            built = os.path.exists(os.path.join(specs_dir, sessions.agent_yaml_name(b["id"], "test")))
+            built = os.path.exists(os.path.join(specs_dir, sessions.agent_yaml_name(b["id"], "live")))
             out.append({"id": b["id"], "name": b.get("name") or b["id"], "built": built})
         return out
 
@@ -425,9 +425,8 @@ class AppState:
                         unresolved = agent_configgen._load_unresolved(sdir, bid)
                         compiled = self.config_fn(b, observed, answers, model_fn,
                                                   unresolved=unresolved)
-                        for mode in ("test", "live"):
-                            _write_text(os.path.join(specs_dir, sessions.agent_yaml_name(bid, mode)),
-                                        compiled[mode]["yaml"])
+                        _write_text(os.path.join(specs_dir, sessions.agent_yaml_name(bid, "live")),
+                                    compiled["live"]["yaml"])
                         _write_json(os.path.join(specs_dir, sessions.grounding_name(bid)),
                                     compiled["grounding"])
                         job["generated"] += 1

@@ -353,7 +353,6 @@ async function loadAndShow(tab) {
       text = "No agents yet — run the interview, then Build agents.";
     } else {
       text = data.agents.map(a =>
-        `===== ${a.bundle_id} — agent (test) =====\n${a.test_yaml || "(none)"}\n\n` +
         `===== ${a.bundle_id} — agent (live, NOT deployed) =====\n${a.live_yaml || "(none)"}\n\n` +
         `===== ${a.bundle_id} — grounding =====\n` +
         (a.grounding ? JSON.stringify(a.grounding, null, 2) : "(none)")

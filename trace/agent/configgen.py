@@ -148,8 +148,8 @@ def assemble_system_text(model_out, working_rules):
     return "\n".join(lines)
 
 
-def _envelope(bundle, model_out, system_text, variant):
-    """Stamp one YAML-variant envelope dict; structural fields are code constants."""
+def _envelope(bundle, model_out, system_text):
+    """Stamp the live YAML envelope dict; structural fields are code constants."""
     name = str(bundle.get("name") or bundle.get("id") or "Agent").strip()
     description = str(model_out.get("description", "") or bundle.get("description", "")
                       or name).strip()
@@ -158,29 +158,27 @@ def _envelope(bundle, model_out, system_text, variant):
         "description": description,
         "model": config.DEFAULT_MODEL,
         "system": system_text,
-        "mcp_servers": [],
-        "tools": [{"type": config.AGENT_TOOLSET_TYPE}],
-        "skills": [],
-        "metadata": {"trace_bundle_id": bundle.get("id"), "variant": variant},
-    }
-    if variant == "live":
         # Template only: a single nominal Pipedream server with a base URL (no
         # externalUserId yet — unknown until deploy). The Deployer rewrites mcp_servers
         # + mcp_toolset to the customer's per-app URLs at create time
         # (config.pipedream_mcp_servers); the approval-required policy is fixed here.
-        env["mcp_servers"] = [{"name": config.PIPEDREAM_MCP_NAME, "type": "url",
-                               "url": config.PIPEDREAM_MCP_BASE}]
-        env["tools"].append({
-            "type": config.MCP_TOOLSET_TYPE,
-            "mcp_server_name": config.PIPEDREAM_MCP_NAME,
-            "default_config": {"permission_policy": {"type": config.LIVE_PERMISSION_POLICY}},
-        })
+        "mcp_servers": [{"name": config.PIPEDREAM_MCP_NAME, "type": "url",
+                         "url": config.PIPEDREAM_MCP_BASE}],
+        "tools": [
+            {"type": config.AGENT_TOOLSET_TYPE},
+            {"type": config.MCP_TOOLSET_TYPE,
+             "mcp_server_name": config.PIPEDREAM_MCP_NAME,
+             "default_config": {"permission_policy": {"type": config.LIVE_PERMISSION_POLICY}}},
+        ],
+        "skills": [],
+        "metadata": {"trace_bundle_id": bundle.get("id"), "variant": "live"},
+    }
     return env
 
 
-def validate_config_envelope(env, variant):
-    """Structural validation: required fields, the fixed toolset, and the test/live
-    MCP rules. Raises ValueError on a violation."""
+def validate_config_envelope(env):
+    """Structural validation: required fields, the fixed toolset, and the live MCP rules
+    (>=1 Pipedream server, every mcp_toolset approval-required). Raises on a violation."""
     for k in ("name", "description", "model", "system", "tools"):
         if not env.get(k):
             raise ValueError(f"config envelope missing required field {k!r}")
@@ -189,36 +187,29 @@ def validate_config_envelope(env, variant):
     if env["tools"][0].get("type") != config.AGENT_TOOLSET_TYPE:
         raise ValueError("first tool must be the agent toolset")
     mcp_tools = [t for t in env["tools"] if t.get("type") == config.MCP_TOOLSET_TYPE]
-    if variant == "test":
-        if env.get("mcp_servers") or mcp_tools:
-            raise ValueError("test config must contain no MCP servers or mcp_toolset")
-    else:  # live: >=1 Pipedream MCP server, every mcp_toolset approval-required.
-        # The config-gen template carries one nominal server; the Deployer expands it to
-        # one server per app (config.pipedream_mcp_servers) once the customer is known.
-        servers = env.get("mcp_servers") or []
-        if not servers:
-            raise ValueError("live config must declare at least one Pipedream MCP server")
-        if not all((s.get("name") or "").startswith(config.PIPEDREAM_MCP_NAME) for s in servers):
-            raise ValueError("live config MCP servers must be Pipedream servers")
-        if not mcp_tools:
-            raise ValueError("live config must include the Pipedream mcp_toolset")
-        for t in mcp_tools:
-            pol = (t.get("default_config", {}).get("permission_policy", {}) or {}).get("type")
-            if pol != config.LIVE_PERMISSION_POLICY:
-                raise ValueError("live mcp_toolset must be approval-required")
+    # The config-gen template carries one nominal server; the Deployer expands it to one
+    # server per app (config.pipedream_mcp_servers) once the customer is known.
+    servers = env.get("mcp_servers") or []
+    if not servers:
+        raise ValueError("live config must declare at least one Pipedream MCP server")
+    if not all((s.get("name") or "").startswith(config.PIPEDREAM_MCP_NAME) for s in servers):
+        raise ValueError("live config MCP servers must be Pipedream servers")
+    if not mcp_tools:
+        raise ValueError("live config must include the Pipedream mcp_toolset")
+    for t in mcp_tools:
+        pol = (t.get("default_config", {}).get("permission_policy", {}) or {}).get("type")
+        if pol != config.LIVE_PERMISSION_POLICY:
+            raise ValueError("live mcp_toolset must be approval-required")
     return True
 
 
-def build_envelopes(bundle, model_out, system_text):
-    """Both variants as ``{variant: {dict, yaml}}`` (YAML via the reused emitter)."""
-    out = {}
-    for variant in ("test", "live"):
-        env = _envelope(bundle, model_out, system_text, variant)
-        validate_config_envelope(env, variant)
-        text = compiler.emit_yaml(env)
-        compiler.validate_yaml(text)            # round-trip: well-formed + tab-free
-        out[variant] = {"dict": env, "yaml": text}
-    return out
+def build_envelope(bundle, model_out, system_text):
+    """The live envelope as ``{dict, yaml}`` (YAML via the reused emitter)."""
+    env = _envelope(bundle, model_out, system_text)
+    validate_config_envelope(env)
+    text = compiler.emit_yaml(env)
+    compiler.validate_yaml(text)                # round-trip: well-formed + tab-free
+    return {"dict": env, "yaml": text}
 
 
 # --------------------------------------------------------------------------
@@ -263,11 +254,11 @@ def build_grounding(bundle_id, steps, working_rules, requirements, unresolved=No
 # --------------------------------------------------------------------------
 def compile_config(bundle, observed_events, user_answers, model_fn, model=DEFAULT_MODEL,
                    unresolved=None, test_feedback=None):
-    """Run the model once and assemble the configs + grounding for one bundle.
-    Returns ``{test, live, grounding, content}``. ``model_fn`` is required (callers
+    """Run the model once and assemble the live config + grounding for one bundle.
+    Returns ``{live, grounding, content}``. ``model_fn`` is required (callers
     that want the default should construct it; tests inject a stub). ``unresolved``
     (skipped interview questions) is recorded in the grounding record.
-    ``test_feedback`` (Phase 5: dry-run corrections) is AUTHORITATIVE and folded in."""
+    ``test_feedback`` (worker corrections) is AUTHORITATIVE and folded in."""
     workflow_description = {
         "name": bundle.get("name", ""), "description": bundle.get("description", ""),
         "trigger": bundle.get("trigger", ""), "steps": list(bundle.get("steps", []) or []),
@@ -281,11 +272,10 @@ def compile_config(bundle, observed_events, user_answers, model_fn, model=DEFAUL
     steps = _items(model_out, "steps")
     requirements = _items(model_out, "requirements")
     system_text = assemble_system_text(model_out, working_rules)
-    envelopes = build_envelopes(bundle, model_out, system_text)
+    envelope = build_envelope(bundle, model_out, system_text)
     grounding = build_grounding(bundle.get("id"), steps, working_rules, requirements,
                                 unresolved=unresolved)
-    return {"test": envelopes["test"], "live": envelopes["live"],
-            "grounding": grounding, "content": model_out}
+    return {"live": envelope, "grounding": grounding, "content": model_out}
 
 
 def _interview_path(answers_dir, bundle_id):
@@ -349,9 +339,9 @@ def _load_test_feedback(answers_dir, bundle_id):
 def generate_configs(reviewed_path, event_log_path, model=DEFAULT_MODEL, model_fn=None,
                      answers_dir=None):
     """Generate configs for every approved bundle in ``reviewed_path``. Returns
-    ``(results, report)`` where each result is
-    ``{id, built, test_yaml, live_yaml, grounding}``. Non-approved bundles and
-    anti-bundles produce ``built=False`` with ``None`` payloads — NO markdown."""
+    ``(results, report)`` where each result is ``{id, built, live_yaml, grounding}``.
+    Non-approved bundles and anti-bundles produce ``built=False`` with ``None``
+    payloads — NO markdown."""
     with open(reviewed_path, encoding="utf-8") as f:
         reviewed = json.load(f)
     with open(event_log_path, encoding="utf-8") as f:
@@ -371,7 +361,7 @@ def generate_configs(reviewed_path, event_log_path, model=DEFAULT_MODEL, model_f
     for b in reviewed["bundles"]:
         if b.get("disposition") != "approve_for_build":
             results.append({"id": b["id"], "built": False,
-                            "test_yaml": None, "live_yaml": None, "grounding": None})
+                            "live_yaml": None, "grounding": None})
             continue
         _, observed_events, _ = make_engine_inputs(b, event_log)
         user_answers = _load_answers(answers_dir, b["id"])
@@ -380,10 +370,9 @@ def generate_configs(reviewed_path, event_log_path, model=DEFAULT_MODEL, model_f
         compiled = compile_config(b, observed_events, user_answers, model_fn, model,
                                   unresolved=unresolved, test_feedback=test_feedback)
         results.append({"id": b["id"], "built": True,
-                        "test_yaml": compiled["test"]["yaml"],
                         "live_yaml": compiled["live"]["yaml"],
                         "grounding": compiled["grounding"]})
     for a in reviewed["anti_bundles"]:
         results.append({"id": a["id"], "built": False,
-                        "test_yaml": None, "live_yaml": None, "grounding": None})
+                        "live_yaml": None, "grounding": None})
     return results, report

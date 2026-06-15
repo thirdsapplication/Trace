@@ -127,9 +127,8 @@ class UIChainTest(unittest.TestCase):
 
         _, data = self.req("GET", f"/api/sessions/{self.sid}/agents")
         agent = next(a for a in data["agents"] if a["bundle_id"] == "B1")
-        self.assertIn("system:", agent["test_yaml"])
+        self.assertIn("system:", agent["live_yaml"])
         self.assertIn("mcp_server_name", agent["live_yaml"])     # live has Pipedream
-        self.assertNotIn("mcp_server_name", agent["test_yaml"])  # test has none
         # grounding carries the answered question as a user_answer source + the skip
         g = agent["grounding"]
         self.assertTrue(any(isinstance(i["source"], dict) and i["source"].get("type") == "user_answer"

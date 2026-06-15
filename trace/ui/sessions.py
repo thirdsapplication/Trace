@@ -213,17 +213,16 @@ def list_agents(root, sid):
         return []
     bundles = {}
     for fn in sorted(os.listdir(d)):
-        m = re.match(r"^agent_(.+)\.(test|live)\.yaml$", fn)
+        m = re.match(r"^agent_(.+)\.live\.yaml$", fn)
         if m:
             with open(os.path.join(d, fn), encoding="utf-8") as f:
-                bundles.setdefault(m.group(1), {})[m.group(2) + "_yaml"] = f.read()
+                bundles[m.group(1)] = f.read()
     out = []
-    for bid, data in bundles.items():
+    for bid, live_yaml in bundles.items():
         grounding = _read_json(os.path.join(d, f"grounding_{bid}.json"))
         dep = _read_json(os.path.join(d, f"deploy_{bid}.json"))
-        out.append({"bundle_id": bid, "test_yaml": data.get("test_yaml"),
-                    "live_yaml": data.get("live_yaml"), "grounding": grounding,
-                    "deploy": dep})
+        out.append({"bundle_id": bid, "live_yaml": live_yaml,
+                    "grounding": grounding, "deploy": dep})
     return out
 
 

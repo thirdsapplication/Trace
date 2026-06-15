@@ -171,11 +171,14 @@ class ManagedAgentsClient:
 
     # --- agents / environments / sessions ---
     def create_agent(self, envelope_dict):
-        # Pass only the documented create params (name, model, system, tools);
-        # description/mcp_* live in the YAML, not the create call.
+        # Create params: name, model, system, tools, AND mcp_servers — the agent needs
+        # its MCP servers registered (the finalized per-customer Pipedream servers), or
+        # its mcp_toolset entries have no server backing them. (Beta shape — confirm
+        # against current Managed Agents docs.)
         a = _retry(lambda: self._agents_ns("agents").create(
             name=envelope_dict["name"], model=envelope_dict["model"],
-            system=envelope_dict["system"], tools=envelope_dict["tools"]))
+            system=envelope_dict["system"], tools=envelope_dict["tools"],
+            mcp_servers=envelope_dict.get("mcp_servers") or []))
         return _idof(a)
 
     def _find_agent(self, name):
@@ -199,7 +202,8 @@ class ManagedAgentsClient:
             return False
         try:
             _retry(lambda: update(agent_id, model=envelope_dict["model"],
-                                  system=envelope_dict["system"], tools=envelope_dict["tools"]))
+                                  system=envelope_dict["system"], tools=envelope_dict["tools"],
+                                  mcp_servers=envelope_dict.get("mcp_servers") or []))
             return True
         except Exception:
             return False
@@ -216,7 +220,8 @@ class ManagedAgentsClient:
             return {"id": agent_id, "name": name, "reused": True}
         a = _retry(lambda: self._agents_ns("agents").create(
             name=name, model=envelope_dict["model"],
-            system=envelope_dict["system"], tools=envelope_dict["tools"]))
+            system=envelope_dict["system"], tools=envelope_dict["tools"],
+            mcp_servers=envelope_dict.get("mcp_servers") or []))
         return {"id": _idof(a), "name": name, "reused": False}
 
     def create_environment(self, defaults=None):

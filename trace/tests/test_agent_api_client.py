@@ -76,5 +76,50 @@ class RetryTest(unittest.TestCase):
         self.assertEqual(calls["n"], 3)              # tried exactly `attempts` times
 
 
+class AgentCreateForwardsMcpServersTest(unittest.TestCase):
+    """Regression: the agent create/reuse calls must forward ``mcp_servers`` to the
+    platform, or the deployed live agent's mcp_toolset has no server backing it (it
+    behaves like a tool-less test agent)."""
+
+    def _client(self, fake_ns):
+        # bypass __init__ so no anthropic SDK / API key is needed
+        c = api_client.ManagedAgentsClient.__new__(api_client.ManagedAgentsClient)
+        c._beta_version = "beta-x"
+        c._agents_ns = lambda name: fake_ns
+        return c
+
+    _ENV = {"name": "Order intake", "model": "m", "system": "s",
+            "tools": [{"type": "agent"}, {"type": "mcp_toolset", "mcp_server_name": "Trace gmail"}],
+            "mcp_servers": [{"name": "Trace gmail", "type": "url", "url": "https://x?app=gmail"}]}
+
+    def test_create_branch_forwards_mcp_servers(self):
+        captured = {}
+
+        class NS:
+            def list(self):
+                return []                       # no existing agent -> create path
+            def create(self, **kw):
+                captured.update(kw)
+                return {"id": "agent_1"}
+
+        out = self._client(NS()).create_or_reuse_agent(self._ENV)
+        self.assertFalse(out["reused"])
+        self.assertEqual(captured["mcp_servers"], self._ENV["mcp_servers"])
+
+    def test_reuse_branch_forwards_mcp_servers(self):
+        captured = {}
+
+        class NS:
+            def list(self):
+                return [{"id": "agent_1", "name": "Order intake"}]   # existing -> update path
+            def update(self, agent_id, **kw):
+                captured.update(kw)
+                return {"id": agent_id}
+
+        out = self._client(NS()).create_or_reuse_agent(self._ENV)
+        self.assertTrue(out["reused"])
+        self.assertEqual(captured["mcp_servers"], self._ENV["mcp_servers"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -3,9 +3,9 @@
     python -m trace.agent.configgen_cli reviewed_bundles.json event_log.json \
         -o configs/ [--answers-dir DIR] [--model M] [--dry-run]
 
-Writes ``agent_<id>.test.yaml``, ``agent_<id>.live.yaml`` and ``grounding_<id>.json``
-per approved bundle. ``--dry-run`` prints the system prompt and each bundle's exact
-prompt material with NO model call (free).
+Writes ``agent_<id>.live.yaml`` and ``grounding_<id>.json`` per approved bundle.
+``--dry-run`` prints the system prompt and each bundle's exact prompt material with
+NO model call (free).
 """
 
 import argparse
@@ -67,8 +67,6 @@ def main():
         if not r["built"]:
             continue
         bid = _safe(r["id"])
-        with open(os.path.join(args.out, f"agent_{bid}.test.yaml"), "w", encoding="utf-8") as f:
-            f.write(r["test_yaml"])
         with open(os.path.join(args.out, f"agent_{bid}.live.yaml"), "w", encoding="utf-8") as f:
             f.write(r["live_yaml"])
         with open(os.path.join(args.out, f"grounding_{bid}.json"), "w", encoding="utf-8") as f:
