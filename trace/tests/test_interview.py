@@ -53,7 +53,7 @@ class InterviewEngineTest(unittest.TestCase):
         qs = self._questions()
         # 6 raw -> drop runtime_discoverable + empty -> 4 kept
         self.assertEqual(len(qs), 4)
-        self.assertLessEqual(len(qs), 5)
+        self.assertLessEqual(len(qs), interview._MAX_QUESTIONS)
         self.assertEqual([q["cost_if_wrong"] for q in qs], ["high", "medium", "medium", "low"])
         self.assertEqual([q["id"] for q in qs], ["q1", "q2", "q3", "q4"])
         # the runtime-discoverable 'column names' question is gone
@@ -106,6 +106,55 @@ class InterviewEngineTest(unittest.TestCase):
         low = SYSTEM_PROMPT.lower()
         for term in ("marcy", "recruiter", "gmail", "riverbend", "po-1001"):
             self.assertNotIn(term, low)
+
+    def test_cap_doubled_to_ten(self):
+        # 12 substantively distinct, well-formed questions -> capped at the doubled
+        # limit (10), not the old 5
+        self.assertEqual(interview._MAX_QUESTIONS, 10)
+        prompts = [
+            "Which destination receives the finished record?",
+            "Should multiple line items become separate rows or stay combined?",
+            "When the source disagrees with prior entries, whose value prevails?",
+            "What marks an incoming item as already processed?",
+            "Under what condition must a human approve before sending?",
+            "What tone or signature belongs on outgoing replies?",
+            "Which currency or unit applies when none is stated?",
+            "How far back should the agent look for matching context?",
+            "What deadline or schedule governs when this runs?",
+            "Which sender domains are trusted without extra review?",
+            "What fallback applies when a required field is missing?",
+            "How should attachments be named when saved?",
+        ]
+        raw = {"questions": [
+            {"unknown": f"u{i}", "lens": "undetermined_decision", "why_it_matters": "x",
+             "question": p, "cost_if_wrong": "medium", "runtime_discoverable": False}
+            for i, p in enumerate(prompts)]}
+        ev, ak = _load("marcy")
+        b = _bundle(ak["bundles"][0])
+        qs = interview.generate_questions(b, ev, model_fn=_stub(raw))["questions"]
+        self.assertEqual(len(qs), 10)
+        self.assertEqual([q["id"] for q in qs], [f"q{i + 1}" for i in range(10)])
+
+    def test_near_duplicate_questions_dropped(self):
+        # two near-identical phrasings collapse to one; the distinct one survives
+        raw = {"questions": [
+            {"unknown": "tab", "lens": "capture_blind_spot", "why_it_matters": "x",
+             "question": "Which tab do new records go into?", "cost_if_wrong": "high",
+             "runtime_discoverable": False},
+            {"unknown": "tab2", "lens": "capture_blind_spot", "why_it_matters": "x",
+             "question": "What tab should new records go into?", "cost_if_wrong": "medium",
+             "runtime_discoverable": False},
+            {"unknown": "conflict", "lens": "undetermined_decision", "why_it_matters": "x",
+             "question": "When the source disagrees with existing rows, which value wins?",
+             "cost_if_wrong": "high", "runtime_discoverable": False},
+        ]}
+        ev, ak = _load("marcy")
+        b = _bundle(ak["bundles"][0])
+        qs = interview.generate_questions(b, ev, model_fn=_stub(raw))["questions"]
+        texts = [q["question"] for q in qs]
+        self.assertEqual(len(qs), 2)                          # the rephrase was dropped
+        self.assertIn("Which tab do new records go into?", texts)   # higher-cost keeper
+        self.assertTrue(any("which value wins" in t for t in texts))
 
 
 class InterviewToConfigFeedTest(unittest.TestCase):

@@ -35,8 +35,12 @@ Then TRIAGE HARD. Only ASK about an unknown if BOTH hold:
       observed instances disagree.
 SUPPRESS anything the agent can read live at run time (column names, existing
 formats) and anything the events already answer consistently (e.g. a reply
-text identical across instances). Rank by cost-if-wrong. Ask at most 5
-questions; aim for 3 or fewer.
+text identical across instances). Rank by cost-if-wrong. Ask at most 10
+questions; aim for 6 or fewer. Be thorough: surface every distinct unknown
+that passes the triage above (both lenses) rather than stopping at the first
+few. But never pad to reach a number, and never include two questions that ask
+the same thing in different words — merge or drop near-duplicates. Quality and
+distinctness matter more than quantity.
 
 Each question must be answerable in one short line, ask for a GENERAL RULE
 (never an instance value like a specific row number), and may include a
