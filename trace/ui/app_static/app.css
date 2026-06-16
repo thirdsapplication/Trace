@@ -94,6 +94,8 @@ input:focus { outline: none; border-color: var(--accent); background: var(--acce
 .step-chip.done { color: var(--accent); background: var(--accent-pill); }
 .step-chip.active { color: #fff; background: var(--ink); }
 .step-chip.active .n { color: #fff; }
+.step-chip.nav { cursor: pointer; }
+.step-chip.nav:hover { filter: brightness(0.97); }
 .progress { height: 5px; border-radius: 3px; background: var(--chip-2); overflow: hidden; margin: 14px 0; }
 .progress > i { display: block; height: 100%; background: var(--accent); border-radius: 3px;
   transition: width .4s ease; }

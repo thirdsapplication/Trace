@@ -121,10 +121,11 @@ function renderAuth(mode) {
 
 /* ---------------- shell ---------------- */
 function shell(inner) {
-  const reached = deriveStep();
+  const reached = deriveStep();                 // furthest step the artifacts allow
   const chips = STEPS.map((st, i) => {
-    const cls = i === S.step ? "active" : (i < reached ? "done" : "");
-    return `<span class="step-chip ${cls}"><span class="n">${String(i + 1).padStart(2, "0")}</span>${st.label}</span>`;
+    const nav = i <= reached;                    // completed steps + the current one are navigable
+    const cls = [i === S.step ? "active" : (i < reached ? "done" : ""), nav ? "nav" : ""].join(" ").trim();
+    return `<span class="step-chip ${cls}" ${nav ? `data-step="${i}"` : ""}><span class="n">${String(i + 1).padStart(2, "0")}</span>${st.label}</span>`;
   }).join("");
   root.innerHTML = `
     <div class="topbar">
@@ -135,6 +136,7 @@ function shell(inner) {
     <div class="steps">${chips}</div>
     <div id="stage">${inner}</div>`;
   $("#logout").onclick = async () => { await api("POST", "/api/auth/logout", {}); S.user = null; clearTimers(); renderAuth(); };
+  root.querySelectorAll(".step-chip.nav").forEach(c => c.onclick = () => goStep(parseInt(c.dataset.step, 10)));
 }
 
 function render() {
@@ -455,7 +457,20 @@ async function renderGolive(sid) {
     $("#liveGo").onclick = async () => {
       $("#liveGo").disabled = true; $("#liveGo").textContent = "Deploying…";
       const r = await upost(sid, "/deploy", { trigger: "on a new matching task" });
-      if (!r.ok && r.status !== 202) { $("#liveMsg").textContent = friendly(r.data.error); $("#liveGo").disabled = false; return; }
+      if (!r.ok && r.status !== 202) {
+        $("#liveGo").disabled = false; $("#liveGo").textContent = "Go live";
+        if (r.data.error === "not_eligible") {
+          $("#liveMsg").className = "msg err";
+          $("#liveMsg").textContent = "Connect an app your agents can act in first.";
+          if (!$("#liveBack"))
+            $("#liveMsg").insertAdjacentHTML("afterend",
+              `<button id="liveBack" class="btn-secondary full" style="margin-top:10px;">Back to Connect</button>`);
+          $("#liveBack").onclick = () => goStep(5);
+        } else {
+          $("#liveMsg").className = "msg err"; $("#liveMsg").textContent = friendly(r.data.error);
+        }
+        return;
+      }
       try { await pollJob(sid, "deploy"); } catch (e) { $("#liveMsg").textContent = friendly(e.message); }
       await refreshSession(); render();
     };

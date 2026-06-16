@@ -10,7 +10,7 @@ future OAuth-client swap is a one-module change in ``connect_client.py``.
 
 import datetime
 
-from . import compiler, config
+from . import config
 
 
 def _now():
@@ -24,26 +24,52 @@ def _slug_for(app):
     return next((v for k, v in config.CONNECT_APP_TABLE.items() if k in low), None)
 
 
+def _apps_in_event(event):
+    """Connectable apps observed in ONE event, matching `app`, `window`, and `detail`
+    against the app table. A real browser capture puts the browser in `app`
+    (e.g. "Google Chrome") and the service only in the window title
+    (e.g. "… - Gmail"), so all three fields are scanned. Returns ``[{slug, label,
+    observed_as}]`` — one per distinct slug, in first-seen order."""
+    out, seen = [], set()
+    for field in ("app", "window", "detail"):
+        text = (event.get(field) or "").strip()
+        if not text:
+            continue
+        entry = _slug_for(text)
+        if entry and entry["slug"] not in seen:
+            seen.add(entry["slug"])
+            out.append({"slug": entry["slug"], "label": entry["label"], "observed_as": text})
+    return out
+
+
 def app_union(approved_bundles, event_log):
     """The de-duplicated set of connectable apps across the customer's approved bundles.
     Returns ``(apps, unmapped)`` where ``apps`` is ``[{slug, label, observed_as}]`` in
-    first-seen order and ``unmapped`` lists observed apps with no table row (surfaced,
-    never silently dropped)."""
-    by_slug, unmapped = {}, []
-    seen_unmapped = set()
+    first-seen order and ``unmapped`` lists observed app names whose events matched
+    nothing in the app table (surfaced, never silently dropped). Each evidence event is
+    scanned across ``app``/``window``/``detail`` so a service named only in the window
+    title (browser captures) is still found."""
+    idx = {e.get("id"): e for e in (event_log or []) if isinstance(e, dict)}
+    by_slug, unmapped, seen_unmapped = {}, [], set()
     for b in approved_bundles or []:
-        for app in compiler.observed_apps(b, event_log):
-            entry = _slug_for(app)
-            if entry is None:
-                if app.lower() not in seen_unmapped:
-                    seen_unmapped.add(app.lower())
-                    unmapped.append(app)
+        for eid in b.get("evidence_event_ids", []):
+            ev = idx.get(eid)
+            if not isinstance(ev, dict):
                 continue
-            slug = entry["slug"]
-            if slug not in by_slug:
-                by_slug[slug] = {"slug": slug, "label": entry["label"], "observed_as": [app]}
-            elif app not in by_slug[slug]["observed_as"]:
-                by_slug[slug]["observed_as"].append(app)
+            matches = _apps_in_event(ev)
+            if matches:
+                for m in matches:
+                    slug = m["slug"]
+                    if slug not in by_slug:
+                        by_slug[slug] = {"slug": slug, "label": m["label"],
+                                         "observed_as": [m["observed_as"]]}
+                    elif m["observed_as"] not in by_slug[slug]["observed_as"]:
+                        by_slug[slug]["observed_as"].append(m["observed_as"])
+                continue
+            app = (ev.get("app") or "").strip()            # nothing matched -> surface it
+            if app and app.lower() not in seen_unmapped:
+                seen_unmapped.add(app.lower())
+                unmapped.append(app)
     return list(by_slug.values()), unmapped
 
 

@@ -77,6 +77,24 @@ class AppUnionTest(unittest.TestCase):
         # an observed app with no table row (e.g. the PDF viewer) is surfaced, not dropped
         self.assertTrue(any(u.lower() not in ("gmail", "sheets") for u in unmapped) or unmapped == [])
 
+    def test_union_detects_apps_from_window_titles(self):
+        # a real browser capture: the service is only in the window title, not `app`
+        event_log = [
+            {"id": "e1", "app": "Google Chrome", "window": "Inbox (3) - you@acme.com - Gmail",
+             "action": "read_email", "detail": "Read the inbound order email."},
+            {"id": "e2", "app": "Google Chrome", "window": "Open_Orders - Google Sheets",
+             "action": "enter_data", "detail": "Entered a new order row."},
+            {"id": "e3", "app": "Preview", "window": "PO-1001.pdf",
+             "action": "open_document", "detail": "Opened the attached PO."},
+        ]
+        bundle = {"id": "B1", "evidence_event_ids": ["e1", "e2", "e3"]}
+        apps, unmapped = connect.app_union([bundle], event_log)
+        slugs = {a["slug"] for a in apps}
+        self.assertIn("gmail", slugs)                  # found in the window title
+        self.assertIn("google_sheets", slugs)
+        self.assertIn("Preview", unmapped)             # truly unrecognized, surfaced
+        self.assertNotIn("Google Chrome", unmapped)    # not surfaced — its events matched
+
 
 class VerifyIdentityTest(unittest.TestCase):
     def test_three_states(self):
