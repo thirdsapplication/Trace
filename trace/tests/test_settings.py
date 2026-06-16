@@ -6,6 +6,7 @@ are pushed into the agent config, and that the HTTP routes round-trip.
 """
 
 import json
+import os
 import threading
 import unittest
 import urllib.error
@@ -14,19 +15,48 @@ import urllib.request
 from trace.agent import config
 from trace.ui import app, keystore, sessions
 
+_PLATFORM_ENV = (keystore._ENV_KEY, *keystore._PD_ENV.values())
+
+
+def _pop_platform_env():
+    """Remove any ambient platform-credential env vars so stored/clear tests are
+    deterministic regardless of the host environment (WS4 preload reads them)."""
+    return {k: os.environ.pop(k, None) for k in _PLATFORM_ENV}
+
+
+def _restore_platform_env(saved):
+    for k, v in saved.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
+
 
 class KeystorePipedreamTest(unittest.TestCase):
     def setUp(self):
-        import tempfile, os
+        import tempfile
         self._tmp = tempfile.TemporaryDirectory()
         self._saved = (keystore._FALLBACK_DIR, keystore._FALLBACK_PATH, keystore._keyring)
         keystore._FALLBACK_DIR = self._tmp.name
         keystore._FALLBACK_PATH = os.path.join(self._tmp.name, "config.json")
         keystore._keyring = lambda: None            # force the 0600 file backend
+        self._env = _pop_platform_env()
 
     def tearDown(self):
         keystore._FALLBACK_DIR, keystore._FALLBACK_PATH, keystore._keyring = self._saved
+        _restore_platform_env(self._env)
         self._tmp.cleanup()
+
+    def test_pipedream_env_preload_when_unstored(self):
+        # WS4: with nothing stored, Pipedream settings load from the server environment
+        self.assertFalse(keystore.pipedream_info()["configured"])
+        os.environ[keystore._PD_ENV["project_id"]] = "proj_env"
+        os.environ[keystore._PD_ENV["client_id"]] = "cid_env"
+        os.environ[keystore._PD_ENV["client_secret"]] = "sec_env"
+        info = keystore.pipedream_info()
+        self.assertTrue(info["configured"])
+        self.assertEqual(info["project_id"], "proj_env")
+        self.assertNotIn("sec_env", json.dumps(info))          # secret never exposed
 
     def test_round_trip_and_masking(self):
         keystore.save_pipedream(project_id="proj_x", client_id="cid_1234",
@@ -74,12 +104,13 @@ class KeystorePipedreamTest(unittest.TestCase):
 
 class PipedreamRouteTest(unittest.TestCase):
     def setUp(self):
-        import tempfile, os
+        import tempfile
         self._tmp = tempfile.TemporaryDirectory()
         self._saved_ks = (keystore._FALLBACK_DIR, keystore._FALLBACK_PATH, keystore._keyring)
         keystore._FALLBACK_DIR = self._tmp.name
         keystore._FALLBACK_PATH = os.path.join(self._tmp.name, "config.json")
         keystore._keyring = lambda: None
+        self._env = _pop_platform_env()
         self._saved_cfg = (config.PIPEDREAM_PROJECT, config.PIPEDREAM_CLIENT_ID,
                            config.PIPEDREAM_CLIENT_SECRET, config.PIPEDREAM_ENVIRONMENT)
         self.root = os.path.join(self._tmp.name, "sessions")
@@ -91,6 +122,7 @@ class PipedreamRouteTest(unittest.TestCase):
     def tearDown(self):
         self.httpd.shutdown(); self.httpd.server_close()
         keystore._FALLBACK_DIR, keystore._FALLBACK_PATH, keystore._keyring = self._saved_ks
+        _restore_platform_env(self._env)
         (config.PIPEDREAM_PROJECT, config.PIPEDREAM_CLIENT_ID,
          config.PIPEDREAM_CLIENT_SECRET, config.PIPEDREAM_ENVIRONMENT) = self._saved_cfg
         self._tmp.cleanup()

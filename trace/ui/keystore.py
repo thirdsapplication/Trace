@@ -29,6 +29,18 @@ _PD = {
 _FALLBACK_DIR = os.path.expanduser("~/.trace")
 _FALLBACK_PATH = os.path.join(_FALLBACK_DIR, "config.json")
 
+# WS4: platform credentials may be preloaded from the server environment instead of the
+# Test UI Settings, so an end-user surface never has to ask for them. A stored value
+# (keychain/file) always wins; the env var is the fallback. Pipedream env names match
+# config.py's own reads.
+_ENV_KEY = "ANTHROPIC_API_KEY"
+_PD_ENV = {
+    "project_id": "PIPEDREAM_PROJECT_ID",
+    "client_id": "PIPEDREAM_CLIENT_ID",
+    "client_secret": "PIPEDREAM_CLIENT_SECRET",
+    "environment": "PIPEDREAM_ENVIRONMENT",
+}
+
 
 def _keyring():
     """Return the keyring module if usable, else None. Never raises."""
@@ -122,8 +134,19 @@ def save_key(key):
 
 
 def get_key():
-    """Return the saved key, or None. (Internal use only — never expose this.)"""
-    return _get(_ACCOUNT)
+    """Return the saved key, or None. A stored value wins; otherwise fall back to the
+    ANTHROPIC_API_KEY server environment variable (WS4 preload). Internal use only —
+    never expose this."""
+    return _get(_ACCOUNT) or (os.environ.get(_ENV_KEY) or "").strip() or None
+
+
+def key_source():
+    """'stored' | 'env' | None — where get_key resolved from (non-secret, for status)."""
+    if _get(_ACCOUNT):
+        return "stored"
+    if (os.environ.get(_ENV_KEY) or "").strip():
+        return "env"
+    return None
 
 
 def clear_key():
@@ -137,7 +160,9 @@ def info():
     masked = None
     if key and len(key) >= 4:
         masked = "…" + key[-4:]
-    return {"saved": bool(key), "backend": backend_name(), "masked_tail": masked}
+    src = key_source()
+    return {"saved": bool(key), "backend": ("env" if src == "env" else backend_name()),
+            "masked_tail": masked, "source": src}
 
 
 # --- Pipedream Connect settings ---
@@ -152,13 +177,20 @@ def save_pipedream(project_id=None, client_id=None, client_secret=None, environm
     return backend_name()
 
 
+def _pd_field(field):
+    """Stored value wins; else the server environment variable (WS4 preload)."""
+    return _get(_PD[field]) or (os.environ.get(_PD_ENV[field]) or "").strip()
+
+
 def get_pipedream():
-    """The stored settings (secret included — internal use only, never exposed)."""
+    """The settings (secret included — internal use only, never exposed). Each field falls
+    back to its server environment variable when not stored, so the platform credentials
+    can be preloaded without the Settings UI (WS4)."""
     return {
-        "project_id": _get(_PD["project_id"]) or "",
-        "client_id": _get(_PD["client_id"]) or "",
-        "client_secret": _get(_PD["client_secret"]) or "",
-        "environment": _get(_PD["environment"]) or "production",
+        "project_id": _pd_field("project_id"),
+        "client_id": _pd_field("client_id"),
+        "client_secret": _pd_field("client_secret"),
+        "environment": _pd_field("environment") or "production",
     }
 
 

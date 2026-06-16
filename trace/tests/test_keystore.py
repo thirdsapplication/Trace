@@ -17,12 +17,30 @@ class KeystoreFileFallbackTest(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         keystore._FALLBACK_DIR = self._tmp.name
         keystore._FALLBACK_PATH = os.path.join(self._tmp.name, "config.json")
+        # isolate from any ambient env preload so stored/clear behavior is deterministic
+        self._orig_env = os.environ.pop(keystore._ENV_KEY, None)
 
     def tearDown(self):
         keystore._keyring = self._orig_keyring
         keystore._FALLBACK_DIR = self._orig_dir
         keystore._FALLBACK_PATH = self._orig_path
+        if self._orig_env is not None:
+            os.environ[keystore._ENV_KEY] = self._orig_env
+        else:
+            os.environ.pop(keystore._ENV_KEY, None)
         self._tmp.cleanup()
+
+    def test_env_preload_when_unstored(self):
+        # WS4: with nothing stored, the key loads from the server environment variable
+        self.assertIsNone(keystore.get_key())
+        os.environ[keystore._ENV_KEY] = "sk-ant-from-env"
+        self.assertEqual(keystore.get_key(), "sk-ant-from-env")
+        self.assertEqual(keystore.key_source(), "env")
+        self.assertEqual(keystore.info()["backend"], "env")
+        # a stored value still wins over the environment
+        keystore.save_key("sk-ant-stored")
+        self.assertEqual(keystore.get_key(), "sk-ant-stored")
+        self.assertEqual(keystore.key_source(), "stored")
 
     def test_save_and_get(self):
         self.assertEqual(keystore.save_key("sk-ant-abc123"), "file")
