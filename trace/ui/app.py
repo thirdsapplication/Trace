@@ -13,12 +13,14 @@ network: ``AppState.reconstruct_fn`` and ``AppState.controller_factory``.
 """
 
 import argparse
+import calendar
 import json
 import os
 import re
 import shutil
 import ssl
 import threading
+import time
 import urllib.parse
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -76,6 +78,19 @@ STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 DISCOVERY_FIXTURES_DIR = os.path.join(
     os.path.dirname(os.path.dirname(__file__)), "discovery", "fixtures")
 SHORT_RECORDING_THRESHOLD = 5  # events; below this, warn before a paid run
+
+
+def _token_stale(expires_at_iso, margin=None):
+    """True if a stored Pipedream-token expiry is missing, unparseable, past, or within
+    the safety margin — i.e. the credential should be refreshed before a run (WS5)."""
+    margin = agent_config.TOKEN_REFRESH_MARGIN_SECONDS if margin is None else margin
+    if not expires_at_iso:
+        return True
+    try:
+        exp = calendar.timegm(time.strptime(expires_at_iso, "%Y-%m-%dT%H:%M:%SZ"))
+    except (ValueError, TypeError):
+        return True
+    return time.time() >= exp - margin
 
 
 def list_fixtures():
@@ -545,6 +560,36 @@ class AppState:
         threading.Thread(target=run, daemon=True).start()
 
     # --- Phase 6: live deployment ----------------------------------------
+    def _refresh_stale_bindings(self, sid, conn):
+        """WS5: re-mint + rotate the Pipedream token for any usable app whose stored token
+        is stale, so a run long after Connect still authenticates — no manual re-verify.
+        Best-effort: a refresh failure never blocks deploy (a truly dead token would
+        surface as the run's own auth error). Reuses ConnectClient.refresh_binding, which
+        rotates only the token and never re-sends the immutable mcp_server_url."""
+        vault_ref = (conn or {}).get("vault_ref")
+        if not vault_ref:
+            return conn
+        uid = conn.get("external_user_id")
+        stale = [slug for slug, a in (conn.get("apps") or {}).items()
+                 if a.get("usable") and _token_stale(a.get("token_expires_at"))]
+        if not stale:
+            return conn
+        try:
+            client = self.connect_fn()
+        except Exception:
+            return conn
+        changed = False
+        for slug in stale:
+            try:
+                out = client.refresh_binding(vault_ref, uid, slug)
+                conn["apps"][slug]["token_expires_at"] = out.get("expires_at")
+                changed = True
+            except Exception:
+                pass
+        if changed:
+            self._save_connection(sid, conn)
+        return conn
+
     def _deploy_eligible(self, sid):
         """Approved bundles that have a built config AND a usable connection."""
         root = self.sessions_root
@@ -580,6 +625,7 @@ class AppState:
         def run():
             try:
                 eligible, _, conn = self._deploy_eligible(sid)
+                conn = self._refresh_stale_bindings(sid, conn)   # WS5: token fresh before run
                 if selected_ids is not None:
                     eligible = [b for b in eligible if b["id"] in set(selected_ids)]
                 for b in eligible:

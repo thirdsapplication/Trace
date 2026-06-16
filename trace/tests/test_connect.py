@@ -39,7 +39,11 @@ class StubConnectClient:
 
     def bind_connection(self, vault_ref, external_user_id, app, account=None):
         self.calls.append(("bind", vault_ref, external_user_id, app))
-        return {"binding_ref": f"bind-{external_user_id}-{app}"}
+        return {"binding_ref": f"bind-{external_user_id}-{app}", "expires_at": "2099-01-01T00:00:00Z"}
+
+    def refresh_binding(self, vault_ref, external_user_id, app):
+        self.calls.append(("refresh", vault_ref, external_user_id, app))
+        return {"expires_at": "2099-01-01T00:00:00Z"}
 
     def get_account(self, external_user_id, app):
         self.calls.append(("account", external_user_id, app))
@@ -225,6 +229,33 @@ class RealBindCredentialTest(unittest.TestCase):
             _FakeVaults(credentials=_FakeCreds(create_error=RuntimeError("500 server error"))))
         with self.assertRaises(Exception):
             c.bind_connection("vlt-s1", "trace-s1", "gmail")
+
+    def test_bind_returns_token_expiry(self):
+        c, _, _ = self._client()
+        out = c.bind_connection("vlt-s1", "trace-s1", "gmail")
+        self.assertTrue(out["expires_at"])                          # TTL surfaced for refresh (WS5)
+
+    def test_refresh_binding_rotates_existing_token(self):
+        # WS5: refresh re-mints + rotates the token into the existing credential, never
+        # re-sending the immutable mcp_server_url, and creates nothing new.
+        c, vaults, _ = self._client()                               # list serves cred-existing
+        out = c.refresh_binding("vlt-s1", "trace-s1", "gmail")
+        self.assertTrue(out["expires_at"])
+        upd = vaults.credentials.updated[-1]
+        self.assertEqual(upd["cred_id"], "cred-existing")
+        self.assertEqual(upd["auth"]["type"], "mcp_oauth")
+        self.assertEqual(upd["auth"]["access_token"], "pdtok_abc")  # rotated token
+        self.assertNotIn("mcp_server_url", upd["auth"])             # immutable: never on rotation
+        self.assertEqual(vaults.credentials.created, [])           # rotation only, no new cred
+
+    def test_refresh_binding_falls_back_to_bind_when_unbound(self):
+        creds = _FakeCreds()
+        creds.list = lambda vault_ref: []                          # nothing bound yet
+        c, _, _ = self._client(_FakeVaults(credentials=creds))
+        out = c.refresh_binding("vlt-s1", "trace-s1", "gmail")
+        self.assertTrue(out["expires_at"])
+        self.assertEqual(len(creds.created), 1)                    # full bind created the cred
+        self.assertEqual(creds.updated, [])
 
 
 class EnsureVaultTest(unittest.TestCase):

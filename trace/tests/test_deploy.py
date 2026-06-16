@@ -283,6 +283,26 @@ class UIDeployTest(unittest.TestCase):
         self.assertEqual(code, 202)
         self.assertEqual(self._await("deploy")["state"], "done")
 
+    def test_run_refreshes_stale_pipedream_token_before_deploy(self):
+        # WS5: a token that expired between Connect and run is refreshed-and-rotated by the
+        # deploy path with no manual re-verify.
+        self._full_chain()
+        conn_path = sessions.path(self.root, self.sid, sessions.CONNECTION)
+        with open(conn_path) as f:
+            conn = json.load(f)
+        usable = [s for s, a in conn["apps"].items() if a.get("usable")]
+        self.assertTrue(usable)
+        for s in usable:                                   # force-expire the stored token
+            conn["apps"][s]["token_expires_at"] = "2000-01-01T00:00:00Z"
+        with open(conn_path, "w") as f:
+            json.dump(conn, f)
+        self.req("POST", f"/api/sessions/{self.sid}/deploy", {"trigger": "on inbound"})
+        self.assertEqual(self._await("deploy")["state"], "done")
+        with open(conn_path) as f:
+            refreshed = json.load(f)
+        for s in usable:                                   # rotated to the fresh expiry
+            self.assertEqual(refreshed["apps"][s]["token_expires_at"], "2099-01-01T00:00:00Z")
+
     def test_deploy_shows_held_action_and_approve_flips_it(self):
         self._full_chain()
         self.req("POST", f"/api/sessions/{self.sid}/deploy", {"trigger": "on inbound"})

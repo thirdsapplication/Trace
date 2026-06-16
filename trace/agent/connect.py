@@ -114,6 +114,7 @@ def bind_and_verify(client, record, slug, expected_email):
 
     entry = record["apps"].setdefault(slug, {"label": slug, "observed_as": []})
     entry["binding_ref"] = binding.get("binding_ref")
+    entry["token_expires_at"] = binding.get("expires_at")   # for refresh-before-run (WS5)
     entry["connected"] = bool(account.get("connected"))
     entry["account"] = {"account_id": account.get("account_id"),
                         "identity_email": account.get("identity_email")}

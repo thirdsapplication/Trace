@@ -255,17 +255,23 @@ class ConnectClient:
                 return _idof(c)
         return None
 
+    @staticmethod
+    def _token_expiry_iso(tok):
+        """ISO ``expires_at`` for a freshly minted token (its 1h TTL from now)."""
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                             time.gmtime(time.time() + float(tok.get("expires_in") or 3600)))
+
     def bind_connection(self, vault_ref, external_user_id, app, account=None):
         """Write the Pipedream connection into the vault as an mcp_oauth credential keyed
         to this customer's per-app MCP server URL. The bearer is Trace's project-scoped
         Pipedream dev token (minted fresh here); ``external_user_id`` and ``app`` ride in
         the URL, NOT in the credential. Idempotent: a credential already keyed to that URL
         has its token rotated (``mcp_server_url`` is an immutable key, so it is sent only on
-        create, never on update)."""
+        create, never on update). Returns ``{binding_ref, expires_at}`` (the token's TTL, so
+        the caller can refresh before a later run)."""
         creds = self._vaults_ns().credentials
         tok = _retry(self.mint_access_token)
-        expires_at = (time.strftime("%Y-%m-%dT%H:%M:%SZ",
-                                    time.gmtime(time.time() + float(tok.get("expires_in") or 3600))))
+        expires_at = self._token_expiry_iso(tok)
         mcp_server_url = config.pipedream_mcp_url(external_user_id, app)
         display_name = f"Trace {app}"
         # token-only fields, valid for both create and update; create adds the immutable URL.
@@ -283,7 +289,26 @@ class ConnectClient:
                 c = _retry(lambda: creds.update(cred_id, vault_id=vault_ref, auth=token_auth))
             else:
                 raise
-        return {"binding_ref": _idof(c) or f"{vault_ref}:{app}"}
+        return {"binding_ref": _idof(c) or f"{vault_ref}:{app}", "expires_at": expires_at}
+
+    def refresh_binding(self, vault_ref, external_user_id, app):
+        """Re-mint Trace's Pipedream token and ROTATE it into the existing vault credential
+        for this app, so a live agent that runs long after Connect still authenticates. The
+        Pipedream token is a project client_credentials token (no per-user refresh grant) —
+        'refresh' is a fresh mint. Reuses the token-rotation update path: the immutable
+        ``mcp_server_url`` is never re-sent. If nothing is bound yet, falls back to a full
+        bind. Returns ``{expires_at}``."""
+        mcp_server_url = config.pipedream_mcp_url(external_user_id, app)
+        cred_id = self._find_credential(vault_ref, mcp_server_url)
+        if not cred_id:
+            return {"expires_at": self.bind_connection(vault_ref, external_user_id, app)["expires_at"]}
+        creds = self._vaults_ns().credentials
+        tok = _retry(self.mint_access_token)
+        expires_at = self._token_expiry_iso(tok)
+        token_auth = {"type": "mcp_oauth", "access_token": tok["access_token"],
+                      "expires_at": expires_at}
+        _retry(lambda: creds.update(cred_id, vault_id=vault_ref, auth=token_auth))
+        return {"expires_at": expires_at}
 
     # --- Phase 5: READ-ONLY reads through the bound connection ---
     # There is no per-app "destination" endpoint. The primary dry-run read path is the

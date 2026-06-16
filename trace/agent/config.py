@@ -64,6 +64,10 @@ PIPEDREAM_CLIENT_SECRET = os.environ.get("PIPEDREAM_CLIENT_SECRET", "")
 PIPEDREAM_ENVIRONMENT = os.environ.get("PIPEDREAM_ENVIRONMENT", "production")  # development|production
 PIPEDREAM_API_BASE = "https://api.pipedream.com/v1"   # Connect REST + OAuth (v1)
 PIPEDREAM_CONNECT_BASE = PIPEDREAM_API_BASE           # paths are project-scoped: /connect/{project_id}/...
+# The vault credential holds a ~1h Pipedream token. Before a deploy/run we re-mint and
+# rotate it if it is past, or within this margin of, its expiry — so a run long after
+# Connect still authenticates (WS5).
+TOKEN_REFRESH_MARGIN_SECONDS = 300
 
 
 def pipedream_mcp_url(external_user_id, app, project=None, environment=None):
