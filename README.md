@@ -119,6 +119,24 @@ Leave the terminal running; **Ctrl-C stops the whole app.** Then, in the browser
 
 macOS alternative to the command: double-click **`launch_ui.command`** at the repo root.
 
+### 2b. End-user UI (the worker-facing surface)
+
+The same server also hosts a separate, polished **end-user UI at `/app`**
+(`http://127.0.0.1:8765/app`) — a non-technical, Direction-H–styled flow over the
+identical pipeline (record → find workflows → review → questions → build → connect →
+go live), with every outbound action held for one-tap approval. It's a distinct surface
+from this founder Test UI; both drive the same backend with no forked logic.
+
+- **Accounts:** end users sign in with email + password (`/api/auth/*`); passwords are
+  hashed+salted (`hashlib.scrypt`) in a 0600 file. Self-signup is on by default; set
+  `TRACE_DISABLE_SIGNUP=1` for operator-provisioned only.
+- **Isolation:** every end-user request is server-scoped to the logged-in user's own
+  sessions/agents/connections (the `/api/u/*` namespace); a user maps to a stable
+  `external_user_id` (`trace-user-<id>`) + per-customer vault.
+- **No credentials in the UI:** platform credentials are preloaded from the server
+  environment (`ANTHROPIC_API_KEY`, `PIPEDREAM_PROJECT_ID`/`CLIENT_ID`/`CLIENT_SECRET`/
+  `ENVIRONMENT`) — stored Settings values still win — so end users never see or enter them.
+
 ### 3. macOS permissions (required before capture records anything)
 
 Grant these to the app that runs the command (your Terminal/iTerm, or the launcher):
@@ -161,14 +179,14 @@ cat captures/event_log.json
 ### 6. Anywhere smoke test (no key, no Mac, no cost)
 
 ```bash
-# full automated suite (301 tests)
+# full automated suite (321 tests)
 python -m unittest discover -s trace/tests -t . -p "test_*.py"
 
 # preview the chunked prompt on the bundled sample (no model call)
 python -m trace.reconstruct.cli trace/samples/sample_raw_events.jsonl --dry-run --chunk-size 8 --overlap 2
 ```
 
-Expect `Ran 301 tests … OK`, and a printed system prompt + 3 rendered chunks.
+Expect `Ran 321 tests … OK`, and a printed system prompt + 3 rendered chunks.
 
 **Useful flags:**
 - UI: `python -m trace.ui.app --port 8765 --collector-port 8137 --sessions-root captures/sessions --no-open`
@@ -372,7 +390,7 @@ first chunk — capture and `--dry-run` are unaffected.
 python -m unittest discover -s trace/tests -t . -p "test_*.py"
 ```
 
-The suite (301 tests) covers the capture/reconstruct/discovery spine — redaction,
+The suite (321 tests) covers the capture/reconstruct/discovery spine — redaction,
 keystroke coalescing, the raw writer, chunking, schema validation/normalization,
 fragment-stitch flagging, boundary de-duplication, contiguous-entry coalescing,
 document-open detection, the browser-capture collector path, the full reconstruction

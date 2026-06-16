@@ -179,5 +179,48 @@ class IsolationTest(_AuthHTTPBase):
         self.assertEqual(self.state._external_user_id(plain), f"trace-{plain}")
 
 
+class EndUserUITest(_AuthHTTPBase):
+    """WS2 — the end-user UI is served separately at /app, carries the Direction H
+    tokens, leaks no platform credentials/IDs/paths, and uses the scoped API."""
+
+    def asset(self, path):
+        url = f"http://127.0.0.1:{self.port}{path}"
+        r = urllib.request.urlopen(url)
+        return r.status, r.read().decode("utf-8")
+
+    def test_served_separately_with_direction_h(self):
+        code, html = self.asset("/app")
+        self.assertEqual(code, 200)
+        self.assertIn('id="root"', html)
+        self.assertIn("/app/app.js", html)
+        code, css = self.asset("/app/app.css")
+        self.assertIn("#F26A1B", css)               # accent token
+        self.assertIn("Hanken Grotesk", css)         # heading font
+        self.assertIn("#1A1A1A", css)                # primary CTA ink
+        # the founder Test UI is still at / and unchanged
+        code, root_html = self.asset("/")
+        self.assertEqual(code, 200)
+        self.assertIn("Engine 1 Test Harness", root_html)
+
+    def test_spa_fallback_for_unknown_subpath(self):
+        code, html = self.asset("/app/anything/here")
+        self.assertEqual(code, 200)
+        self.assertIn('id="root"', html)             # falls back to the SPA shell
+
+    def test_no_credentials_or_jargon_in_assets(self):
+        blob = "".join(self.asset(p)[1] for p in ("/app", "/app/app.css", "/app/app.js"))
+        low = blob.lower()
+        for forbidden in ("sk-ant", "client_secret", "pipedream_client", "test harness",
+                          "test mode", "external_user_id"):
+            self.assertNotIn(forbidden, low)
+
+    def test_scoped_api_responses_carry_no_secrets(self):
+        cookie, _ = self.signup("a@x.com", "longenough1")
+        for path in ("/api/u/me", "/api/u/sessions"):
+            _, data, _ = self.req("GET", path, cookie=cookie)
+            self.assertNotIn("sk-ant", json.dumps(data))
+            self.assertNotIn("client_secret", json.dumps(data))
+
+
 if __name__ == "__main__":
     unittest.main()
