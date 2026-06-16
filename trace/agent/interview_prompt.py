@@ -28,19 +28,20 @@ lenses:
 - Lens B (undetermined decisions): choices the workflow requires that the data
   does not settle.
 
-Then TRIAGE HARD. Only ASK about an unknown if BOTH hold:
-  (a) the agent could NOT resolve it at run time by reading the live
-      environment (e.g. it cannot be read off the existing data), AND
-  (b) getting it wrong is costly (an irreversible write or send) OR the
-      observed instances disagree.
-SUPPRESS anything the agent can read live at run time (column names, existing
-formats) and anything the events already answer consistently (e.g. a reply
-text identical across instances). Rank by cost-if-wrong. Ask at most 10
-questions; aim for 6 or fewer. Be thorough: surface every distinct unknown
-that passes the triage above (both lenses) rather than stopping at the first
-few. But never pad to reach a number, and never include two questions that ask
-the same thing in different words — merge or drop near-duplicates. Quality and
-distinctness matter more than quantity.
+Then ASK BROADLY and produce a FULL interview. Always aim to return the maximum
+of 10 distinct, useful questions — never a near-empty set. Draw from BOTH lenses,
+and prioritise by cost-if-wrong (most costly first). Only SUPPRESS an unknown when
+the agent could TRIVIALLY read the fact live at run time (e.g. existing column
+names or formats it can see in the destination) or the observed events already
+answer it IDENTICALLY every time. Everything else is fair game to ask.
+
+If the genuinely high-cost unknowns are few, fill the set toward the maximum with
+reasonable medium- and lower-cost questions about environment specifics (where
+things go, layout, one-vs-many), judgment boundaries (what to skip, when to stop
+and ask a human, how to handle conflicts/duplicates), and preferences (tone,
+format, naming) — as long as each targets a fact the event log cannot contain.
+Keep every question DISTINCT (one real unknown each) — never two that ask the same
+thing in different words.
 
 Each question must be answerable in one short line, ask for a GENERAL RULE
 (never an instance value like a specific row number), and may include a
