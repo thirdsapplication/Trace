@@ -44,7 +44,7 @@ from ..agent import interview as agent_interview
 from ..agent import connect as agent_connect
 from ..agent import config as agent_config
 from ..agent import deploy as agent_deploy
-from . import keystore, permissions, sessions
+from . import keystore, permissions, sessions, users
 
 
 def _write_json(path, obj):
@@ -74,10 +74,24 @@ def _interview_record(bid, questions, answers):
     return {"bundle_id": bid, "questions": questions, "answers": answers,
             "unresolved": unresolved, "status": status}
 
-STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
+STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")          # founder Test UI
+APP_STATIC_DIR = os.path.join(os.path.dirname(__file__), "app_static")  # end-user UI (WS2)
 DISCOVERY_FIXTURES_DIR = os.path.join(
     os.path.dirname(os.path.dirname(__file__)), "discovery", "fixtures")
 SHORT_RECORDING_THRESHOLD = 5  # events; below this, warn before a paid run
+
+# Pipeline POST actions the end-user surface may drive (WS3 allow-list; reuses the exact
+# same handler methods as the Test UI — no forked pipeline logic).
+_USER_SESSION_ACTIONS = frozenset((
+    "dry-run", "reconstruct", "discovery-dry-run", "discover", "reviewed-bundles",
+    "interview", "interview-dry-run", "build", "connection-identity", "deploy",
+    "cleanup-platform"))
+
+
+def _signup_enabled():
+    """Self-registration is on by default; an operator can disable it with
+    TRACE_DISABLE_SIGNUP=1 to run provisioned-only."""
+    return os.environ.get("TRACE_DISABLE_SIGNUP", "").strip().lower() not in ("1", "true", "yes")
 
 
 def _token_stale(expires_at_iso, margin=None):
@@ -492,15 +506,22 @@ class AppState:
                 **(result or {})}
 
     # --- Phase 4: connection layer (Pipedream Connect + MA vault) ---------
+    def _external_user_id(self, sid):
+        """The Pipedream/vault isolation key for a session. End-user sessions share one
+        per-customer id (``trace-user-<id>`` -> one vault per user, WS3); the founder's
+        Test UI keeps a per-session id (unchanged)."""
+        owner = (sessions.read_meta(self.sessions_root, sid) or {}).get("owner_user_id")
+        return users.external_user_id(owner) if owner else f"trace-{sid}"
+
     def _load_connection(self, sid):
-        """Load the per-session connection record, or seed one with a per-session
+        """Load the per-session connection record, or seed one with the session's
         external_user_id and the current app union."""
         root = self.sessions_root
         rec = sessions.read_json_artifact(root, sid, sessions.CONNECTION)
         approved, event_log = self._approved_for_stage4(sid)
         union, unmapped = agent_connect.app_union(approved, event_log)
         if rec is None:
-            rec = agent_connect.new_record(f"trace-{sid}", union)
+            rec = agent_connect.new_record(self._external_user_id(sid), union)
         rec = agent_connect.merge_union(rec, union, unmapped)
         return rec, union
 
@@ -704,6 +725,138 @@ def make_handler(state):
             except json.JSONDecodeError:
                 return {}
 
+        # --- auth (WS3): cookie <-> end-user; the Test UI never uses any of this ---
+        def _cookie(self, name):
+            for part in (self.headers.get("Cookie", "") or "").split(";"):
+                k, _, v = part.strip().partition("=")
+                if k == name:
+                    return v
+            return None
+
+        def _current_user(self):
+            uid = users.session_user(self._cookie(users.COOKIE_NAME))
+            return users.get(uid) if uid else None
+
+        def _json_auth(self, code, body, set_token=None, clear=False):
+            """JSON response that may set/clear the httpOnly auth cookie. (Secure flag
+            omitted for local http; add it behind TLS in production.)"""
+            data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            if set_token is not None:
+                self.send_header("Set-Cookie",
+                                 f"{users.COOKIE_NAME}={set_token}; Path=/; HttpOnly; SameSite=Lax")
+            if clear:
+                self.send_header("Set-Cookie",
+                                 f"{users.COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0")
+            self.end_headers()
+            self.wfile.write(data)
+
+        def _auth_signup(self, body):
+            if not _signup_enabled():
+                return self._json(403, {"error": "signup_disabled"})
+            try:
+                u = users.create_user((body or {}).get("email"), (body or {}).get("password"))
+            except ValueError as e:
+                return self._json(400, {"error": str(e)})
+            return self._json_auth(200, {"user": u}, set_token=users.start_session(u["user_id"]))
+
+        def _auth_login(self, body):
+            u = users.verify((body or {}).get("email"), (body or {}).get("password"))
+            if not u:
+                return self._json(401, {"error": "invalid_credentials"})
+            return self._json_auth(200, {"user": u}, set_token=users.start_session(u["user_id"]))
+
+        def _auth_logout(self):
+            users.end_session(self._cookie(users.COOKIE_NAME))
+            return self._json_auth(200, {"ok": True}, clear=True)
+
+        def _owns(self, sid, user):
+            return (sessions.read_meta(root, sid) or {}).get("owner_user_id") == user["user_id"]
+
+        # --- end-user namespace (WS3): same pipeline, scoped to the logged-in user ---
+        def _user_get(self, rest, user):
+            if rest in ("/me", ""):
+                return self._json(200, {"user": user, "signup_enabled": _signup_enabled()})
+            if rest == "/sessions":
+                mine = [s for s in sessions.list_sessions(root)
+                        if s.get("owner_user_id") == user["user_id"]]
+                return self._json(200, {"sessions": mine})
+            if rest == "/fixtures":                          # demo entry without mac capture
+                return self._json(200, {"fixtures": [
+                    {"name": f["name"]} for f in list_fixtures()]})
+            if rest == "/preflight":
+                return self._json(200, _preflight(state))
+            m = re.match(r"^/sessions/([^/]+)(/.*)?$", rest)
+            if m:
+                if not self._owns(m.group(1), user):
+                    return self._json(404, {"error": "not_found"})
+                return self._session_get(m.group(1), m.group(2) or "")
+            return self._json(404, {"error": "not_found"})
+
+        def _user_post(self, rest, body, user):
+            uid = user["user_id"]
+            if rest == "/capture/start":
+                return self._capture_start(owner=uid)
+            if rest == "/capture/stop":
+                return self._capture_stop()
+            if rest in ("/capture/pause", "/capture/resume"):
+                return self._capture_ctl(rest.rsplit("/", 1)[1])
+            if rest == "/load-fixture":
+                return self._load_fixture(body, owner=uid)
+            m = re.match(r"^/sessions/([^/]+)/(.+)$", rest)
+            if m:
+                sid, sub = m.group(1), m.group(2)
+                if not self._owns(sid, user):
+                    return self._json(404, {"error": "not_found"})
+                mi = re.match(r"^interview/([^/]+)$", sub)
+                if mi:
+                    return self._save_interview(sid, mi.group(1), body)
+                mcb = re.match(r"^connect/([^/]+)/callback$", sub)
+                if mcb:
+                    return self._connect_callback(sid, mcb.group(1))
+                mc = re.match(r"^connect/([^/]+)$", sub)
+                if mc:
+                    return self._connect_start(sid, mc.group(1))
+                mdr = re.match(r"^deploy/([^/]+)/(approve|reject)$", sub)
+                if mdr:
+                    return self._deploy_resolve(sid, mdr.group(1), mdr.group(2), body)
+                if sub in _USER_SESSION_ACTIONS:
+                    return self._session_post(sid, sub, body)
+            return self._json(404, {"error": "not_found"})
+
+        def _session_post(self, sid, action, body):
+            """Dispatch one session-scoped pipeline action — shared by the Test UI and the
+            scoped end-user namespace (identical pipeline logic, no fork)."""
+            if action == "dry-run":
+                return self._dry_run(sid, body)
+            if action == "reconstruct":
+                return self._reconstruct(sid, body)
+            if action == "discovery-dry-run":
+                return self._discovery_dry_run(sid)
+            if action == "discover":
+                return self._discover(sid)
+            if action == "score":
+                return self._score(sid, body)
+            if action == "reviewed-bundles":
+                return self._save_reviewed(sid, body)
+            if action == "generate-specs":
+                return self._generate_specs(sid)
+            if action == "specs-dry-run":
+                return self._specs_dry_run(sid)
+            if action == "interview":
+                return self._interview(sid, body)
+            if action == "interview-dry-run":
+                return self._interview_dry_run(sid)
+            if action == "cleanup-platform":
+                return self._cleanup_platform(sid)
+            if action == "connection-identity":
+                return self._set_identity(sid, body)
+            if action == "deploy":
+                return self._deploy(sid, body)
+            return self._build(sid, body)
+
         # --- routing ---
         def do_GET(self):
             p = self.path.split("?", 1)[0]
@@ -711,6 +864,18 @@ def make_handler(state):
                 return self._serve_static("index.html")
             if p.startswith("/static/"):
                 return self._serve_static(p[len("/static/"):])
+            if p == "/app" or p == "/app/":                 # end-user UI (WS2)
+                return self._serve_app("index.html")
+            if p.startswith("/app/"):
+                return self._serve_app(p[len("/app/"):])
+            if p == "/api/auth/me":                         # WS3
+                return self._json(200, {"user": self._current_user(),
+                                        "signup_enabled": _signup_enabled()})
+            if p == "/api/u" or p.startswith("/api/u/"):    # scoped end-user API
+                u = self._current_user()
+                if not u:
+                    return self._json(401, {"error": "auth_required"})
+                return self._user_get(p[len("/api/u"):], u)
             if p == "/api/status":
                 return self._status()
             if p == "/api/settings":
@@ -736,6 +901,17 @@ def make_handler(state):
         def do_POST(self):
             p = self.path.split("?", 1)[0]
             body = self._body()
+            if p == "/api/auth/signup":                     # WS3
+                return self._auth_signup(body)
+            if p == "/api/auth/login":
+                return self._auth_login(body)
+            if p == "/api/auth/logout":
+                return self._auth_logout()
+            if p == "/api/u" or p.startswith("/api/u/"):    # scoped end-user API
+                u = self._current_user()
+                if not u:
+                    return self._json(401, {"error": "auth_required"})
+                return self._user_post(p[len("/api/u"):], body, u)
             # save one bundle's interview answers
             mi = re.match(r"^/api/sessions/([^/]+)/interview/([^/]+)$", p)
             if mi:
@@ -771,34 +947,7 @@ def make_handler(state):
                          r"interview-dry-run|build|connection-identity|deploy|"
                          r"cleanup-platform)$", p)
             if m:
-                sid, action = m.group(1), m.group(2)
-                if action == "dry-run":
-                    return self._dry_run(sid, body)
-                if action == "reconstruct":
-                    return self._reconstruct(sid, body)
-                if action == "discovery-dry-run":
-                    return self._discovery_dry_run(sid)
-                if action == "discover":
-                    return self._discover(sid)
-                if action == "score":
-                    return self._score(sid, body)
-                if action == "reviewed-bundles":
-                    return self._save_reviewed(sid, body)
-                if action == "generate-specs":
-                    return self._generate_specs(sid)
-                if action == "specs-dry-run":
-                    return self._specs_dry_run(sid)
-                if action == "interview":
-                    return self._interview(sid, body)
-                if action == "interview-dry-run":
-                    return self._interview_dry_run(sid)
-                if action == "cleanup-platform":
-                    return self._cleanup_platform(sid)
-                if action == "connection-identity":
-                    return self._set_identity(sid, body)
-                if action == "deploy":
-                    return self._deploy(sid, body)
-                return self._build(sid, body)
+                return self._session_post(m.group(1), m.group(2), body)
             return self._json(404, {"error": "not_found"})
 
         def do_DELETE(self):
@@ -820,6 +969,19 @@ def make_handler(state):
             rel = rel.lstrip("/")
             full = os.path.normpath(os.path.join(STATIC_DIR, rel))
             if not full.startswith(STATIC_DIR) or not os.path.isfile(full):
+                return self._json(404, {"error": "not_found"})
+            ext = os.path.splitext(full)[1]
+            with open(full, "rb") as f:
+                self._text(200, f.read(), _CONTENT_TYPES.get(ext, "application/octet-stream"))
+
+        def _serve_app(self, rel):
+            """Serve the end-user UI (WS2) from app_static/. Unknown sub-paths fall back to
+            index.html so the single-page app can own its own routing."""
+            rel = (rel or "").lstrip("/") or "index.html"
+            full = os.path.normpath(os.path.join(APP_STATIC_DIR, rel))
+            if not full.startswith(APP_STATIC_DIR) or not os.path.isfile(full):
+                full = os.path.join(APP_STATIC_DIR, "index.html")
+            if not os.path.isfile(full):
                 return self._json(404, {"error": "not_found"})
             ext = os.path.splitext(full)[1]
             with open(full, "rb") as f:
@@ -858,12 +1020,14 @@ def make_handler(state):
                     s = {"running": False, "state": "idle", "session_id": None}
             return self._json(200, s)
 
-        def _capture_start(self):
+        def _capture_start(self, owner=None):
             with state.lock:
                 if state.controller and state.controller.running:
                     return self._json(409, {"error": "already_running",
                                             "session_id": state.current_sid})
                 sid = sessions.create_session(root)
+                if owner:                                   # WS3: tag the owning end-user
+                    sessions.update_meta(root, sid, owner_user_id=owner)
                 out = sessions.path(root, sid, sessions.RAW)
                 controller = state.controller_factory(out)
                 try:
@@ -1012,12 +1176,14 @@ def make_handler(state):
             return self._json(202, {"state": "running", "session_id": sid})
 
         # --- discovery (Stage 2) ---
-        def _load_fixture(self, body):
+        def _load_fixture(self, body, owner=None):
             name = (body or {}).get("name", "")
             fx = next((f for f in list_fixtures() if f["name"] == name), None)
             if not fx:
                 return self._json(404, {"error": "unknown_fixture"})
             sid = sessions.create_session(root, label=f"fixture:{name}")
+            if owner:                                       # WS3: tag the owning end-user
+                sessions.update_meta(root, sid, owner_user_id=owner)
             with open(fx["event_log"], "r", encoding="utf-8") as src, \
                     open(sessions.path(root, sid, sessions.EVENT_LOG), "w", encoding="utf-8") as dst:
                 dst.write(src.read())
