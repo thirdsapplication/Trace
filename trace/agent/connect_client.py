@@ -23,6 +23,7 @@ Phase 4 runs offline against a stub (see ``trace/tests/test_connect.py``).
 import json
 import ssl
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -46,6 +47,33 @@ def _ssl_context():
 
 
 _SSL_CONTEXT = _ssl_context()
+
+
+def _urlopen(req):
+    """``urlopen`` (certifi TLS) that surfaces the server's error BODY on failure.
+
+    A ``urllib.error.HTTPError`` stringifies to just ``"HTTP Error 400: Bad Request"``,
+    discarding the response body — which is exactly where Pipedream explains *why* a
+    request was rejected (a missing/invalid field, etc.). Catch it, read the body, and
+    re-raise a ``RuntimeError`` carrying status + method + URL + body, so the real
+    cause shows up in the connect job error and logs instead of a generic 400. On
+    success returns the raw response bytes."""
+    try:
+        with urllib.request.urlopen(req, timeout=config.REQUEST_TIMEOUT,
+                                    context=_SSL_CONTEXT) as resp:
+            return resp.read()
+    except urllib.error.HTTPError as e:
+        try:
+            body = (e.read() or b"").decode("utf-8", "replace").strip()[:2000]
+        except Exception:
+            body = "<unreadable response body>"
+        err = RuntimeError(
+            f"Pipedream {e.code} {e.reason} on {req.get_method()} {req.full_url}: "
+            f"{body or '<empty body>'}")
+        # Preserve the status so _retry's _is_retryable still backs off on transient
+        # 5xx/429 (which otherwise wouldn't match by text alone).
+        err.status = e.code
+        raise err from e
 
 
 def _with_app(url, app):
@@ -132,9 +160,7 @@ class ConnectClient:
                            "client_secret": self._client_secret}).encode("utf-8")
         req = urllib.request.Request(url, data=body, method="POST",
                                      headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=config.REQUEST_TIMEOUT,
-                                    context=_SSL_CONTEXT) as resp:
-            out = json.loads(resp.read() or b"{}")
+        out = json.loads(_urlopen(req) or b"{}")
         return {"access_token": out.get("access_token"),
                 "expires_in": out.get("expires_in") or 3600}
 
@@ -159,9 +185,7 @@ class ConnectClient:
             "Authorization": f"Bearer {self._access_token()}",
             "x-pd-environment": self._environment,
         })
-        with urllib.request.urlopen(req, timeout=config.REQUEST_TIMEOUT,
-                                    context=_SSL_CONTEXT) as resp:
-            raw = resp.read()
+        raw = _urlopen(req)
         return json.loads(raw) if raw else {}
 
     def create_connect_token(self, external_user_id, app):
