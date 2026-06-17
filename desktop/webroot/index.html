@@ -1,0 +1,28 @@
+<!doctype html>
+<!-- Placeholder shown while the local node starts. The Rust shell navigates the
+     window to http://127.0.0.1:<port>/app (the real end-user UI) once the node
+     answers. Kept dependency-free and self-contained. -->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Trace</title>
+    <style>
+      html, body { height: 100%; margin: 0; }
+      body {
+        display: flex; align-items: center; justify-content: center;
+        font: 15px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        color: #111; background: #fafafa;
+      }
+      .box { text-align: center; }
+      .dot { font-size: 22px; letter-spacing: 2px; }
+      .muted { color: #888; margin-top: 8px; }
+    </style>
+  </head>
+  <body>
+    <div class="box">
+      <div class="dot">● Trace</div>
+      <div class="muted">Starting…</div>
+    </div>
+  </body>
+</html>

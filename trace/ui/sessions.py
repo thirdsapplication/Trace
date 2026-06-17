@@ -59,6 +59,39 @@ def create_session(root, label=None):
     return sid
 
 
+def _unique_session_id(root):
+    """A session id whose directory does not yet exist. The base id is a
+    second-resolution timestamp, which can collide when several users upload in
+    the same second against the shared cloud sessions root; append a short random
+    suffix until the directory is free so distinct uploads never share a dir."""
+    import secrets
+    sid = new_session_id()
+    while os.path.exists(session_dir(root, sid)):
+        sid = f"{new_session_id()}-{secrets.token_hex(3)}"
+    return sid
+
+
+def create_upload_session(root, owner_user_id, raw_text):
+    """Phase 2: materialize a session from raw events uploaded by a desktop client.
+
+    Creates a fresh, collision-free session owned by ``owner_user_id``, writes the
+    uploaded ``raw_events.jsonl`` text verbatim, and records the event count — so
+    the existing pipeline (reconstruct/discover) reads it from the cloud's own
+    filesystem exactly as it would a locally-captured session. Returns
+    ``(sid, raw_event_count)``. Workflow-agnostic: the body is opaque event lines.
+    """
+    sid = _unique_session_id(root)
+    os.makedirs(session_dir(root, sid), exist_ok=True)
+    write_meta(root, sid, {"id": sid, "label": None, "created_at": _now(),
+                           "stopped_at": _now(), "reconstructed_at": None,
+                           "owner_user_id": owner_user_id})
+    with open(path(root, sid, RAW), "w", encoding="utf-8") as f:
+        f.write(raw_text or "")
+    count = artifacts(root, sid)["raw_event_count"]
+    update_meta(root, sid, raw_event_count=count)
+    return sid, count
+
+
 def read_meta(root, sid):
     try:
         with open(path(root, sid, META), "r", encoding="utf-8") as f:

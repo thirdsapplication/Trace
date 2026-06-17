@@ -17,3 +17,12 @@ venv/
 # Secrets
 .env
 !.env.example
+
+# Desktop app build artifacts (Phase 2) — never commit binaries or build output.
+build/
+dist/
+src-tauri/target/
+src-tauri/binaries/
+src-tauri/icons/
+src-tauri/gen/
+node_modules/

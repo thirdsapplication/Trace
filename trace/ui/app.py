@@ -44,7 +44,7 @@ from ..agent import interview as agent_interview
 from ..agent import connect as agent_connect
 from ..agent import config as agent_config
 from ..agent import deploy as agent_deploy
-from . import db, keystore, permissions, sessions, users
+from . import cloud, db, keystore, permissions, sessions, users
 
 
 def _write_json(path, obj):
@@ -154,9 +154,18 @@ class AppState:
                  reconstruct_fn=None, controller_factory=None, key_store=None,
                  discovery_fn=None, score_fn=None, artifact_fn=None,
                  interview_fn=None, config_fn=None, cleanup_fn=None,
-                 connect_fn=None, deploy_fn=None):
+                 connect_fn=None, deploy_fn=None, cloud_backend=None, proxy_fn=None):
         self.sessions_root = sessions_root
         self.collector_port = collector_port
+        # Phase 2 (desktop app): when a cloud backend URL is configured, this
+        # process is the local "desktop node" — it runs capture locally and
+        # proxies auth + pipeline to the cloud. Unset (env or arg) → today's exact
+        # behavior (local dev, and the cloud deployment itself). Switched only by
+        # configuration, so dual-run stays first-class.
+        self.cloud_backend = (
+            cloud_backend or os.environ.get("TRACE_CLOUD_BACKEND") or "").strip().rstrip("/") or None
+        self.proxy_fn = proxy_fn or cloud.http_proxy   # injectable for tests
+        self.local_to_cloud_sid = {}                   # desktop: local capture sid -> cloud sid
         self.reconstruct_fn = reconstruct_fn or _real_reconstruct
         self.discovery_fn = discovery_fn or _real_discover
         self.score_fn = score_fn or discovery_scorer.score
@@ -737,6 +746,79 @@ def make_handler(state):
             uid = users.session_user(self._cookie(users.COOKIE_NAME))
             return users.get(uid) if uid else None
 
+        # --- desktop mode (Phase 2): proxy everything to the cloud except the few
+        # things that must run on this machine (capture + the local-machine probes) ---
+        def _is_local_desktop_path(self, p):
+            """Paths the desktop node MUST serve itself (never proxy): capture control
+            (capture watches THIS machine) and the local-machine probes. Everything
+            else — UI assets, auth, all pipeline actions — is proxied to the cloud."""
+            if p == "/health" or p in ("/api/status", "/api/permissions"):
+                return True
+            return p.startswith("/api/u/capture/") or p.startswith("/api/capture/")
+
+        def _should_proxy(self, p):
+            return bool(state.cloud_backend) and not self._is_local_desktop_path(p)
+
+        def _proxy(self):
+            """Relay the current request to the cloud backend, forwarding the auth
+            cookie up and the cloud's status/body/Set-Cookie back down. One localhost
+            origin in, one cloud origin out — so the UI never sees cross-origin."""
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            body = self.rfile.read(length) if length else None
+            fwd = {}
+            for h in ("Cookie", "Content-Type", "Accept"):
+                if self.headers.get(h):
+                    fwd[h] = self.headers.get(h)
+            try:
+                status, headers, data = state.proxy_fn(
+                    state.cloud_backend, self.command, self.path, fwd, body)
+            except Exception as e:                      # cloud unreachable / DNS / TLS
+                return self._json(502, {"error": "cloud_unreachable", "detail": str(e)})
+            self.send_response(status)
+            for k, v in headers:                        # Content-Type + Set-Cookie preserved
+                self.send_header(k, v)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def _upload_raw_to_cloud(self, local_sid):
+            """Desktop: POST the just-captured raw_events.jsonl to the cloud, which
+            creates a cloud-owned session from it. Returns the cloud session id (or
+            None on failure). Forwards the auth cookie so the cloud scopes ownership
+            to the logged-in user. JSONL is wrapped in JSON so the existing body
+            parsing on the cloud side handles it."""
+            raw_path = sessions.path(root, local_sid, sessions.RAW)
+            try:
+                with open(raw_path, "r", encoding="utf-8") as f:
+                    raw_text = f.read()
+            except FileNotFoundError:
+                raw_text = ""
+            payload = json.dumps({"raw": raw_text}).encode("utf-8")
+            fwd = {"Content-Type": "application/json"}
+            if self.headers.get("Cookie"):
+                fwd["Cookie"] = self.headers.get("Cookie")
+            status, _headers, data = state.proxy_fn(
+                state.cloud_backend, "POST", "/api/u/sessions/raw-upload", fwd, payload)
+            if status != 200:
+                return None
+            try:
+                cloud_sid = json.loads(data).get("session_id")
+            except (json.JSONDecodeError, AttributeError):
+                return None
+            if cloud_sid:
+                state.local_to_cloud_sid[local_sid] = cloud_sid
+            return cloud_sid
+
+        def _raw_upload(self, user, body):
+            """Cloud side: materialize a session from raw events uploaded by a desktop
+            client, owned by the authenticated user. The pipeline then runs against it
+            unchanged. Reached via the proxied POST /api/u/sessions/raw-upload."""
+            raw_text = (body or {}).get("raw")
+            if raw_text is None:
+                return self._json(400, {"error": "missing_raw"})
+            sid, count = sessions.create_upload_session(root, user["user_id"], raw_text)
+            return self._json(200, {"session_id": sid, "raw_event_count": count})
+
         def _json_auth(self, code, body, set_token=None, clear=False):
             """JSON response that may set/clear the httpOnly auth cookie. (Secure flag
             omitted for local http; add it behind TLS in production.)"""
@@ -803,6 +885,8 @@ def make_handler(state):
                 return self._capture_stop()
             if rest in ("/capture/pause", "/capture/resume"):
                 return self._capture_ctl(rest.rsplit("/", 1)[1])
+            if rest == "/sessions/raw-upload":           # Phase 2: desktop capture upload
+                return self._raw_upload(user, body)
             if rest == "/load-fixture":
                 return self._load_fixture(body, owner=uid)
             m = re.match(r"^/sessions/([^/]+)/(.+)$", rest)
@@ -860,6 +944,8 @@ def make_handler(state):
         # --- routing ---
         def do_GET(self):
             p = self.path.split("?", 1)[0]
+            if self._should_proxy(p):                       # Phase 2: desktop → cloud
+                return self._proxy()
             if p == "/health":                              # Phase 1: liveness probe
                 # Dependency-free on purpose: Render's health check and the
                 # human's first smoke test must pass even before keys/DB are set.
@@ -906,6 +992,21 @@ def make_handler(state):
 
         def do_POST(self):
             p = self.path.split("?", 1)[0]
+            if self._should_proxy(p):                       # Phase 2: desktop → cloud
+                return self._proxy()
+            # Desktop mode: capture control runs locally and identity lives in the
+            # cloud, so handle these before the /api/u/ local-auth gate (no local
+            # user store here). Ownership of the resulting session is established
+            # cloud-side at upload time.
+            if state.cloud_backend:
+                if p in ("/api/u/capture/start", "/api/capture/start"):
+                    return self._capture_start(owner=None)
+                if p in ("/api/u/capture/stop", "/api/capture/stop"):
+                    return self._capture_stop()
+                if p in ("/api/u/capture/pause", "/api/capture/pause"):
+                    return self._capture_ctl("pause")
+                if p in ("/api/u/capture/resume", "/api/capture/resume"):
+                    return self._capture_ctl("resume")
             body = self._body()
             if p == "/api/auth/signup":                     # WS3
                 return self._auth_signup(body)
@@ -1063,6 +1164,19 @@ def make_handler(state):
                                      capture_warning=health["message"])
                 state.controller = None
                 state.current_sid = None
+            # Desktop mode: the pipeline lives in the cloud, so push the captured
+            # stream up and hand the UI back the CLOUD session id — its subsequent
+            # (proxied) reconstruct/discover then target the cloud session.
+            if state.cloud_backend:
+                cloud_sid = self._upload_raw_to_cloud(sid)
+                if not cloud_sid:
+                    return self._json(502, {"error": "upload_failed",
+                                            "local_session_id": sid,
+                                            "raw_event_count": count})
+                return self._json(200, {"session_id": cloud_sid,
+                                        "local_session_id": sid,
+                                        "raw_event_count": count,
+                                        "capture_health": health})
             return self._json(200, {"session_id": sid, "raw_event_count": count,
                                     "capture_health": health})
 
@@ -1495,11 +1609,12 @@ def _preflight(state):
 
 
 def build_server(host="127.0.0.1", port=8765, sessions_root="captures/sessions",
-                 collector_port=8137, state=None):
+                 collector_port=8137, state=None, cloud_backend=None):
     # Phase 1: ensure the Postgres schema when a database is configured
     # (DATABASE_URL set); a no-op on a local run so boot stays the same path.
     db.init_db()
-    state = state or AppState(sessions_root, collector_port=collector_port)
+    state = state or AppState(sessions_root, collector_port=collector_port,
+                              cloud_backend=cloud_backend)
     httpd = ThreadingHTTPServer((host, port), make_handler(state))
     return httpd, state
 
@@ -1514,16 +1629,22 @@ def main():
     ap.add_argument("--sessions-root",
                     default=os.environ.get("TRACE_SESSIONS_ROOT", "captures/sessions"))
     ap.add_argument("--collector-port", type=int, default=8137)
+    # Phase 2: when set, this process is the desktop node — capture local, pipeline
+    # proxied to this cloud URL. Unset → unchanged local/cloud behavior.
+    ap.add_argument("--cloud-backend", default=os.environ.get("TRACE_CLOUD_BACKEND"))
     ap.add_argument("--no-open", action="store_true", help="don't auto-open the browser")
     args = ap.parse_args()
 
     httpd, _ = build_server(host=args.host, port=args.port,
                             sessions_root=args.sessions_root,
-                            collector_port=args.collector_port)
+                            collector_port=args.collector_port,
+                            cloud_backend=args.cloud_backend)
     url = f"http://{args.host}:{args.port}/"
     print(f"Trace test UI: {url}")
     print(f"  sessions  -> {os.path.abspath(args.sessions_root)}")
     print(f"  collector -> 127.0.0.1:{args.collector_port} (browser extension target)")
+    if args.cloud_backend:
+        print(f"  desktop mode -> proxying auth + pipeline to {args.cloud_backend}")
     print("Ctrl-C to stop.")
     # Only pop a browser for a genuine local bind; in the cloud (0.0.0.0 / a
     # non-loopback host) there is no display and the URL isn't reachable here.
