@@ -717,11 +717,16 @@ def make_handler(state):
             self.end_headers()
             self.wfile.write(data)
 
-        def _text(self, code, body, ctype):
+        def _text(self, code, body, ctype, no_cache=False):
             data = body if isinstance(body, bytes) else body.encode("utf-8")
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(data)))
+            # The desktop app proxies the UI from the cloud so it auto-updates on
+            # deploy; tell the webview never to cache UI assets, or it serves a
+            # stale app.js after a redeploy and the new screen never appears.
+            if no_cache:
+                self.send_header("Cache-Control", "no-store, must-revalidate")
             self.end_headers()
             self.wfile.write(data)
 
@@ -1079,7 +1084,8 @@ def make_handler(state):
                 return self._json(404, {"error": "not_found"})
             ext = os.path.splitext(full)[1]
             with open(full, "rb") as f:
-                self._text(200, f.read(), _CONTENT_TYPES.get(ext, "application/octet-stream"))
+                self._text(200, f.read(), _CONTENT_TYPES.get(ext, "application/octet-stream"),
+                           no_cache=True)
 
         def _serve_app(self, rel):
             """Serve the end-user UI (WS2) from app_static/. Unknown sub-paths fall back to
@@ -1092,7 +1098,8 @@ def make_handler(state):
                 return self._json(404, {"error": "not_found"})
             ext = os.path.splitext(full)[1]
             with open(full, "rb") as f:
-                self._text(200, f.read(), _CONTENT_TYPES.get(ext, "application/octet-stream"))
+                self._text(200, f.read(), _CONTENT_TYPES.get(ext, "application/octet-stream"),
+                           no_cache=True)
 
         # --- settings ---
         def _save_key(self, body):
