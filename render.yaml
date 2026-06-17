@@ -45,4 +45,4 @@ services:
 
 databases:
   - name: trace-db
-    plan: starter
+    plan: basic-256mb
