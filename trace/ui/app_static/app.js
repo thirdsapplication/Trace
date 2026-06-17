@@ -34,6 +34,22 @@ async function api(method, path, body) {
 const uget = (sid, sub) => api("GET", `/api/u/sessions/${sid}${sub || ""}`);
 const upost = (sid, sub, body) => api("POST", `/api/u/sessions/${sid}${sub}`, body || {});
 
+/* Open an external URL. In a normal browser this is a new tab; inside the Tauri
+   desktop webview window.open() to an external https URL is blocked, so route
+   through the shell's open_external command when present (works after a shell
+   rebuild). Either way the caller also shows a copyable link as a guaranteed
+   fallback, so connecting works even before the shell supports auto-open. */
+function openExternal(url) {
+  try {
+    const t = window.__TAURI__;
+    if (t && t.core && typeof t.core.invoke === "function") {
+      t.core.invoke("open_external", { url }).catch(() => window.open(url, "_blank", "noopener"));
+      return;
+    }
+  } catch (e) { /* fall through to a normal browser open */ }
+  window.open(url, "_blank", "noopener");
+}
+
 function clearTimers() { S._timers.forEach(clearTimeout); S._timers = []; }
 function wait(ms) { return new Promise(res => { const t = setTimeout(res, ms); S._timers.push(t); }); }
 
@@ -426,8 +442,23 @@ async function connectApp(sid, slug) {
     const d = await pollJob(sid, "connect", () => {});
     url = d.connect_url;
   } catch (e) { $("#connMsg").textContent = friendly(e.message); return; }
-  if (url) window.open(url, "_blank", "noopener");
-  $("#connMsg").innerHTML = `Approve <b>${esc(slug)}</b> in the window that opened, then`;
+  if (url) {
+    openExternal(url);
+    $("#connMsg").innerHTML =
+      `Approve <b>${esc(slug)}</b> in your browser, then click verify below.` +
+      `<div class="muted" style="margin-top:6px;font-size:13px;">No window? Copy this link into your browser:</div>` +
+      `<div class="row" style="margin-top:4px;gap:6px;">` +
+        `<input id="connUrl" readonly value="${esc(url)}" style="flex:1;font-size:12px;" onfocus="this.select()">` +
+        `<button id="connCopy" class="btn-secondary btn-sm" type="button">Copy</button>` +
+      `</div>`;
+    const cp = $("#connCopy");
+    if (cp) cp.onclick = () => {
+      const i = $("#connUrl"); i.focus(); i.select();
+      try { document.execCommand("copy"); cp.textContent = "Copied"; } catch (e) { /* user can copy manually */ }
+    };
+  } else {
+    $("#connMsg").textContent = `Could not start sign-in for ${slug}. Please try again.`;
+  }
   $("#connBody").insertAdjacentHTML("beforeend",
     `<button id="connVerify" class="btn-accent full" style="margin-top:10px;">I've approved — verify</button>`);
   $("#connVerify").onclick = async () => {

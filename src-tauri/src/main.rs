@@ -33,6 +33,15 @@ const DEFAULT_CLOUD_BACKEND: &str = "https://trace-backend.onrender.com";
 // Holds the running sidecar so we can kill it on exit.
 struct Sidecar(Mutex<Option<CommandChild>>);
 
+// Open a URL in the user's default system browser. The end-user UI (served from
+// the cloud) calls this via window.__TAURI__.core.invoke("open_external", { url })
+// because window.open() to an external https URL is blocked inside the webview —
+// this is how the Pipedream Connect / Google authorization page gets opened.
+#[tauri::command]
+fn open_external(url: String) -> Result<(), String> {
+    opener::open(&url).map_err(|e| e.to_string())
+}
+
 fn pick_free_port() -> u16 {
     // Bind to :0, read the assigned port, then drop the listener so the sidecar
     // can take it. A momentary race window, but fine for a single local app.
@@ -63,6 +72,7 @@ fn wait_until_ready(port: u16) {
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .invoke_handler(tauri::generate_handler![open_external])
         .manage(Sidecar(Mutex::new(None)))
         .setup(|app| {
             let port = pick_free_port();

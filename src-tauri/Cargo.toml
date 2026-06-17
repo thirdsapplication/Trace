@@ -11,6 +11,9 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-shell = "2"
+# Open external URLs (the Pipedream Connect auth page) in the system browser;
+# window.open() is blocked inside the webview.
+opener = "0.7"
 
 [features]
 # Tauri's default custom-protocol feature for production builds.
