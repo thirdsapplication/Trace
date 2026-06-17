@@ -1,0 +1,48 @@
+# Render blueprint for the Trace cloud backend (Phase 1).
+#
+# "New → Blueprint" in Render reads this file and provisions both the web service
+# (built from the Dockerfile) and a managed Postgres database in roughly one
+# click. Render then prompts for the secret values marked `sync: false` — paste
+# the values from .env.example. DATABASE_URL and SESSION_SECRET are filled in
+# automatically (see below), so do not paste those.
+#
+# Tier note: Starter (paid) is chosen deliberately — a free web service sleeps
+# after ~15 min idle and free Postgres is expired after a set period. Downgrade
+# to free only for a throwaway one-off test.
+
+services:
+  - type: web
+    name: trace-backend
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter
+    healthCheckPath: /health
+    envVars:
+      # Bind all interfaces in the cloud; Render injects $PORT automatically, so
+      # PORT is not declared here. Locally, HOST defaults to 127.0.0.1.
+      - key: HOST
+        value: 0.0.0.0
+      # Secrets — Render prompts for these on deploy; values never live in the repo.
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: PIPEDREAM_PROJECT_ID
+        sync: false
+      - key: PIPEDREAM_CLIENT_ID
+        sync: false
+      - key: PIPEDREAM_CLIENT_SECRET
+        sync: false
+      - key: PIPEDREAM_ENVIRONMENT
+        sync: false
+      # App session secret — Render generates a strong random value (no need to
+      # invent one); Phase 2 uses it to sign restart-surviving sessions.
+      - key: SESSION_SECRET
+        generateValue: true
+      # Postgres connection string — wired automatically from the database below.
+      - key: DATABASE_URL
+        fromDatabase:
+          name: trace-db
+          property: connectionString
+
+databases:
+  - name: trace-db
+    plan: starter

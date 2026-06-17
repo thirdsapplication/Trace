@@ -41,6 +41,12 @@ _SESSIONS = {}
 _SESSION_TTL = 7 * 24 * 3600
 COOKIE_NAME = "trace_auth"
 
+# Phase 1 seam: the cloud backend supplies a stable SESSION_SECRET (env var) so
+# Phase 2 can mint *signed*, restart-surviving sessions instead of the in-process
+# opaque tokens below. Read here now (and listed in .env.example / render.yaml)
+# so the deployment carries it; the signing logic itself lands in Phase 2.
+SESSION_SECRET = (os.environ.get("SESSION_SECRET") or "").strip() or None
+
 
 def _now():
     return datetime.datetime.now().astimezone().isoformat(timespec="seconds")

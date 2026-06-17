@@ -20,6 +20,15 @@ keyring>=24.0 ; sys_platform == "darwin"
 # Stage 4 (Agent Compiler) — emit/validate Managed Agents agent-definition YAML.
 PyYAML>=6.0
 
+# Phase 1 (cloud backend). Both cross-platform, so unconditional:
+# - python-dotenv: load a git-ignored .env on a local run (no-op in the cloud,
+#   where Render supplies the same names as real environment variables).
+# - psycopg (v3): connect to the managed Postgres via DATABASE_URL and create the
+#   users/sessions schema on startup. Imported lazily, so a DB-less local run
+#   never needs it at runtime; pinned here so the container build has it.
+python-dotenv>=1.0
+psycopg[binary]>=3.1
+
 # CA bundle for the stdlib Pipedream Connect HTTPS calls (connect_client.py), so TLS
 # verification doesn't depend on the OS cert store. Also pulled in transitively by anthropic.
 certifi>=2024.0

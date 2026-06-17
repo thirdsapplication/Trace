@@ -44,7 +44,7 @@ from ..agent import interview as agent_interview
 from ..agent import connect as agent_connect
 from ..agent import config as agent_config
 from ..agent import deploy as agent_deploy
-from . import keystore, permissions, sessions, users
+from . import db, keystore, permissions, sessions, users
 
 
 def _write_json(path, obj):
@@ -860,6 +860,12 @@ def make_handler(state):
         # --- routing ---
         def do_GET(self):
             p = self.path.split("?", 1)[0]
+            if p == "/health":                              # Phase 1: liveness probe
+                # Dependency-free on purpose: Render's health check and the
+                # human's first smoke test must pass even before keys/DB are set.
+                return self._json(200, {"status": "ok", "service": "trace-backend",
+                                        "database": "configured" if db.is_configured()
+                                        else "local"})
             if p == "/" or p == "/index.html":
                 return self._serve_static("index.html")
             if p.startswith("/static/"):
@@ -1490,6 +1496,9 @@ def _preflight(state):
 
 def build_server(host="127.0.0.1", port=8765, sessions_root="captures/sessions",
                  collector_port=8137, state=None):
+    # Phase 1: ensure the Postgres schema when a database is configured
+    # (DATABASE_URL set); a no-op on a local run so boot stays the same path.
+    db.init_db()
     state = state or AppState(sessions_root, collector_port=collector_port)
     httpd = ThreadingHTTPServer((host, port), make_handler(state))
     return httpd, state
@@ -1497,20 +1506,28 @@ def build_server(host="127.0.0.1", port=8765, sessions_root="captures/sessions",
 
 def main():
     ap = argparse.ArgumentParser(description="Trace Engine 1 — local test UI")
-    ap.add_argument("--port", type=int, default=8765)
-    ap.add_argument("--sessions-root", default="captures/sessions")
+    # Env wins so the same code runs locally and on Render (which injects $PORT),
+    # switched only by configuration; the CLI flags remain as explicit overrides
+    # and supply the defaults when neither env nor flag is set.
+    ap.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8765")))
+    ap.add_argument("--host", default=os.environ.get("HOST", "127.0.0.1"))
+    ap.add_argument("--sessions-root",
+                    default=os.environ.get("TRACE_SESSIONS_ROOT", "captures/sessions"))
     ap.add_argument("--collector-port", type=int, default=8137)
     ap.add_argument("--no-open", action="store_true", help="don't auto-open the browser")
     args = ap.parse_args()
 
-    httpd, _ = build_server(port=args.port, sessions_root=args.sessions_root,
+    httpd, _ = build_server(host=args.host, port=args.port,
+                            sessions_root=args.sessions_root,
                             collector_port=args.collector_port)
-    url = f"http://127.0.0.1:{args.port}/"
+    url = f"http://{args.host}:{args.port}/"
     print(f"Trace test UI: {url}")
     print(f"  sessions  -> {os.path.abspath(args.sessions_root)}")
     print(f"  collector -> 127.0.0.1:{args.collector_port} (browser extension target)")
     print("Ctrl-C to stop.")
-    if not args.no_open:
+    # Only pop a browser for a genuine local bind; in the cloud (0.0.0.0 / a
+    # non-loopback host) there is no display and the URL isn't reachable here.
+    if not args.no_open and args.host in ("127.0.0.1", "localhost"):
         threading.Timer(0.6, lambda: webbrowser.open(url)).start()
     try:
         httpd.serve_forever()

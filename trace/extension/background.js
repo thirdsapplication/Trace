@@ -16,8 +16,15 @@
 // (which DO survive termination) only to retry events that failed while the
 // collector was briefly down.
 
-const COLLECTOR_URL = "http://127.0.0.1:8137/event";
-const HELLO_URL = "http://127.0.0.1:8137/hello";
+// The collector is the LOCAL half of capture (it watches the local machine), so
+// it stays on localhost even in the hybrid cloud architecture — only the backend
+// *pipeline* moves to the cloud. The base is a single named constant here so a
+// future packaged build (Phase 3) can repoint capture if ever needed; the
+// cloud backend base URL, by contrast, is just the Render origin the served UI
+// is loaded from (the frontend already uses origin-relative fetches).
+const COLLECTOR_BASE = "http://127.0.0.1:8137";
+const COLLECTOR_URL = `${COLLECTOR_BASE}/event`;
+const HELLO_URL = `${COLLECTOR_BASE}/hello`;
 const RETRY_ALARM = "trace_retry";
 const RETRY_PERIOD_MIN = 0.5; // chrome.alarms minimum is ~0.5 min
 
