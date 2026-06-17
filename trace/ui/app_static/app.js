@@ -442,7 +442,7 @@ async function connectApp(sid, slug) {
 async function stepGolive() {
   const sid = S.session.id;
   shell(`<div class="panel"><div class="eyebrow">Step seven</div><h2>${S.session.deploy_at ? "Your agents are working" : "You're all set"}</h2>
-    <p class="lead">Your agents read on their own — but every time they want to send or change something, they ask you first.</p>
+    <p class="lead">Your agents will handle this work on their own from now on, starting on the next matching task.</p>
     <div id="liveBody"><p class="muted">Loading…</p></div></div>`);
   await renderGolive(sid);
 }

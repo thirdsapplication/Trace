@@ -161,7 +161,7 @@ def _envelope(bundle, model_out, system_text):
         # Template only: a single nominal Pipedream server with a base URL (no
         # externalUserId yet — unknown until deploy). The Deployer rewrites mcp_servers
         # + mcp_toolset to the customer's per-app URLs at create time
-        # (config.pipedream_mcp_servers); the approval-required policy is fixed here.
+        # (config.pipedream_mcp_servers); the default permission policy is fixed here.
         "mcp_servers": [{"name": config.PIPEDREAM_MCP_NAME, "type": "url",
                          "url": config.PIPEDREAM_MCP_BASE}],
         "tools": [
@@ -178,7 +178,8 @@ def _envelope(bundle, model_out, system_text):
 
 def validate_config_envelope(env):
     """Structural validation: required fields, the fixed toolset, and the live MCP rules
-    (>=1 Pipedream server, every mcp_toolset approval-required). Raises on a violation."""
+    (>=1 Pipedream server, every mcp_toolset on the configured permission policy). Raises
+    on a violation."""
     for k in ("name", "description", "model", "system", "tools"):
         if not env.get(k):
             raise ValueError(f"config envelope missing required field {k!r}")
@@ -199,7 +200,7 @@ def validate_config_envelope(env):
     for t in mcp_tools:
         pol = (t.get("default_config", {}).get("permission_policy", {}) or {}).get("type")
         if pol != config.LIVE_PERMISSION_POLICY:
-            raise ValueError("live mcp_toolset must be approval-required")
+            raise ValueError("live mcp_toolset must use the configured live permission policy")
     return True
 
 

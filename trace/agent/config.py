@@ -51,8 +51,9 @@ APPROVAL_PERMISSION_POLICY = "require_approval"
 # (api.pipedream.com) — two DIFFERENT services, kept as separate constants on purpose.
 PIPEDREAM_MCP_BASE = "https://remote.mcp.pipedream.net/v3"
 PIPEDREAM_MCP_NAME = "pipedream"        # the mcp_server_name the live toolset references
-# Nested object (NOT a bare string); platform default elsewhere is always_allow.
-LIVE_PERMISSION_POLICY = "always_ask"   # -> permission_policy {"type": "always_ask"}
+# Nested object (NOT a bare string). Default: every live toolset (the agent toolset and
+# the per-app Pipedream MCP toolsets) runs WITHOUT an approval gate.
+LIVE_PERMISSION_POLICY = "always_allow"   # -> permission_policy {"type": "always_allow"}
 
 # --- Phase 4: Connection Layer (Pipedream Connect + Managed Agents vault) ---
 # Trace's single Pipedream project + its client-credentials app, sourced from the

@@ -3,9 +3,10 @@
 Creates and runs the LIVE-variant agent on Claude Managed Agents, connected to the
 worker's real apps through the Phase-4 Pipedream connection: the bound vault is injected
 into the live session (the single injection point, ``create_session(vault_ids=…)``), so
-the agent acts ONLY on its own customer's accounts. The LIVE YAML already pins the
-Pipedream toolset to approval-required, so every outbound write/send is HELD; this module
-surfaces those held actions for one-tap approve/reject. Reads proceed.
+the agent acts ONLY on its own customer's accounts. Live toolsets default to
+``always_allow`` (``config.LIVE_PERMISSION_POLICY``), so the agent acts autonomously; the
+held-action plumbing below (``list_held`` / ``approve`` / ``reject``) stays available for
+any toolset configured ``always_ask`` but does not trigger under the default.
 
 This module imports no platform SDK — every external call goes through the injected
 ``client`` (a ManagedAgentsClient), so the whole flow runs offline against a stub. The
@@ -33,8 +34,9 @@ def finalize_live_envelope(live_envelope_dict, connection_record):
     """Bake the customer's per-app Pipedream MCP servers into the LIVE agent at create
     time (the reference's "one customer, one workflow -> bake the URL"). The config-gen
     template carries one nominal server; here it becomes one server per usable app, each
-    URL carrying this customer's ``externalUserId``, plus the matching approval-required
-    mcp_toolset entries. Returns a NEW dict (the template is not mutated)."""
+    URL carrying this customer's ``externalUserId``, plus the matching mcp_toolset entries
+    (on the default ``always_allow`` policy). Returns a NEW dict (the template is not
+    mutated)."""
     env = copy.deepcopy(live_envelope_dict)
     uid = (connection_record or {}).get("external_user_id")
     slugs = _usable_app_slugs(connection_record)

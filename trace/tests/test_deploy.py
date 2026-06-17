@@ -12,7 +12,7 @@ import time
 import unittest
 import urllib.request
 
-from trace.agent import configgen, deploy
+from trace.agent import config, configgen, deploy
 from trace.tests.test_configgen import _bundle, _load, _stub as _config_stub
 from trace.tests.test_ui_agent import EVENTS, REVIEWED, FakeKeystore, fake_config_fn
 from trace.tests.test_connect import StubConnectClient
@@ -84,10 +84,10 @@ class DeployTest(unittest.TestCase):
         urls = " ".join(s["url"] for s in servers)
         self.assertIn("externalUserId=trace-s1", urls)
         self.assertIn("app=gmail", urls)
-        # and exactly one approval-required mcp_toolset per server
+        # and exactly one mcp_toolset per server, on the configured (default) permission policy
         toolsets = [t for t in client.agents[0]["tools"] if t.get("type") == "mcp_toolset"]
         self.assertEqual(len(toolsets), len(servers))
-        self.assertTrue(all(t["default_config"]["permission_policy"]["type"] == "always_ask"
+        self.assertTrue(all(t["default_config"]["permission_policy"]["type"] == config.LIVE_PERMISSION_POLICY
                             for t in toolsets))
         # the bound vault was injected at session creation (the single injection point)
         self.assertEqual(client.last_vault_ids, ["vlt-s1"])
