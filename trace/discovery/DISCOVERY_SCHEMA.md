@@ -29,6 +29,7 @@ artifact, stays visible. The engine consumes the log as-is; it does not repair i
       "frequency": "<how often it recurred in this log>",
       "evidence_event_ids": ["e..."],
       "why_automatable": "<why software could do it; note human-checkpoint exceptions>",
+      "rationale": "<one plain-language sentence for the end user: why this is automatable>",
       "confidence": "high|medium|low"
     }
   ],
@@ -39,6 +40,7 @@ artifact, stays visible. The engine consumes the log as-is; it does not repair i
       "description": "<the surface workflow>",
       "why_judgment": "<why the core step needs a human every time>",
       "recommended_handling": "<what a human should do / where the checkpoint sits>",
+      "rationale": "<one plain-language sentence for the end user: why this needs a person>",
       "evidence_event_ids": ["e..."],
       "confidence": "high|medium|low"
     }

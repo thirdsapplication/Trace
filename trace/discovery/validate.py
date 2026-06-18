@@ -9,9 +9,9 @@ carry no answer-key-derived content.
 VALID_CONFIDENCE = {"high", "medium", "low"}
 
 _BUNDLE_FIELDS = ["name", "description", "trigger", "steps", "frequency",
-                  "evidence_event_ids", "why_automatable", "confidence"]
+                  "evidence_event_ids", "why_automatable", "rationale", "confidence"]
 _ANTI_FIELDS = ["name", "description", "why_judgment", "recommended_handling",
-                "evidence_event_ids", "confidence"]
+                "rationale", "evidence_event_ids", "confidence"]
 
 
 class DiscoveryReport:
@@ -88,6 +88,7 @@ def _norm_bundle(b, idx, valid_ids, report):
         "frequency": str(b.get("frequency") or "").strip(),
         "evidence_event_ids": ev,
         "why_automatable": str(b.get("why_automatable") or "").strip(),
+        "rationale": str(b.get("rationale") or "").strip(),
         "confidence": _norm_confidence(b.get("confidence"), report, f"bundle #{idx}"),
     }
     return out
@@ -106,6 +107,7 @@ def _norm_anti(a, idx, valid_ids, report):
         "description": str(a.get("description") or "").strip(),
         "why_judgment": str(a.get("why_judgment") or "").strip(),
         "recommended_handling": str(a.get("recommended_handling") or "").strip(),
+        "rationale": str(a.get("rationale") or "").strip(),
         "evidence_event_ids": ev,
         "confidence": _norm_confidence(a.get("confidence"), report, f"anti-bundle #{idx}"),
     }

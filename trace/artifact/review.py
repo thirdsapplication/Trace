@@ -83,6 +83,9 @@ def seed_review(discovery):
             "preferred_output": "",
             "evidence_event_ids": ev,
             "confidence": b.get("confidence", "medium"),
+            # one-line, user-facing reason for the classification (Spec 5); fall back
+            # to the engine's internal "why" if an older discovery lacks rationale
+            "rationale": (b.get("rationale") or b.get("why_automatable") or "").strip(),
             "reclassified_from": None,
             "original_reason_for_judgment": "",
         })
@@ -96,6 +99,7 @@ def seed_review(discovery):
             "description": a.get("description", ""),
             "why_judgment": a.get("why_judgment", ""),
             "recommended_handling": a.get("recommended_handling", ""),
+            "rationale": (a.get("rationale") or a.get("why_judgment") or "").strip(),
             "included_example_event_ids": list(ev),
             "evidence_event_ids": ev,
             "confidence": a.get("confidence", "medium"),
@@ -186,6 +190,7 @@ def validate_reviewed(obj, valid_event_ids, report):
                 "preferred_output": str(raw.get("preferred_output", "") or "").strip(),
                 "evidence_event_ids": ev,
                 "confidence": _norm_conf(raw.get("confidence")),
+                "rationale": str(raw.get("rationale", "") or "").strip(),
                 "reclassified_from": recl if recl in VALID_CLASSIFICATION else None,
                 "original_reason_for_judgment": str(raw.get("original_reason_for_judgment", "") or "").strip(),
             })
@@ -197,6 +202,7 @@ def validate_reviewed(obj, valid_event_ids, report):
                 "description": str(raw.get("description", "") or "").strip(),
                 "why_judgment": str(raw.get("why_judgment", "") or "").strip(),
                 "recommended_handling": str(raw.get("recommended_handling", "") or "").strip(),
+                "rationale": str(raw.get("rationale", "") or "").strip(),
                 "included_example_event_ids": incl,
                 "evidence_event_ids": ev,
                 "confidence": _norm_conf(raw.get("confidence")),

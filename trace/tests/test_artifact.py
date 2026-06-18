@@ -46,6 +46,37 @@ class SeedTest(unittest.TestCase):
         self.assertEqual(r["anti_bundles"][0]["classification"], "anti_bundle")
 
 
+class RationaleTest(unittest.TestCase):
+    """Spec 5 Change 1: the one-line rationale is carried into the review contract
+    for both groups, and survives validate_reviewed (incl. across a reclassification)."""
+    def setUp(self):
+        self.ids = {"e1", "e2", "e3"}
+        self.rep = review.ReviewReport()
+
+    def test_seed_carries_rationale_both_groups(self):
+        disc = json.loads(json.dumps(DISCOVERY))
+        disc["bundles"][0]["rationale"] = "Same steps every time, so an agent can do it."
+        disc["anti_bundles"][0]["rationale"] = "Each case needs a judgment call."
+        r = review.seed_review(disc)
+        self.assertEqual(r["bundles"][0]["rationale"], "Same steps every time, so an agent can do it.")
+        self.assertEqual(r["anti_bundles"][0]["rationale"], "Each case needs a judgment call.")
+
+    def test_seed_falls_back_to_internal_why_when_no_rationale(self):
+        r = review.seed_review(DISCOVERY)                  # DISCOVERY has no rationale field
+        self.assertEqual(r["bundles"][0]["rationale"], "rules")               # from why_automatable
+        self.assertEqual(r["anti_bundles"][0]["rationale"], "discretionary call each time")  # why_judgment
+
+    def test_rationale_survives_validate_and_reclassification(self):
+        obj = {"anti_bundles": [{"id": "Y", "classification": "bundle", "name": "n",
+                                 "steps": ["a"], "disposition": "approve_for_build",
+                                 "rationale": "Actually a fixed update each time.",
+                                 "reclassified_from": "anti_bundle",
+                                 "evidence_event_ids": ["e1"], "included_example_event_ids": ["e1"]}],
+               "bundles": [], "notes": ""}
+        out = review.validate_reviewed(obj, self.ids, self.rep)
+        self.assertEqual(out["bundles"][0]["rationale"], "Actually a fixed update each time.")
+
+
 class FetchExamplesTest(unittest.TestCase):
     def test_examples_are_verbatim(self):
         ex = review.fetch_examples(EVENTS, ["e2", "e3"])
@@ -159,6 +190,37 @@ class GenerateSpecsTest(unittest.TestCase):
         self.assertIn("Manual handling", a["markdown"])
         self.assertIn("discretionary call each time", a["markdown"])
         self.assertTrue(a["filename"].endswith("_manual.md"))
+        os.remove(rp); os.remove(ep)
+
+    def test_flipped_anti_to_bundle_builds(self):
+        # Spec 5 Change 2: a user marking a "manual" item automatable makes it build.
+        r = review.seed_review(DISCOVERY)
+        a = r["anti_bundles"][0]
+        flipped = {**a, "classification": "bundle", "disposition": "approve_for_build",
+                   "steps": [], "reclassified_from": "anti_bundle",
+                   "original_reason_for_judgment": a.get("why_judgment", "")}
+        reviewed = {"bundles": r["bundles"] + [flipped], "anti_bundles": [], "notes": ""}
+        rp, ep = write(reviewed), write(EVENTS)
+        stub = lambda s, u: json.dumps({"intent": "x", "derived_acceptance_criteria": [],
+                                        "example_assessments": {}, "notes": ""})
+        results, _ = generate_specs(rp, ep, model_fn=stub)
+        a1 = next(r for r in results if r["id"] == "A1")
+        self.assertTrue(a1["built"])
+        self.assertEqual(a1["classification"], "bundle")
+        os.remove(rp); os.remove(ep)
+
+    def test_flipped_bundle_to_manual_excluded(self):
+        # Spec 5 Change 2: a user marking an automatable item manual excludes it.
+        r = review.seed_review(DISCOVERY)
+        b = r["bundles"][0]
+        flipped = {**b, "classification": "anti_bundle", "reclassified_from": "bundle",
+                   "why_judgment": "user says this needs a person"}
+        reviewed = {"bundles": [], "anti_bundles": r["anti_bundles"] + [flipped], "notes": ""}
+        rp, ep = write(reviewed), write(EVENTS)
+        results, _ = generate_specs(rp, ep, model_fn=self._boom)   # nothing approved => no model call
+        b1 = next(r for r in results if r["id"] == "B1")
+        self.assertFalse(b1["built"])
+        self.assertEqual(b1["classification"], "anti_bundle")
         os.remove(rp); os.remove(ep)
 
     def test_divergence_marks_contradicted_example_illustrative(self):

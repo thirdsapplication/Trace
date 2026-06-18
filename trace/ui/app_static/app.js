@@ -366,43 +366,69 @@ async function runWorkflows(sid, a) {
 async function stepReview() {
   const sid = S.session.id;
   shell(`<div class="panel"><div class="eyebrow">Step three</div><h2>Review what we found</h2>
-    <p class="lead">Choose which routines Trace should automate. The rest stay yours to handle.</p>
+    <p class="lead">Here's what we saw and why. If we got one wrong, flip it — what you mark <b>Automate</b> gets built; <b>Manual</b> stays yours to handle.</p>
     <div id="revBody"><p class="muted">Loading…</p></div></div>`);
   const { ok, data } = await uget(sid, "/review-data");
   if (!ok) { $("#revBody").innerHTML = `<p class="msg err">${friendly(data.error)}</p>`; return; }
   const reviewed = data.reviewed;
-  const bundles = reviewed.bundles || [], anti = reviewed.anti_bundles || [];
-  // local selection state: every automatable bundle on by default
-  const sel = {};
-  bundles.forEach(b => { sel[b.id] = (b.disposition || "approve_for_build") === "approve_for_build"; });
-  const card = (b, automatable) => `
-    <div class="card opt ${automatable && sel[b.id] ? "sel" : ""}" data-id="${esc(b.id)}" data-auto="${automatable}">
-      ${automatable ? `<span class="check">✓</span><span class="check-hollow"></span>` : ""}
-      <div style="flex:1;">
-        <div class="title">${esc(b.name || b.id)}</div>
-        <div class="sub">${automatable ? esc((b.steps || []).slice(0, 3).join(" · ") || (b.trigger || "")) : "needs your judgment"}</div>
+  // One flat list; remember each item's original + current classification so the
+  // user can flip in either direction (Spec 5). The backend routes by classification.
+  const items = [...(reviewed.bundles || []), ...(reviewed.anti_bundles || [])];
+  const orig = {}, cls = {};
+  items.forEach(it => { orig[it.id] = it.classification; cls[it.id] = it.classification; });
+  // the one-line reason the engine gave (fall back to the internal "why" fields)
+  const reasonOf = (it) => it.rationale || it.why_automatable || it.why_judgment || "";
+
+  const card = (it) => {
+    const id = it.id, auto = cls[id] === "bundle";
+    const reason = reasonOf(it);
+    return `<div class="card" data-id="${esc(id)}" style="display:block;">
+      <div class="spread">
+        <div class="title">${esc(it.name || id)}</div>
+        <span class="pill ${auto ? "pill-on" : "pill-off"}">${auto ? "AUTOMATE" : "MANUAL"}</span>
       </div>
-      <span class="pill ${automatable ? "pill-on" : "pill-off"}">${automatable ? "AUTOMATE" : "MANUAL"}</span>
+      <div class="sub" style="margin-top:6px;">${reason ? esc(reason) : `<span class="muted">no reason given</span>`}</div>
+      <div class="row" style="margin-top:10px;gap:6px;">
+        <button class="flip ${auto ? "btn-accent" : "btn-secondary"} btn-sm" data-id="${esc(id)}" data-to="bundle">Automate</button>
+        <button class="flip ${auto ? "btn-secondary" : "btn-accent"} btn-sm" data-id="${esc(id)}" data-to="anti_bundle">Manual</button>
+      </div>
     </div>`;
+  };
+
+  const paint = () => {
+    $("#revStack").innerHTML = items.length
+      ? items.map(card).join("") : `<p class="muted">Nothing to review.</p>`;
+    root.querySelectorAll(".flip").forEach(b => b.onclick = () => {
+      cls[b.dataset.id] = b.dataset.to; paint();
+    });
+    const n = items.filter(it => cls[it.id] === "bundle").length;
+    $("#revGo").textContent = n ? `Continue with ${n} to automate` : "Continue";
+  };
+
   $("#revBody").innerHTML = `
-    <div class="stack">${bundles.map(b => card(b, true)).join("") || `<p class="muted">No automatable routines were found.</p>`}
-      ${anti.map(b => card(b, false)).join("")}</div>
+    <div class="stack" id="revStack"></div>
     <p id="revMsg" class="msg err" style="margin-top:14px;"></p>
     <button id="revGo" class="btn-primary full" style="margin-top:6px;">Continue</button>`;
-  root.querySelectorAll('.opt[data-auto="true"]').forEach(el => {
-    el.onclick = () => { const id = el.dataset.id; sel[id] = !sel[id]; el.classList.toggle("sel", sel[id]); updateRevBtn(); };
-  });
-  const updateRevBtn = () => {
-    const n = bundles.filter(b => sel[b.id]).length;
-    $("#revGo").textContent = n ? `Continue with ${n} selected` : "Continue";
-    $("#revGo").disabled = false;
-  };
-  updateRevBtn();
+  paint();
+
   $("#revGo").onclick = async () => {
-    bundles.forEach(b => { b.disposition = sel[b.id] ? "approve_for_build" : "reject"; });
-    anti.forEach(b => { b.disposition = b.disposition || "reject"; });
+    // Apply the user's authoritative classification, preserving each item's fields.
+    const outBundles = [], outAnti = [];
+    items.forEach(it => {
+      const id = it.id, finalCls = cls[id], changed = finalCls !== orig[id];
+      const o = { ...it, classification: finalCls, reclassified_from: changed ? orig[id] : null };
+      if (finalCls === "bundle") {
+        o.disposition = "approve_for_build";
+        if (orig[id] === "anti_bundle")            // carry the prior reason for the record
+          o.original_reason_for_judgment = it.why_judgment || it.rationale || "";
+        outBundles.push(o);
+      } else {
+        outAnti.push(o);                           // manual → excluded from building
+      }
+    });
     $("#revGo").disabled = true; $("#revGo").textContent = "Saving…";
-    const r = await upost(sid, "/reviewed-bundles", reviewed);
+    const r = await upost(sid, "/reviewed-bundles",
+                          { bundles: outBundles, anti_bundles: outAnti, notes: reviewed.notes || "" });
     if (!r.ok) { $("#revMsg").textContent = friendly(r.data.error); $("#revGo").disabled = false; return; }
     await refreshSession(); goStep(3);
   };

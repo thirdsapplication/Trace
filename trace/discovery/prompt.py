@@ -131,6 +131,7 @@ Return JSON only — no preamble or commentary outside the JSON. Use this schema
       "frequency": "how often it occurred during the day",
       "evidence_event_ids": ["e001", "e002", "..."],
       "why_automatable": "why the steps can be reduced to a fixed rule; note where a human checkpoint is still needed for exceptions",
+      "rationale": "one plain-language sentence, no jargon, for the end user: why this is automatable",
       "confidence": "high | medium | low"
     }
   ],
@@ -141,6 +142,7 @@ Return JSON only — no preamble or commentary outside the JSON. Use this schema
       "description": "what the work is on the surface",
       "why_judgment": "why the core step needs a human every time and can't be reduced to a fixed rule",
       "recommended_handling": "what a human should do / where the checkpoint sits",
+      "rationale": "one plain-language sentence, no jargon, for the end user: why this needs a person rather than an agent",
       "evidence_event_ids": ["e0xx", "..."],
       "confidence": "high | medium | low"
     }

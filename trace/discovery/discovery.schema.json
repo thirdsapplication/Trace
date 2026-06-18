@@ -11,7 +11,7 @@
       "items": {
         "type": "object",
         "required": ["id", "name", "description", "trigger", "steps", "frequency",
-                     "evidence_event_ids", "why_automatable", "confidence"],
+                     "evidence_event_ids", "why_automatable", "rationale", "confidence"],
         "additionalProperties": false,
         "properties": {
           "id": { "type": "string", "pattern": "^B[0-9]+$" },
@@ -22,6 +22,7 @@
           "frequency": { "type": "string" },
           "evidence_event_ids": { "type": "array", "items": { "type": "string" } },
           "why_automatable": { "type": "string" },
+          "rationale": { "type": "string" },
           "confidence": { "type": "string", "enum": ["high", "medium", "low"] }
         }
       }
@@ -31,7 +32,7 @@
       "items": {
         "type": "object",
         "required": ["id", "name", "description", "why_judgment",
-                     "recommended_handling", "evidence_event_ids", "confidence"],
+                     "recommended_handling", "rationale", "evidence_event_ids", "confidence"],
         "additionalProperties": false,
         "properties": {
           "id": { "type": "string", "pattern": "^A[0-9]+$" },
@@ -39,6 +40,7 @@
           "description": { "type": "string" },
           "why_judgment": { "type": "string" },
           "recommended_handling": { "type": "string" },
+          "rationale": { "type": "string" },
           "evidence_event_ids": { "type": "array", "items": { "type": "string" } },
           "confidence": { "type": "string", "enum": ["high", "medium", "low"] }
         }

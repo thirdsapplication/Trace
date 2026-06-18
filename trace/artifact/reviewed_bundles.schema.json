@@ -39,6 +39,7 @@
           "preferred_output": { "type": "string" },
           "evidence_event_ids": { "type": "array", "items": { "type": "string" } },
           "confidence": { "type": "string", "enum": ["high", "medium", "low"] },
+          "rationale": { "type": "string" },
           "reclassified_from": { "type": ["string", "null"], "enum": ["bundle", "anti_bundle", null] },
           "original_reason_for_judgment": { "type": "string" }
         }
@@ -58,6 +59,7 @@
           "description": { "type": "string" },
           "why_judgment": { "type": "string" },
           "recommended_handling": { "type": "string" },
+          "rationale": { "type": "string" },
           "included_example_event_ids": { "type": "array", "items": { "type": "string" } },
           "evidence_event_ids": { "type": "array", "items": { "type": "string" } },
           "confidence": { "type": "string", "enum": ["high", "medium", "low"] },

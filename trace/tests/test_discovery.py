@@ -75,6 +75,15 @@ class ValidateTest(unittest.TestCase):
         self.assertEqual(out["bundles"][0]["confidence"], "low")  # repaired
         self.assertEqual(out["anti_bundles"][0]["id"], "A1")
 
+    def test_carries_rationale_and_defaults_when_absent(self):
+        # Spec 5: per-candidate rationale is carried for both groups; absent -> "".
+        obj = {"bundles": [{"name": "a", "evidence_event_ids": ["e001"], "confidence": "high",
+                            "rationale": "Same steps every time."}],
+               "anti_bundles": [{"name": "c", "evidence_event_ids": ["e003"], "confidence": "high"}]}
+        out = validate.validate_discovery(obj, self.ids, self.report)
+        self.assertEqual(out["bundles"][0]["rationale"], "Same steps every time.")
+        self.assertEqual(out["anti_bundles"][0]["rationale"], "")   # defaulted, present in contract
+
     def test_dedupes_evidence(self):
         obj = {"bundles": [{"name": "a", "evidence_event_ids": ["e001", "e001", "e002"],
                             "confidence": "high"}]}
