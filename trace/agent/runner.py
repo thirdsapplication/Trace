@@ -13,9 +13,11 @@ Pure orchestration over an injected ``client``, so it runs offline against a stu
 
 import datetime
 
-from . import config, deploy
+from . import deploy
 
-_TERMINAL_FAIL = ("failed", "error", "timeout", "cancel")
+# event-type markers (substring match against the MA event stream)
+_FAIL_MARKERS = ("failed", "error", "cancel", "timeout")
+_APPROVAL_STOP = ("requires_action", "requires_approval", "tool_confirmation")
 
 
 def _now():
@@ -45,36 +47,53 @@ def schedule_due(cadence, last_run_epoch, now_epoch):
     return False
 
 
-def _status(events, held):
-    if held:
-        return "halted"
+# --- Spec 6: derive a Trace-native run outcome from the session event stream ---
+# Status is read from what actually happened, NOT from a raw count of tool calls.
+# An always-allow agent's tool calls EXECUTE (no tool_confirmation), so they are
+# completed actions — never "awaiting approval". "Needs approval" is reported only
+# when the session genuinely stopped for input (stop_reason=requires_action).
+
+def _action_labels(events):
+    """Short, plain labels for the tool actions the agent actually took, in order
+    (an executed outbound call surfaces as an ``mcp_tool_use`` event)."""
+    out = []
     for ev in events:
-        if any(k in (ev.get("type") or "").lower() for k in _TERMINAL_FAIL):
-            return "failed"
-    return "clean"
+        t = (ev.get("type") or "").lower()
+        if "tool_use" in t and "confirmation" not in t and "result" not in t:
+            out.append((ev.get("name") or ev.get("text") or "action").strip()[:120] or "action")
+    return out
 
 
-def _summary(events, held, status):
-    if status == "halted":
-        return f"{len(held)} action(s) awaiting your approval"
-    # last non-empty text the agent produced, else a terminal/status note
+def _last_text(events):
     for ev in reversed(events):
         text = (ev.get("text") or "").strip()
         if text:
             return text[:280]
-    if status == "failed":
-        return "Run failed before completing."
-    return f"Completed ({len(events)} events)."
+    return ""
+
+
+def _failed(events):
+    return any(any(k in (ev.get("type") or "").lower() for k in _FAIL_MARKERS) for ev in events)
+
+
+def _needs_approval(events):
+    """True only if the session genuinely stopped waiting for approval."""
+    return any(any(k in (ev.get("stop_reason") or "").lower() for k in _APPROVAL_STOP)
+               for ev in events)
+
+
+def _plural(n, word):
+    return f"{n} {word}" + ("" if n == 1 else "s")
 
 
 def run_once(client, agent):
     """Run one agent once. ``agent`` is a registry row carrying ``agent_id``,
     ``vault_ref``, and ``trigger``. Returns a run record dict
-    ``{agent_id, status, summary, run_session_id, console_url}``; never raises
-    (a platform failure becomes a ``failed`` record so the activity view shows it).
+    ``{agent_id, status, summary, details, run_session_id}`` where ``status`` is
+    ``completed`` | ``needs_approval`` | ``failed`` and ``details`` is the in-Trace
+    list of actions. Never raises (a platform failure becomes a ``failed`` record).
     """
     agent_id = agent.get("agent_id")
-    console_url = config.console_url() if hasattr(config, "console_url") else config.CONSOLE_BASE
     trigger = agent.get("trigger") or "on a new matching task"
     vault_ref = agent.get("vault_ref")
     try:
@@ -83,12 +102,29 @@ def run_once(client, agent):
             agent_id, environment_id, resources=[], title="Trace scheduled run",
             vault_ids=[vault_ref] if vault_ref else None)
         events = client.send_trigger_and_collect(run_session_id, trigger)
-        held = deploy.list_held(client, run_session_id)
-        status = _status(events, held)
-        return {"agent_id": agent_id, "status": status,
-                "summary": _summary(events, held, status),
-                "run_session_id": run_session_id, "console_url": console_url}
     except Exception as e:                                  # noqa: BLE001
         return {"agent_id": agent_id, "status": "failed",
-                "summary": f"{type(e).__name__}: {e}",
-                "run_session_id": None, "console_url": console_url}
+                "summary": f"Couldn't run: {type(e).__name__}", "details": [],
+                "run_session_id": None}
+
+    actions = _action_labels(events)
+    if _failed(events):
+        return {"agent_id": agent_id, "status": "failed",
+                "summary": _last_text(events) or "The run stopped before finishing.",
+                "details": actions, "run_session_id": run_session_id}
+    if _needs_approval(events):
+        # genuinely paused for approval — count the unresolved requests, not all actions
+        try:
+            pending = deploy.list_held(client, run_session_id)
+        except Exception:
+            pending = []
+        labels = [(p.get("summary") or p.get("kind") or "action") for p in pending] or actions
+        n = len(labels)
+        return {"agent_id": agent_id, "status": "needs_approval",
+                "summary": f"Waiting for you to approve {_plural(n, 'action')}.",
+                "details": labels, "run_session_id": run_session_id}
+    # completed: actions executed (the normal always-allow case)
+    n = len(actions)
+    summary = _last_text(events) or (f"Completed {_plural(n, 'action')}." if n else "Completed with no actions needed.")
+    return {"agent_id": agent_id, "status": "completed",
+            "summary": summary, "details": actions, "run_session_id": run_session_id}

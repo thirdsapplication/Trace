@@ -37,6 +37,10 @@ class FakeMA:
         return self.held
 
 
+def _tool(name):
+    return {"type": "agent.mcp_tool_use", "name": name, "text": ""}
+
+
 def _agent(owner="usr_1", agent_id="agent-1"):
     return {"agent_id": agent_id, "owner_user_id": owner, "external_user_id": "x",
             "bundle_id": "wf", "name": "WF", "vault_ref": "vlt-1",
@@ -44,24 +48,47 @@ def _agent(owner="usr_1", agent_id="agent-1"):
 
 
 class RunnerTest(unittest.TestCase):
-    def test_clean_run(self):
+    def test_completed_run(self):
         rec = runner.run_once(FakeMA(), _agent())
-        self.assertEqual(rec["status"], "clean")
+        self.assertEqual(rec["status"], "completed")
         self.assertEqual(rec["summary"], "Handled 2 emails")
         self.assertEqual(rec["run_session_id"], "run-sess-1")
+
+    def test_always_allow_actions_are_completed_not_pending(self):
+        # Spec 6 bug: an always-allow agent's executed tool calls (mcp_tool_use with
+        # NO requires_action stop, even if the platform over-reports them as held)
+        # must read as completed actions — never "needs approval".
+        events = [_tool("update_row"), _tool("update_row"), _tool("update_row"),
+                  {"type": "session.status_idle", "stop_reason": "end_turn", "text": ""}]
+        ma = FakeMA(events=events, held=[{"action_id": "x", "summary": "y"}] * 3)  # over-reported
+        rec = runner.run_once(ma, _agent())
+        self.assertEqual(rec["status"], "completed")
+        self.assertEqual(len(rec["details"]), 3)               # 3 actions TAKEN
+        self.assertIn("Completed 3 actions", rec["summary"])
+        self.assertNotIn("approv", rec["summary"].lower())
+
+    def test_needs_approval_only_on_requires_action_stop(self):
+        events = [_tool("send_email"),
+                  {"type": "session.status_idle", "stop_reason": "requires_action"}]
+        ma = FakeMA(events=events, held=[{"action_id": "a1", "summary": "send email to Bob"}])
+        rec = runner.run_once(ma, _agent())
+        self.assertEqual(rec["status"], "needs_approval")
+        self.assertIn("approve", rec["summary"].lower())
+        self.assertEqual(rec["details"], ["send email to Bob"])
 
     def test_failed_event(self):
         rec = runner.run_once(FakeMA(events=[{"type": "session.failed", "text": "nope"}]), _agent())
         self.assertEqual(rec["status"], "failed")
 
-    def test_halted_when_held(self):
-        rec = runner.run_once(FakeMA(held=[{"action_id": "a1", "summary": "send email"}]), _agent())
-        self.assertEqual(rec["status"], "halted")
-
     def test_platform_error_is_failed_not_raised(self):
         rec = runner.run_once(FakeMA(fail=True), _agent())
         self.assertEqual(rec["status"], "failed")
         self.assertIsNone(rec["run_session_id"])
+
+    def test_no_run_record_references_console(self):
+        rec = runner.run_once(FakeMA(), _agent())
+        self.assertNotIn("console_url", rec)
+        self.assertNotIn("console", repr(rec).lower())
 
     def test_vault_injected(self):
         ma = FakeMA()
@@ -103,7 +130,7 @@ class SchedulerPassTest(unittest.TestCase):
         self.state.run_due_schedules(now=time.time())
         runs = registry.runs_for_agent(self.root, "agent-1")
         self.assertEqual(len(runs), 1)
-        self.assertEqual(runs[0]["status"], "clean")
+        self.assertEqual(runs[0]["status"], "completed")
         # immediately again -> not due (just ran), still one run
         self.state.run_due_schedules(now=time.time())
         self.assertEqual(len(registry.runs_for_agent(self.root, "agent-1")), 1)

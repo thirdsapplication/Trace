@@ -15,6 +15,7 @@ isolation key the app already derives in ``users.external_user_id`` — so Phase
 can adopt them without reshaping the contract.
 """
 
+import json
 import os
 
 # Tables mirror the existing JSON/file shapes (users.py, sessions.py meta) so
@@ -82,10 +83,10 @@ CREATE TABLE IF NOT EXISTS agent_runs (
     agent_id       TEXT NOT NULL,
     owner_user_id  TEXT NOT NULL,
     ran_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
-    status         TEXT NOT NULL,         -- clean | failed | halted
+    status         TEXT NOT NULL,         -- completed | failed | needs_approval
     summary        TEXT,
-    run_session_id TEXT,
-    console_url    TEXT
+    details        TEXT,                  -- JSON list of in-Trace action labels
+    run_session_id TEXT
 );
 CREATE INDEX IF NOT EXISTS agent_runs_agent_idx ON agent_runs (agent_id, ran_at DESC);
 """
@@ -136,6 +137,9 @@ def init_db():
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute(_SCHEMA)
+            # Spec 6: add the in-Trace action list to agent_runs tables created
+            # before it existed (idempotent; no-op on a fresh schema above).
+            cur.execute("ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS details TEXT")
         conn.commit()
     return True
 
@@ -287,15 +291,23 @@ def run_add(rec):
     with connect() as conn, conn.cursor() as cur:
         cur.execute(
             "INSERT INTO agent_runs (agent_id, owner_user_id, status, summary, "
-            "run_session_id, console_url) VALUES (%(agent_id)s, %(owner_user_id)s, "
-            "%(status)s, %(summary)s, %(run_session_id)s, %(console_url)s)", rec)
+            "details, run_session_id) VALUES (%s, %s, %s, %s, %s, %s)",
+            (rec.get("agent_id"), rec.get("owner_user_id"), rec.get("status"),
+             rec.get("summary"), json.dumps(rec.get("details") or []),
+             rec.get("run_session_id")))
 
 
 def runs_for_agent(agent_id, limit=20):
     with connect() as conn, conn.cursor() as cur:
-        cur.execute("SELECT ran_at, status, summary, run_session_id, console_url "
+        cur.execute("SELECT ran_at, status, summary, details, run_session_id "
                     "FROM agent_runs WHERE agent_id = %s ORDER BY ran_at DESC LIMIT %s",
                     (agent_id, limit))
-        return [{"ran_at": r[0].isoformat(timespec="seconds") if hasattr(r[0], "isoformat") else r[0],
-                 "status": r[1], "summary": r[2], "run_session_id": r[3], "console_url": r[4]}
-                for r in cur.fetchall()]
+        out = []
+        for r in cur.fetchall():
+            try:
+                details = json.loads(r[3]) if r[3] else []
+            except (TypeError, ValueError):
+                details = []
+            out.append({"ran_at": r[0].isoformat(timespec="seconds") if hasattr(r[0], "isoformat") else r[0],
+                        "status": r[1], "summary": r[2], "details": details, "run_session_id": r[4]})
+        return out

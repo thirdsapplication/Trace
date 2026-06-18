@@ -746,14 +746,13 @@ class AppState:
         try:
             client = self._live_client()
             rec = agent_runner.run_once(client, agent)
-        except Exception as e:
+        except Exception:
             rec = {"agent_id": agent.get("agent_id"), "status": "failed",
-                   "summary": f"{type(e).__name__}: {e}", "run_session_id": None,
-                   "console_url": agent_config.CONSOLE_BASE}
+                   "summary": "Couldn't start the run.", "details": [], "run_session_id": None}
         registry.run_add(self.sessions_root, {
             "agent_id": agent.get("agent_id"), "owner_user_id": agent.get("owner_user_id"),
             "status": rec["status"], "summary": rec["summary"],
-            "run_session_id": rec["run_session_id"], "console_url": rec["console_url"]})
+            "details": rec.get("details") or [], "run_session_id": rec.get("run_session_id")})
         registry.schedule_mark_run(self.sessions_root, agent.get("agent_id"))
         return rec
 

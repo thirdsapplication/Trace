@@ -103,7 +103,7 @@ def _content_text(content):
 
 
 def _event_dict(event):
-    """Normalize a streamed event to ``{type, text, name}``."""
+    """Normalize a streamed event to ``{type, text, name, stop_reason}``."""
     et = getattr(event, "type", None) or (event.get("type") if isinstance(event, dict) else None)
     text, name = "", None
     content = getattr(event, "content", None)
@@ -116,7 +116,14 @@ def _event_dict(event):
     elif isinstance(content, str):
         text = content
     name = getattr(event, "name", None) or (event.get("name") if isinstance(event, dict) else None)
-    return {"type": et, "text": text, "name": name}
+    # stop_reason distinguishes a completed idle from one held for approval
+    # (requires_action). May sit on the event or its nested message/session.
+    stop_reason = (getattr(event, "stop_reason", None)
+                   or (event.get("stop_reason") if isinstance(event, dict) else None))
+    if not stop_reason:
+        nested = getattr(event, "message", None) or getattr(event, "session", None)
+        stop_reason = getattr(nested, "stop_reason", None) if nested is not None else None
+    return {"type": et, "text": text, "name": name, "stop_reason": stop_reason}
 
 
 class ManagedAgentsClient:

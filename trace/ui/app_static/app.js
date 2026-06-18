@@ -191,8 +191,11 @@ function valueToCadence(v) {
   return null;
 }
 function runBadge(status) {
-  const cls = status === "clean" ? "pill-on" : (status === "halted" ? "pill-warn" : "pill-off");
-  const label = status === "clean" ? "ran cleanly" : (status === "halted" ? "needs approval" : "failed");
+  // completed/needs_approval/failed (+ tolerate older clean/halted records)
+  const ok = status === "completed" || status === "clean";
+  const appr = status === "needs_approval" || status === "halted";
+  const cls = ok ? "pill-on" : (appr ? "pill-warn" : "pill-off");
+  const label = ok ? "completed" : (appr ? "needs approval" : "failed");
   return `<span class="pill ${cls}">${label}</span>`;
 }
 function agentCard(a) {
@@ -214,14 +217,18 @@ function agentCard(a) {
     </div>
     <details class="agent-activity" style="margin-top:10px;" ${last ? "open" : ""}>
       <summary class="label" style="cursor:pointer;">Activity${runs.length ? ` (${runs.length})` : ""}</summary>
-      ${runs.length ? runs.map(r => `
+      ${runs.length ? runs.map(r => {
+        const acts = r.details || [];
+        return `
         <div class="run-row" style="margin-top:8px;">
           <div class="row" style="gap:8px;align-items:center;">
             <span class="muted" style="font-size:12px;">${esc(r.ran_at || "")}</span>${runBadge(r.status)}
-            ${r.console_url ? `<button class="btn-link ext-link" data-url="${esc(r.console_url)}" style="font-size:12px;">view in console ↗</button>` : ""}
+            ${acts.length ? `<span class="muted" style="font-size:12px;">${acts.length} action${acts.length === 1 ? "" : "s"}</span>` : ""}
           </div>
           <div class="sub" style="margin-top:2px;">${esc(r.summary || "")}</div>
-        </div>`).join("")
+          ${acts.length ? `<details style="margin-top:4px;"><summary class="muted" style="font-size:12px;cursor:pointer;">what it did</summary>
+            <ul style="margin:6px 0 0 16px;padding:0;">${acts.map(d => `<li class="sub">${esc(d)}</li>`).join("")}</ul></details>` : ""}
+        </div>`; }).join("")
         : `<div class="muted" style="font-size:13px;margin-top:6px;">No runs yet — set a schedule or hit Run now.</div>`}
     </details>
   </div>`;
@@ -263,8 +270,6 @@ async function renderDashboard() {
     // the run is async; refresh shortly to show the recorded outcome
     setTimeout(renderDashboard, 4000);
   });
-  // Spec 3: open a run's full trace in the system browser (works in the webview)
-  root.querySelectorAll(".ext-link").forEach(b => b.onclick = () => openExternal(b.dataset.url));
 }
 
 /* ---------------- 01 RECORD ---------------- */

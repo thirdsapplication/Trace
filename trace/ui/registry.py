@@ -132,7 +132,7 @@ def schedule_mark_run(root, agent_id):
 
 # --- runs ------------------------------------------------------------------
 def run_add(root, rec):
-    """rec: {agent_id, owner_user_id, status, summary, run_session_id, console_url}."""
+    """rec: {agent_id, owner_user_id, status, summary, details, run_session_id}."""
     if db.is_configured():
         return db.run_add(rec)
     with _LOCK:
