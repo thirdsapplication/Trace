@@ -146,12 +146,14 @@ function shell(inner) {
   root.innerHTML = `
     <div class="topbar">
       <div class="brand">● Trace</div>
-      <div class="row"><span class="muted" style="font-size:13px;">${esc(S.user.email)}</span>
+      <div class="row"><button id="navAgents" class="btn-link">My agents</button>
+        <span class="muted" style="font-size:13px;">${esc(S.user.email)}</span>
         <button id="logout" class="btn-link">Sign out</button></div>
     </div>
     <div class="steps">${chips}</div>
     <div id="stage">${inner}</div>`;
   $("#logout").onclick = async () => { await api("POST", "/api/auth/logout", {}); S.user = null; clearTimers(); renderAuth(); };
+  $("#navAgents").onclick = renderDashboard;
   root.querySelectorAll(".step-chip.nav").forEach(c => c.onclick = () => goStep(parseInt(c.dataset.step, 10)));
 }
 
@@ -161,6 +163,39 @@ function render() {
   fn();
 }
 const goStep = (i) => { S.step = i; render(); };
+
+/* Start a brand-new capture without disturbing existing agents/sessions: null
+   the session so deriveStep is 0, then show the record step (Start recording
+   creates a fresh dated session server-side). */
+function recordAnother() { S.session = null; S.step = 0; render(); }
+
+/* ---------------- AGENTS DASHBOARD (Spec 2/3/4) ---------------- */
+function agentCard(a) {
+  return `<div class="card"><div class="spread">
+      <div class="row"><span class="dot"></span><span class="title">${esc(a.name || a.bundle_id || a.agent_id)}</span></div>
+      <span class="pill pill-on">LIVE</span></div></div>`;
+}
+
+async function renderDashboard() {
+  clearTimers();
+  const { data } = await api("GET", "/api/u/agents");
+  const agents = (data && data.agents) || [];
+  root.innerHTML = `
+    <div class="topbar"><div class="brand">● Trace</div>
+      <div class="row"><span class="muted" style="font-size:13px;">${esc(S.user.email)}</span>
+        <button id="logout" class="btn-link">Sign out</button></div></div>
+    <div class="panel">
+      <div class="spread"><h2>Your agents</h2>
+        <button id="recAnother" class="btn-primary btn-sm">Record another workflow</button></div>
+      <p class="lead">Every workflow you've automated. Record another any time — new agents are added without touching the ones you already have.</p>
+      <div class="stack" id="agentList">${agents.length ? agents.map(agentCard).join("")
+        : `<p class="muted">No agents yet. Record a workflow to build your first.</p>`}</div>
+      <button id="backFlow" class="btn-link" style="margin-top:16px;">← back to setup</button>
+    </div>`;
+  $("#logout").onclick = async () => { await api("POST", "/api/auth/logout", {}); S.user = null; clearTimers(); renderAuth(); };
+  $("#recAnother").onclick = recordAnother;
+  $("#backFlow").onclick = () => loadAndRender();
+}
 
 /* ---------------- 01 RECORD ---------------- */
 function stepRecord() {
@@ -521,7 +556,10 @@ async function renderGolive(sid) {
       <span class="pill pill-on">${esc((b.status || "live").toUpperCase())}</span></div>${held(b)}</div>`).join("")
       || `<p class="muted">No agents are live yet.</p>`}</div>
     <p id="liveMsg" class="msg"></p>
-    <button id="liveRefresh" class="btn-secondary full" style="margin-top:8px;">Refresh</button>`;
+    <div class="row" style="margin-top:8px;gap:8px;">
+      <button id="liveRefresh" class="btn-secondary" style="flex:1;">Refresh</button>
+      <button id="recAnother" class="btn-primary" style="flex:1;">Record another workflow</button></div>
+    <button id="navAgents2" class="btn-link" style="margin-top:10px;">See all my agents →</button>`;
   const resolve = async (bid, aid, decision) => {
     await upost(sid, `/deploy/${bid}/${decision}`, { action_id: aid });
     await renderGolive(sid);
@@ -529,6 +567,8 @@ async function renderGolive(sid) {
   root.querySelectorAll(".dep-ok").forEach(b => b.onclick = () => resolve(b.dataset.b, b.dataset.a, "approve"));
   root.querySelectorAll(".dep-no").forEach(b => b.onclick = () => resolve(b.dataset.b, b.dataset.a, "reject"));
   $("#liveRefresh").onclick = () => renderGolive(sid);
+  $("#recAnother").onclick = recordAnother;
+  $("#navAgents2").onclick = renderDashboard;
 }
 
 /* ---------------- helpers ---------------- */

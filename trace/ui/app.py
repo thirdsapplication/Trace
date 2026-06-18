@@ -44,7 +44,7 @@ from ..agent import interview as agent_interview
 from ..agent import connect as agent_connect
 from ..agent import config as agent_config
 from ..agent import deploy as agent_deploy
-from . import cloud, db, keystore, permissions, sessions, users
+from . import cloud, db, keystore, permissions, registry, sessions, users
 
 
 def _write_json(path, obj):
@@ -666,6 +666,19 @@ class AppState:
                             live_dict = yaml.safe_load(f.read())
                         rec = self.deploy_fn(b, live_dict, conn, start)
                         _write_json(os.path.join(specs_dir, sessions.deploy_record_name(bid)), rec)
+                        # Spec 2/3/4: durable per-user agent index (survives restart),
+                        # so a re-run adds to the user's agent set without clobbering
+                        # prior agents, and schedules/activity have something to key on.
+                        if rec.get("status") == "live" and rec.get("agent_id"):
+                            owner = (sessions.read_meta(root, sid) or {}).get("owner_user_id")
+                            if owner:
+                                registry.agent_upsert(root, {
+                                    "agent_id": rec["agent_id"], "owner_user_id": owner,
+                                    "external_user_id": rec.get("external_user_id"),
+                                    "bundle_id": bid, "name": b.get("name") or bid,
+                                    "vault_ref": rec.get("vault_ref"),
+                                    "trigger": (rec.get("start") or {}).get("value"),
+                                    "session_id": sid})
                         job["deployed"] += 1
                     except Exception as e:
                         job["errors"][bid] = f"{type(e).__name__}: {e}"
@@ -862,6 +875,19 @@ def make_handler(state):
         def _owns(self, sid, user):
             return (sessions.read_meta(root, sid) or {}).get("owner_user_id") == user["user_id"]
 
+        def _agents_for(self, user):
+            """The logged-in user's deployed agents (across all their sessions), each
+            with its schedule and recent run history — backs the agents dashboard
+            (Spec 2) and the activity view (Spec 3). Scoped by owner; never another
+            user's agents."""
+            out = []
+            for a in registry.agents_for_user(root, user["user_id"]):
+                aid = a.get("agent_id")
+                out.append({**a,
+                            "schedule": registry.schedule_get(root, aid),
+                            "recent_runs": registry.runs_for_agent(root, aid, 5)})
+            return out
+
         # --- end-user namespace (WS3): same pipeline, scoped to the logged-in user ---
         def _user_get(self, rest, user):
             if rest in ("/me", ""):
@@ -875,6 +901,8 @@ def make_handler(state):
                     {"name": f["name"]} for f in list_fixtures()]})
             if rest == "/preflight":
                 return self._json(200, _preflight(state))
+            if rest == "/agents":                            # Spec 2/3: all my agents + activity
+                return self._json(200, {"agents": self._agents_for(user)})
             m = re.match(r"^/sessions/([^/]+)(/.*)?$", rest)
             if m:
                 if not self._owns(m.group(1), user):

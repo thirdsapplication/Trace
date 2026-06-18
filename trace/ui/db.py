@@ -52,6 +52,42 @@ CREATE TABLE IF NOT EXISTS auth_sessions (
 
 CREATE INDEX IF NOT EXISTS auth_sessions_user_id_idx
     ON auth_sessions (user_id);
+
+-- Specs 2/3/4: the durable per-user index into the deployed agents (the MA
+-- agents themselves live on Anthropic's platform; these rows survive a Render
+-- restart so "all my agents", schedules, and run history don't reset).
+CREATE TABLE IF NOT EXISTS agents (
+    agent_id         TEXT PRIMARY KEY,
+    owner_user_id    TEXT NOT NULL,
+    external_user_id TEXT,
+    bundle_id        TEXT,
+    name             TEXT,
+    vault_ref        TEXT,
+    trigger          TEXT,
+    session_id       TEXT,
+    deployed_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS agents_owner_idx ON agents (owner_user_id);
+
+CREATE TABLE IF NOT EXISTS schedules (
+    agent_id      TEXT PRIMARY KEY REFERENCES agents(agent_id) ON DELETE CASCADE,
+    owner_user_id TEXT NOT NULL,
+    cadence       TEXT NOT NULL,          -- JSON: {"kind":"interval","minutes":15} | {"kind":"hourly"} | {"kind":"daily","time":"09:00"}
+    paused        BOOLEAN NOT NULL DEFAULT FALSE,
+    last_run_at   TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS agent_runs (
+    id             BIGSERIAL PRIMARY KEY,
+    agent_id       TEXT NOT NULL,
+    owner_user_id  TEXT NOT NULL,
+    ran_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    status         TEXT NOT NULL,         -- clean | failed | halted
+    summary        TEXT,
+    run_session_id TEXT,
+    console_url    TEXT
+);
+CREATE INDEX IF NOT EXISTS agent_runs_agent_idx ON agent_runs (agent_id, ran_at DESC);
 """
 
 
@@ -159,3 +195,107 @@ def auth_end(token):
     """Delete one login token (logout)."""
     with connect() as conn, conn.cursor() as cur:
         cur.execute("DELETE FROM auth_sessions WHERE token = %s", (token,))
+
+
+# --- Specs 2/3/4: durable agents / schedules / runs ------------------------
+# Pure-Postgres; the dual-run switch (Postgres vs filesystem) lives in
+# trace/ui/registry.py, which calls these only when is_configured().
+
+_AGENT_COLS = ("agent_id", "owner_user_id", "external_user_id", "bundle_id",
+               "name", "vault_ref", "trigger", "session_id", "deployed_at")
+
+
+def _agent_row(row):
+    d = dict(zip(_AGENT_COLS, row))
+    d["deployed_at"] = (d["deployed_at"].isoformat(timespec="seconds")
+                        if hasattr(d.get("deployed_at"), "isoformat") else d.get("deployed_at"))
+    return d
+
+
+def agent_upsert(a):
+    """Insert-or-update one deployed agent (keyed by agent_id)."""
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO agents (agent_id, owner_user_id, external_user_id, bundle_id, "
+            "name, vault_ref, trigger, session_id) "
+            "VALUES (%(agent_id)s, %(owner_user_id)s, %(external_user_id)s, %(bundle_id)s, "
+            "%(name)s, %(vault_ref)s, %(trigger)s, %(session_id)s) "
+            "ON CONFLICT (agent_id) DO UPDATE SET "
+            "owner_user_id=EXCLUDED.owner_user_id, external_user_id=EXCLUDED.external_user_id, "
+            "bundle_id=EXCLUDED.bundle_id, name=EXCLUDED.name, vault_ref=EXCLUDED.vault_ref, "
+            "trigger=EXCLUDED.trigger, session_id=EXCLUDED.session_id",
+            a)
+
+
+def agents_for_user(owner_user_id):
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(f"SELECT {', '.join(_AGENT_COLS)} FROM agents "
+                    "WHERE owner_user_id = %s ORDER BY deployed_at DESC", (owner_user_id,))
+        return [_agent_row(r) for r in cur.fetchall()]
+
+
+def schedule_set(agent_id, owner_user_id, cadence, paused=False):
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO schedules (agent_id, owner_user_id, cadence, paused) "
+            "VALUES (%s, %s, %s, %s) "
+            "ON CONFLICT (agent_id) DO UPDATE SET cadence=EXCLUDED.cadence, paused=EXCLUDED.paused",
+            (agent_id, owner_user_id, cadence, paused))
+
+
+def schedule_clear(agent_id):
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute("DELETE FROM schedules WHERE agent_id = %s", (agent_id,))
+
+
+def schedule_get(agent_id):
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT cadence, paused, last_run_at FROM schedules WHERE agent_id = %s",
+                    (agent_id,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        return {"cadence": row[0], "paused": row[1],
+                "last_run_at": row[2].isoformat(timespec="seconds") if hasattr(row[2], "isoformat") else row[2]}
+
+
+def schedule_list_active():
+    """Active (not paused) schedules joined with their agent row — everything the
+    scheduler needs to run headlessly. Returns dicts with agent fields + cadence +
+    last_run_at (epoch seconds, or None)."""
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            f"SELECT {', '.join('a.' + c for c in _AGENT_COLS)}, "
+            "s.cadence, EXTRACT(EPOCH FROM s.last_run_at) "
+            "FROM schedules s JOIN agents a ON a.agent_id = s.agent_id "
+            "WHERE s.paused = FALSE")
+        out = []
+        for r in cur.fetchall():
+            d = _agent_row(r[:len(_AGENT_COLS)])
+            d["cadence"] = r[len(_AGENT_COLS)]
+            d["last_run_epoch"] = float(r[len(_AGENT_COLS) + 1]) if r[len(_AGENT_COLS) + 1] is not None else None
+            out.append(d)
+        return out
+
+
+def schedule_mark_run(agent_id):
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute("UPDATE schedules SET last_run_at = now() WHERE agent_id = %s", (agent_id,))
+
+
+def run_add(rec):
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO agent_runs (agent_id, owner_user_id, status, summary, "
+            "run_session_id, console_url) VALUES (%(agent_id)s, %(owner_user_id)s, "
+            "%(status)s, %(summary)s, %(run_session_id)s, %(console_url)s)", rec)
+
+
+def runs_for_agent(agent_id, limit=20):
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT ran_at, status, summary, run_session_id, console_url "
+                    "FROM agent_runs WHERE agent_id = %s ORDER BY ran_at DESC LIMIT %s",
+                    (agent_id, limit))
+        return [{"ran_at": r[0].isoformat(timespec="seconds") if hasattr(r[0], "isoformat") else r[0],
+                 "status": r[1], "summary": r[2], "run_session_id": r[3], "console_url": r[4]}
+                for r in cur.fetchall()]
