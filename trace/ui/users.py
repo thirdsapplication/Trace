@@ -1,10 +1,16 @@
 """WS3 — end-user accounts + login sessions for the end-user UI.
 
 Email + password accounts, passwords hashed+salted with stdlib ``hashlib.scrypt``
-(no external dependency). Persisted to a 0600 JSON file outside the repo (the same
-posture as ``keystore``). Login establishes a server-side session keyed by an opaque
-token handed back as an httpOnly cookie; the token store is in-process (a restart logs
-everyone out — acceptable for the MVP).
+(no external dependency). Storage is switched by configuration (dual-run):
+
+- when ``DATABASE_URL`` is set (the cloud), accounts and login tokens live in
+  Postgres (via ``db.py``), so they survive instance restarts/redeploys — the
+  cloud's disk is ephemeral, which is why file-based accounts vanished;
+- when it is unset (local dev), accounts persist to a 0600 JSON file and login
+  tokens live in-process, exactly as before.
+
+Either way passwords are stored only as salted scrypt hashes, and login uses an
+opaque token handed back as an httpOnly cookie.
 
 The logged-in ``user_id`` is the per-customer isolation key: it derives the Pipedream
 ``external_user_id`` (``trace-user-<id>``) and the per-customer vault namespace, and it
@@ -24,6 +30,8 @@ import secrets
 import stat
 import threading
 import time
+
+from . import db
 
 # Overridable for tests (mirrors keystore's file-fallback pattern).
 _DIR = os.path.expanduser("~/.trace")
@@ -99,6 +107,12 @@ def _public(u):
     return {"user_id": u["user_id"], "email": u["email"], "created_at": u["created_at"]}
 
 
+def _iso(v):
+    """Render a DB timestamp (or anything) as the same ISO string shape the file
+    path uses, so callers see one consistent ``created_at`` format."""
+    return v.isoformat(timespec="seconds") if hasattr(v, "isoformat") else str(v)
+
+
 # --- accounts -------------------------------------------------------------
 def create_user(email, password):
     """Provision (or self-register) one account. Raises ValueError on a bad email, a
@@ -108,13 +122,19 @@ def create_user(email, password):
         raise ValueError("enter a valid email address")
     if len(password or "") < _MIN_PASSWORD:
         raise ValueError(f"password must be at least {_MIN_PASSWORD} characters")
+    uid = "usr_" + secrets.token_hex(8)
+    pw = _hash_password(password)
+    if db.is_configured():
+        if db.user_by_email(email):
+            raise ValueError("an account with this email already exists")
+        db.user_create(uid, email, pw, external_user_id(uid))   # unique-violation -> ValueError
+        return {"user_id": uid, "email": email, "created_at": _now()}
     with _LOCK:
         d = _load()
         if any(u["email"] == email for u in d.values()):
             raise ValueError("an account with this email already exists")
-        uid = "usr_" + secrets.token_hex(8)
         d[uid] = {"user_id": uid, "email": email,
-                  "password_hash": _hash_password(password), "created_at": _now()}
+                  "password_hash": pw, "created_at": _now()}
         _save(d)
         return _public(d[uid])
 
@@ -122,6 +142,11 @@ def create_user(email, password):
 def verify(email, password):
     """Return the public user for valid credentials, else None."""
     email = (email or "").strip().lower()
+    if db.is_configured():
+        row = db.user_by_email(email)                # (user_id, email, password_hash, created_at)
+        if not row or not _verify_password(password, row[2]):
+            return None
+        return {"user_id": row[0], "email": row[1], "created_at": _iso(row[3])}
     for u in _load().values():
         if u["email"] == email:
             return _public(u) if _verify_password(password, u["password_hash"]) else None
@@ -130,6 +155,9 @@ def verify(email, password):
 
 def get(user_id):
     """The public user for an id, or None."""
+    if db.is_configured():
+        row = db.user_by_id(user_id or "")           # (user_id, email, created_at)
+        return {"user_id": row[0], "email": row[1], "created_at": _iso(row[2])} if row else None
     u = _load().get(user_id or "")
     return _public(u) if u else None
 
@@ -140,14 +168,20 @@ def external_user_id(user_id):
 
 
 # --- login sessions (opaque token <-> user) -------------------------------
+# DB-backed when DATABASE_URL is set (durable across restarts), else in-process.
 def start_session(user_id):
     token = secrets.token_urlsafe(32)
-    _SESSIONS[token] = {"user_id": user_id, "expires": time.time() + _SESSION_TTL}
+    if db.is_configured():
+        db.auth_start(token, user_id, _SESSION_TTL)
+    else:
+        _SESSIONS[token] = {"user_id": user_id, "expires": time.time() + _SESSION_TTL}
     return token
 
 
 def session_user(token):
     """The user_id for a live token, or None (expired tokens are reaped)."""
+    if db.is_configured():
+        return db.auth_session_user(token or "")
     s = _SESSIONS.get(token or "")
     if not s:
         return None
@@ -158,4 +192,7 @@ def session_user(token):
 
 
 def end_session(token):
-    _SESSIONS.pop(token or "", None)
+    if db.is_configured():
+        db.auth_end(token or "")
+    else:
+        _SESSIONS.pop(token or "", None)

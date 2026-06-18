@@ -40,6 +40,18 @@ CREATE TABLE IF NOT EXISTS sessions (
 
 CREATE INDEX IF NOT EXISTS sessions_external_user_id_idx
     ON sessions (external_user_id);
+
+-- Spec 1: durable login sessions (opaque tokens) so a signed-in session
+-- survives an instance restart/redeploy. Distinct from the capture-`sessions`
+-- table above. Reaped lazily on lookup by expires_at.
+CREATE TABLE IF NOT EXISTS auth_sessions (
+    token       TEXT PRIMARY KEY,
+    user_id     TEXT NOT NULL REFERENCES users(user_id),
+    expires_at  TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS auth_sessions_user_id_idx
+    ON auth_sessions (user_id);
 """
 
 
@@ -90,3 +102,60 @@ def init_db():
             cur.execute(_SCHEMA)
         conn.commit()
     return True
+
+
+# --- Spec 1: durable accounts + login sessions -----------------------------
+# These are called by users.py only when DATABASE_URL is set; they keep all
+# Postgres access inside this module. Connections use psycopg's context manager,
+# which commits on a clean exit and rolls back on error.
+
+def user_create(user_id, email, password_hash, external_user_id):
+    """Insert a new account. Raises ValueError if the email already exists."""
+    import psycopg
+    try:
+        with connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO users (user_id, email, password_hash, external_user_id) "
+                "VALUES (%s, %s, %s, %s)",
+                (user_id, email, password_hash, external_user_id))
+    except psycopg.errors.UniqueViolation:
+        raise ValueError("an account with this email already exists")
+
+
+def user_by_email(email):
+    """(user_id, email, password_hash, created_at) for an email, or None."""
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT user_id, email, password_hash, created_at "
+                    "FROM users WHERE email = %s", (email,))
+        return cur.fetchone()
+
+
+def user_by_id(user_id):
+    """(user_id, email, created_at) for an id, or None."""
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT user_id, email, created_at FROM users WHERE user_id = %s",
+                    (user_id,))
+        return cur.fetchone()
+
+
+def auth_start(token, user_id, ttl_seconds):
+    """Persist a login token with a TTL so the session survives a restart."""
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute("INSERT INTO auth_sessions (token, user_id, expires_at) "
+                    "VALUES (%s, %s, now() + (%s * interval '1 second'))",
+                    (token, user_id, ttl_seconds))
+
+
+def auth_session_user(token):
+    """The user_id for a live token, or None. Reaps expired tokens first."""
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute("DELETE FROM auth_sessions WHERE expires_at <= now()")
+        cur.execute("SELECT user_id FROM auth_sessions WHERE token = %s", (token,))
+        row = cur.fetchone()
+        return row[0] if row else None
+
+
+def auth_end(token):
+    """Delete one login token (logout)."""
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute("DELETE FROM auth_sessions WHERE token = %s", (token,))
