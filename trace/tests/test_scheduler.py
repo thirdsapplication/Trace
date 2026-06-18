@@ -41,6 +41,19 @@ def _tool(name):
     return {"type": "agent.mcp_tool_use", "name": name, "text": ""}
 
 
+class FakeConnect:
+    """Stub ConnectClient recording pre-run token refreshes."""
+    def __init__(self, boom=False):
+        self.refreshed = []
+        self.boom = boom
+
+    def refresh_vault(self, vault_ref):
+        self.refreshed.append(vault_ref)
+        if self.boom:
+            raise RuntimeError("pipedream unreachable")
+        return {"refreshed": 1, "expires_at": "2026-01-01T00:00:00Z"}
+
+
 def _agent(owner="usr_1", agent_id="agent-1"):
     return {"agent_id": agent_id, "owner_user_id": owner, "external_user_id": "x",
             "bundle_id": "wf", "name": "WF", "vault_ref": "vlt-1",
@@ -119,6 +132,8 @@ class SchedulerPassTest(unittest.TestCase):
         self.state = app.AppState(self.root, key_store=FakeKeystore())
         self.ma = FakeMA()
         self.state._live_client = lambda: self.ma                     # inject stub client
+        self.fc = FakeConnect()
+        self.state.connect_fn = lambda: self.fc                       # inject stub connect client
 
     def tearDown(self):
         self.state.scheduler_stop.set()
@@ -133,6 +148,20 @@ class SchedulerPassTest(unittest.TestCase):
         self.assertEqual(runs[0]["status"], "completed")
         # immediately again -> not due (just ran), still one run
         self.state.run_due_schedules(now=time.time())
+        self.assertEqual(len(registry.runs_for_agent(self.root, "agent-1")), 1)
+
+    def test_token_refreshed_before_run(self):
+        # The scheduled run must refresh the Pipedream token first, so a run long
+        # after deploy still authenticates (the bug: it never did).
+        registry.agent_upsert(self.root, _agent())          # vault_ref = "vlt-1"
+        registry.schedule_set(self.root, "agent-1", "usr_1", {"kind": "hourly"})
+        self.state.run_due_schedules(now=time.time())
+        self.assertEqual(self.fc.refreshed, ["vlt-1"])       # refreshed before running
+
+    def test_refresh_failure_does_not_block_run(self):
+        self.state.connect_fn = lambda: FakeConnect(boom=True)
+        rec = self.state.run_agent(_agent())                 # must not raise
+        self.assertIn(rec["status"], ("completed", "needs_approval", "failed"))
         self.assertEqual(len(registry.runs_for_agent(self.root, "agent-1")), 1)
 
     def test_paused_schedule_does_not_run(self):

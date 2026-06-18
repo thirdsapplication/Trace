@@ -739,10 +739,27 @@ class AppState:
             if agent_runner.schedule_due(agent.get("cadence"), agent.get("last_run_epoch"), now):
                 self.run_agent(agent)
 
+    def _refresh_agent_binding(self, agent):
+        """Re-mint + rotate the Pipedream token in the agent's vault before a
+        scheduled/Run-now run, so a run long after deploy still authenticates (the
+        Pipedream dev token is ~1h; deploy refreshes via _refresh_stale_bindings, this
+        is its equivalent on the scheduler path). Durable: uses only the vault_ref on
+        the agent row, so it works even after a restart wiped the session's
+        connection.json. Best-effort — a refresh failure lets the run proceed and
+        surface its own auth error rather than silently skipping the run."""
+        vault_ref = agent.get("vault_ref")
+        if not vault_ref:
+            return
+        try:
+            self.connect_fn().refresh_vault(vault_ref)
+        except Exception:
+            pass
+
     def run_agent(self, agent):
         """Run one agent once (scheduled or "Run now"), persist the run record, and
         advance its last_run. Reuses the Deployer's run path via agent_runner; a
         missing key / platform error is recorded as a failed run, never raised."""
+        self._refresh_agent_binding(agent)   # WS5: fresh Pipedream token before the run
         try:
             client = self._live_client()
             rec = agent_runner.run_once(client, agent)

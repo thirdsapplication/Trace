@@ -266,6 +266,19 @@ class RealBindCredentialTest(unittest.TestCase):
         self.assertNotIn("mcp_server_url", upd["auth"])             # immutable: never on rotation
         self.assertEqual(vaults.credentials.created, [])           # rotation only, no new cred
 
+    def test_refresh_vault_rotates_every_credential_from_vault_ref_only(self):
+        # Spec fix: the scheduler refreshes using only vault_ref (no app slug / no
+        # connection.json), rotating a freshly minted token into each credential.
+        creds = _FakeCreds()
+        c, vaults, _ = self._client(_FakeVaults(credentials=creds))
+        out = c.refresh_vault("vlt-s1")
+        self.assertEqual(out["refreshed"], 1)
+        upd = creds.updated[-1]
+        self.assertEqual(upd["auth"]["access_token"], "pdtok_abc")   # fresh token
+        self.assertIn("expires_at", upd["auth"])
+        self.assertNotIn("mcp_server_url", upd["auth"])              # immutable key never re-sent
+        self.assertEqual(creds.created, [])                          # rotation only, no new cred
+
     def test_refresh_binding_falls_back_to_bind_when_unbound(self):
         creds = _FakeCreds()
         creds.list = lambda vault_ref: []                          # nothing bound yet

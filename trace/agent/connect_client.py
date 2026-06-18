@@ -334,6 +334,34 @@ class ConnectClient:
         _retry(lambda: creds.update(cred_id, vault_id=vault_ref, auth=token_auth))
         return {"expires_at": expires_at}
 
+    def refresh_vault(self, vault_ref):
+        """Re-mint Trace's Pipedream token and ROTATE it into EVERY credential in the
+        vault. The dev token is project-scoped (one token serves every app), so this
+        needs only ``vault_ref`` — no app slug, no connection record — which is what the
+        scheduler/Run-now path has durably on the agent row (it must keep working even
+        after a restart wiped the session's connection.json). Best-effort per credential.
+        Returns ``{refreshed, expires_at}``."""
+        creds = self._vaults_ns().credentials
+        try:
+            existing = _data(_retry(lambda: creds.list(vault_ref)))
+        except Exception:
+            existing = []
+        tok = _retry(self.mint_access_token)
+        expires_at = self._token_expiry_iso(tok)
+        token_auth = {"type": "mcp_oauth", "access_token": tok["access_token"],
+                      "expires_at": expires_at}
+        refreshed = 0
+        for c in existing:
+            cred_id = _idof(c)
+            if not cred_id:
+                continue
+            try:
+                _retry(lambda cid=cred_id: creds.update(cid, vault_id=vault_ref, auth=token_auth))
+                refreshed += 1
+            except Exception:
+                pass                                        # one bad credential never blocks the rest
+        return {"refreshed": refreshed, "expires_at": expires_at}
+
     # --- Phase 5: READ-ONLY reads through the bound connection ---
     # There is no per-app "destination" endpoint. The primary dry-run read path is the
     # agent's own MCP read/list tools (discovered at runtime) on a COPY; the source is
