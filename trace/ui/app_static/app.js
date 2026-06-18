@@ -170,10 +170,52 @@ const goStep = (i) => { S.step = i; render(); };
 function recordAnother() { S.session = null; S.step = 0; render(); }
 
 /* ---------------- AGENTS DASHBOARD (Spec 2/3/4) ---------------- */
+const CADENCES = [
+  { v: "", label: "manually" },
+  { v: "interval:15", label: "every 15 min" },
+  { v: "hourly", label: "hourly" },
+  { v: "daily", label: "daily · 9am" },
+];
+function cadenceToValue(c) {
+  if (!c) return "";
+  if (c.kind === "interval") return `interval:${c.minutes || 15}`;
+  if (c.kind === "hourly") return "hourly";
+  if (c.kind === "daily") return "daily";
+  return "";
+}
+function valueToCadence(v) {
+  if (!v) return null;
+  if (v.startsWith("interval:")) return { kind: "interval", minutes: parseInt(v.split(":")[1], 10) };
+  if (v === "hourly") return { kind: "hourly" };
+  if (v === "daily") return { kind: "daily", time: "09:00" };
+  return null;
+}
+function runBadge(status) {
+  const cls = status === "clean" ? "pill-on" : (status === "halted" ? "pill-warn" : "pill-off");
+  const label = status === "clean" ? "ran cleanly" : (status === "halted" ? "needs approval" : "failed");
+  return `<span class="pill ${cls}">${label}</span>`;
+}
 function agentCard(a) {
-  return `<div class="card"><div class="spread">
+  const sched = a.schedule || null;
+  const cur = cadenceToValue(sched && sched.cadence);
+  const paused = sched && sched.paused;
+  const last = (a.recent_runs || [])[0];
+  const opts = CADENCES.map(c => `<option value="${c.v}" ${c.v === cur ? "selected" : ""}>${c.label}</option>`).join("");
+  return `<div class="card" data-agent="${esc(a.agent_id)}">
+    <div class="spread">
       <div class="row"><span class="dot"></span><span class="title">${esc(a.name || a.bundle_id || a.agent_id)}</span></div>
-      <span class="pill pill-on">LIVE</span></div></div>`;
+      <span class="pill ${paused ? "pill-warn" : "pill-on"}">${paused ? "PAUSED" : "LIVE"}</span></div>
+    <div class="row" style="margin-top:10px;gap:8px;align-items:center;flex-wrap:wrap;">
+      <span class="label">Runs</span>
+      <select class="sched" data-agent="${esc(a.agent_id)}">${opts}</select>
+      ${sched ? `<button class="btn-secondary btn-sm pausebtn" data-agent="${esc(a.agent_id)}">${paused ? "Resume" : "Pause"}</button>` : ""}
+      <button class="btn-accent btn-sm runnow" data-agent="${esc(a.agent_id)}">Run now</button>
+    </div>
+    <div class="agent-activity" style="margin-top:10px;">${
+      last ? `<div class="row" style="gap:8px;"><span class="muted" style="font-size:12px;">${esc(last.ran_at || "")}</span>${runBadge(last.status)}</div>
+              <div class="sub" style="margin-top:4px;">${esc(last.summary || "")}</div>`
+           : `<div class="muted" style="font-size:13px;">No runs yet.</div>`}</div>
+  </div>`;
 }
 
 async function renderDashboard() {
@@ -195,6 +237,23 @@ async function renderDashboard() {
   $("#logout").onclick = async () => { await api("POST", "/api/auth/logout", {}); S.user = null; clearTimers(); renderAuth(); };
   $("#recAnother").onclick = recordAnother;
   $("#backFlow").onclick = () => loadAndRender();
+  // Spec 4: schedule / pause / run-now per agent
+  root.querySelectorAll("select.sched").forEach(sel => sel.onchange = async () => {
+    await api("POST", `/api/u/agents/${sel.dataset.agent}/schedule`,
+              { cadence: valueToCadence(sel.value) });
+    renderDashboard();
+  });
+  root.querySelectorAll(".pausebtn").forEach(b => b.onclick = async () => {
+    await api("POST", `/api/u/agents/${b.dataset.agent}/schedule/pause`,
+              { paused: b.textContent === "Pause" });
+    renderDashboard();
+  });
+  root.querySelectorAll(".runnow").forEach(b => b.onclick = async () => {
+    b.disabled = true; b.textContent = "Running…";
+    await api("POST", `/api/u/agents/${b.dataset.agent}/run-now`, {});
+    // the run is async; refresh shortly to show the recorded outcome
+    setTimeout(renderDashboard, 4000);
+  });
 }
 
 /* ---------------- 01 RECORD ---------------- */

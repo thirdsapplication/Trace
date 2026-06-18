@@ -44,6 +44,7 @@ from ..agent import interview as agent_interview
 from ..agent import connect as agent_connect
 from ..agent import config as agent_config
 from ..agent import deploy as agent_deploy
+from ..agent import runner as agent_runner
 from . import cloud, db, keystore, permissions, registry, sessions, users
 
 
@@ -197,6 +198,8 @@ class AppState:
         self.build_jobs = {}         # sid -> {state, error, generated, errors}
         self.connection_jobs = {}    # sid -> {state, error, slug, connect_url, verified, flag}
         self.deploy_jobs = {}        # sid -> {state, error, deployed, errors}
+        self.scheduler_stop = threading.Event()   # Spec 4: Trace-side scheduler
+        self._scheduler_thread = None
         self.lock = threading.Lock()
         os.makedirs(sessions_root, exist_ok=True)
 
@@ -710,6 +713,50 @@ class AppState:
             pass
         return {"action_id": action_id, "status": new_status}
 
+    # --- Spec 4: Trace-side scheduler ------------------------------------
+    def start_scheduler(self, interval=60):
+        """Start the daemon loop that runs due agents on their cadence. No-op on the
+        desktop node (it proxies pipeline calls to the cloud, where the scheduler
+        already runs) and idempotent."""
+        if self.cloud_backend or self._scheduler_thread is not None:
+            return
+
+        def loop():
+            while not self.scheduler_stop.wait(interval):
+                try:
+                    self.run_due_schedules()
+                except Exception:
+                    pass                                  # a bad cycle never kills the loop
+
+        self._scheduler_thread = threading.Thread(target=loop, daemon=True)
+        self._scheduler_thread.start()
+
+    def run_due_schedules(self, now=None):
+        """One scheduler pass: run every active schedule whose cadence is due. Pure
+        of any thread/HTTP state so it's unit-testable directly."""
+        now = time.time() if now is None else now
+        for agent in registry.schedule_list_active(self.sessions_root):
+            if agent_runner.schedule_due(agent.get("cadence"), agent.get("last_run_epoch"), now):
+                self.run_agent(agent)
+
+    def run_agent(self, agent):
+        """Run one agent once (scheduled or "Run now"), persist the run record, and
+        advance its last_run. Reuses the Deployer's run path via agent_runner; a
+        missing key / platform error is recorded as a failed run, never raised."""
+        try:
+            client = self._live_client()
+            rec = agent_runner.run_once(client, agent)
+        except Exception as e:
+            rec = {"agent_id": agent.get("agent_id"), "status": "failed",
+                   "summary": f"{type(e).__name__}: {e}", "run_session_id": None,
+                   "console_url": agent_config.CONSOLE_BASE}
+        registry.run_add(self.sessions_root, {
+            "agent_id": agent.get("agent_id"), "owner_user_id": agent.get("owner_user_id"),
+            "status": rec["status"], "summary": rec["summary"],
+            "run_session_id": rec["run_session_id"], "console_url": rec["console_url"]})
+        registry.schedule_mark_run(self.sessions_root, agent.get("agent_id"))
+        return rec
+
 
 # --------------------------------------------------------------------------
 # Request handling
@@ -888,6 +935,33 @@ def make_handler(state):
                             "recent_runs": registry.runs_for_agent(root, aid, 5)})
             return out
 
+        def _agent_action(self, agent_id, action, body, user):
+            """Spec 4: set/clear/pause an agent's schedule, or run it now. Scoped to
+            the logged-in user (only their own agents). Run-now is async (a real run
+            can take minutes) — the dashboard polls /api/u/agents for the outcome."""
+            agent = next((a for a in registry.agents_for_user(root, user["user_id"])
+                          if a.get("agent_id") == agent_id), None)
+            if not agent:
+                return self._json(404, {"error": "not_found"})
+            if action == "schedule":
+                cadence = (body or {}).get("cadence")
+                if cadence is None:                       # null cadence = turn scheduling off
+                    registry.schedule_clear(root, agent_id)
+                    return self._json(200, {"schedule": None})
+                registry.schedule_set(root, agent_id, user["user_id"], cadence, paused=False)
+                return self._json(200, {"schedule": registry.schedule_get(root, agent_id)})
+            if action == "schedule/pause":
+                s = registry.schedule_get(root, agent_id)
+                if not s:
+                    return self._json(404, {"error": "no_schedule"})
+                registry.schedule_set(root, agent_id, user["user_id"], s["cadence"],
+                                      paused=bool((body or {}).get("paused", True)))
+                return self._json(200, {"schedule": registry.schedule_get(root, agent_id)})
+            if action == "run-now":
+                threading.Thread(target=lambda: state.run_agent(agent), daemon=True).start()
+                return self._json(202, {"state": "running"})
+            return self._json(404, {"error": "not_found"})
+
         # --- end-user namespace (WS3): same pipeline, scoped to the logged-in user ---
         def _user_get(self, rest, user):
             if rest in ("/me", ""):
@@ -920,6 +994,9 @@ def make_handler(state):
                 return self._capture_ctl(rest.rsplit("/", 1)[1])
             if rest == "/sessions/raw-upload":           # Phase 2: desktop capture upload
                 return self._raw_upload(user, body)
+            ma = re.match(r"^/agents/([^/]+)/(schedule|schedule/pause|run-now)$", rest)
+            if ma:                                       # Spec 4: schedule / run-now
+                return self._agent_action(ma.group(1), ma.group(2), body, user)
             if rest == "/load-fixture":
                 return self._load_fixture(body, owner=uid)
             m = re.match(r"^/sessions/([^/]+)/(.+)$", rest)
@@ -1670,10 +1747,11 @@ def main():
     ap.add_argument("--no-open", action="store_true", help="don't auto-open the browser")
     args = ap.parse_args()
 
-    httpd, _ = build_server(host=args.host, port=args.port,
-                            sessions_root=args.sessions_root,
-                            collector_port=args.collector_port,
-                            cloud_backend=args.cloud_backend)
+    httpd, state = build_server(host=args.host, port=args.port,
+                                sessions_root=args.sessions_root,
+                                collector_port=args.collector_port,
+                                cloud_backend=args.cloud_backend)
+    state.start_scheduler()   # Spec 4 (no-op on the desktop node; see start_scheduler)
     url = f"http://{args.host}:{args.port}/"
     print(f"Trace test UI: {url}")
     print(f"  sessions  -> {os.path.abspath(args.sessions_root)}")
