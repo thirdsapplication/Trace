@@ -199,7 +199,8 @@ function agentCard(a) {
   const sched = a.schedule || null;
   const cur = cadenceToValue(sched && sched.cadence);
   const paused = sched && sched.paused;
-  const last = (a.recent_runs || [])[0];
+  const runs = a.recent_runs || [];
+  const last = runs[0];
   const opts = CADENCES.map(c => `<option value="${c.v}" ${c.v === cur ? "selected" : ""}>${c.label}</option>`).join("");
   return `<div class="card" data-agent="${esc(a.agent_id)}">
     <div class="spread">
@@ -211,10 +212,18 @@ function agentCard(a) {
       ${sched ? `<button class="btn-secondary btn-sm pausebtn" data-agent="${esc(a.agent_id)}">${paused ? "Resume" : "Pause"}</button>` : ""}
       <button class="btn-accent btn-sm runnow" data-agent="${esc(a.agent_id)}">Run now</button>
     </div>
-    <div class="agent-activity" style="margin-top:10px;">${
-      last ? `<div class="row" style="gap:8px;"><span class="muted" style="font-size:12px;">${esc(last.ran_at || "")}</span>${runBadge(last.status)}</div>
-              <div class="sub" style="margin-top:4px;">${esc(last.summary || "")}</div>`
-           : `<div class="muted" style="font-size:13px;">No runs yet.</div>`}</div>
+    <details class="agent-activity" style="margin-top:10px;" ${last ? "open" : ""}>
+      <summary class="label" style="cursor:pointer;">Activity${runs.length ? ` (${runs.length})` : ""}</summary>
+      ${runs.length ? runs.map(r => `
+        <div class="run-row" style="margin-top:8px;">
+          <div class="row" style="gap:8px;align-items:center;">
+            <span class="muted" style="font-size:12px;">${esc(r.ran_at || "")}</span>${runBadge(r.status)}
+            ${r.console_url ? `<button class="btn-link ext-link" data-url="${esc(r.console_url)}" style="font-size:12px;">view in console ↗</button>` : ""}
+          </div>
+          <div class="sub" style="margin-top:2px;">${esc(r.summary || "")}</div>
+        </div>`).join("")
+        : `<div class="muted" style="font-size:13px;margin-top:6px;">No runs yet — set a schedule or hit Run now.</div>`}
+    </details>
   </div>`;
 }
 
@@ -254,6 +263,8 @@ async function renderDashboard() {
     // the run is async; refresh shortly to show the recorded outcome
     setTimeout(renderDashboard, 4000);
   });
+  // Spec 3: open a run's full trace in the system browser (works in the webview)
+  root.querySelectorAll(".ext-link").forEach(b => b.onclick = () => openExternal(b.dataset.url));
 }
 
 /* ---------------- 01 RECORD ---------------- */

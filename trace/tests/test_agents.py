@@ -93,6 +93,28 @@ class AgentsEndpointTest(unittest.TestCase):
         status, _, _ = self._req("GET", "/api/u/agents")
         self.assertEqual(status, 401)
 
+    def test_activity_runs_surface_and_render_gracefully(self):
+        # Spec 3: real run records surface per agent, scoped to the user; an agent
+        # with no runs still renders (empty list, not an error).
+        uid, cookie = self._signup("act@b.com")
+        registry.agent_upsert(self.root, {
+            "agent_id": "agent-1", "owner_user_id": uid, "external_user_id": "x",
+            "bundle_id": "wf1", "name": "WF1", "vault_ref": "v", "trigger": "t", "session_id": "s"})
+        registry.run_add(self.root, {"agent_id": "agent-1", "owner_user_id": uid,
+                                     "status": "clean", "summary": "did X",
+                                     "run_session_id": "s1", "console_url": "https://c"})
+        registry.run_add(self.root, {"agent_id": "agent-1", "owner_user_id": uid,
+                                     "status": "failed", "summary": "oops",
+                                     "run_session_id": None, "console_url": "https://c"})
+        registry.agent_upsert(self.root, {
+            "agent_id": "agent-2", "owner_user_id": uid, "external_user_id": "x",
+            "bundle_id": "wf2", "name": "WF2", "vault_ref": "v", "trigger": "t", "session_id": "s"})
+
+        _, data, _ = self._req("GET", "/api/u/agents", cookie=cookie)
+        by_id = {a["agent_id"]: a for a in data["agents"]}
+        self.assertEqual({r["status"] for r in by_id["agent-1"]["recent_runs"]}, {"clean", "failed"})
+        self.assertEqual(by_id["agent-2"]["recent_runs"], [])     # no runs -> graceful empty
+
 
 if __name__ == "__main__":
     unittest.main()
