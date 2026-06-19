@@ -30,19 +30,21 @@ def _usable_app_slugs(connection_record):
             if a.get("usable")]
 
 
-def finalize_live_envelope(live_envelope_dict, connection_record):
+def finalize_live_envelope(live_envelope_dict, connection_record, staged_apps=None):
     """Bake the customer's per-app Pipedream MCP servers into the LIVE agent at create
     time (the reference's "one customer, one workflow -> bake the URL"). The config-gen
     template carries one nominal server; here it becomes one server per usable app, each
-    URL carrying this customer's ``externalUserId``, plus the matching mcp_toolset entries
-    (on the default ``always_allow`` policy). Returns a NEW dict (the template is not
-    mutated)."""
+    URL carrying this customer's ``externalUserId``, plus the matching mcp_toolset entries.
+    ``staged_apps`` (Spec 8) is the subset of slugs the user opted into "stage, don't
+    execute" — those toolsets are baked ``require_approval`` (the platform holds their
+    outbound actions); the rest default ``always_allow``. Returns a NEW dict (the template
+    is not mutated)."""
     env = copy.deepcopy(live_envelope_dict)
     uid = (connection_record or {}).get("external_user_id")
     slugs = _usable_app_slugs(connection_record)
     if not slugs:                                   # no usable app -> leave the template as-is
         return env
-    servers, toolsets = config.pipedream_mcp_servers(uid, slugs)
+    servers, toolsets = config.pipedream_mcp_servers(uid, slugs, staged_slugs=staged_apps)
     env["mcp_servers"] = servers
     env["tools"] = [t for t in env.get("tools", []) if t.get("type") != config.MCP_TOOLSET_TYPE]
     env["tools"].extend(toolsets)
@@ -50,13 +52,14 @@ def finalize_live_envelope(live_envelope_dict, connection_record):
 
 
 def deploy_live(bundle, live_envelope_dict, connection_record, client,
-                trigger=None, schedule=None):
+                trigger=None, schedule=None, staged_apps=None):
     """Create + start the LIVE agent for one bundle over the bound connection. Returns a
-    ``live_record``. The customer's vault is injected at session creation (isolation)."""
+    ``live_record``. The customer's vault is injected at session creation (isolation).
+    ``staged_apps`` (Spec 8) marks which app slugs are staged for approval at deploy."""
     vault_ref = (connection_record or {}).get("vault_ref")
     external_user_id = (connection_record or {}).get("external_user_id")
 
-    live_envelope_dict = finalize_live_envelope(live_envelope_dict, connection_record)
+    live_envelope_dict = finalize_live_envelope(live_envelope_dict, connection_record, staged_apps)
     agent = client.create_or_reuse_agent(live_envelope_dict)
     agent_id = agent.get("id") if isinstance(agent, dict) else agent
     environment_id = client.create_environment()
@@ -86,6 +89,7 @@ def deploy_live(bundle, live_envelope_dict, connection_record, client,
         "start": start,
         "status": status,
         "error": error,
+        "staged_apps": list(staged_apps or []),
         "held_actions": list_held(client, session_id),
         "deployed_at": _now(),
         "isolation": "per-customer (vault scoped to external_user_id)",

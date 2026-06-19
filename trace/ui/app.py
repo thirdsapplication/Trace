@@ -236,7 +236,8 @@ class AppState:
         from ..agent.api_client import ManagedAgentsClient
         client = ManagedAgentsClient(api_key=key)
         return agent_deploy.deploy_live(bundle, live_dict, connection_record, client,
-                                        trigger=start.get("trigger"), schedule=start.get("schedule"))
+                                        trigger=start.get("trigger"), schedule=start.get("schedule"),
+                                        staged_apps=start.get("staged_apps"))
 
     def _live_client(self):
         key = self.keystore.get_key()
@@ -681,7 +682,8 @@ class AppState:
                                     "bundle_id": bid, "name": b.get("name") or bid,
                                     "vault_ref": rec.get("vault_ref"),
                                     "trigger": (rec.get("start") or {}).get("value"),
-                                    "session_id": sid})
+                                    "session_id": sid,
+                                    "staged_apps": rec.get("staged_apps") or []})
                         job["deployed"] += 1
                     except Exception as e:
                         job["errors"][bid] = f"{type(e).__name__}: {e}"
@@ -770,8 +772,47 @@ class AppState:
             "agent_id": agent.get("agent_id"), "owner_user_id": agent.get("owner_user_id"),
             "status": rec["status"], "summary": rec["summary"],
             "details": rec.get("details") or [], "run_session_id": rec.get("run_session_id")})
+        # Spec 8: persist any actions the agent staged for approval (deduped, so a
+        # repeated run never re-stages the same proposal). The run itself completes.
+        for item in rec.get("pending") or []:
+            registry.pending_add(self.sessions_root, {
+                "agent_id": agent.get("agent_id"), "owner_user_id": agent.get("owner_user_id"),
+                "run_session_id": item.get("run_session_id"), "app": item.get("app"),
+                "kind": item.get("kind"), "summary": item.get("summary"),
+                "payload": item.get("payload"), "content_hash": item.get("content_hash")})
         registry.schedule_mark_run(self.sessions_root, agent.get("agent_id"))
         return rec
+
+    def approve_pending(self, item):
+        """Spec 8: perform a staged action on the user's approval (the "quick fresh
+        task"), then mark it processed. Returns the execution record. Never raises."""
+        agent = self._agent_row(item.get("agent_id"), item.get("owner_user_id"))
+        if not agent:
+            registry.pending_set_status(self.sessions_root, item.get("id"), "failed")
+            return {"status": "failed", "summary": "The agent is no longer available."}
+        self._refresh_agent_binding(agent)
+        try:
+            client = self._live_client()
+            res = agent_runner.execute_pending(client, agent, item)
+        except Exception:
+            res = {"status": "failed", "summary": "Couldn't perform it.", "run_session_id": None}
+        registry.pending_set_status(self.sessions_root, item.get("id"),
+                                    "executed" if res["status"] == "executed" else "failed")
+        registry.run_add(self.sessions_root, {
+            "agent_id": agent.get("agent_id"), "owner_user_id": agent.get("owner_user_id"),
+            "status": "completed" if res["status"] == "executed" else "failed",
+            "summary": res.get("summary") or "", "details": [item.get("summary") or item.get("kind") or "action"],
+            "run_session_id": res.get("run_session_id")})
+        return res
+
+    def _agent_row(self, agent_id, owner_user_id):
+        """The durable registry row for one of this user's deployed agents, or None."""
+        if not agent_id or not owner_user_id:
+            return None
+        for a in registry.agents_for_user(self.sessions_root, owner_user_id):
+            if a.get("agent_id") == agent_id:
+                return a
+        return None
 
 
 # --------------------------------------------------------------------------
@@ -978,6 +1019,21 @@ def make_handler(state):
                 return self._json(202, {"state": "running"})
             return self._json(404, {"error": "not_found"})
 
+        def _pending_action(self, pending_id, action, user):
+            """Spec 8: approve (Trace performs the staged action) or reject (discard) one
+            pending item. Scoped to the owner. Approve runs async (a real connector call
+            can take time); the dashboard polls /api/u/pending for the outcome."""
+            item = registry.pending_get(root, pending_id)
+            if not item or item.get("owner_user_id") != user["user_id"]:
+                return self._json(404, {"error": "not_found"})
+            if item.get("status") != "pending":
+                return self._json(409, {"error": "already_processed"})
+            if action == "reject":
+                registry.pending_set_status(root, pending_id, "rejected")
+                return self._json(200, {"id": pending_id, "status": "rejected"})
+            threading.Thread(target=lambda: state.approve_pending(item), daemon=True).start()
+            return self._json(202, {"id": pending_id, "state": "running"})
+
         # --- end-user namespace (WS3): same pipeline, scoped to the logged-in user ---
         def _user_get(self, rest, user):
             if rest in ("/me", ""):
@@ -992,7 +1048,11 @@ def make_handler(state):
             if rest == "/preflight":
                 return self._json(200, _preflight(state))
             if rest == "/agents":                            # Spec 2/3: all my agents + activity
-                return self._json(200, {"agents": self._agents_for(user)})
+                return self._json(200, {"agents": self._agents_for(user),
+                                        "pending_count": registry.pending_count_for_user(root, user["user_id"])})
+            if rest == "/pending":                           # Spec 8: staged actions awaiting review
+                items = registry.pending_for_user(root, user["user_id"])
+                return self._json(200, {"pending": items, "pending_count": len(items)})
             m = re.match(r"^/sessions/([^/]+)(/.*)?$", rest)
             if m:
                 if not self._owns(m.group(1), user):
@@ -1013,6 +1073,9 @@ def make_handler(state):
             ma = re.match(r"^/agents/([^/]+)/(schedule|schedule/pause|run-now)$", rest)
             if ma:                                       # Spec 4: schedule / run-now
                 return self._agent_action(ma.group(1), ma.group(2), body, user)
+            mp = re.match(r"^/pending/([^/]+)/(approve|reject)$", rest)
+            if mp:                                       # Spec 8: approve/reject a staged action
+                return self._pending_action(mp.group(1), mp.group(2), user)
             if rest == "/load-fixture":
                 return self._load_fixture(body, owner=uid)
             m = re.match(r"^/sessions/([^/]+)/(.+)$", rest)
@@ -1620,7 +1683,8 @@ def make_handler(state):
             if not state.keystore.get_key():
                 return self._json(400, {"error": "no_api_key"})
             b = body or {}
-            start = {"trigger": b.get("trigger"), "schedule": b.get("schedule")}
+            start = {"trigger": b.get("trigger"), "schedule": b.get("schedule"),
+                     "staged_apps": b.get("staged_apps")}   # Spec 8: apps staged for approval
             with state.lock:
                 existing = state.deploy_jobs.get(sid)
                 if existing and existing.get("state") == "running":

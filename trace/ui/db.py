@@ -66,9 +66,28 @@ CREATE TABLE IF NOT EXISTS agents (
     vault_ref        TEXT,
     trigger          TEXT,
     session_id       TEXT,
+    staged_apps      TEXT,                  -- Spec 8: JSON list of app slugs staged for approval
     deployed_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS agents_owner_idx ON agents (owner_user_id);
+
+-- Spec 8 ("stage, don't execute"): outbound actions the agent proposed but did NOT
+-- perform. Captured in full at run time, reviewed in Trace, and executed on approval.
+CREATE TABLE IF NOT EXISTS pending_actions (
+    id             BIGSERIAL PRIMARY KEY,
+    agent_id       TEXT NOT NULL,
+    owner_user_id  TEXT NOT NULL,
+    run_session_id TEXT,
+    app            TEXT,
+    kind           TEXT,
+    summary        TEXT,
+    payload        TEXT,                    -- JSON: the action's full arguments
+    content_hash   TEXT,                    -- idempotency: identical proposals dedupe
+    status         TEXT NOT NULL DEFAULT 'pending',  -- pending|approved|rejected|executed|failed
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    processed_at   TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS pending_actions_owner_idx ON pending_actions (owner_user_id, status);
 
 CREATE TABLE IF NOT EXISTS schedules (
     agent_id      TEXT PRIMARY KEY REFERENCES agents(agent_id) ON DELETE CASCADE,
@@ -140,6 +159,8 @@ def init_db():
             # Spec 6: add the in-Trace action list to agent_runs tables created
             # before it existed (idempotent; no-op on a fresh schema above).
             cur.execute("ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS details TEXT")
+            # Spec 8: add the staged-apps column to agents tables created before it.
+            cur.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS staged_apps TEXT")
         conn.commit()
     return True
 
@@ -206,29 +227,35 @@ def auth_end(token):
 # trace/ui/registry.py, which calls these only when is_configured().
 
 _AGENT_COLS = ("agent_id", "owner_user_id", "external_user_id", "bundle_id",
-               "name", "vault_ref", "trigger", "session_id", "deployed_at")
+               "name", "vault_ref", "trigger", "session_id", "staged_apps", "deployed_at")
 
 
 def _agent_row(row):
     d = dict(zip(_AGENT_COLS, row))
     d["deployed_at"] = (d["deployed_at"].isoformat(timespec="seconds")
                         if hasattr(d.get("deployed_at"), "isoformat") else d.get("deployed_at"))
+    try:
+        d["staged_apps"] = json.loads(d["staged_apps"]) if d.get("staged_apps") else []
+    except (TypeError, ValueError):
+        d["staged_apps"] = []
     return d
 
 
 def agent_upsert(a):
     """Insert-or-update one deployed agent (keyed by agent_id)."""
+    p = dict(a)
+    p["staged_apps"] = json.dumps(list(a.get("staged_apps") or []))
     with connect() as conn, conn.cursor() as cur:
         cur.execute(
             "INSERT INTO agents (agent_id, owner_user_id, external_user_id, bundle_id, "
-            "name, vault_ref, trigger, session_id) "
+            "name, vault_ref, trigger, session_id, staged_apps) "
             "VALUES (%(agent_id)s, %(owner_user_id)s, %(external_user_id)s, %(bundle_id)s, "
-            "%(name)s, %(vault_ref)s, %(trigger)s, %(session_id)s) "
+            "%(name)s, %(vault_ref)s, %(trigger)s, %(session_id)s, %(staged_apps)s) "
             "ON CONFLICT (agent_id) DO UPDATE SET "
             "owner_user_id=EXCLUDED.owner_user_id, external_user_id=EXCLUDED.external_user_id, "
             "bundle_id=EXCLUDED.bundle_id, name=EXCLUDED.name, vault_ref=EXCLUDED.vault_ref, "
-            "trigger=EXCLUDED.trigger, session_id=EXCLUDED.session_id",
-            a)
+            "trigger=EXCLUDED.trigger, session_id=EXCLUDED.session_id, staged_apps=EXCLUDED.staged_apps",
+            p)
 
 
 def agents_for_user(owner_user_id):
@@ -311,3 +338,80 @@ def runs_for_agent(agent_id, limit=20):
             out.append({"ran_at": r[0].isoformat(timespec="seconds") if hasattr(r[0], "isoformat") else r[0],
                         "status": r[1], "summary": r[2], "details": details, "run_session_id": r[4]})
         return out
+
+
+# --- Spec 8: staged (pending) actions --------------------------------------
+
+_PENDING_COLS = ("id", "agent_id", "owner_user_id", "run_session_id", "app", "kind",
+                 "summary", "payload", "content_hash", "status", "created_at", "processed_at")
+
+
+def _pending_row(row):
+    d = dict(zip(_PENDING_COLS, row))
+    try:
+        d["payload"] = json.loads(d["payload"]) if d.get("payload") else {}
+    except (TypeError, ValueError):
+        d["payload"] = {}
+    for k in ("created_at", "processed_at"):
+        if hasattr(d.get(k), "isoformat"):
+            d[k] = d[k].isoformat(timespec="seconds")
+    return d
+
+
+def pending_add(rec):
+    """Insert one staged action, unless an identical one (same agent + content_hash)
+    is already pending or executed — the idempotency guard so a repeated scheduled run
+    never re-stages the same proposal. Returns True if inserted, False if deduped."""
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM pending_actions WHERE agent_id = %s AND content_hash = %s "
+            "AND status IN ('pending', 'executed') LIMIT 1",
+            (rec.get("agent_id"), rec.get("content_hash")))
+        if cur.fetchone():
+            return False
+        cur.execute(
+            "INSERT INTO pending_actions (agent_id, owner_user_id, run_session_id, app, "
+            "kind, summary, payload, content_hash) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+            (rec.get("agent_id"), rec.get("owner_user_id"), rec.get("run_session_id"),
+             rec.get("app"), rec.get("kind"), rec.get("summary"),
+             json.dumps(rec.get("payload") or {}), rec.get("content_hash")))
+        return True
+
+
+def pending_for_user(owner_user_id, status="pending"):
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(f"SELECT {', '.join(_PENDING_COLS)} FROM pending_actions "
+                    "WHERE owner_user_id = %s AND status = %s ORDER BY created_at DESC",
+                    (owner_user_id, status))
+        return [_pending_row(r) for r in cur.fetchall()]
+
+
+def pending_get(pending_id):
+    try:
+        pid = int(pending_id)
+    except (TypeError, ValueError):
+        return None
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(f"SELECT {', '.join(_PENDING_COLS)} FROM pending_actions WHERE id = %s",
+                    (pid,))
+        row = cur.fetchone()
+        return _pending_row(row) if row else None
+
+
+def pending_set_status(pending_id, status):
+    try:
+        pid = int(pending_id)
+    except (TypeError, ValueError):
+        return
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute("UPDATE pending_actions SET status = %s, processed_at = now() "
+                    "WHERE id = %s", (status, pid))
+
+
+def pending_count_for_user(owner_user_id):
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM pending_actions "
+                    "WHERE owner_user_id = %s AND status = 'pending'", (owner_user_id,))
+        row = cur.fetchone()
+        return int(row[0]) if row else 0

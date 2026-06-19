@@ -116,5 +116,55 @@ class AgentsEndpointTest(unittest.TestCase):
         self.assertEqual(by_id["agent-2"]["recent_runs"], [])     # no runs -> graceful empty
 
 
+class PendingEndpointTest(AgentsEndpointTest):
+    """Spec 8: the /api/u/pending review surface — owner-scoped listing, count,
+    and approve/reject. File-mode (dual-run) path."""
+
+    def _stage(self, uid):
+        registry.agent_upsert(self.root, {
+            "agent_id": "agent-1", "owner_user_id": uid, "external_user_id": "x",
+            "bundle_id": "wf", "name": "WF", "vault_ref": "v", "trigger": "t", "session_id": "s"})
+        registry.pending_add(self.root, {
+            "agent_id": "agent-1", "owner_user_id": uid, "run_session_id": "rs",
+            "app": "gmail", "kind": "gmail-send-email", "summary": "Email Bob",
+            "payload": {"to": "bob@x.com"}, "content_hash": "h1"})
+
+    def test_pending_listed_and_scoped(self):
+        uid_a, cookie_a = self._signup("pa@x.com")
+        _, cookie_b = self._signup("pb@x.com")
+        self._stage(uid_a)
+        status, data, _ = self._req("GET", "/api/u/pending", cookie=cookie_a)
+        self.assertEqual(status, 200)
+        self.assertEqual(data["pending_count"], 1)
+        self.assertEqual(data["pending"][0]["payload"], {"to": "bob@x.com"})
+        # the agents endpoint exposes the badge count too
+        _, ag, _ = self._req("GET", "/api/u/agents", cookie=cookie_a)
+        self.assertEqual(ag["pending_count"], 1)
+        # another user sees none of it
+        _, data_b, _ = self._req("GET", "/api/u/pending", cookie=cookie_b)
+        self.assertEqual(data_b["pending"], [])
+
+    def test_reject_discards_without_executing(self):
+        uid, cookie = self._signup("pr@x.com")
+        self._stage(uid)
+        item = registry.pending_for_user(self.root, uid)[0]
+        status, data, _ = self._req("POST", f"/api/u/pending/{item['id']}/reject", {}, cookie=cookie)
+        self.assertEqual(status, 200)
+        self.assertEqual(data["status"], "rejected")
+        self.assertEqual(registry.pending_count_for_user(self.root, uid), 0)
+
+    def test_pending_requires_auth_and_ownership(self):
+        uid, _ = self._signup("po@x.com")
+        _, other_cookie = self._signup("pother@x.com")
+        self._stage(uid)
+        item = registry.pending_for_user(self.root, uid)[0]
+        # someone else cannot act on it
+        status, _, _ = self._req("POST", f"/api/u/pending/{item['id']}/reject", {}, cookie=other_cookie)
+        self.assertEqual(status, 404)
+        # unauthenticated listing is rejected
+        status, _, _ = self._req("GET", "/api/u/pending")
+        self.assertEqual(status, 401)
+
+
 if __name__ == "__main__":
     unittest.main()

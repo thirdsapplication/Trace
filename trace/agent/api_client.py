@@ -331,7 +331,9 @@ class ManagedAgentsClient:
         """Outbound writes/sends the agent is holding for approval. A held call surfaces as
         the session going ``status_idle`` with ``stop_reason=requires_action`` and a pending
         ``agent.mcp_tool_use`` carrying a ``tool_use_id``. Returns
-        ``[{action_id, kind, summary}]`` where ``action_id`` is that ``tool_use_id``."""
+        ``[{action_id, kind, summary, input}]`` where ``action_id`` is that ``tool_use_id``
+        and ``input`` is the tool's full arguments (recipient/subject/body, or the write
+        target+values) — the fully-specified action Trace stages for review (Spec 8)."""
         sessions = self._agents_ns("sessions")
         res = _retry(lambda: sessions.events.list(session_id))
         out, resolved = [], set()
@@ -347,9 +349,11 @@ class ManagedAgentsClient:
             tuid = _attr(ev, "tool_use_id") or _idof(ev)
             if not tuid or tuid in resolved:
                 continue
+            tool_input = _attr(ev, "input") or _attr(ev, "arguments") or {}
             out.append({"action_id": tuid,
                         "kind": _attr(ev, "kind") or _attr(ev, "name") or "write",
-                        "summary": _attr(ev, "summary") or _attr(ev, "name") or ""})
+                        "summary": _attr(ev, "summary") or _attr(ev, "name") or "",
+                        "input": tool_input})
         return out
 
     def approve_action(self, session_id, action_id):

@@ -12,6 +12,8 @@ Pure orchestration over an injected ``client``, so it runs offline against a stu
 """
 
 import datetime
+import hashlib
+import json
 
 from . import deploy
 
@@ -86,6 +88,31 @@ def _plural(n, word):
     return f"{n} {word}" + ("" if n == 1 else "s")
 
 
+def _content_hash(agent_id, kind, payload):
+    """Stable id for one proposed action (Spec 8 idempotency): identical
+    agent+kind+payload hash the same, so the same staged item is never duplicated
+    across repeated scheduled runs."""
+    blob = json.dumps({"a": agent_id, "k": kind, "p": payload},
+                      sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:32]
+
+
+def _pending_items(agent_id, held, run_session_id):
+    """Turn the platform's held actions into Trace-side staged-action records,
+    capturing each action's FULL input so Trace can review and later execute it."""
+    items = []
+    for h in held:
+        payload = h.get("input") or {}
+        kind = h.get("kind") or "write"
+        items.append({"action_id": h.get("action_id"),
+                      "kind": kind,
+                      "summary": h.get("summary") or kind,
+                      "payload": payload,
+                      "content_hash": _content_hash(agent_id, kind, payload),
+                      "run_session_id": run_session_id})
+    return items
+
+
 def run_once(client, agent):
     """Run one agent once. ``agent`` is a registry row carrying ``agent_id``,
     ``vault_ref``, and ``trigger``. Returns a run record dict
@@ -113,18 +140,61 @@ def run_once(client, agent):
                 "summary": _last_text(events) or "The run stopped before finishing.",
                 "details": actions, "run_session_id": run_session_id}
     if _needs_approval(events):
-        # genuinely paused for approval — count the unresolved requests, not all actions
+        # genuinely paused for approval — staged for in-Trace review (Spec 8). Harvest the
+        # held actions' FULL payloads so the user can review and approve later; NEVER
+        # approve here (that would execute). The held session is left to idle out — Trace
+        # executes on approval as a fresh task, so its timeout is irrelevant.
         try:
-            pending = deploy.list_held(client, run_session_id)
+            held = deploy.list_held(client, run_session_id)
         except Exception:
-            pending = []
+            held = []
+        pending = _pending_items(agent_id, held, run_session_id)
         labels = [(p.get("summary") or p.get("kind") or "action") for p in pending] or actions
         n = len(labels)
         return {"agent_id": agent_id, "status": "needs_approval",
-                "summary": f"Waiting for you to approve {_plural(n, 'action')}.",
-                "details": labels, "run_session_id": run_session_id}
+                "summary": f"Staged {_plural(n, 'action')} for you to approve.",
+                "details": labels, "pending": pending, "run_session_id": run_session_id}
     # completed: actions executed (the normal always-allow case)
     n = len(actions)
     summary = _last_text(events) or (f"Completed {_plural(n, 'action')}." if n else "Completed with no actions needed.")
     return {"agent_id": agent_id, "status": "completed",
             "summary": summary, "details": actions, "run_session_id": run_session_id}
+
+
+def execute_pending(client, agent, pending):
+    """Perform one previously-staged action (Spec 8 "quick fresh task"). On the user's
+    approval, run the deployed agent on a fresh, targeted instruction — "do exactly this
+    saved action" — then approve the resulting hold IN THAT BRAND-NEW SESSION (safe: the
+    session is fresh, so no timeout). Reuses the same vault-injected run path as
+    ``run_once``; all MA calls stay in ``client``. Returns
+    ``{status: executed|failed, summary, run_session_id}``. Never raises."""
+    agent_id = agent.get("agent_id")
+    vault_ref = agent.get("vault_ref")
+    summary = pending.get("summary") or pending.get("kind") or "the action"
+    payload = pending.get("payload") or {}
+    instruction = ("Perform exactly this single action and nothing else: "
+                   f"{summary}. Details: {json.dumps(payload, ensure_ascii=False, default=str)}")
+    try:
+        environment_id = client.create_environment()
+        run_session_id = client.create_session(
+            agent_id, environment_id, resources=[], title="Trace approved action",
+            vault_ids=[vault_ref] if vault_ref else None)
+        events = client.send_trigger_and_collect(run_session_id, instruction)
+    except Exception as e:                                  # noqa: BLE001
+        return {"status": "failed", "summary": f"Couldn't perform it: {type(e).__name__}",
+                "run_session_id": None}
+
+    # If the staged toolset is still require_approval, this fresh run will hold the
+    # action too — approve it here (fresh session, no timeout) so it executes.
+    try:
+        for h in deploy.list_held(client, run_session_id):
+            deploy.approve(client, run_session_id, h.get("action_id"))
+    except Exception:
+        pass
+    if _failed(events):
+        return {"status": "failed",
+                "summary": _last_text(events) or "The action stopped before finishing.",
+                "run_session_id": run_session_id}
+    return {"status": "executed",
+            "summary": _last_text(events) or f"Performed {summary}.",
+            "run_session_id": run_session_id}

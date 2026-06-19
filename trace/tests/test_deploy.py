@@ -95,6 +95,34 @@ class DeployTest(unittest.TestCase):
         self.assertEqual(rec["status"], "live")
         self.assertEqual(rec["start"]["mode"], "trigger")
 
+    # --- Spec 8: deploy-time per-connector staging policy ----------------
+    def test_staged_slug_gets_require_approval_others_always_allow(self):
+        servers, toolsets = config.pipedream_mcp_servers(
+            "trace-s1", ["gmail", "google_sheets"], staged_slugs=["gmail"])
+        pol = {t["mcp_server_name"]: t["default_config"]["permission_policy"]["type"]
+               for t in toolsets}
+        self.assertEqual(pol["pipedream_gmail"], config.APPROVAL_PERMISSION_POLICY)
+        self.assertEqual(pol["pipedream_google_sheets"], config.LIVE_PERMISSION_POLICY)
+
+    def test_no_staged_slugs_is_unchanged(self):
+        _, toolsets = config.pipedream_mcp_servers("trace-s1", ["gmail", "google_sheets"])
+        self.assertTrue(all(t["default_config"]["permission_policy"]["type"] == config.LIVE_PERMISSION_POLICY
+                            for t in toolsets))
+
+    def test_deploy_live_bakes_staging_and_records_it(self):
+        bundle, live = _live_dict()
+        conn = {"external_user_id": "trace-s1", "vault_ref": "vlt-s1",
+                "apps": {"gmail": {"usable": True}, "google_sheets": {"usable": True}}}
+        client = FakeDeployClient()
+        rec = deploy.deploy_live(bundle, live, conn, client,
+                                 trigger="on a new task", staged_apps=["gmail"])
+        toolsets = [t for t in client.agents[0]["tools"] if t.get("type") == "mcp_toolset"]
+        pol = {t["mcp_server_name"]: t["default_config"]["permission_policy"]["type"]
+               for t in toolsets}
+        self.assertEqual(pol["pipedream_gmail"], config.APPROVAL_PERMISSION_POLICY)
+        self.assertEqual(pol["pipedream_google_sheets"], config.LIVE_PERMISSION_POLICY)
+        self.assertEqual(rec["staged_apps"], ["gmail"])
+
     def test_outbound_writes_and_sends_are_held(self):
         bundle, live = _live_dict()
         rec = deploy.deploy_live(bundle, live, CONNECTION, FakeDeployClient())

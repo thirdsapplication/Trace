@@ -153,6 +153,63 @@ def runs_for_agent(root, agent_id, limit=20):
     return list(reversed(rows))[:limit]
 
 
+# --- pending (staged) actions — Spec 8 -------------------------------------
+def pending_add(root, rec):
+    """rec: {agent_id, owner_user_id, run_session_id, app, kind, summary, payload,
+    content_hash}. Deduped on (agent_id, content_hash) against pending/executed items
+    so a repeated scheduled run never re-stages the same proposal. Returns True if
+    inserted, False if deduped."""
+    if db.is_configured():
+        return db.pending_add(rec)
+    with _LOCK:
+        d = _load(root, "pending.json")
+        for it in d.values():
+            if (it.get("agent_id") == rec.get("agent_id")
+                    and it.get("content_hash") == rec.get("content_hash")
+                    and it.get("status") in ("pending", "executed")):
+                return False
+        nid = str(max((int(k) for k in d), default=0) + 1)
+        d[nid] = {**rec, "id": nid, "status": "pending",
+                  "created_at": _now_iso(), "processed_at": None}
+        _save(root, "pending.json", d)
+        return True
+
+
+def pending_for_user(root, owner_user_id, status="pending"):
+    if db.is_configured():
+        return db.pending_for_user(owner_user_id, status)
+    d = _load(root, "pending.json")
+    return sorted((it for it in d.values()
+                   if it.get("owner_user_id") == owner_user_id and it.get("status") == status),
+                  key=lambda it: it.get("created_at") or "", reverse=True)
+
+
+def pending_get(root, pending_id):
+    if db.is_configured():
+        return db.pending_get(pending_id)
+    return _load(root, "pending.json").get(str(pending_id))
+
+
+def pending_set_status(root, pending_id, status):
+    if db.is_configured():
+        return db.pending_set_status(pending_id, status)
+    with _LOCK:
+        d = _load(root, "pending.json")
+        it = d.get(str(pending_id))
+        if it:
+            it["status"] = status
+            it["processed_at"] = _now_iso()
+            _save(root, "pending.json", d)
+
+
+def pending_count_for_user(root, owner_user_id):
+    if db.is_configured():
+        return db.pending_count_for_user(owner_user_id)
+    d = _load(root, "pending.json")
+    return sum(1 for it in d.values()
+               if it.get("owner_user_id") == owner_user_id and it.get("status") == "pending")
+
+
 # --- small utils -----------------------------------------------------------
 def _safe(s):
     return "".join(c if c.isalnum() else "_" for c in str(s))

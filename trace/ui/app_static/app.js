@@ -101,6 +101,11 @@ function connectionUsable() {
   const apps = (S.conn && S.conn.record && S.conn.record.apps) || {};
   return Object.values(apps).some(a => a.usable);
 }
+function usableApps() {
+  const apps = (S.conn && S.conn.record && S.conn.record.apps) || {};
+  return Object.keys(apps).filter(s => apps[s].usable)
+    .map(s => ({ slug: s, label: apps[s].label || s }));
+}
 
 async function loadAndRender() { await refreshSession(); render(); }
 
@@ -198,6 +203,22 @@ function runBadge(status) {
   const label = ok ? "completed" : (appr ? "needs approval" : "failed");
   return `<span class="pill ${cls}">${label}</span>`;
 }
+function pendingCard(p) {
+  const pl = p.payload || {};
+  const rows = Object.keys(pl).map(k => {
+    const v = pl[k];
+    const val = (v && typeof v === "object") ? JSON.stringify(v) : String(v);
+    return `<div class="sub" style="margin-top:2px;"><b>${esc(k)}:</b> ${esc(val)}</div>`;
+  }).join("");
+  return `<div class="card" data-pending="${esc(p.id)}">
+    <div class="row"><span class="dot"></span><span class="title">${esc(p.summary || p.kind || "Action")}</span></div>
+    <div style="margin-top:6px;">${rows || `<div class="sub muted">No details captured.</div>`}</div>
+    <div class="row" style="margin-top:10px;gap:8px;">
+      <button class="btn-accent btn-sm pend-ok" data-id="${esc(p.id)}">Approve &amp; run</button>
+      <button class="btn-secondary btn-sm pend-no" data-id="${esc(p.id)}">Reject</button></div>
+  </div>`;
+}
+
 function agentCard(a) {
   const sched = a.schedule || null;
   const cur = cadenceToValue(sched && sched.cadence);
@@ -238,10 +259,18 @@ async function renderDashboard() {
   clearTimers();
   const { data } = await api("GET", "/api/u/agents");
   const agents = (data && data.agents) || [];
+  const pending = ((await api("GET", "/api/u/pending")).data || {}).pending || [];
+  const pendingHtml = pending.length ? `
+    <div class="panel" style="margin-bottom:14px;">
+      <div class="spread"><h2>Pending approvals <span class="pill pill-warn">${pending.length}</span></h2></div>
+      <p class="lead">These actions were staged for you to review. Nothing happens until you approve.</p>
+      <div class="stack" id="pendingList">${pending.map(pendingCard).join("")}</div>
+    </div>` : "";
   root.innerHTML = `
     <div class="topbar"><div class="brand">● Trace</div>
       <div class="row"><span class="muted" style="font-size:13px;">${esc(S.user.email)}</span>
         <button id="logout" class="btn-link">Sign out</button></div></div>
+    ${pendingHtml}
     <div class="panel">
       <div class="spread"><h2>Your agents</h2>
         <button id="recAnother" class="btn-primary btn-sm">Record another workflow</button></div>
@@ -253,6 +282,16 @@ async function renderDashboard() {
   $("#logout").onclick = async () => { await api("POST", "/api/auth/logout", {}); S.user = null; clearTimers(); renderAuth(); };
   $("#recAnother").onclick = recordAnother;
   $("#backFlow").onclick = () => loadAndRender();
+  // Spec 8: approve (Trace performs it) / reject (discard) a staged action
+  root.querySelectorAll(".pend-ok").forEach(b => b.onclick = async () => {
+    b.disabled = true; b.textContent = "Running…";
+    await api("POST", `/api/u/pending/${b.dataset.id}/approve`, {});
+    setTimeout(renderDashboard, 4000);                  // approval runs async
+  });
+  root.querySelectorAll(".pend-no").forEach(b => b.onclick = async () => {
+    await api("POST", `/api/u/pending/${b.dataset.id}/reject`, {});
+    renderDashboard();
+  });
   // Spec 4: schedule / pause / run-now per agent
   root.querySelectorAll("select.sched").forEach(sel => sel.onchange = async () => {
     await api("POST", `/api/u/agents/${sel.dataset.agent}/schedule`,
@@ -615,15 +654,29 @@ async function stepGolive() {
 }
 async function renderGolive(sid) {
   if (!S.session.deploy_at) {
+    if (!S.conn) { try { S.conn = (await uget(sid, "/connection-data")).data; } catch (e) { /* best effort */ } }
+    const staging = usableApps();
+    const stageRow = (a) => `<label class="row" style="gap:8px;justify-content:flex-start;margin-top:8px;">
+        <input type="checkbox" class="stage-app" data-slug="${esc(a.slug)}" checked>
+        <span class="title" style="font-size:13.5px;">Stage ${esc(a.label)} actions for my approval</span></label>`;
+    const stagingHtml = staging.length ? `
+      <div class="card" style="margin-top:12px;text-align:left;">
+        <div class="title" style="font-size:14px;">Before they act</div>
+        <div class="sub" style="margin-top:4px;">For anything you'd rather check first, keep it staged: the agent prepares the action and you approve it here before it actually happens. Unchecked apps run automatically.</div>
+        ${staging.map(stageRow).join("")}
+      </div>` : "";
     $("#liveBody").innerHTML = `
       <div class="card center" style="padding:22px;"><div class="big-check">↑</div>
         <div class="title" style="font-size:17px;">Ready to go live</div>
         <div class="notice">They'll start on the next matching task.</div></div>
+      ${stagingHtml}
       <p id="liveMsg" class="msg err" style="margin-top:12px;"></p>
       <button id="liveGo" class="btn-primary full" style="margin-top:6px;">Go live</button>`;
     $("#liveGo").onclick = async () => {
       $("#liveGo").disabled = true; $("#liveGo").textContent = "Deploying…";
-      const r = await upost(sid, "/deploy", { trigger: "on a new matching task" });
+      const staged_apps = Array.from(document.querySelectorAll(".stage-app"))
+        .filter(c => c.checked).map(c => c.dataset.slug);
+      const r = await upost(sid, "/deploy", { trigger: "on a new matching task", staged_apps });
       if (!r.ok && r.status !== 202) {
         $("#liveGo").disabled = false; $("#liveGo").textContent = "Go live";
         if (r.data.error === "not_eligible") {

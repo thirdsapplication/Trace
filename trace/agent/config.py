@@ -85,17 +85,25 @@ def pipedream_mcp_url(external_user_id, app, project=None, environment=None):
     return f"{PIPEDREAM_MCP_BASE}?{q}"
 
 
-def pipedream_mcp_servers(external_user_id, app_slugs):
+def pipedream_mcp_servers(external_user_id, app_slugs, staged_slugs=None):
     """Build the LIVE agent's connection block for one customer: one ``mcp_servers``
-    entry per app (one app per URL) plus the matching approval-required ``mcp_toolset``
-    entries. Returns ``(servers, toolsets)``."""
+    entry per app (one app per URL) plus the matching ``mcp_toolset`` entries. Returns
+    ``(servers, toolsets)``.
+
+    ``staged_slugs`` (Spec 8 "stage, don't execute") is the set of app slugs the user
+    opted into staging at deploy: that app's toolset gets ``require_approval`` so the
+    platform HOLDS its outbound actions (Trace captures + stages them) instead of
+    auto-executing. Any slug not in the set keeps ``always_allow``. ``None`` (the
+    default) stages nothing — every toolset is ``always_allow``, the prior behavior."""
+    staged = set(staged_slugs or ())
     servers, toolsets = [], []
     for slug in app_slugs:
         name = f"{PIPEDREAM_MCP_NAME}_{slug}"
+        policy = APPROVAL_PERMISSION_POLICY if slug in staged else LIVE_PERMISSION_POLICY
         servers.append({"name": name, "type": "url",
                         "url": pipedream_mcp_url(external_user_id, slug)})
         toolsets.append({"type": MCP_TOOLSET_TYPE, "mcp_server_name": name,
-                         "default_config": {"permission_policy": {"type": LIVE_PERMISSION_POLICY}}})
+                         "default_config": {"permission_policy": {"type": policy}}})
     return servers, toolsets
 
 # Observed-app substring -> Pipedream app {slug, label}. Domain-neutral; same match

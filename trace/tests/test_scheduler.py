@@ -20,6 +20,7 @@ class FakeMA:
         self.held = held or []
         self.fail = fail
         self.sessions = []
+        self.approved, self.rejected = [], []
 
     def create_environment(self):
         return "env-1"
@@ -35,6 +36,12 @@ class FakeMA:
 
     def list_pending_approvals(self, sid):
         return self.held
+
+    def approve_action(self, sid, action_id):
+        self.approved.append(action_id)
+
+    def reject_action(self, sid, action_id, message=None):
+        self.rejected.append(action_id)
 
 
 def _tool(name):
@@ -88,6 +95,49 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(rec["status"], "needs_approval")
         self.assertIn("approve", rec["summary"].lower())
         self.assertEqual(rec["details"], ["send email to Bob"])
+
+    # --- Spec 8: stage, don't execute -----------------------------------
+    def test_staged_action_captures_full_payload_and_never_approves(self):
+        held = [{"action_id": "a1", "kind": "gmail-send-email", "summary": "Email Bob",
+                 "input": {"to": "bob@x.com", "subject": "Hi", "body": "Hello"}}]
+        events = [_tool("gmail-send-email"),
+                  {"type": "session.status_idle", "stop_reason": "requires_action"}]
+        ma = FakeMA(events=events, held=held)
+        rec = runner.run_once(ma, _agent())
+        self.assertEqual(rec["status"], "needs_approval")
+        self.assertEqual(len(rec["pending"]), 1)
+        p = rec["pending"][0]
+        self.assertEqual(p["payload"], {"to": "bob@x.com", "subject": "Hi", "body": "Hello"})
+        self.assertTrue(p["content_hash"])
+        self.assertEqual(ma.approved, [])                      # NEVER sends on the scheduled run
+
+    def test_execute_pending_runs_fresh_task_and_approves(self):
+        # On approval the fresh, targeted run holds the action; execute_pending approves
+        # it in that brand-new session so it actually executes.
+        held = [{"action_id": "a1", "kind": "gmail-send-email", "summary": "Email Bob",
+                 "input": {"to": "bob@x.com"}}]
+        ma = FakeMA(events=[_tool("gmail-send-email"), {"type": "session.status_idle", "text": "Sent."}],
+                    held=held)
+        res = runner.execute_pending(ma, _agent(), {"summary": "Email Bob", "kind": "gmail-send-email",
+                                                    "payload": {"to": "bob@x.com"}})
+        self.assertEqual(res["status"], "executed")
+        self.assertEqual(ma.approved, ["a1"])
+
+    def test_execute_pending_non_email_write_is_generic(self):
+        # A non-email write (sheets) stages + executes through the same general path.
+        held = [{"action_id": "w9", "kind": "google_sheets-add-row", "summary": "Add row",
+                 "input": {"spreadsheet": "Q3", "values": [1, 2, 3]}}]
+        ma = FakeMA(events=[_tool("google_sheets-add-row"), {"type": "session.status_idle", "text": "Updated."}],
+                    held=held)
+        res = runner.execute_pending(ma, _agent(), {"summary": "Add row", "kind": "google_sheets-add-row",
+                                                    "payload": {"spreadsheet": "Q3", "values": [1, 2, 3]}})
+        self.assertEqual(res["status"], "executed")
+        self.assertEqual(ma.approved, ["w9"])
+
+    def test_execute_pending_failed_on_platform_error(self):
+        res = runner.execute_pending(FakeMA(fail=True), _agent(),
+                                     {"summary": "x", "kind": "k", "payload": {}})
+        self.assertEqual(res["status"], "failed")
 
     def test_failed_event(self):
         rec = runner.run_once(FakeMA(events=[{"type": "session.failed", "text": "nope"}]), _agent())
@@ -169,6 +219,36 @@ class SchedulerPassTest(unittest.TestCase):
         registry.schedule_set(self.root, "agent-1", "usr_1", {"kind": "hourly"}, paused=True)
         self.state.run_due_schedules(now=time.time())
         self.assertEqual(registry.runs_for_agent(self.root, "agent-1"), [])
+
+    # --- Spec 8: staged actions persist, dedupe, and execute on approval ---
+    def _staging_ma(self):
+        held = [{"action_id": "a1", "kind": "gmail-send-email", "summary": "Email Bob",
+                 "input": {"to": "bob@x.com", "subject": "Hi"}}]
+        events = [_tool("gmail-send-email"),
+                  {"type": "session.status_idle", "stop_reason": "requires_action"}]
+        return FakeMA(events=events, held=held)
+
+    def test_staged_run_persists_pending_and_dedupes(self):
+        registry.agent_upsert(self.root, _agent())
+        self.state._live_client = lambda: self._staging_ma()
+        self.state.run_agent(_agent())
+        self.state.run_agent(_agent())                        # identical proposal again
+        pend = registry.pending_for_user(self.root, "usr_1")
+        self.assertEqual(len(pend), 1)                        # deduped, not re-staged
+        self.assertEqual(pend[0]["payload"], {"to": "bob@x.com", "subject": "Hi"})
+        self.assertEqual(registry.pending_count_for_user(self.root, "usr_1"), 1)
+
+    def test_approve_pending_executes_and_marks_processed(self):
+        registry.agent_upsert(self.root, _agent())
+        ma = self._staging_ma()
+        self.state._live_client = lambda: ma
+        self.state.run_agent(_agent())
+        item = registry.pending_for_user(self.root, "usr_1")[0]
+        res = self.state.approve_pending(item)
+        self.assertEqual(res["status"], "executed")
+        self.assertEqual(ma.approved, ["a1"])                 # Trace performed it
+        self.assertEqual(registry.pending_count_for_user(self.root, "usr_1"), 0)
+        self.assertEqual(registry.pending_get(self.root, item["id"])["status"], "executed")
 
     def test_schedule_persists_across_restart(self):
         registry.agent_upsert(self.root, _agent())
