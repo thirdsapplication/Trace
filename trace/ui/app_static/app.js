@@ -252,6 +252,11 @@ function agentCard(a) {
         </div>`; }).join("")
         : `<div class="muted" style="font-size:13px;margin-top:6px;">No runs yet — set a schedule or hit Run now.</div>`}
     </details>
+    <div class="row" style="margin-top:10px;">
+      ${a.capture_present
+        ? `<button class="btn-link delcap" data-agent="${esc(a.agent_id)}" style="color:var(--danger,#b3261e);">Delete capture data</button>`
+        : `<span class="muted" style="font-size:12px;">Capture data deleted</span>`}
+    </div>
   </div>`;
 }
 
@@ -290,6 +295,13 @@ async function renderDashboard() {
   });
   root.querySelectorAll(".pend-no").forEach(b => b.onclick = async () => {
     await api("POST", `/api/u/pending/${b.dataset.id}/reject`, {});
+    renderDashboard();
+  });
+  // Delete this workflow's capture data everywhere (the agent keeps running)
+  root.querySelectorAll(".delcap").forEach(b => b.onclick = async () => {
+    if (!confirm("Delete all recorded data for this workflow from your device and the cloud? Your agent keeps running. This can't be undone.")) return;
+    b.disabled = true; b.textContent = "Deleting…";
+    await api("POST", `/api/u/agents/${b.dataset.agent}/delete-capture-data`, {});
     renderDashboard();
   });
   // Spec 4: schedule / pause / run-now per agent

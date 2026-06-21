@@ -5,13 +5,14 @@ scoped to the owner.
 """
 
 import json
+import os
 import tempfile
 import threading
 import unittest
 import urllib.error
 import urllib.request
 
-from trace.ui import app, registry, users
+from trace.ui import app, registry, sessions, users
 from trace.tests.test_ui import FakeController, FakeKeystore, fake_reconstruct
 
 
@@ -164,6 +165,73 @@ class PendingEndpointTest(AgentsEndpointTest):
         # unauthenticated listing is rejected
         status, _, _ = self._req("GET", "/api/u/pending")
         self.assertEqual(status, 401)
+
+
+class DeleteCaptureDataTest(AgentsEndpointTest):
+    """User-facing "delete capture data": removes the capture session everywhere,
+    purges capture-derived platform data, and keeps the live agent. File-mode."""
+
+    def _make_session(self, uid, with_run=True):
+        sid, _ = sessions.create_upload_session(
+            self.root, uid, '{"ts":"t","source":"browser","payload":{}}\n')
+        registry.agent_upsert(self.root, {
+            "agent_id": "agent-1", "owner_user_id": uid, "external_user_id": "x",
+            "bundle_id": "wf", "name": "WF", "vault_ref": "v", "trigger": "t",
+            "session_id": sid})
+        if with_run:                                       # a capture-derived run record
+            specs = sessions.path(self.root, sid, sessions.SPECS_DIR)
+            os.makedirs(specs, exist_ok=True)
+            with open(os.path.join(specs, "run_1.json"), "w", encoding="utf-8") as f:
+                json.dump({"sessions": [{"session_id": "test-sess"}],
+                           "uploaded_file_ids": ["file_1"], "agent_id": "agent-1"}, f)
+        return sid
+
+    def test_delete_removes_session_and_keeps_agent_live(self):
+        uid, cookie = self._signup("d@x.com")
+        calls = []
+        self.state.cleanup_fn = lambda s, f, a, agent_names=None: (
+            calls.append((s, f, a, agent_names)) or {"removed": {}, "errors": []})
+        sid = self._make_session(uid)
+        self.assertTrue(os.path.isdir(sessions.session_dir(self.root, sid)))
+
+        status, data, _ = self._req("POST", "/api/u/agents/agent-1/delete-capture-data",
+                                    {}, cookie=cookie)
+        self.assertEqual(status, 200)
+        self.assertTrue(data["deleted"])
+        self.assertFalse(os.path.isdir(sessions.session_dir(self.root, sid)))   # capture gone
+        # platform purge targeted derived data only — live agent preserved
+        self.assertEqual(len(calls), 1)
+        s_ids, f_ids, a_ids, a_names = calls[0]
+        self.assertEqual(a_ids, [])                         # no live agent deleted
+        self.assertEqual(a_names, [])                       # no name-sweep of live agents
+        self.assertEqual(f_ids, ["file_1"])
+        self.assertEqual(s_ids, ["test-sess"])
+        # the agent is still listed and still runnable (registry untouched), capture gone
+        _, ag, _ = self._req("GET", "/api/u/agents", cookie=cookie)
+        a0 = ag["agents"][0]
+        self.assertEqual(a0["agent_id"], "agent-1")
+        self.assertFalse(a0["capture_present"])
+
+    def test_delete_scoped_to_owner(self):
+        uid, _ = self._signup("o1@x.com")
+        _, other = self._signup("o2@x.com")
+        sid = self._make_session(uid, with_run=False)
+        status, _, _ = self._req("POST", "/api/u/agents/agent-1/delete-capture-data",
+                                 {}, cookie=other)
+        self.assertEqual(status, 404)                       # not this user's agent
+        self.assertTrue(os.path.isdir(sessions.session_dir(self.root, sid)))    # untouched
+
+    def test_delete_proceeds_when_platform_purge_errors(self):
+        uid, cookie = self._signup("be@x.com")
+        def boom(*a, **k):
+            raise RuntimeError("MA unreachable")
+        self.state.cleanup_fn = boom
+        sid = self._make_session(uid)
+        status, data, _ = self._req("POST", "/api/u/agents/agent-1/delete-capture-data",
+                                    {}, cookie=cookie)
+        self.assertEqual(status, 200)
+        self.assertTrue(data["deleted"])
+        self.assertFalse(os.path.isdir(sessions.session_dir(self.root, sid)))   # best-effort
 
 
 if __name__ == "__main__":

@@ -518,6 +518,37 @@ class AppState:
                               "agents": agent_ids, "agent_names": agent_names},
                 **(result or {})}
 
+    def delete_capture_data(self, sid, owner_user_id):
+        """User-facing "delete my capture data": remove one workflow's capture session
+        (raw recording + every derived artifact) from disk, plus the capture-derived
+        files / test sessions on the platform — while the LIVE agent keeps running (its
+        durable registry row, vault, schedule, and run history are untouched; the run
+        path never reads the session dir). Owner-scoped. Best-effort on the platform
+        side (an error there never blocks the on-disk delete)."""
+        root = self.sessions_root
+        meta = sessions.read_meta(root, sid)
+        if not meta or meta.get("owner_user_id") != owner_user_id:
+            return {"error": "not_found"}
+        # Capture-derived data on the platform = uploaded files + test/manual-eval run
+        # sessions. NOT the live agent/session ids (no agent_ids/agent_names), so a live
+        # agent is never taken down. Gather before rmtree (this reads the run records).
+        file_ids, test_sessions = [], []
+        for r in sessions.list_runs(root, sid):
+            for s in r.get("sessions", []):
+                if s.get("session_id"):
+                    test_sessions.append(s["session_id"])
+            file_ids.extend(r.get("uploaded_file_ids", []) or [])
+        file_ids = list(dict.fromkeys(file_ids))
+        test_sessions = list(dict.fromkeys(test_sessions))
+        platform = None
+        if file_ids or test_sessions:
+            try:
+                platform = self.cleanup_fn(test_sessions, file_ids, [], agent_names=[])
+            except Exception as e:                        # noqa: BLE001
+                platform = {"error": f"{type(e).__name__}: {e}"}
+        shutil.rmtree(sessions.session_dir(root, sid), ignore_errors=True)
+        return {"session_id": sid, "deleted": True, "platform": platform}
+
     # --- Phase 4: connection layer (Pipedream Connect + MA vault) ---------
     def _external_user_id(self, sid):
         """The Pipedream/vault isolation key for a session. End-user sessions share one
@@ -929,7 +960,58 @@ def make_handler(state):
                 return None
             if cloud_sid:
                 state.local_to_cloud_sid[local_sid] = cloud_sid
+                # Persist the reverse link so "delete capture data" can find this local
+                # copy even after a desktop restart (the in-memory map is lost on restart).
+                try:
+                    sessions.update_meta(root, local_sid, cloud_sid=cloud_sid)
+                except Exception:
+                    pass
             return cloud_sid
+
+        def _delete_capture_desktop(self):
+            """Desktop side of "delete capture data": forward the delete to the cloud
+            (removes the cloud copy + capture-derived platform data), then remove the
+            matching LOCAL session dir. The cloud result is authoritative; the local
+            removal is best-effort, located via the persisted ``cloud_sid`` meta link."""
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            body = self.rfile.read(length) if length else None
+            fwd = {}
+            for h in ("Cookie", "Content-Type", "Accept"):
+                if self.headers.get(h):
+                    fwd[h] = self.headers.get(h)
+            try:
+                status, headers, data = state.proxy_fn(
+                    state.cloud_backend, "POST", self.path, fwd, body)
+            except Exception as e:                          # cloud unreachable
+                return self._json(502, {"error": "cloud_unreachable", "detail": str(e)})
+            if status == 200:
+                try:
+                    cloud_sid = json.loads(data).get("session_id")
+                except (json.JSONDecodeError, AttributeError):
+                    cloud_sid = None
+                self._delete_local_for_cloud_sid(cloud_sid)
+            self.send_response(status)
+            for k, v in headers:
+                self.send_header(k, v)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def _delete_local_for_cloud_sid(self, cloud_sid):
+            """Remove the local capture session that was uploaded as ``cloud_sid`` (best
+            effort): the durable ``meta.cloud_sid`` link, else the in-memory map."""
+            if not cloud_sid:
+                return
+            local_sid = None
+            for s in sessions.list_sessions(root):
+                if s.get("id") and s.get("cloud_sid") == cloud_sid:
+                    local_sid = s.get("id")
+                    break
+            if not local_sid:
+                local_sid = next((l for l, c in state.local_to_cloud_sid.items() if c == cloud_sid), None)
+            if local_sid:
+                shutil.rmtree(sessions.session_dir(root, local_sid), ignore_errors=True)
+                state.local_to_cloud_sid.pop(local_sid, None)
 
         def _raw_upload(self, user, body):
             """Cloud side: materialize a session from raw events uploaded by a desktop
@@ -989,7 +1071,9 @@ def make_handler(state):
                 aid = a.get("agent_id")
                 out.append({**a,
                             "schedule": registry.schedule_get(root, aid),
-                            "recent_runs": registry.runs_for_agent(root, aid, 5)})
+                            "recent_runs": registry.runs_for_agent(root, aid, 5),
+                            "capture_present": bool(a.get("session_id")) and
+                            os.path.isdir(sessions.session_dir(root, a.get("session_id")))})
             return out
 
         def _agent_action(self, agent_id, action, body, user):
@@ -1034,6 +1118,21 @@ def make_handler(state):
             threading.Thread(target=lambda: state.approve_pending(item), daemon=True).start()
             return self._json(202, {"id": pending_id, "state": "running"})
 
+        def _delete_capture_data(self, agent_id, user):
+            """Delete one workflow's capture data (the origin session). Resolves the
+            agent owner-scoped, then removes its capture session; the agent stays live."""
+            agent = next((a for a in registry.agents_for_user(root, user["user_id"])
+                          if a.get("agent_id") == agent_id), None)
+            if not agent:
+                return self._json(404, {"error": "not_found"})
+            sid = agent.get("session_id")
+            if not sid:
+                return self._json(404, {"error": "no_capture_session"})
+            res = state.delete_capture_data(sid, user["user_id"])
+            if res.get("error"):
+                return self._json(404, res)
+            return self._json(200, res)
+
         # --- end-user namespace (WS3): same pipeline, scoped to the logged-in user ---
         def _user_get(self, rest, user):
             if rest in ("/me", ""):
@@ -1076,6 +1175,9 @@ def make_handler(state):
             mp = re.match(r"^/pending/([^/]+)/(approve|reject)$", rest)
             if mp:                                       # Spec 8: approve/reject a staged action
                 return self._pending_action(mp.group(1), mp.group(2), user)
+            md = re.match(r"^/agents/([^/]+)/delete-capture-data$", rest)
+            if md:                                       # delete this workflow's capture data
+                return self._delete_capture_data(md.group(1), user)
             if rest == "/load-fixture":
                 return self._load_fixture(body, owner=uid)
             m = re.match(r"^/sessions/([^/]+)/(.+)$", rest)
@@ -1181,6 +1283,10 @@ def make_handler(state):
 
         def do_POST(self):
             p = self.path.split("?", 1)[0]
+            # Desktop: "delete capture data" must wipe BOTH the cloud copy (proxied) and
+            # the LOCAL copy — intercept before the generic proxy to do both.
+            if state.cloud_backend and re.match(r"^/api/u/agents/[^/]+/delete-capture-data$", p):
+                return self._delete_capture_desktop()
             if self._should_proxy(p):                       # Phase 2: desktop → cloud
                 return self._proxy()
             # Desktop mode: capture control runs locally and identity lives in the

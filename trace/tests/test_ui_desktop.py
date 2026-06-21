@@ -12,13 +12,14 @@ the architecture over genuine loopback HTTP:
 """
 
 import json
+import os
 import tempfile
 import threading
 import unittest
 import urllib.error
 import urllib.request
 
-from trace.ui import app, sessions, users
+from trace.ui import app, registry, sessions, users
 from trace.tests.test_ui import FakeController, FakeKeystore, fake_reconstruct
 
 
@@ -144,6 +145,36 @@ class DesktopProxyTest(unittest.TestCase):
         # Unauthenticated upload is refused.
         status, _, _ = self.cloud("POST", "/api/u/sessions/raw-upload", {"raw": raw})
         self.assertEqual(status, 401)
+
+    def test_delete_capture_data_wipes_local_and_cloud(self):
+        # Capture on desktop → upload to cloud, then "delete capture data" must remove
+        # BOTH the cloud copy (proxied) and the local copy (intercepted on the desktop).
+        _, _, cookie = self.desk("POST", "/api/auth/signup",
+                                 {"email": "del@x.com", "password": "password1"})
+        uid = users.session_user(cookie.split("=", 1)[1])
+        self.desk("POST", "/api/u/capture/start", cookie=cookie)
+        _, stopped, _ = self.desk("POST", "/api/u/capture/stop", cookie=cookie)
+        local_sid, cloud_sid = stopped["local_session_id"], stopped["session_id"]
+        # the upload persisted the reverse link into local meta (survives restart)
+        self.assertEqual(
+            sessions.read_meta(self._desk_tmp.name, local_sid).get("cloud_sid"), cloud_sid)
+        # an agent was deployed from this capture (registered cloud-side)
+        registry.agent_upsert(self._cloud_tmp.name, {
+            "agent_id": "agent-x", "owner_user_id": uid, "external_user_id": "x",
+            "bundle_id": "wf", "name": "WF", "vault_ref": "v", "trigger": "t",
+            "session_id": cloud_sid})
+        self.assertTrue(os.path.isdir(sessions.session_dir(self._cloud_tmp.name, cloud_sid)))
+        self.assertTrue(os.path.isdir(sessions.session_dir(self._desk_tmp.name, local_sid)))
+
+        status, data, _ = self.desk(
+            "POST", "/api/u/agents/agent-x/delete-capture-data", {}, cookie=cookie)
+        self.assertEqual(status, 200)
+        self.assertTrue(data["deleted"])
+        # both copies gone; the agent row stays (agent keeps running)
+        self.assertFalse(os.path.isdir(sessions.session_dir(self._cloud_tmp.name, cloud_sid)))
+        self.assertFalse(os.path.isdir(sessions.session_dir(self._desk_tmp.name, local_sid)))
+        self.assertEqual([a["agent_id"] for a in registry.agents_for_user(self._cloud_tmp.name, uid)],
+                         ["agent-x"])
 
     def test_plain_node_unchanged_dual_run(self):
         # No cloud_backend → capture/stop returns the LOCAL sid, no upload, no proxy.
