@@ -28,8 +28,10 @@ def _now():
 
 def schedule_due(cadence, last_run_epoch, now_epoch):
     """Whether a schedule should fire now, given its cadence dict and the epoch of
-    its last run (or None). Cadences: {"kind":"interval","minutes":N} |
-    {"kind":"hourly"} | {"kind":"daily","time":"HH:MM"} (local time)."""
+    its last run (or None). Current cadences: {"kind":"daily","time":"HH:MM"} |
+    {"kind":"weekly","weekday":N,"time":"HH:MM"} (N: 0=Mon … 6=Sun), local time.
+    {"kind":"interval","minutes":N} and {"kind":"hourly"} are legacy (no longer
+    offered in the UI) but still honored so any pre-existing schedule keeps firing."""
     if not cadence:
         return False
     kind = cadence.get("kind")
@@ -46,6 +48,22 @@ def schedule_due(cadence, last_run_epoch, now_epoch):
         if now_dt < scheduled:
             return False
         return last_run_epoch is None or datetime.datetime.fromtimestamp(last_run_epoch) < scheduled
+    if kind == "weekly":
+        try:
+            hh, mm = (int(x) for x in str(cadence.get("time", "09:00")).split(":"))
+        except Exception:
+            hh, mm = 9, 0
+        try:
+            weekday = int(cadence.get("weekday", 0)) % 7      # 0=Mon … 6=Sun
+        except Exception:
+            weekday = 0
+        now_dt = datetime.datetime.fromtimestamp(now_epoch)
+        at_time = now_dt.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        # the most recent occurrence of weekday@time at or before now
+        anchor = at_time - datetime.timedelta(days=(now_dt.weekday() - weekday) % 7)
+        if now_dt < anchor:                                    # today is the day but before the time
+            anchor -= datetime.timedelta(days=7)
+        return last_run_epoch is None or datetime.datetime.fromtimestamp(last_run_epoch) < anchor
     return False
 
 

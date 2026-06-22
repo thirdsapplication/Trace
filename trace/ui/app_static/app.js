@@ -177,22 +177,19 @@ function recordAnother() { S.session = null; S.step = 0; render(); }
 /* ---------------- AGENTS DASHBOARD (Spec 2/3/4) ---------------- */
 const CADENCES = [
   { v: "", label: "manually" },
-  { v: "interval:15", label: "every 15 min" },
-  { v: "hourly", label: "hourly" },
   { v: "daily", label: "daily · 9am" },
+  { v: "weekly", label: "weekly · Mon 9am" },
 ];
 function cadenceToValue(c) {
-  if (!c) return "";
-  if (c.kind === "interval") return `interval:${c.minutes || 15}`;
-  if (c.kind === "hourly") return "hourly";
-  if (c.kind === "daily") return "daily";
+  // map only the supported cadences; anything else (none, or a legacy
+  // interval/hourly) shows as "manually" rather than a removed option.
+  if (c && c.kind === "daily") return "daily";
+  if (c && c.kind === "weekly") return "weekly";
   return "";
 }
 function valueToCadence(v) {
-  if (!v) return null;
-  if (v.startsWith("interval:")) return { kind: "interval", minutes: parseInt(v.split(":")[1], 10) };
-  if (v === "hourly") return { kind: "hourly" };
   if (v === "daily") return { kind: "daily", time: "09:00" };
+  if (v === "weekly") return { kind: "weekly", weekday: 0, time: "09:00" };
   return null;
 }
 function runBadge(status) {

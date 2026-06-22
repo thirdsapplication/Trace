@@ -4,6 +4,7 @@ durability across a restart, and the desktop-node guard. Offline against a stub
 MA client + file-mode registry (no DATABASE_URL).
 """
 
+import datetime
 import tempfile
 import time
 import unittest
@@ -160,16 +161,38 @@ class RunnerTest(unittest.TestCase):
 
 
 class ScheduleDueTest(unittest.TestCase):
-    def test_interval(self):
-        c = {"kind": "interval", "minutes": 15}
-        self.assertTrue(runner.schedule_due(c, None, 1000))           # never run -> due
-        self.assertFalse(runner.schedule_due(c, 1000, 1000 + 600))    # 10 min later -> not due
-        self.assertTrue(runner.schedule_due(c, 1000, 1000 + 900))     # 15 min later -> due
+    @staticmethod
+    def _epoch(y, mo, d, hh, mm):
+        return datetime.datetime(y, mo, d, hh, mm).timestamp()      # local time, matches schedule_due
 
-    def test_hourly(self):
-        c = {"kind": "hourly"}
-        self.assertTrue(runner.schedule_due(c, 1000, 1000 + 3600))
-        self.assertFalse(runner.schedule_due(c, 1000, 1000 + 1800))
+    def test_daily(self):
+        c = {"kind": "daily", "time": "09:00"}
+        before_9 = self._epoch(2026, 6, 24, 8, 0)                   # Wed 08:00
+        after_9 = self._epoch(2026, 6, 24, 10, 0)                   # Wed 10:00
+        self.assertFalse(runner.schedule_due(c, None, before_9))    # before 9am -> not due
+        self.assertTrue(runner.schedule_due(c, None, after_9))      # after 9am, never run -> due
+        ran_today = self._epoch(2026, 6, 24, 9, 30)
+        self.assertFalse(runner.schedule_due(c, ran_today, after_9))  # already ran today -> not due
+        ran_yesterday = self._epoch(2026, 6, 23, 9, 30)
+        self.assertTrue(runner.schedule_due(c, ran_yesterday, after_9))  # last ran before today's 9am
+
+    def test_weekly(self):
+        c = {"kind": "weekly", "weekday": 0, "time": "09:00"}        # Monday 09:00
+        wed = self._epoch(2026, 6, 24, 10, 0)                       # 2026-06-24 is a Wednesday
+        self.assertTrue(runner.schedule_due(c, None, wed))          # never run -> due
+        ran_this_week = self._epoch(2026, 6, 22, 9, 30)            # Mon of the same week, after anchor
+        self.assertFalse(runner.schedule_due(c, ran_this_week, wed))  # already ran this week -> not due
+        ran_last_week = self._epoch(2026, 6, 15, 9, 30)           # the previous Monday
+        self.assertTrue(runner.schedule_due(c, ran_last_week, wed))   # before this week's anchor -> due
+        mon_before_9 = self._epoch(2026, 6, 22, 8, 0)             # Monday but before 09:00
+        self.assertFalse(runner.schedule_due(c, ran_last_week, mon_before_9))  # anchor is last Monday; already ran then
+
+    def test_legacy_cadences_still_fire(self):
+        # interval/hourly are no longer offered in the UI but remain honored so a
+        # pre-existing schedule keeps running.
+        self.assertTrue(runner.schedule_due({"kind": "interval", "minutes": 15}, 1000, 1000 + 900))
+        self.assertFalse(runner.schedule_due({"kind": "interval", "minutes": 15}, 1000, 1000 + 600))
+        self.assertTrue(runner.schedule_due({"kind": "hourly"}, 1000, 1000 + 3600))
 
     def test_none_never_due(self):
         self.assertFalse(runner.schedule_due(None, None, 1000))

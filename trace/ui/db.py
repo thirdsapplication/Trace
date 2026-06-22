@@ -92,7 +92,7 @@ CREATE INDEX IF NOT EXISTS pending_actions_owner_idx ON pending_actions (owner_u
 CREATE TABLE IF NOT EXISTS schedules (
     agent_id      TEXT PRIMARY KEY REFERENCES agents(agent_id) ON DELETE CASCADE,
     owner_user_id TEXT NOT NULL,
-    cadence       TEXT NOT NULL,          -- JSON: {"kind":"interval","minutes":15} | {"kind":"hourly"} | {"kind":"daily","time":"09:00"}
+    cadence       TEXT NOT NULL,          -- JSON: {"kind":"daily","time":"09:00"} | {"kind":"weekly","weekday":0,"time":"09:00"} (interval/hourly = legacy)
     paused        BOOLEAN NOT NULL DEFAULT FALSE,
     last_run_at   TIMESTAMPTZ
 );
