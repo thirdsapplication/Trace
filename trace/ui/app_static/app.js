@@ -193,26 +193,35 @@ function valueToCadence(v) {
   return null;
 }
 function runBadge(status) {
-  // completed/needs_approval/failed (+ tolerate older clean/halted records)
+  // completed | needs_approval/staged | running/ran | failed (+ older clean/halted)
   const ok = status === "completed" || status === "clean";
-  const appr = status === "needs_approval" || status === "halted";
-  const cls = ok ? "pill-on" : (appr ? "pill-warn" : "pill-off");
-  const label = ok ? "completed" : (appr ? "needs approval" : "failed");
+  const appr = status === "needs_approval" || status === "halted" || status === "staged";
+  const pend = status === "running" || status === "ran";
+  const cls = ok ? "pill-on" : (appr ? "pill-warn" : (pend ? "pill" : "pill-off"));
+  const label = ok ? "completed" : (appr ? "needs approval"
+    : (status === "running" ? "running" : (status === "ran" ? "ran" : "failed")));
   return `<span class="pill ${cls}">${label}</span>`;
 }
-function pendingCard(p) {
+
+// one proposed action in the activity screen (checkbox to include in an approve batch)
+function proposalRow(p) {
   const pl = p.payload || {};
   const rows = Object.keys(pl).map(k => {
     const v = pl[k];
     const val = (v && typeof v === "object") ? JSON.stringify(v) : String(v);
     return `<div class="sub" style="margin-top:2px;"><b>${esc(k)}:</b> ${esc(val)}</div>`;
   }).join("");
-  return `<div class="card" data-pending="${esc(p.id)}">
-    <div class="row"><span class="dot"></span><span class="title">${esc(p.summary || p.kind || "Action")}</span></div>
-    <div style="margin-top:6px;">${rows || `<div class="sub muted">No details captured.</div>`}</div>
-    <div class="row" style="margin-top:10px;gap:8px;">
-      <button class="btn-accent btn-sm pend-ok" data-id="${esc(p.id)}">Approve &amp; run</button>
-      <button class="btn-secondary btn-sm pend-no" data-id="${esc(p.id)}">Reject</button></div>
+  const done = p.status && p.status !== "pending";
+  return `<div class="card" style="margin-top:8px;">
+    <div class="row" style="gap:8px;align-items:flex-start;">
+      ${done ? `<span class="pill ${p.status === "executed" ? "pill-on" : "pill-off"}">${esc(p.status)}</span>`
+             : `<input type="checkbox" class="prop" data-id="${esc(p.id)}" checked style="margin-top:4px;">`}
+      <div style="flex:1;">
+        <div class="title" style="font-size:14px;">${p.app ? `<span class="muted">${esc(p.app)} · </span>` : ""}${esc(p.summary || p.kind || "Action")}</div>
+        <div style="margin-top:4px;">${rows || `<div class="sub muted">No details captured.</div>`}</div>
+      </div>
+      ${done ? "" : `<button class="btn-link prop-no" data-id="${esc(p.id)}" style="color:var(--danger,#b3261e);">Reject</button>`}
+    </div>
   </div>`;
 }
 
@@ -232,23 +241,9 @@ function agentCard(a) {
       <select class="sched" data-agent="${esc(a.agent_id)}">${opts}</select>
       ${sched ? `<button class="btn-secondary btn-sm pausebtn" data-agent="${esc(a.agent_id)}">${paused ? "Resume" : "Pause"}</button>` : ""}
       <button class="btn-accent btn-sm runnow" data-agent="${esc(a.agent_id)}">Run now</button>
+      <button class="btn-secondary btn-sm viewactivity" data-agent="${esc(a.agent_id)}">View activity →</button>
     </div>
-    <details class="agent-activity" style="margin-top:10px;" ${last ? "open" : ""}>
-      <summary class="label" style="cursor:pointer;">Activity${runs.length ? ` (${runs.length})` : ""}</summary>
-      ${runs.length ? runs.map(r => {
-        const acts = r.details || [];
-        return `
-        <div class="run-row" style="margin-top:8px;">
-          <div class="row" style="gap:8px;align-items:center;">
-            <span class="muted" style="font-size:12px;">${esc(r.ran_at || "")}</span>${runBadge(r.status)}
-            ${acts.length ? `<span class="muted" style="font-size:12px;">${acts.length} action${acts.length === 1 ? "" : "s"}</span>` : ""}
-          </div>
-          <div class="sub" style="margin-top:2px;">${esc(r.summary || "")}</div>
-          ${acts.length ? `<details style="margin-top:4px;"><summary class="muted" style="font-size:12px;cursor:pointer;">what it did</summary>
-            <ul style="margin:6px 0 0 16px;padding:0;">${acts.map(d => `<li class="sub">${esc(d)}</li>`).join("")}</ul></details>` : ""}
-        </div>`; }).join("")
-        : `<div class="muted" style="font-size:13px;margin-top:6px;">No runs yet — set a schedule or hit Run now.</div>`}
-    </details>
+    <div class="sub muted" style="margin-top:8px;font-size:13px;">${last ? esc(last.ran_at || "") + " · last run" : "No runs yet — set a schedule or hit Run now."}</div>
     <div class="row" style="margin-top:10px;">
       ${a.capture_present
         ? `<button class="btn-link delcap" data-agent="${esc(a.agent_id)}" style="color:var(--danger,#b3261e);">Delete capture data</button>`
@@ -261,18 +256,10 @@ async function renderDashboard() {
   clearTimers();
   const { data } = await api("GET", "/api/u/agents");
   const agents = (data && data.agents) || [];
-  const pending = ((await api("GET", "/api/u/pending")).data || {}).pending || [];
-  const pendingHtml = pending.length ? `
-    <div class="panel" style="margin-bottom:14px;">
-      <div class="spread"><h2>Pending approvals <span class="pill pill-warn">${pending.length}</span></h2></div>
-      <p class="lead">These actions were staged for you to review. Nothing happens until you approve.</p>
-      <div class="stack" id="pendingList">${pending.map(pendingCard).join("")}</div>
-    </div>` : "";
   root.innerHTML = `
     <div class="topbar"><div class="brand">● Trace</div>
       <div class="row"><span class="muted" style="font-size:13px;">${esc(S.user.email)}</span>
         <button id="logout" class="btn-link">Sign out</button></div></div>
-    ${pendingHtml}
     <div class="panel">
       <div class="spread"><h2>Your agents</h2>
         <button id="recAnother" class="btn-primary btn-sm">Record another workflow</button></div>
@@ -284,16 +271,8 @@ async function renderDashboard() {
   $("#logout").onclick = async () => { await api("POST", "/api/auth/logout", {}); S.user = null; clearTimers(); renderAuth(); };
   $("#recAnother").onclick = recordAnother;
   $("#backFlow").onclick = () => loadAndRender();
-  // Spec 8: approve (Trace performs it) / reject (discard) a staged action
-  root.querySelectorAll(".pend-ok").forEach(b => b.onclick = async () => {
-    b.disabled = true; b.textContent = "Running…";
-    await api("POST", `/api/u/pending/${b.dataset.id}/approve`, {});
-    setTimeout(renderDashboard, 4000);                  // approval runs async
-  });
-  root.querySelectorAll(".pend-no").forEach(b => b.onclick = async () => {
-    await api("POST", `/api/u/pending/${b.dataset.id}/reject`, {});
-    renderDashboard();
-  });
+  // open the full-screen activity view (real session logs + approvals)
+  root.querySelectorAll(".viewactivity").forEach(b => b.onclick = () => renderActivity(b.dataset.agent));
   // Delete this workflow's capture data everywhere (the agent keeps running)
   root.querySelectorAll(".delcap").forEach(b => b.onclick = async () => {
     if (!confirm("Delete all recorded data for this workflow from your device and the cloud? Your agent keeps running. This can't be undone.")) return;
@@ -317,6 +296,55 @@ async function renderDashboard() {
     await api("POST", `/api/u/agents/${b.dataset.agent}/run-now`, {});
     // the run is async; refresh shortly to show the recorded outcome
     setTimeout(renderDashboard, 4000);
+  });
+}
+
+// full-screen activity view: real session summaries + per-action approval
+async function renderActivity(agentId) {
+  clearTimers();
+  root.innerHTML = `
+    <div class="topbar"><div class="brand">● Trace</div>
+      <div class="row"><span class="muted" style="font-size:13px;">${esc(S.user.email)}</span>
+        <button id="logout" class="btn-link">Sign out</button></div></div>
+    <div class="panel">
+      <button id="backAgents" class="btn-link">← back to agents</button>
+      <h2 id="actTitle">Activity</h2>
+      <p class="lead">What this agent actually did in each run, in plain language. For staged runs, pick the actions to approve.</p>
+      <div id="actBody"><p class="muted">Loading…</p></div>
+    </div>`;
+  $("#logout").onclick = async () => { await api("POST", "/api/auth/logout", {}); S.user = null; clearTimers(); renderAuth(); };
+  $("#backAgents").onclick = renderDashboard;
+  const { data } = await api("GET", `/api/u/agents/${agentId}/activity`);
+  const sessions = (data && data.activity) || [];
+  const name = (data && data.agent && data.agent.name) || "";
+  if (name) $("#actTitle").textContent = `Activity — ${name}`;
+  const sessionCard = (s) => {
+    const props = s.proposals || [];
+    const approvable = props.filter(p => !p.status || p.status === "pending");
+    return `<div class="card" data-sess="${esc(s.run_session_id || "")}" style="margin-top:12px;">
+      <div class="row" style="gap:8px;align-items:center;">
+        <span class="muted" style="font-size:12px;">${esc(s.ran_at || "")}</span>${runBadge(s.status)}</div>
+      <div class="sub" style="margin-top:6px;font-size:14px;">${esc(s.summary || "No summary yet — the run may still be in progress.")}</div>
+      ${props.length ? `<div style="margin-top:10px;"><div class="label">Proposed actions</div>
+        ${props.map(proposalRow).join("")}
+        ${approvable.length ? `<button class="btn-accent btn-sm approve-sel" style="margin-top:10px;">Approve &amp; run selected</button>` : ""}
+      </div>` : ""}
+    </div>`;
+  };
+  $("#actBody").innerHTML = sessions.length
+    ? sessions.map(sessionCard).join("")
+    : `<p class="muted">No runs yet — set a schedule or hit Run now on the agents screen.</p>`;
+  root.querySelectorAll(".approve-sel").forEach(b => b.onclick = async () => {
+    const panel = b.closest("[data-sess]");
+    const ids = Array.from(panel.querySelectorAll(".prop")).filter(c => c.checked).map(c => c.dataset.id);
+    if (!ids.length) { b.textContent = "Select at least one"; return; }
+    b.disabled = true; b.textContent = "Running…";
+    await api("POST", `/api/u/agents/${agentId}/approve-actions`, { pending_ids: ids });
+    setTimeout(() => renderActivity(agentId), 4000);     // execution is async
+  });
+  root.querySelectorAll(".prop-no").forEach(b => b.onclick = async () => {
+    await api("POST", `/api/u/pending/${b.dataset.id}/reject`, {});
+    renderActivity(agentId);
   });
 }
 

@@ -215,45 +215,33 @@ def run_once(client, agent):
         run_session_id = client.create_session(
             agent_id, environment_id, resources=[], title="Trace scheduled run",
             vault_ids=[vault_ref] if vault_ref else None)
-        events = client.send_trigger_and_collect(run_session_id, trigger)
     except Exception as e:                                  # noqa: BLE001
         return {"agent_id": agent_id, "status": "failed",
-                "summary": f"Couldn't run: {type(e).__name__}", "details": [],
+                "summary": f"Couldn't start the run: {type(e).__name__}", "details": [],
                 "run_session_id": None}
-    # Reading the result must NEVER raise (that previously surfaced as a bogus
-    # "Couldn't start the run." with no pending actions). Degrade gracefully instead.
-    try:
-        return _build_run_record(agent_id, events, staged, run_session_id, client)
-    except Exception as e:                                  # noqa: BLE001
-        return {"agent_id": agent_id, "status": "failed",
-                "summary": f"Ran, but couldn't read the result: {type(e).__name__}",
+    # The session now EXISTS — preserve its id no matter what happens next, so the
+    # activity view can always read the real session (the prior bug discarded it).
+    fallback = {"agent_id": agent_id, "status": "ran",
+                "summary": "Run started — open Activity for what it did.",
                 "details": [], "run_session_id": run_session_id}
+    try:
+        events = client.send_trigger_and_collect(run_session_id, trigger)
+    except Exception:                                      # noqa: BLE001 — triggered; couldn't collect
+        return fallback
+    try:
+        return _build_run_record(agent_id, events, run_session_id, client)
+    except Exception:                                      # noqa: BLE001 — analysis must never raise
+        return fallback
 
 
-def _build_run_record(agent_id, events, staged, run_session_id, client):
-    """Turn the collected event stream into a run record. For a STAGED agent, parse the
-    agent's proposed actions out of its final message into pending approvals; otherwise
-    report what executed (with a benign held-action fallback for the always_allow case)."""
+def _build_run_record(agent_id, events, run_session_id, client):
+    """A coarse run record (failed/needs_approval/completed) for the run log. The
+    authoritative per-session summary + staged proposals come from the activity engine
+    (which reads the real session events); this is only a lightweight fallback label."""
     actions = _action_labels(events)
     if _failed(events):
         return {"agent_id": agent_id, "status": "failed",
                 "summary": _last_text(events) or "The run stopped before finishing.",
-                "details": actions, "run_session_id": run_session_id}
-    if staged:
-        final = _final_text(events)
-        proposals = _parse_proposals(final)
-        if proposals is None:                          # contract not followed — surface, don't drop
-            proposals = ([{"app": "", "action": "review",
-                           "summary": _first_line(final) or "Review the agent's proposal",
-                           "details": {"description": final}}] if final.strip() else [])
-        pending = _proposals_to_pending(agent_id, proposals, run_session_id)
-        if pending:
-            return {"agent_id": agent_id, "status": "needs_approval",
-                    "summary": f"Staged {_plural(len(pending), 'action')} for you to approve.",
-                    "details": [p["summary"] for p in pending], "pending": pending,
-                    "run_session_id": run_session_id}
-        return {"agent_id": agent_id, "status": "completed",
-                "summary": _last_text(events) or "Completed with nothing to approve.",
                 "details": actions, "run_session_id": run_session_id}
     if _needs_approval(events):                        # always_allow shouldn't hold, but be safe
         try:
@@ -301,4 +289,37 @@ def execute_pending(client, agent, pending):
                 "run_session_id": run_session_id}
     return {"status": "executed",
             "summary": _last_text(events) or f"Performed {summary}.",
+            "run_session_id": run_session_id}
+
+
+def execute_actions(client, agent, items):
+    """Perform several approved staged actions in ONE fresh session (batch approve from
+    the activity screen). Explicit EXECUTE instruction overrides staging. Returns
+    ``{status: executed|failed, summary, run_session_id}``. Never raises."""
+    agent_id = agent.get("agent_id")
+    vault_ref = agent.get("vault_ref")
+    lines = []
+    for i, it in enumerate(items, 1):
+        summary = it.get("summary") or it.get("kind") or "action"
+        details = json.dumps(it.get("payload") or {}, ensure_ascii=False, default=str)
+        lines.append(f"{i}. {summary} — Details: {details}")
+    instruction = (
+        "You are approved to perform these actions now, for real. Do NOT stage, propose, "
+        "or describe them — actually carry each one out using your tools, then stop:\n"
+        + "\n".join(lines))
+    try:
+        environment_id = client.create_environment()
+        run_session_id = client.create_session(
+            agent_id, environment_id, resources=[], title="Trace approved actions",
+            vault_ids=[vault_ref] if vault_ref else None)
+        events = client.send_trigger_and_collect(run_session_id, instruction)
+    except Exception as e:                                  # noqa: BLE001
+        return {"status": "failed", "summary": f"Couldn't perform them: {type(e).__name__}",
+                "run_session_id": None}
+    if _failed(events):
+        return {"status": "failed",
+                "summary": _last_text(events) or "Stopped before finishing.",
+                "run_session_id": run_session_id}
+    return {"status": "executed",
+            "summary": _last_text(events) or f"Performed {_plural(len(items), 'action')}.",
             "run_session_id": run_session_id}

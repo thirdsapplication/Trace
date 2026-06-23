@@ -45,6 +45,7 @@ from ..agent import connect as agent_connect
 from ..agent import config as agent_config
 from ..agent import deploy as agent_deploy
 from ..agent import runner as agent_runner
+from ..agent import activity as agent_activity
 from . import cloud, db, keystore, permissions, registry, sessions, users
 
 
@@ -155,7 +156,8 @@ class AppState:
                  reconstruct_fn=None, controller_factory=None, key_store=None,
                  discovery_fn=None, score_fn=None, artifact_fn=None,
                  interview_fn=None, config_fn=None, cleanup_fn=None,
-                 connect_fn=None, deploy_fn=None, cloud_backend=None, proxy_fn=None):
+                 connect_fn=None, deploy_fn=None, cloud_backend=None, proxy_fn=None,
+                 summarize_fn=None):
         self.sessions_root = sessions_root
         self.collector_port = collector_port
         # Phase 2 (desktop app): when a cloud backend URL is configured, this
@@ -182,6 +184,9 @@ class AppState:
         # Phase 6: live deployment. ``deploy_fn`` deploys one bundle's LIVE agent over the
         # bound connection and returns its live record; tests inject a stub.
         self.deploy_fn = deploy_fn or self._default_deploy
+        # Activity view: a model_fn(system, user)->str that summarizes session logs into
+        # plain language (Haiku). Injected as a stub in tests; built lazily from the key.
+        self.summarize_fn = summarize_fn
         self.controller_factory = controller_factory or (
             lambda out: CaptureController(out, collector_port=collector_port))
         self.keystore = key_store or keystore
@@ -374,6 +379,119 @@ class AppState:
                 holder["fn"] = agent_configgen._default_model_fn(agent_configgen.DEFAULT_MODEL)
             return holder["fn"](system, user)
         return call
+
+    def _summarize_model_fn(self):
+        """The injected summarizer if present (tests), else a lazy Haiku caller from the
+        saved key. Raises ``no_api_key`` only if it actually needs to call the model."""
+        if self.summarize_fn:
+            return self.summarize_fn
+        key = self.keystore.get_key()
+        if not key:
+            raise RuntimeError("no_api_key")
+        os.environ["ANTHROPIC_API_KEY"] = key
+        holder = {}
+
+        def call(system, user):
+            if "fn" not in holder:
+                holder["fn"] = agent_configgen._default_model_fn(agent_config.SUMMARY_MODEL)
+            return holder["fn"](system, user)
+        return call
+
+    def agent_activity(self, agent, limit=10):
+        """The agent's recent runs as REAL session activity: for each run's session id,
+        read the session's events from the platform, summarize them in plain language
+        (cached per session), classify the outcome, and surface any staged proposals as
+        approvable items. Authoritative (ground truth), unlike the run self-report.
+        Best-effort per session — one bad fetch never breaks the list."""
+        root = self.sessions_root
+        owner = agent.get("owner_user_id")
+        staged = bool(agent.get("staged_apps"))
+        try:
+            client = self._live_client()
+        except Exception:
+            client = None
+        try:
+            model_fn = self._summarize_model_fn()
+        except Exception:
+            model_fn = None
+        out = []
+        seen = set()
+        for run in registry.runs_for_agent(root, agent.get("agent_id"), limit):
+            sid = run.get("run_session_id")
+            entry = {"ran_at": run.get("ran_at"), "run_session_id": sid,
+                     "status": run.get("status"), "summary": run.get("summary") or "",
+                     "proposals": []}
+            if not sid or sid in seen or client is None:
+                out.append(entry)
+                continue
+            seen.add(sid)
+            try:
+                events = client.list_session_events(sid)
+            except Exception:
+                out.append(entry)
+                continue
+            entry["status"] = agent_activity.session_status(events)
+            cached = registry.summary_get(root, sid)
+            if cached and cached.get("summary"):
+                entry["summary"] = cached["summary"]
+            elif model_fn is not None and agent_activity.is_terminal(events):
+                summ = agent_activity.summarize_session(events, agent.get("name"), model_fn)
+                if summ:
+                    entry["summary"] = summ
+                    registry.summary_set(root, sid, summ, entry["status"])
+            if staged:                                     # surface proposals as approvable items
+                entry["proposals"] = self._session_proposals(agent, sid, events, owner)
+            out.append(entry)
+        return out
+
+    def _session_proposals(self, agent, run_session_id, events, owner):
+        """Persist this session's proposed actions as pending items (deduped) and return
+        them (with their stored status) for the activity screen. Falls back to the final
+        message text when the agent didn't emit a structured block, so nothing is lost."""
+        root = self.sessions_root
+        agent_id = agent.get("agent_id")
+        proposals = agent_activity.extract_proposals(events)
+        if not proposals:
+            final = agent_runner._final_text(events)
+            if final.strip() and agent_activity.is_terminal(events):
+                proposals = [{"app": "", "action": "review",
+                              "summary": agent_runner._first_line(final) or "Review the proposal",
+                              "details": {"description": final}}]
+        for it in agent_runner._proposals_to_pending(agent_id, proposals, run_session_id):
+            registry.pending_add(root, {
+                "agent_id": agent_id, "owner_user_id": owner,
+                "run_session_id": run_session_id, "app": it.get("app"),
+                "kind": it.get("kind"), "summary": it.get("summary"),
+                "payload": it.get("payload"), "content_hash": it.get("content_hash")})
+        return [p for p in registry.pending_for_user(root, owner, status="pending")
+                if p.get("run_session_id") == run_session_id]
+
+    def approve_actions(self, agent, pending_ids):
+        """Approve a chosen set of staged actions: perform them in ONE fresh session and
+        mark each executed. Returns the execution record. Never raises."""
+        root = self.sessions_root
+        items = []
+        for pid in pending_ids or []:
+            it = registry.pending_get(root, pid)
+            if it and it.get("owner_user_id") == agent.get("owner_user_id") and it.get("status") == "pending":
+                items.append(it)
+        if not items:
+            return {"status": "failed", "summary": "Nothing to approve."}
+        self._refresh_agent_binding(agent)
+        try:
+            client = self._live_client()
+            res = agent_runner.execute_actions(client, agent, items)
+        except Exception:
+            res = {"status": "failed", "summary": "Couldn't perform them.", "run_session_id": None}
+        new_status = "executed" if res["status"] == "executed" else "failed"
+        for it in items:
+            registry.pending_set_status(root, it.get("id"), new_status)
+        registry.run_add(root, {
+            "agent_id": agent.get("agent_id"), "owner_user_id": agent.get("owner_user_id"),
+            "status": "completed" if res["status"] == "executed" else "failed",
+            "summary": res.get("summary") or "", "details": [it.get("summary") for it in items],
+            "run_session_id": res.get("run_session_id")})
+        return res
 
     def _approved_for_stage4(self, sid):
         root = self.sessions_root
@@ -1166,6 +1284,16 @@ def make_handler(state):
             if rest == "/pending":                           # Spec 8: staged actions awaiting review
                 items = registry.pending_for_user(root, user["user_id"])
                 return self._json(200, {"pending": items, "pending_count": len(items)})
+            maa = re.match(r"^/agents/([^/]+)/activity$", rest)
+            if maa:                                          # real session activity (Haiku summaries)
+                agent = next((a for a in registry.agents_for_user(root, user["user_id"])
+                              if a.get("agent_id") == maa.group(1)), None)
+                if not agent:
+                    return self._json(404, {"error": "not_found"})
+                return self._json(200, {"agent": {"agent_id": agent.get("agent_id"),
+                                                  "name": agent.get("name") or agent.get("bundle_id"),
+                                                  "staged_apps": agent.get("staged_apps") or []},
+                                        "activity": state.agent_activity(agent)})
             m = re.match(r"^/sessions/([^/]+)(/.*)?$", rest)
             if m:
                 if not self._owns(m.group(1), user):
@@ -1192,6 +1320,15 @@ def make_handler(state):
             md = re.match(r"^/agents/([^/]+)/delete-capture-data$", rest)
             if md:                                       # delete this workflow's capture data
                 return self._delete_capture_data(md.group(1), user)
+            maa = re.match(r"^/agents/([^/]+)/approve-actions$", rest)
+            if maa:                                      # approve selected staged actions (activity screen)
+                agent = next((a for a in registry.agents_for_user(root, user["user_id"])
+                              if a.get("agent_id") == maa.group(1)), None)
+                if not agent:
+                    return self._json(404, {"error": "not_found"})
+                ids = (body or {}).get("pending_ids") or []
+                threading.Thread(target=lambda: state.approve_actions(agent, ids), daemon=True).start()
+                return self._json(202, {"state": "running"})
             if rest == "/load-fixture":
                 return self._load_fixture(body, owner=uid)
             m = re.match(r"^/sessions/([^/]+)/(.+)$", rest)

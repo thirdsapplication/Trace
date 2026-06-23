@@ -102,6 +102,24 @@ def _content_text(content):
     return data
 
 
+def _full_event_dict(event):
+    """Normalize a session event to the fuller shape the activity summarizer needs:
+    ``{type, text, name, input, mcp_server_name, is_error, stop_reason, processed_at}``.
+    Superset of ``_event_dict`` (so run-status helpers still work)."""
+    d = _event_dict(event)
+    for k in ("input", "mcp_server_name", "is_error", "processed_at",
+              "tool_use_id", "mcp_tool_use_id", "agent_name"):
+        d[k] = _attr(event, k)
+    return d
+
+
+def _has_terminal(events):
+    """True once the session reached a terminal event (idle/completed/failed/ended)."""
+    return any(any(k in (e.get("type") or "").lower()
+                   for k in ("idle", "completed", "failed", "ended", "done"))
+               for e in events)
+
+
 def _event_dict(event):
     """Normalize a streamed event to ``{type, text, name, stop_reason}``."""
     et = getattr(event, "type", None) or (event.get("type") if isinstance(event, dict) else None)
@@ -123,6 +141,8 @@ def _event_dict(event):
     if not stop_reason:
         nested = getattr(event, "message", None) or getattr(event, "session", None)
         stop_reason = getattr(nested, "stop_reason", None) if nested is not None else None
+    if isinstance(stop_reason, dict):                  # real events nest it: {"type":"end_turn"}
+        stop_reason = stop_reason.get("type")
     return {"type": et, "text": text, "name": name, "stop_reason": stop_reason}
 
 
@@ -240,31 +260,36 @@ class ManagedAgentsClient:
             kw["vault_ids"] = list(vault_ids)              # the single vault-injection point
         return _idof(_retry(lambda: self._agents_ns("sessions").create(**kw)))
 
+    def list_session_events(self, session_id):
+        """The full event list for a session (the reliable read — ``events.list``, the
+        same call ``list_pending_approvals`` uses), normalized for the summarizer."""
+        res = _retry(lambda: self._agents_ns("sessions").events.list(session_id))
+        return [_full_event_dict(e) for e in _data(res)]
+
     def send_trigger_and_collect(self, session_id, trigger_text, timeout=None, max_events=None):
-        """Send ONLY the trigger user.message and stream events until the agent
-        finishes (a terminal event such as ``session.status_idle``). Bounded by a
-        wall-clock and an event cap so it can never hang waiting on the platform.
-        Never sends a second event — the zero-coaching rule (P9)."""
+        """Send ONLY the trigger user.message, then POLL the session's event list until
+        a terminal event or a wall-clock/event-count bound. Uses ``events.list`` (which
+        is reliable) rather than ``events.stream`` (which the platform can reject with a
+        non-retryable 400). Never sends a second event — the zero-coaching rule (P9)."""
         timeout = timeout or config.DEFAULT_SESSION_TIMEOUT
         max_events = max_events or config.DEFAULT_MAX_EVENTS
+        poll = getattr(config, "SESSION_POLL_SECONDS", 3)
         deadline = time.monotonic() + timeout
         sessions = self._agents_ns("sessions")
-        events = []
-        with sessions.events.stream(session_id) as stream:
-            sessions.events.send(session_id, events=[
-                {"type": "user.message", "content": [{"type": "text", "text": trigger_text}]}])
-            for event in stream:
-                ev = _event_dict(event)
-                events.append(ev)
-                et = ev["type"] or ""
-                if any(k in et for k in ("idle", "completed", "failed", "ended", "done")):
-                    break
-                if len(events) >= max_events or time.monotonic() > deadline:
-                    events.append({"type": "client.timeout", "name": None,
-                                   "text": f"stopped after {timeout}s / {max_events} events "
-                                           "without a terminal event"})
-                    break
-        return events
+        _retry(lambda: sessions.events.send(session_id, events=[
+            {"type": "user.message", "content": [{"type": "text", "text": trigger_text}]}]))
+        while True:
+            try:
+                events = self.list_session_events(session_id)
+            except Exception:                                  # transient read — keep waiting
+                events = []
+            if _has_terminal(events):
+                return events
+            if len(events) >= max_events or time.monotonic() > deadline:
+                return events + [{"type": "client.timeout", "name": None,
+                                  "text": f"stopped after {timeout}s / {max_events} events "
+                                          "without a terminal event"}]
+            time.sleep(poll)
 
     def download_outputs(self, session_id, exclude_ids=None):
         """Download the agent's WRITTEN files for a session as

@@ -18,6 +18,9 @@ MCP_TOOLSET_TYPE = "mcp_toolset"
 
 # --- pipeline defaults (overridable) ---------------------------------------
 DEFAULT_MODEL = "claude-sonnet-4-6"
+# Lightweight model for summarizing an agent's session logs into plain language for
+# the activity view (cheap; cached per session).
+SUMMARY_MODEL = "claude-haiku-4-5"
 # Manual-evaluation mode (current): evaluation is done by the user in the Console,
 # so we keep each run cheap — one session per bundle, a single session's tokens —
 # and never fan out. Recent rounds burned credits running many sessions.
@@ -27,6 +30,7 @@ DEFAULT_MAX_SESSIONS = 1                 # cost guard: sessions per run
 # under a minute once the environment is warm).
 DEFAULT_SESSION_TIMEOUT = 240            # seconds per session
 DEFAULT_MAX_EVENTS = 500                 # events per session
+SESSION_POLL_SECONDS = 3                 # poll interval for events.list while a run is in flight
 REQUEST_TIMEOUT = 120                    # per-HTTP-request read timeout (seconds)
 # Transient platform errors (503 overloaded / file storage temporarily unavailable,
 # 429, 5xx) are retried with exponential backoff before giving up.

@@ -108,6 +108,15 @@ CREATE TABLE IF NOT EXISTS agent_runs (
     run_session_id TEXT
 );
 CREATE INDEX IF NOT EXISTS agent_runs_agent_idx ON agent_runs (agent_id, ran_at DESC);
+
+-- Cached plain-language summaries of real MA session logs (the activity view), keyed
+-- by the session id so a terminal session is summarized once, not on every page load.
+CREATE TABLE IF NOT EXISTS session_summaries (
+    session_id  TEXT PRIMARY KEY,
+    summary     TEXT,
+    status      TEXT,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 """
 
 
@@ -415,3 +424,22 @@ def pending_count_for_user(owner_user_id):
                     "WHERE owner_user_id = %s AND status = 'pending'", (owner_user_id,))
         row = cur.fetchone()
         return int(row[0]) if row else 0
+
+
+# --- session-summary cache (activity view) ---------------------------------
+
+def summary_get(session_id):
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT summary, status FROM session_summaries WHERE session_id = %s",
+                    (session_id,))
+        row = cur.fetchone()
+        return {"summary": row[0], "status": row[1]} if row else None
+
+
+def summary_set(session_id, summary, status):
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO session_summaries (session_id, summary, status) "
+            "VALUES (%s, %s, %s) ON CONFLICT (session_id) DO UPDATE SET "
+            "summary=EXCLUDED.summary, status=EXCLUDED.status",
+            (session_id, summary, status))

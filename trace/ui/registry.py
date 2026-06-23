@@ -210,6 +210,22 @@ def pending_count_for_user(root, owner_user_id):
                if it.get("owner_user_id") == owner_user_id and it.get("status") == "pending")
 
 
+# --- session-summary cache (activity view) ---------------------------------
+def summary_get(root, session_id):
+    if db.is_configured():
+        return db.summary_get(session_id)
+    return _load(root, "session_summaries.json").get(session_id)
+
+
+def summary_set(root, session_id, summary, status):
+    if db.is_configured():
+        return db.summary_set(session_id, summary, status)
+    with _LOCK:
+        d = _load(root, "session_summaries.json")
+        d[session_id] = {"summary": summary, "status": status, "created_at": _now_iso()}
+        _save(root, "session_summaries.json", d)
+
+
 # --- small utils -----------------------------------------------------------
 def _safe(s):
     return "".join(c if c.isalnum() else "_" for c in str(s))

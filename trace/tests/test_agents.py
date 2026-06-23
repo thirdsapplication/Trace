@@ -234,5 +234,54 @@ class DeleteCaptureDataTest(AgentsEndpointTest):
         self.assertFalse(os.path.isdir(sessions.session_dir(self.root, sid)))   # best-effort
 
 
+class ActivityEndpointTest(AgentsEndpointTest):
+    """Activity view endpoints: real session summaries + per-action approval, owner-scoped."""
+
+    def _setup_staged(self, uid):
+        from trace.tests.test_scheduler import FakeMA, _PROPOSAL_BLOCK
+        registry.agent_upsert(self.root, {
+            "agent_id": "agent-1", "owner_user_id": uid, "external_user_id": "x",
+            "bundle_id": "wf", "name": "WF", "vault_ref": "v", "trigger": "t",
+            "session_id": "s", "staged_apps": ["gmail"]})
+        registry.run_add(self.root, {"agent_id": "agent-1", "owner_user_id": uid,
+                                     "status": "ran", "summary": "ran", "details": [],
+                                     "run_session_id": "sess-1"})
+        ma = FakeMA(events=[{"type": "agent.message", "text": _PROPOSAL_BLOCK},
+                            {"type": "session.thread_status_idle", "stop_reason": {"type": "end_turn"}}])
+        self.state._live_client = lambda: ma
+        self.state.summarize_fn = lambda s, u: "Checked the inbox; proposed actions."
+        return ma
+
+    def test_activity_returns_summary_and_proposals(self):
+        uid, cookie = self._signup("a1@x.com")
+        self._setup_staged(uid)
+        status, data, _ = self._req("GET", "/api/u/agents/agent-1/activity", cookie=cookie)
+        self.assertEqual(status, 200)
+        act = data["activity"]
+        self.assertEqual(len(act), 1)
+        self.assertEqual(act[0]["summary"], "Checked the inbox; proposed actions.")
+        self.assertEqual(act[0]["status"], "staged")
+        self.assertEqual(len(act[0]["proposals"]), 1)
+
+    def test_activity_scoped_to_owner(self):
+        uid, _ = self._signup("o1@x.com")
+        _, other = self._signup("o2@x.com")
+        self._setup_staged(uid)
+        status, _, _ = self._req("GET", "/api/u/agents/agent-1/activity", cookie=other)
+        self.assertEqual(status, 404)
+        status, _, _ = self._req("GET", "/api/u/agents/agent-1/activity")   # unauthenticated
+        self.assertEqual(status, 401)
+
+    def test_approve_actions_endpoint_accepts_selection(self):
+        uid, cookie = self._signup("a3@x.com")
+        self._setup_staged(uid)
+        self._req("GET", "/api/u/agents/agent-1/activity", cookie=cookie)   # creates pending
+        pend = registry.pending_for_user(self.root, uid)
+        self.assertTrue(pend)
+        status, _, _ = self._req("POST", "/api/u/agents/agent-1/approve-actions",
+                                 {"pending_ids": [pend[0]["id"]]}, cookie=cookie)
+        self.assertEqual(status, 202)
+
+
 if __name__ == "__main__":
     unittest.main()
