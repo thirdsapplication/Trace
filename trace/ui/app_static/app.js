@@ -713,10 +713,14 @@ async function renderGolive(sid) {
       <button class="btn-accent btn-sm dep-ok" data-b="${esc(b.id)}" data-a="${esc(a.action_id)}">Approve</button>
       <button class="btn-secondary btn-sm dep-no" data-b="${esc(b.id)}" data-a="${esc(a.action_id)}">Decline</button></div>`;
   }).join("");
+  // a bundle with no deploy record (creation failed) must NOT show as LIVE
+  const statusPill = (b) => b.status === "live"
+    ? `<span class="pill pill-on">LIVE</span>`
+    : `<span class="pill pill-off">${esc((b.status || "not created").toUpperCase())}</span>`;
   $("#liveBody").innerHTML = `
     <div class="stack">${bundles.map(b => `<div class="card"><div class="spread">
       <div class="row"><span class="dot"></span><span class="title">${esc(b.name || b.id)}</span></div>
-      <span class="pill pill-on">${esc((b.status || "live").toUpperCase())}</span></div>${held(b)}</div>`).join("")
+      ${statusPill(b)}</div>${held(b)}</div>`).join("")
       || `<p class="muted">No agents are live yet.</p>`}</div>
     <p id="liveMsg" class="msg"></p>
     <div class="row" style="margin-top:8px;gap:8px;">

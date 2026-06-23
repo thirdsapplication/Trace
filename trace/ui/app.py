@@ -718,8 +718,18 @@ class AppState:
                         job["deployed"] += 1
                     except Exception as e:
                         job["errors"][bid] = f"{type(e).__name__}: {e}"
-                sessions.update_meta(root, sid, deploy_at=sessions._now())
-                job.update(state="done")
+                # Only mark the session deployed if at least one agent was actually
+                # created; never report a total failure as "live" (the per-bundle
+                # platform error is surfaced so the real cause is visible).
+                if job["deployed"]:
+                    sessions.update_meta(root, sid, deploy_at=sessions._now())
+                    job.update(state="done")
+                elif job["errors"]:
+                    job.update(state="error",
+                               error="No agents were created. " +
+                                     "; ".join(f"{bid}: {msg}" for bid, msg in job["errors"].items()))
+                else:
+                    job.update(state="done")          # nothing eligible -> nothing to do
             except Exception as e:
                 job.update(state="error", error=str(e))
 

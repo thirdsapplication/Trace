@@ -96,12 +96,18 @@ class DeployTest(unittest.TestCase):
         self.assertEqual(rec["start"]["mode"], "trigger")
 
     # --- Spec 8: deploy-time per-connector staging policy ----------------
-    def test_staged_slug_gets_require_approval_others_always_allow(self):
+    def test_approval_policy_is_the_platform_enum(self):
+        # The platform accepts `always_ask` (NOT `require_approval`, which it rejects —
+        # that broke staged deploys). Pin the literal so we never regress the enum.
+        self.assertEqual(config.APPROVAL_PERMISSION_POLICY, "always_ask")
+
+    def test_staged_slug_gets_approval_policy_others_always_allow(self):
         servers, toolsets = config.pipedream_mcp_servers(
             "trace-s1", ["gmail", "google_sheets"], staged_slugs=["gmail"])
         pol = {t["mcp_server_name"]: t["default_config"]["permission_policy"]["type"]
                for t in toolsets}
         self.assertEqual(pol["pipedream_gmail"], config.APPROVAL_PERMISSION_POLICY)
+        self.assertEqual(pol["pipedream_gmail"], "always_ask")
         self.assertEqual(pol["pipedream_google_sheets"], config.LIVE_PERMISSION_POLICY)
 
     def test_no_staged_slugs_is_unchanged(self):
@@ -348,6 +354,22 @@ class UIDeployTest(unittest.TestCase):
         _, data = self.req("GET", f"/api/sessions/{self.sid}/deploy-bundles")
         held = next(x for x in data["bundles"] if x["id"] == "B1")["held_actions"]
         self.assertEqual(held[0]["status"], "approved")
+
+    def test_total_failure_reports_error_not_phantom_live(self):
+        # Regression: when agent creation fails (e.g. the platform rejects the toolset),
+        # the deploy must surface the error — not silently mark the session deployed and
+        # show "live" with zero agents created.
+        self._full_chain()
+        def boom(*a, **k):
+            raise RuntimeError("400 invalid permission policy")
+        self.state.deploy_fn = boom
+        self.req("POST", f"/api/sessions/{self.sid}/deploy", {"trigger": "on inbound"})
+        st = self._await("deploy")
+        self.assertEqual(st["state"], "error")
+        self.assertIn("invalid permission policy", st["error"])    # real platform error surfaced
+        # the session is NOT marked deployed and no live record was written
+        self.assertFalse((sessions.read_meta(self.root, self.sid) or {}).get("deploy_at"))
+        self.assertEqual(sessions.list_deploy_records(self.root, self.sid), [])
 
     def test_cleanup_harvests_live_session(self):
         captured = {}

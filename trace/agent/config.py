@@ -37,9 +37,13 @@ MOUNT_PATH = "/workspace/files"          # where the Test Deployer mounts artifa
 # The framing makes this contractual and the Deployer retrieves session-scoped files.
 OUTPUTS_PATH = "/workspace/outputs"
 
-# P5 — safe default: every outbound-write capability requires approval. Never
-# emit always_allow by default. Confirm the exact enum against current docs.
-APPROVAL_PERMISSION_POLICY = "require_approval"
+# P5 — approval-required policy for outbound-write toolsets. The platform gates a
+# call by going idle with a pending tool_use, resolved by replying with a
+# `tool_confirmation` event (see api_client.approve_action/reject_action). The enum
+# value the Managed Agents platform accepts is `always_ask` (NOT `require_approval`,
+# which the API rejects — that broke Spec 8 staged deploys). Never emit always_allow
+# by default.
+APPROVAL_PERMISSION_POLICY = "always_ask"
 
 # --- Config Engine (Phase 1) -----------------------------------------------
 # The Config Engine writes the agent configuration directly (no markdown spec, no
