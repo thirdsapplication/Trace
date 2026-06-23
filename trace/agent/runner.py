@@ -14,8 +14,9 @@ Pure orchestration over an injected ``client``, so it runs offline against a stu
 import datetime
 import hashlib
 import json
+import re
 
-from . import deploy
+from . import config, deploy
 
 # event-type markers (substring match against the MA event stream)
 _FAIL_MARKERS = ("failed", "error", "cancel", "timeout")
@@ -131,6 +132,72 @@ def _pending_items(agent_id, held, run_session_id):
     return items
 
 
+# --- Spec 8 prompt-level staging ------------------------------------------
+def _final_text(events):
+    """The agent's full final message (untruncated), where the proposed-actions
+    block lives — unlike _last_text which truncates for summaries."""
+    for ev in reversed(events):
+        t = (ev.get("text") or "").strip()
+        if t:
+            return t
+    return ""
+
+
+def _first_line(text, n=160):
+    line = (text or "").strip().splitlines()[0] if (text or "").strip() else ""
+    return line[:n]
+
+
+def _app_label(slug):
+    return str(slug or "").replace("_", " ").title()
+
+
+def _staging_trigger(base_trigger, staged_slugs):
+    """Prepend the staging directive (naming the staged apps) to the run's trigger so
+    the agent reads freely but proposes — not performs — outbound actions in those apps."""
+    apps = ", ".join(_app_label(s) for s in staged_slugs) or "the staged apps"
+    # plain replace (not str.format) — the directive contains literal JSON braces
+    directive = config.STAGING_DIRECTIVE.replace("{apps}", apps)
+    return f"{directive}\nTask: {base_trigger}"
+
+
+def _parse_proposals(text):
+    """Parse the agent's ``proposed_actions`` JSON array out of its final message.
+    Returns a list (possibly empty) on success, or None if no array could be parsed
+    (the caller then falls back so a proposal is never silently dropped)."""
+    if not text:
+        return None
+    m = re.search(r"```(?:proposed_actions|json)?\s*(\[.*?\])\s*```", text, re.DOTALL)
+    blob = m.group(1) if m else None
+    if blob is None:                                   # no fence — try a bare top-level array
+        m2 = re.search(r"(\[.*\])", text, re.DOTALL)
+        blob = m2.group(1) if m2 else None
+    if blob is None:
+        return None
+    try:
+        data = json.loads(blob)
+    except (ValueError, TypeError):
+        return None
+    return data if isinstance(data, list) else None
+
+
+def _proposals_to_pending(agent_id, proposals, run_session_id):
+    items = []
+    for p in proposals:
+        if not isinstance(p, dict):
+            continue
+        details = p.get("details")
+        if not isinstance(details, (dict, list)):
+            details = {"description": str(details)} if details is not None else {}
+        kind = str(p.get("action") or p.get("app") or "action")
+        summary = str(p.get("summary") or kind)
+        items.append({"action_id": None, "kind": kind, "summary": summary,
+                      "app": p.get("app") or "", "payload": details,
+                      "content_hash": _content_hash(agent_id, kind, details),
+                      "run_session_id": run_session_id})
+    return items
+
+
 def run_once(client, agent):
     """Run one agent once. ``agent`` is a registry row carrying ``agent_id``,
     ``vault_ref``, and ``trigger``. Returns a run record dict
@@ -139,8 +206,10 @@ def run_once(client, agent):
     list of actions. Never raises (a platform failure becomes a ``failed`` record).
     """
     agent_id = agent.get("agent_id")
-    trigger = agent.get("trigger") or "on a new matching task"
+    base_trigger = agent.get("trigger") or "on a new matching task"
     vault_ref = agent.get("vault_ref")
+    staged = [s for s in (agent.get("staged_apps") or []) if s]
+    trigger = _staging_trigger(base_trigger, staged) if staged else base_trigger
     try:
         environment_id = client.create_environment()
         run_session_id = client.create_session(
@@ -151,28 +220,51 @@ def run_once(client, agent):
         return {"agent_id": agent_id, "status": "failed",
                 "summary": f"Couldn't run: {type(e).__name__}", "details": [],
                 "run_session_id": None}
+    # Reading the result must NEVER raise (that previously surfaced as a bogus
+    # "Couldn't start the run." with no pending actions). Degrade gracefully instead.
+    try:
+        return _build_run_record(agent_id, events, staged, run_session_id, client)
+    except Exception as e:                                  # noqa: BLE001
+        return {"agent_id": agent_id, "status": "failed",
+                "summary": f"Ran, but couldn't read the result: {type(e).__name__}",
+                "details": [], "run_session_id": run_session_id}
 
+
+def _build_run_record(agent_id, events, staged, run_session_id, client):
+    """Turn the collected event stream into a run record. For a STAGED agent, parse the
+    agent's proposed actions out of its final message into pending approvals; otherwise
+    report what executed (with a benign held-action fallback for the always_allow case)."""
     actions = _action_labels(events)
     if _failed(events):
         return {"agent_id": agent_id, "status": "failed",
                 "summary": _last_text(events) or "The run stopped before finishing.",
                 "details": actions, "run_session_id": run_session_id}
-    if _needs_approval(events):
-        # genuinely paused for approval — staged for in-Trace review (Spec 8). Harvest the
-        # held actions' FULL payloads so the user can review and approve later; NEVER
-        # approve here (that would execute). The held session is left to idle out — Trace
-        # executes on approval as a fresh task, so its timeout is irrelevant.
+    if staged:
+        final = _final_text(events)
+        proposals = _parse_proposals(final)
+        if proposals is None:                          # contract not followed — surface, don't drop
+            proposals = ([{"app": "", "action": "review",
+                           "summary": _first_line(final) or "Review the agent's proposal",
+                           "details": {"description": final}}] if final.strip() else [])
+        pending = _proposals_to_pending(agent_id, proposals, run_session_id)
+        if pending:
+            return {"agent_id": agent_id, "status": "needs_approval",
+                    "summary": f"Staged {_plural(len(pending), 'action')} for you to approve.",
+                    "details": [p["summary"] for p in pending], "pending": pending,
+                    "run_session_id": run_session_id}
+        return {"agent_id": agent_id, "status": "completed",
+                "summary": _last_text(events) or "Completed with nothing to approve.",
+                "details": actions, "run_session_id": run_session_id}
+    if _needs_approval(events):                        # always_allow shouldn't hold, but be safe
         try:
             held = deploy.list_held(client, run_session_id)
         except Exception:
             held = []
         pending = _pending_items(agent_id, held, run_session_id)
         labels = [(p.get("summary") or p.get("kind") or "action") for p in pending] or actions
-        n = len(labels)
         return {"agent_id": agent_id, "status": "needs_approval",
-                "summary": f"Staged {_plural(n, 'action')} for you to approve.",
+                "summary": f"Staged {_plural(len(labels), 'action')} for you to approve.",
                 "details": labels, "pending": pending, "run_session_id": run_session_id}
-    # completed: actions executed (the normal always-allow case)
     n = len(actions)
     summary = _last_text(events) or (f"Completed {_plural(n, 'action')}." if n else "Completed with no actions needed.")
     return {"agent_id": agent_id, "status": "completed",
@@ -180,18 +272,20 @@ def run_once(client, agent):
 
 
 def execute_pending(client, agent, pending):
-    """Perform one previously-staged action (Spec 8 "quick fresh task"). On the user's
-    approval, run the deployed agent on a fresh, targeted instruction — "do exactly this
-    saved action" — then approve the resulting hold IN THAT BRAND-NEW SESSION (safe: the
-    session is fresh, so no timeout). Reuses the same vault-injected run path as
-    ``run_once``; all MA calls stay in ``client``. Returns
-    ``{status: executed|failed, summary, run_session_id}``. Never raises."""
+    """Perform one previously-staged action on the user's approval (Spec 8 "quick fresh
+    task"). Runs the deployed agent on a fresh session with an explicit EXECUTE
+    instruction that overrides staging (staging lives only in the scheduled-run trigger,
+    not the agent's system prompt, so a plain execute trigger performs the action under
+    the always_allow toolsets). Returns ``{status: executed|failed, summary,
+    run_session_id}``. Never raises."""
     agent_id = agent.get("agent_id")
     vault_ref = agent.get("vault_ref")
     summary = pending.get("summary") or pending.get("kind") or "the action"
     payload = pending.get("payload") or {}
-    instruction = ("Perform exactly this single action and nothing else: "
-                   f"{summary}. Details: {json.dumps(payload, ensure_ascii=False, default=str)}")
+    instruction = (
+        "You are approved to perform this ONE action now, for real. Do NOT stage, "
+        "propose, or describe it — actually carry it out using your tools, then stop. "
+        f"Action: {summary}. Details: {json.dumps(payload, ensure_ascii=False, default=str)}")
     try:
         environment_id = client.create_environment()
         run_session_id = client.create_session(
@@ -201,14 +295,6 @@ def execute_pending(client, agent, pending):
     except Exception as e:                                  # noqa: BLE001
         return {"status": "failed", "summary": f"Couldn't perform it: {type(e).__name__}",
                 "run_session_id": None}
-
-    # If the staged toolset is still require_approval, this fresh run will hold the
-    # action too — approve it here (fresh session, no timeout) so it executes.
-    try:
-        for h in deploy.list_held(client, run_session_id):
-            deploy.approve(client, run_session_id, h.get("action_id"))
-    except Exception:
-        pass
     if _failed(events):
         return {"status": "failed",
                 "summary": _last_text(events) or "The action stopped before finishing.",

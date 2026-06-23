@@ -94,21 +94,46 @@ def pipedream_mcp_servers(external_user_id, app_slugs, staged_slugs=None):
     entry per app (one app per URL) plus the matching ``mcp_toolset`` entries. Returns
     ``(servers, toolsets)``.
 
-    ``staged_slugs`` (Spec 8 "stage, don't execute") is the set of app slugs the user
-    opted into staging at deploy: that app's toolset gets ``require_approval`` so the
-    platform HOLDS its outbound actions (Trace captures + stages them) instead of
-    auto-executing. Any slug not in the set keeps ``always_allow``. ``None`` (the
-    default) stages nothing — every toolset is ``always_allow``, the prior behavior."""
-    staged = set(staged_slugs or ())
+    Every toolset is ``always_allow``. NOTE (Spec 8): staging is NOT enforced at the
+    platform here — Managed Agents approval is per-connector (per-toolset), so
+    ``always_ask`` would gate read tools (find/list/get) exactly like writes and the
+    agent would halt awaiting approval on its first inbox read. Staging is therefore
+    prompt-level: reads run freely and a per-run directive (``STAGING_DIRECTIVE``) tells
+    the agent to propose, not perform, the staged actions. ``staged_slugs`` is accepted
+    and ignored here (kept for call-site compatibility); the staged set rides on the
+    agent row and drives the run-time directive instead."""
     servers, toolsets = [], []
     for slug in app_slugs:
         name = f"{PIPEDREAM_MCP_NAME}_{slug}"
-        policy = APPROVAL_PERMISSION_POLICY if slug in staged else LIVE_PERMISSION_POLICY
         servers.append({"name": name, "type": "url",
                         "url": pipedream_mcp_url(external_user_id, slug)})
         toolsets.append({"type": MCP_TOOLSET_TYPE, "mcp_server_name": name,
-                         "default_config": {"permission_policy": {"type": policy}}})
+                         "default_config": {"permission_policy": {"type": LIVE_PERMISSION_POLICY}}})
     return servers, toolsets
+
+
+# Spec 8 prompt-level staging: prepended to a staged agent's trigger so it does all
+# reading/analysis but PROPOSES (does not perform) outbound actions in the staged apps.
+# `{apps}` is filled with the human app labels (e.g. "Gmail, Google Sheets").
+STAGING_DIRECTIVE = (
+    "STAGING MODE — read freely, but do NOT execute outbound actions for: {apps}.\n"
+    "Do all the reading, lookups, and analysis you need (these are allowed). But for "
+    "any action in those apps that sends, creates, updates, or deletes anything (e.g. "
+    "sending an email, adding or editing a row, posting a record), DO NOT call the tool. "
+    "Instead, gather the exact details and, as your FINAL message, output one fenced code "
+    "block tagged `proposed_actions` containing a JSON array — one object per action you "
+    "would have taken, each: {\"app\": \"<app>\", \"action\": \"<short verb>\", "
+    "\"summary\": \"<one line a human can approve>\", \"details\": { ...the full, exact "
+    "fields needed to perform it, e.g. to/subject/body or the row values... }}. "
+    "If there are no outbound actions to take, output an empty array. Take outbound "
+    "actions normally in any app NOT listed above.\n\n"
+    "Example final message:\n"
+    "```proposed_actions\n"
+    "[{\"app\": \"Gmail\", \"action\": \"send email\", \"summary\": \"Confirm PO-1234 to "
+    "buyer@acme.com\", \"details\": {\"to\": \"buyer@acme.com\", \"subject\": \"Order "
+    "PO-1234 confirmed\", \"body\": \"...\"}}]\n"
+    "```\n")
+
 
 # Observed-app substring -> Pipedream app {slug, label}. Domain-neutral; same match
 # idiom as APP_MCP_TABLE. Apps with no row are surfaced as 'unmapped', never guessed.

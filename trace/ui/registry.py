@@ -40,7 +40,7 @@ def _save(root, name, obj):
     p = os.path.join(_dir(root), name)
     tmp = p + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(obj, f)
+        json.dump(obj, f, default=str)          # default=str: a non-JSON-native payload can't crash persistence
     os.replace(tmp, p)
 
 

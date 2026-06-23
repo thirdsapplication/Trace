@@ -21,7 +21,7 @@ class FakeMA:
         self.held = held or []
         self.fail = fail
         self.sessions = []
-        self.approved, self.rejected = [], []
+        self.approved, self.rejected, self.triggers = [], [], []
 
     def create_environment(self):
         return "env-1"
@@ -33,6 +33,7 @@ class FakeMA:
         return "run-sess-1"
 
     def send_trigger_and_collect(self, sid, trigger, timeout=None, max_events=None):
+        self.triggers.append(trigger)
         return self.events
 
     def list_pending_approvals(self, sid):
@@ -62,10 +63,17 @@ class FakeConnect:
         return {"refreshed": 1, "expires_at": "2026-01-01T00:00:00Z"}
 
 
-def _agent(owner="usr_1", agent_id="agent-1"):
+def _agent(owner="usr_1", agent_id="agent-1", staged_apps=None):
     return {"agent_id": agent_id, "owner_user_id": owner, "external_user_id": "x",
             "bundle_id": "wf", "name": "WF", "vault_ref": "vlt-1",
-            "trigger": "on a new task", "session_id": "s"}
+            "trigger": "on a new task", "session_id": "s", "staged_apps": staged_apps or []}
+
+
+# A staged agent's final message carrying the proposed-actions contract block.
+_PROPOSAL_BLOCK = ('```proposed_actions\n'
+                   '[{"app": "Gmail", "action": "send email", '
+                   '"summary": "Confirm PO-1234 to bob@x.com", '
+                   '"details": {"to": "bob@x.com", "subject": "Confirmed", "body": "Hi"}}]\n```')
 
 
 class RunnerTest(unittest.TestCase):
@@ -97,43 +105,73 @@ class RunnerTest(unittest.TestCase):
         self.assertIn("approve", rec["summary"].lower())
         self.assertEqual(rec["details"], ["send email to Bob"])
 
-    # --- Spec 8: stage, don't execute -----------------------------------
-    def test_staged_action_captures_full_payload_and_never_approves(self):
-        held = [{"action_id": "a1", "kind": "gmail-send-email", "summary": "Email Bob",
-                 "input": {"to": "bob@x.com", "subject": "Hi", "body": "Hello"}}]
-        events = [_tool("gmail-send-email"),
-                  {"type": "session.status_idle", "stop_reason": "requires_action"}]
-        ma = FakeMA(events=events, held=held)
-        rec = runner.run_once(ma, _agent())
+    # --- Spec 8: prompt-level staging -----------------------------------
+    def test_staged_agent_proposes_not_executes(self):
+        # A staged agent reads freely and PROPOSES its outbound action (no platform
+        # hold). run_once parses the proposal into a pending approval, and the staging
+        # directive (naming the app) was prepended to the run trigger.
+        ma = FakeMA(events=[{"type": "agent.message", "text": _PROPOSAL_BLOCK},
+                            {"type": "session.status_idle", "text": ""}])
+        rec = runner.run_once(ma, _agent(staged_apps=["gmail"]))
         self.assertEqual(rec["status"], "needs_approval")
         self.assertEqual(len(rec["pending"]), 1)
         p = rec["pending"][0]
-        self.assertEqual(p["payload"], {"to": "bob@x.com", "subject": "Hi", "body": "Hello"})
+        self.assertEqual(p["summary"], "Confirm PO-1234 to bob@x.com")
+        self.assertEqual(p["payload"]["to"], "bob@x.com")
+        self.assertEqual(p["app"], "Gmail")
         self.assertTrue(p["content_hash"])
-        self.assertEqual(ma.approved, [])                      # NEVER sends on the scheduled run
+        self.assertEqual(ma.approved, [])                      # never executes on the staged run
+        self.assertIn("STAGING MODE", ma.triggers[0])          # directive prepended
+        self.assertIn("Gmail", ma.triggers[0])
 
-    def test_execute_pending_runs_fresh_task_and_approves(self):
-        # On approval the fresh, targeted run holds the action; execute_pending approves
-        # it in that brand-new session so it actually executes.
-        held = [{"action_id": "a1", "kind": "gmail-send-email", "summary": "Email Bob",
-                 "input": {"to": "bob@x.com"}}]
-        ma = FakeMA(events=[_tool("gmail-send-email"), {"type": "session.status_idle", "text": "Sent."}],
-                    held=held)
+    def test_staged_agent_empty_proposals_completes(self):
+        ma = FakeMA(events=[{"type": "agent.message", "text": "```proposed_actions\n[]\n```"},
+                            {"type": "session.status_idle", "text": ""}])
+        rec = runner.run_once(ma, _agent(staged_apps=["gmail"]))
+        self.assertEqual(rec["status"], "completed")
+        self.assertFalse(rec.get("pending"))
+
+    def test_staged_agent_malformed_proposal_falls_back_not_dropped(self):
+        # If the agent doesn't follow the contract, surface its message for review
+        # rather than silently dropping a possible action — and NEVER raise.
+        ma = FakeMA(events=[{"type": "agent.message", "text": "I would email Bob about PO-1234."},
+                            {"type": "session.status_idle", "text": ""}])
+        rec = runner.run_once(ma, _agent(staged_apps=["gmail"]))
+        self.assertEqual(rec["status"], "needs_approval")
+        self.assertEqual(len(rec["pending"]), 1)
+
+    def test_non_staged_agent_runs_normally(self):
+        ma = FakeMA()
+        rec = runner.run_once(ma, _agent())                    # no staged_apps
+        self.assertEqual(rec["status"], "completed")
+        self.assertNotIn("STAGING MODE", ma.triggers[0])       # plain trigger, no directive
+
+    def test_run_once_never_raises_even_if_analysis_breaks(self):
+        # Regression for the bogus "Couldn't start the run." — a post-run analysis error
+        # must degrade to a recorded failure, not escape run_once.
+        orig = runner._build_run_record
+        runner._build_run_record = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
+        try:
+            rec = runner.run_once(FakeMA(), _agent())
+        finally:
+            runner._build_run_record = orig
+        self.assertEqual(rec["status"], "failed")
+        self.assertIn("couldn't read", rec["summary"].lower())
+
+    def test_execute_pending_performs_the_action(self):
+        ma = FakeMA(events=[_tool("gmail-send-email"), {"type": "session.status_idle", "text": "Sent."}])
         res = runner.execute_pending(ma, _agent(), {"summary": "Email Bob", "kind": "gmail-send-email",
                                                     "payload": {"to": "bob@x.com"}})
         self.assertEqual(res["status"], "executed")
-        self.assertEqual(ma.approved, ["a1"])
+        self.assertIn("Email Bob", ma.triggers[-1])            # the exact action was instructed
+        self.assertIn("perform this ONE action", ma.triggers[-1])
 
     def test_execute_pending_non_email_write_is_generic(self):
-        # A non-email write (sheets) stages + executes through the same general path.
-        held = [{"action_id": "w9", "kind": "google_sheets-add-row", "summary": "Add row",
-                 "input": {"spreadsheet": "Q3", "values": [1, 2, 3]}}]
-        ma = FakeMA(events=[_tool("google_sheets-add-row"), {"type": "session.status_idle", "text": "Updated."}],
-                    held=held)
-        res = runner.execute_pending(ma, _agent(), {"summary": "Add row", "kind": "google_sheets-add-row",
+        ma = FakeMA(events=[_tool("google_sheets-add-row"), {"type": "session.status_idle", "text": "Updated."}])
+        res = runner.execute_pending(ma, _agent(), {"summary": "Add row to Q3", "kind": "google_sheets-add-row",
                                                     "payload": {"spreadsheet": "Q3", "values": [1, 2, 3]}})
         self.assertEqual(res["status"], "executed")
-        self.assertEqual(ma.approved, ["w9"])
+        self.assertIn("Add row to Q3", ma.triggers[-1])
 
     def test_execute_pending_failed_on_platform_error(self):
         res = runner.execute_pending(FakeMA(fail=True), _agent(),
@@ -245,31 +283,32 @@ class SchedulerPassTest(unittest.TestCase):
 
     # --- Spec 8: staged actions persist, dedupe, and execute on approval ---
     def _staging_ma(self):
-        held = [{"action_id": "a1", "kind": "gmail-send-email", "summary": "Email Bob",
-                 "input": {"to": "bob@x.com", "subject": "Hi"}}]
-        events = [_tool("gmail-send-email"),
-                  {"type": "session.status_idle", "stop_reason": "requires_action"}]
-        return FakeMA(events=events, held=held)
+        # a staged agent that proposes one Gmail action (prompt-level staging)
+        return FakeMA(events=[{"type": "agent.message", "text": _PROPOSAL_BLOCK},
+                              {"type": "session.status_idle", "text": ""}])
+
+    def _staged_agent(self):
+        registry.agent_upsert(self.root, _agent(staged_apps=["gmail"]))
+        return _agent(staged_apps=["gmail"])
 
     def test_staged_run_persists_pending_and_dedupes(self):
-        registry.agent_upsert(self.root, _agent())
+        agent = self._staged_agent()
         self.state._live_client = lambda: self._staging_ma()
-        self.state.run_agent(_agent())
-        self.state.run_agent(_agent())                        # identical proposal again
+        self.state.run_agent(agent)
+        self.state.run_agent(agent)                           # identical proposal again
         pend = registry.pending_for_user(self.root, "usr_1")
         self.assertEqual(len(pend), 1)                        # deduped, not re-staged
-        self.assertEqual(pend[0]["payload"], {"to": "bob@x.com", "subject": "Hi"})
+        self.assertEqual(pend[0]["payload"]["to"], "bob@x.com")
         self.assertEqual(registry.pending_count_for_user(self.root, "usr_1"), 1)
 
     def test_approve_pending_executes_and_marks_processed(self):
-        registry.agent_upsert(self.root, _agent())
+        agent = self._staged_agent()
         ma = self._staging_ma()
         self.state._live_client = lambda: ma
-        self.state.run_agent(_agent())
+        self.state.run_agent(agent)
         item = registry.pending_for_user(self.root, "usr_1")[0]
         res = self.state.approve_pending(item)
-        self.assertEqual(res["status"], "executed")
-        self.assertEqual(ma.approved, ["a1"])                 # Trace performed it
+        self.assertEqual(res["status"], "executed")           # Trace performed it (fresh task)
         self.assertEqual(registry.pending_count_for_user(self.root, "usr_1"), 0)
         self.assertEqual(registry.pending_get(self.root, item["id"])["status"], "executed")
 

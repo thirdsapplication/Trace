@@ -814,13 +814,17 @@ class AppState:
             "status": rec["status"], "summary": rec["summary"],
             "details": rec.get("details") or [], "run_session_id": rec.get("run_session_id")})
         # Spec 8: persist any actions the agent staged for approval (deduped, so a
-        # repeated run never re-stages the same proposal). The run itself completes.
+        # repeated run never re-stages the same proposal). Guarded so a persistence
+        # error can't crash the run thread or flip the already-recorded outcome.
         for item in rec.get("pending") or []:
-            registry.pending_add(self.sessions_root, {
-                "agent_id": agent.get("agent_id"), "owner_user_id": agent.get("owner_user_id"),
-                "run_session_id": item.get("run_session_id"), "app": item.get("app"),
-                "kind": item.get("kind"), "summary": item.get("summary"),
-                "payload": item.get("payload"), "content_hash": item.get("content_hash")})
+            try:
+                registry.pending_add(self.sessions_root, {
+                    "agent_id": agent.get("agent_id"), "owner_user_id": agent.get("owner_user_id"),
+                    "run_session_id": item.get("run_session_id"), "app": item.get("app"),
+                    "kind": item.get("kind"), "summary": item.get("summary"),
+                    "payload": item.get("payload"), "content_hash": item.get("content_hash")})
+            except Exception:
+                pass
         registry.schedule_mark_run(self.sessions_root, agent.get("agent_id"))
         return rec
 

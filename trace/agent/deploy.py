@@ -35,16 +35,16 @@ def finalize_live_envelope(live_envelope_dict, connection_record, staged_apps=No
     time (the reference's "one customer, one workflow -> bake the URL"). The config-gen
     template carries one nominal server; here it becomes one server per usable app, each
     URL carrying this customer's ``externalUserId``, plus the matching mcp_toolset entries.
-    ``staged_apps`` (Spec 8) is the subset of slugs the user opted into "stage, don't
-    execute" — those toolsets are baked ``require_approval`` (the platform holds their
-    outbound actions); the rest default ``always_allow``. Returns a NEW dict (the template
-    is not mutated)."""
+    ``staged_apps`` (Spec 8) is recorded on the deploy record/agent row but does NOT
+    change the platform policy: every toolset is ``always_allow``. Staging is prompt-level
+    (per-connector approval would gate reads too) — the staged set drives a run-time
+    directive (see runner). Returns a NEW dict (the template is not mutated)."""
     env = copy.deepcopy(live_envelope_dict)
     uid = (connection_record or {}).get("external_user_id")
     slugs = _usable_app_slugs(connection_record)
     if not slugs:                                   # no usable app -> leave the template as-is
         return env
-    servers, toolsets = config.pipedream_mcp_servers(uid, slugs, staged_slugs=staged_apps)
+    servers, toolsets = config.pipedream_mcp_servers(uid, slugs)
     env["mcp_servers"] = servers
     env["tools"] = [t for t in env.get("tools", []) if t.get("type") != config.MCP_TOOLSET_TYPE]
     env["tools"].extend(toolsets)

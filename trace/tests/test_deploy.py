@@ -95,27 +95,22 @@ class DeployTest(unittest.TestCase):
         self.assertEqual(rec["status"], "live")
         self.assertEqual(rec["start"]["mode"], "trigger")
 
-    # --- Spec 8: deploy-time per-connector staging policy ----------------
-    def test_approval_policy_is_the_platform_enum(self):
-        # The platform accepts `always_ask` (NOT `require_approval`, which it rejects —
-        # that broke staged deploys). Pin the literal so we never regress the enum.
-        self.assertEqual(config.APPROVAL_PERMISSION_POLICY, "always_ask")
-
-    def test_staged_slug_gets_approval_policy_others_always_allow(self):
-        servers, toolsets = config.pipedream_mcp_servers(
+    # --- Spec 8: staging is PROMPT-LEVEL, never platform-gated -------------
+    # Per-connector approval would gate read tools (find/list/get) exactly like writes
+    # and halt the agent on its first inbox read, so staged toolsets stay always_allow;
+    # staging is enforced by a run-time directive (see test_scheduler) instead.
+    def test_every_live_toolset_is_always_allow_even_when_staged(self):
+        _, toolsets = config.pipedream_mcp_servers(
             "trace-s1", ["gmail", "google_sheets"], staged_slugs=["gmail"])
-        pol = {t["mcp_server_name"]: t["default_config"]["permission_policy"]["type"]
-               for t in toolsets}
-        self.assertEqual(pol["pipedream_gmail"], config.APPROVAL_PERMISSION_POLICY)
-        self.assertEqual(pol["pipedream_gmail"], "always_ask")
-        self.assertEqual(pol["pipedream_google_sheets"], config.LIVE_PERMISSION_POLICY)
+        self.assertTrue(all(t["default_config"]["permission_policy"]["type"] == config.LIVE_PERMISSION_POLICY
+                            for t in toolsets))            # NOTHING is always_ask at the platform
 
     def test_no_staged_slugs_is_unchanged(self):
         _, toolsets = config.pipedream_mcp_servers("trace-s1", ["gmail", "google_sheets"])
         self.assertTrue(all(t["default_config"]["permission_policy"]["type"] == config.LIVE_PERMISSION_POLICY
                             for t in toolsets))
 
-    def test_deploy_live_bakes_staging_and_records_it(self):
+    def test_deploy_live_records_staged_apps_without_gating(self):
         bundle, live = _live_dict()
         conn = {"external_user_id": "trace-s1", "vault_ref": "vlt-s1",
                 "apps": {"gmail": {"usable": True}, "google_sheets": {"usable": True}}}
@@ -123,10 +118,9 @@ class DeployTest(unittest.TestCase):
         rec = deploy.deploy_live(bundle, live, conn, client,
                                  trigger="on a new task", staged_apps=["gmail"])
         toolsets = [t for t in client.agents[0]["tools"] if t.get("type") == "mcp_toolset"]
-        pol = {t["mcp_server_name"]: t["default_config"]["permission_policy"]["type"]
-               for t in toolsets}
-        self.assertEqual(pol["pipedream_gmail"], config.APPROVAL_PERMISSION_POLICY)
-        self.assertEqual(pol["pipedream_google_sheets"], config.LIVE_PERMISSION_POLICY)
+        # staged_apps is recorded for the run-time directive, but the platform gates nothing
+        self.assertTrue(all(t["default_config"]["permission_policy"]["type"] == config.LIVE_PERMISSION_POLICY
+                            for t in toolsets))
         self.assertEqual(rec["staged_apps"], ["gmail"])
 
     def test_outbound_writes_and_sends_are_held(self):
