@@ -65,6 +65,13 @@ CANNED_WITH_MATCH["working_rules"].append(
     {"text": "Match the existing rows already in the destination and follow their format.",
      "source": {"type": "events", "ids": ["e003"]}})
 
+# Variant whose working rules already include a (workflow-tailored) anti-duplication rule.
+CANNED_WITH_NODUP = json.loads(json.dumps(CANNED))
+CANNED_WITH_NODUP["working_rules"].append(
+    {"text": "Do not duplicate outputs: never send a second confirmation email or add a "
+             "second ERP row for an order already handled.",
+     "source": {"type": "events", "ids": ["e004"]}})
+
 
 def _stub(out=CANNED):
     return lambda system, user: json.dumps(out)
@@ -144,12 +151,60 @@ class ConfigGenTest(unittest.TestCase):
         self.assertNotIn(config.MATCH_EXAMPLES_RULE, out["live"]["yaml"])
         self.assertIn("Match the existing rows already in the destination", out["live"]["yaml"])
 
+    # 5b — Spec 7: anti-duplication rule ------------------------------------
+    def test_anti_dup_rule_appended_when_missing(self):
+        out = _compile("marcy", model_out=CANNED)            # CANNED has no anti-dup rule
+        self.assertIn(config.NO_DUPLICATION_RULE, out["live"]["yaml"])
+        keys = [i["key"] for i in out["grounding"]["instructions"]]
+        self.assertIn("rule_no_duplication", keys)
+        entry = next(i for i in out["grounding"]["instructions"]
+                     if i["key"] == "rule_no_duplication")
+        self.assertFalse(entry["observed"])
+        self.assertEqual(entry["source"], {"type": "discovery"})
+
+    def test_anti_dup_rule_not_duplicated_when_present(self):
+        out = _compile("marcy", model_out=CANNED_WITH_NODUP)
+        # the model supplied its own anti-dup rule -> the canonical one is NOT appended
+        keys = [i["key"] for i in out["grounding"]["instructions"]]
+        self.assertNotIn("rule_no_duplication", keys)
+        self.assertNotIn(config.NO_DUPLICATION_RULE, out["live"]["yaml"])
+        self.assertIn("never send a second confirmation email", out["live"]["yaml"])
+
+    def test_anti_dup_is_workflow_specific_two_domains_and_not_hardcoded(self):
+        # The engine surfaces the model's workflow-NAMED anti-dup rule (suppressing the
+        # generic backstop), and the engine's own constant names no specific domain.
+        orders = json.loads(json.dumps(CANNED))
+        orders["working_rules"].append(
+            {"text": "Never duplicate: if a confirmation email was already sent or an ERP "
+                     "row already added for this order, do not do it again.",
+             "source": {"type": "discovery"}})
+        recruiter = json.loads(json.dumps(CANNED))
+        recruiter["working_rules"].append(
+            {"text": "Never duplicate: if an interview invite was already sent or a candidate "
+                     "row already added to the tracker, do not do it again.",
+             "source": {"type": "discovery"}})
+        o_yaml = _compile("marcy", model_out=orders)["live"]["yaml"]
+        r_yaml = _compile("recruiter", model_out=recruiter)["live"]["yaml"]
+        # each workflow's OWN named actions land in its own prompt
+        self.assertIn("confirmation email", o_yaml)
+        self.assertIn("ERP row", o_yaml)
+        self.assertIn("interview invite", r_yaml)
+        self.assertIn("candidate row", r_yaml)
+        # model-supplied tailored rule present -> generic backstop suppressed in both
+        self.assertNotIn(config.NO_DUPLICATION_RULE, o_yaml)
+        self.assertNotIn(config.NO_DUPLICATION_RULE, r_yaml)
+        # the engine constant is domain-neutral (no hardcoded email/ERP/etc.)
+        low = config.NO_DUPLICATION_RULE.lower()
+        for word in ("email", "erp", "confirmation", "invite", "candidate"):
+            self.assertNotIn(word, low)
+
     # 6 ---------------------------------------------------------------------
     def test_grounding_complete_and_well_formed(self):
         out = _compile("marcy", model_out=CANNED)
         instr = out["grounding"]["instructions"]
-        # steps(2) + working_rules(2 + appended canonical = 3) + requirements(1) = 6
-        self.assertEqual(len(instr), 6)
+        # steps(2) + working_rules(2 + 2 appended canonical: match + no-dup = 4)
+        # + requirements(1) = 7
+        self.assertEqual(len(instr), 7)
         self.assertEqual(out["grounding"]["bundle_id"], "AKB1")
         for it in instr:
             self.assertTrue(it["key"])

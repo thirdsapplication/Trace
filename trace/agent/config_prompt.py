@@ -37,6 +37,13 @@ Rules for the content you write:
 - ALWAYS include one working rule telling the agent to look at the examples of
   this work product already present in the live environment and match their
   format (e.g. the existing rows already in the destination sheet).
+- ALWAYS include one working rule that prevents duplicating work across runs:
+  NAME this workflow's concrete outputs / side-effects (the rows it creates, the
+  messages it sends, the records it posts — whatever THIS workflow actually
+  produces) and tell the agent to first check the live environment for evidence
+  each was already done for the item, and skip it if so. State the named actions
+  for THIS workflow specifically; do not assume email or ERP unless this workflow
+  uses them.
 - Fold any user_answers that express a rule (e.g. a conflict-resolution rule,
   a destination, a one-vs-many layout) into the steps or working rules.
 - Fold any test_feedback corrections into the step or working rule they concern.

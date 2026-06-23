@@ -118,14 +118,30 @@ def _has_match_rule(working_rules):
     return False
 
 
+def _has_no_dup_rule(working_rules):
+    """True if a working rule already guards against duplicating prior work (Spec 7)."""
+    for r in working_rules:
+        low = r["text"].lower()
+        if "duplicat" in low:
+            return True
+        if "already" in low and any(w in low for w in ("skip", "avoid", "again", "repeat")):
+            return True
+    return False
+
+
 def final_working_rules(model_out):
-    """Model working rules plus the canonical 'match existing examples' rule, appended
-    (with a stable key + discovery source) only if the model omitted it (P spec §5/§6.1)."""
+    """Model working rules plus the canonical rules, each appended (with a stable key +
+    discovery source) only if the model omitted it: the 'match existing examples' rule
+    (P spec §5/§6.1) and the anti-duplication rule (Spec 7), so every agent has both."""
     rules = _items(model_out, "working_rules")
     if not _has_match_rule(rules):
         rules = rules + [{"text": config.MATCH_EXAMPLES_RULE,
                           "source": {"type": "discovery"},
                           "key": "rule_match_existing_examples"}]
+    if not _has_no_dup_rule(rules):
+        rules = rules + [{"text": config.NO_DUPLICATION_RULE,
+                          "source": {"type": "discovery"},
+                          "key": "rule_no_duplication"}]
     return rules
 
 

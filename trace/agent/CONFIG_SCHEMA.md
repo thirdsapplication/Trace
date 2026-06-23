@@ -35,8 +35,8 @@ Each `source` is `{type:"events", ids:[...]}` | `{type:"discovery"}` |
 
 ## Assembled `system` order (deterministic)
 role → `You work with:` (bulleted apps/artifacts) → `Steps:` (numbered) →
-`How to do the work:` (working rules; the canonical "match existing examples" rule is
-appended if the model omits it) → `Requirements:`.
+`How to do the work:` (working rules; the canonical "match existing examples" and
+anti-duplication rules are each appended if the model omits them) → `Requirements:`.
 
 ## Stamped structural constants (code, never the model)
 `model: claude-sonnet-4-6`; test toolset `agent_toolset_20260401`; live adds the

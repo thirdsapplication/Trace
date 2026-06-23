@@ -131,6 +131,17 @@ CONNECT_EXPECTATION_COPY = ("Google will ask you to pick your account, then appr
 MATCH_EXAMPLES_RULE = ("Before producing the work product, look at the examples of this "
                        "work already present in the live environment and match their format.")
 
+# Canonical anti-duplication working rule (Spec 7). The PRINCIPLE is constant and
+# domain-neutral; the config engine is told (config_prompt) to also emit a version that
+# NAMES this workflow's concrete outputs. This constant is the deterministic backstop,
+# appended only if the model omitted any anti-duplication rule, so every agent has one.
+# Worded to avoid the match/existing/example words (so it never trips _has_match_rule).
+NO_DUPLICATION_RULE = ("Never repeat an action this workflow already completed: before "
+                       "sending, creating, or changing anything outside the workflow, "
+                       "check the live environment for evidence the same action was already "
+                       "done for this item (for example a prior message in Sent, or an entry "
+                       "already recorded for it), and skip it if so.")
+
 # --- Console (manual-evaluation mode) --------------------------------------
 # The run result is a POINTER to the live session, read by the user in the Console.
 # The exact deep-link path to a single session is not finalized in the beta docs,
