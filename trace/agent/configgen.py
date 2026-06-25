@@ -129,10 +129,25 @@ def _has_no_dup_rule(working_rules):
     return False
 
 
+def _has_prompt_injection_rule(working_rules):
+    """True if a working rule already guards against prompt injection (treating read
+    content as untrusted data rather than instructions)."""
+    for r in working_rules:
+        low = r["text"].lower()
+        if "injection" in low:
+            return True
+        if "instruction" in low and any(w in low for w in
+                                        ("ignore", "untrusted", "as data", "not instruction",
+                                         "do not comply", "do not follow", "don't follow")):
+            return True
+    return False
+
+
 def final_working_rules(model_out):
     """Model working rules plus the canonical rules, each appended (with a stable key +
     discovery source) only if the model omitted it: the 'match existing examples' rule
-    (P spec §5/§6.1) and the anti-duplication rule (Spec 7), so every agent has both."""
+    (P spec §5/§6.1), the anti-duplication rule (Spec 7), and the anti-prompt-injection
+    rule, so every agent always carries all three."""
     rules = _items(model_out, "working_rules")
     if not _has_match_rule(rules):
         rules = rules + [{"text": config.MATCH_EXAMPLES_RULE,
@@ -142,6 +157,10 @@ def final_working_rules(model_out):
         rules = rules + [{"text": config.NO_DUPLICATION_RULE,
                           "source": {"type": "discovery"},
                           "key": "rule_no_duplication"}]
+    if not _has_prompt_injection_rule(rules):
+        rules = rules + [{"text": config.PROMPT_INJECTION_RULE,
+                          "source": {"type": "discovery"},
+                          "key": "rule_prompt_injection"}]
     return rules
 
 
