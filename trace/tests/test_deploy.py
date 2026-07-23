@@ -205,6 +205,15 @@ class DeployTest(unittest.TestCase):
         self.assertIsNone(rec["session_id"])
         self.assertEqual(client.sessions, [])
 
+    def test_deploy_time_cron_schedule_is_honored(self):
+        bundle, live = _live_dict()
+        client = FakeDeployClient()
+        rec = deploy.deploy_live(bundle, live, CONNECTION, client, schedule="0 9 * * 1")
+        dep = client.deployments[0]
+        self.assertEqual(dep["schedule"], {"expression": "0 9 * * 1",
+                                           "timezone": config.TRACE_SCHEDULE_TZ})
+        self.assertEqual(rec["start"], {"mode": "deployment-schedule", "value": "0 9 * * 1"})
+
     def test_deployment_initial_message_has_task_and_memory_directive(self):
         bundle, live = _live_dict()
         client = FakeDeployClient()

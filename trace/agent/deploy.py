@@ -91,16 +91,22 @@ def deploy_live(bundle, live_envelope_dict, connection_record, client,
 
     base_trigger = trigger or (bundle.get("trigger") or "on a new matching event")
     trigger_text = build_deployment_trigger(base_trigger, staged_apps)
+    # A cron ``schedule`` at deploy (the founder Test UI's "on a schedule" mode) is
+    # honored as the deployment's cron; the end-user flow deploys manual (schedule=None)
+    # and attaches a cadence afterwards from the dashboard.
+    cron = ({"expression": schedule, "timezone": config.TRACE_SCHEDULE_TZ}
+            if schedule else None)
     deployment_id = client.create_deployment(
         name=f"trace-{bundle.get('id')}",
         agent_id=agent_id, environment_id=environment_id,
         trigger_text=trigger_text,
-        schedule=None,                                     # manual at deploy; cadence attaches cron later
+        schedule=cron,
         resources=[config.memory_resource(memory_store_id)],
         vault_ids=[vault_ref] if vault_ref else None,
         metadata={"trace_bundle_id": str(bundle.get("id"))})
 
-    start = {"mode": "deployment-manual", "value": base_trigger}
+    start = {"mode": "deployment-schedule" if schedule else "deployment-manual",
+             "value": schedule or base_trigger}
     return {
         "bundle_id": bundle.get("id"),
         "agent_id": agent_id,

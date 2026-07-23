@@ -112,6 +112,21 @@ CREATE TABLE IF NOT EXISTS agent_runs (
 );
 CREATE INDEX IF NOT EXISTS agent_runs_agent_idx ON agent_runs (agent_id, ran_at DESC);
 
+-- Direct messages between a user and their agents (the Instagram-style "My agents"
+-- view): user-sent messages get an agent reply via a real chat session; agents also
+-- send proactive notes (failed runs, staged approvals). Unread drives the badge.
+CREATE TABLE IF NOT EXISTS agent_messages (
+    id             BIGSERIAL PRIMARY KEY,
+    agent_id       TEXT NOT NULL,
+    owner_user_id  TEXT NOT NULL,
+    sender         TEXT NOT NULL,          -- 'user' | 'agent'
+    text           TEXT,
+    read           BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS agent_messages_thread_idx
+    ON agent_messages (owner_user_id, agent_id, created_at);
+
 -- Cached plain-language summaries of real MA session logs (the activity view), keyed
 -- by the session id so a terminal session is summarized once, not on every page load.
 CREATE TABLE IF NOT EXISTS session_summaries (
@@ -478,6 +493,52 @@ def pending_count_for_user(owner_user_id):
                     "WHERE owner_user_id = %s AND status = 'pending'", (owner_user_id,))
         row = cur.fetchone()
         return int(row[0]) if row else 0
+
+
+# --- agent direct messages (Instagram-style "My agents") --------------------
+
+def message_add(rec):
+    """Insert one message. rec: {agent_id, owner_user_id, sender, text, read?}."""
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO agent_messages (agent_id, owner_user_id, sender, text, read) "
+            "VALUES (%s, %s, %s, %s, %s)",
+            (rec.get("agent_id"), rec.get("owner_user_id"), rec.get("sender"),
+             rec.get("text"), bool(rec.get("read", False))))
+
+
+def messages_for_agent(owner_user_id, agent_id, limit=50):
+    """One thread, oldest-first (the chat view's natural order)."""
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, sender, text, read, created_at FROM agent_messages "
+            "WHERE owner_user_id = %s AND agent_id = %s "
+            "ORDER BY created_at DESC, id DESC LIMIT %s",
+            (owner_user_id, agent_id, limit))
+        rows = cur.fetchall()
+    out = []
+    for r in reversed(rows):
+        out.append({"id": r[0], "sender": r[1], "text": r[2], "read": bool(r[3]),
+                    "created_at": r[4].isoformat(timespec="seconds")
+                    if hasattr(r[4], "isoformat") else r[4]})
+    return out
+
+
+def messages_mark_read(owner_user_id, agent_id):
+    """Opening a thread marks the agent's messages in it as read."""
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute("UPDATE agent_messages SET read = TRUE "
+                    "WHERE owner_user_id = %s AND agent_id = %s AND sender = 'agent'",
+                    (owner_user_id, agent_id))
+
+
+def messages_unread_counts(owner_user_id):
+    """{agent_id: unread agent-sent count} — drives the DM badges."""
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT agent_id, COUNT(*) FROM agent_messages "
+                    "WHERE owner_user_id = %s AND sender = 'agent' AND read = FALSE "
+                    "GROUP BY agent_id", (owner_user_id,))
+        return {r[0]: int(r[1]) for r in cur.fetchall()}
 
 
 # --- session-summary cache (activity view) ---------------------------------

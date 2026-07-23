@@ -250,6 +250,60 @@ def pending_count_for_user(root, owner_user_id):
                if it.get("owner_user_id") == owner_user_id and it.get("status") == "pending")
 
 
+# --- agent direct messages (Instagram-style "My agents") --------------------
+def message_add(root, rec):
+    """rec: {agent_id, owner_user_id, sender ('user'|'agent'), text, read?}."""
+    if db.is_configured():
+        return db.message_add(rec)
+    with _LOCK:
+        d = _load(root, "messages.json")
+        nid = str(max((int(k) for k in d), default=0) + 1)
+        d[nid] = {"id": nid, "agent_id": rec.get("agent_id"),
+                  "owner_user_id": rec.get("owner_user_id"),
+                  "sender": rec.get("sender"), "text": rec.get("text"),
+                  "read": bool(rec.get("read", False)), "created_at": _now_iso()}
+        _save(root, "messages.json", d)
+
+
+def messages_for_agent(root, owner_user_id, agent_id, limit=50):
+    """One thread, oldest-first."""
+    if db.is_configured():
+        return db.messages_for_agent(owner_user_id, agent_id, limit)
+    d = _load(root, "messages.json")
+    mine = [m for m in d.values()
+            if m.get("owner_user_id") == owner_user_id and m.get("agent_id") == agent_id]
+    mine.sort(key=lambda m: (m.get("created_at") or "", int(m.get("id") or 0)))
+    return mine[-limit:]
+
+
+def messages_mark_read(root, owner_user_id, agent_id):
+    if db.is_configured():
+        return db.messages_mark_read(owner_user_id, agent_id)
+    with _LOCK:
+        d = _load(root, "messages.json")
+        changed = False
+        for m in d.values():
+            if (m.get("owner_user_id") == owner_user_id and m.get("agent_id") == agent_id
+                    and m.get("sender") == "agent" and not m.get("read")):
+                m["read"] = True
+                changed = True
+        if changed:
+            _save(root, "messages.json", d)
+
+
+def messages_unread_counts(root, owner_user_id):
+    """{agent_id: unread agent-sent count}."""
+    if db.is_configured():
+        return db.messages_unread_counts(owner_user_id)
+    d = _load(root, "messages.json")
+    out = {}
+    for m in d.values():
+        if (m.get("owner_user_id") == owner_user_id and m.get("sender") == "agent"
+                and not m.get("read")):
+            out[m["agent_id"]] = out.get(m["agent_id"], 0) + 1
+    return out
+
+
 # --- session-summary cache (activity view) ---------------------------------
 def summary_get(root, session_id):
     if db.is_configured():

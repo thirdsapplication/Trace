@@ -216,6 +216,7 @@ class AppState:
         self.scheduler_stop = threading.Event()   # Spec 4: Trace-side scheduler
         self._scheduler_thread = None
         self._vault_refreshed = {}   # vault_ref -> epoch of last rolling refresh (deployment sync)
+        self.chat_jobs = {}          # agent_id -> {state, error} (a DM reply in flight)
         # Admin portal: live-only LLM prompt log (a bounded in-memory ring; nothing is
         # persisted — prompts embed capture-derived user data). Served exclusively
         # through the token-gated /api/admin/ surface.
@@ -1054,11 +1055,31 @@ class AppState:
         log. Pure of any thread/HTTP state so it's unit-testable directly."""
         now = time.time() if now is None else now
         for agent in registry.schedule_list_active(self.sessions_root):
-            if agent.get("deployment_id"):
+            # The platform crons a deployment agent ONLY when its cadence maps to a
+            # platform cron (daily/weekly/hourly). A deployment agent whose cadence has
+            # no cron mapping (e.g. legacy interval) falls through to the Trace-side
+            # scheduler here, so it still fires rather than silently never running.
+            if agent.get("deployment_id") and agent_config.cadence_to_cron(agent.get("cadence")):
                 continue
             if agent_runner.schedule_due(agent.get("cadence"), agent.get("last_run_epoch"), now):
                 self.run_agent(agent)
         self.sync_deployment_runs(now)
+
+    def _record_deployment_run(self, agent, drun_id, status, summary, run_session_id):
+        """Record ONE platform run, at most once across the scheduler sync pass and
+        Run-now — both can observe the same deployment_run. The seen-check and the
+        insert happen under one lock so the check-then-add is atomic (drun_id has no
+        DB uniqueness constraint). A None drun_id (a run that never started) is always
+        recorded. Returns True if it wrote a row."""
+        aid = agent.get("agent_id")
+        with self.lock:
+            if drun_id and drun_id in registry.run_seen_drun_ids(self.sessions_root, aid):
+                return False
+            registry.run_add(self.sessions_root, {
+                "agent_id": aid, "owner_user_id": agent.get("owner_user_id"),
+                "status": status, "summary": summary, "details": [],
+                "run_session_id": run_session_id, "drun_id": drun_id})
+            return True
 
     # Rolling vault-refresh throttle: platform cron fires without Trace in the loop,
     # and the Pipedream dev token lives ~1h — refreshing each deployment agent's vault
@@ -1085,10 +1106,9 @@ class AppState:
                     self._vault_refreshed[vault_ref] = now
                 client = self._live_client()
                 agent_id = agent.get("agent_id")
-                seen = registry.run_seen_drun_ids(self.sessions_root, agent_id)
                 fresh = False
                 for drun in client.list_deployment_runs(agent.get("deployment_id")):
-                    if not drun.get("id") or drun["id"] in seen:
+                    if not drun.get("id"):
                         continue
                     if drun.get("error_type"):
                         status = "failed"
@@ -1097,11 +1117,11 @@ class AppState:
                     else:
                         status = "ran"
                         summary = "Scheduled run started — open Activity for what it did."
-                    registry.run_add(self.sessions_root, {
-                        "agent_id": agent_id, "owner_user_id": agent.get("owner_user_id"),
-                        "status": status, "summary": summary, "details": [],
-                        "run_session_id": drun.get("session_id"), "drun_id": drun["id"]})
-                    fresh = True
+                    if self._record_deployment_run(agent, drun["id"], status, summary,
+                                                   drun.get("session_id")):
+                        fresh = True
+                        if status == "failed":              # DM only on a genuinely-new failure
+                            self._agent_dm(agent, f"My last run hit a problem: {summary}")
                 if fresh:
                     registry.schedule_mark_run(self.sessions_root, agent_id)
             except Exception:                              # noqa: BLE001
@@ -1126,37 +1146,169 @@ class AppState:
         except Exception as e:                              # noqa: BLE001
             rec = {"status": "failed", "summary": f"Couldn't start the run: {type(e).__name__}",
                    "run_session_id": None, "drun_id": None}
-        registry.run_add(self.sessions_root, {
-            "agent_id": agent.get("agent_id"), "owner_user_id": agent.get("owner_user_id"),
-            "status": rec["status"], "summary": rec["summary"], "details": [],
-            "run_session_id": rec.get("run_session_id"), "drun_id": rec.get("drun_id")})
+        # Dedup-safe record: the scheduler sync pass can list this same drun_id
+        # concurrently — the locked recorder ensures it lands exactly once.
+        self._record_deployment_run(agent, rec.get("drun_id"), rec["status"], rec["summary"],
+                                    rec.get("run_session_id"))
         registry.schedule_mark_run(self.sessions_root, agent.get("agent_id"))
+        if rec["status"] == "failed":
+            self._agent_dm(agent, f"My last run hit a problem: {rec['summary']}")
         return rec
+
+    # --- Instagram-style "My agents": DMs + home feed ---------------------
+    def _agent_dm(self, agent, text):
+        """Record a proactive message FROM the agent to its owner (failed runs,
+        staged approvals). Best-effort — a store error never breaks a run path."""
+        try:
+            registry.message_add(self.sessions_root, {
+                "agent_id": agent.get("agent_id"),
+                "owner_user_id": agent.get("owner_user_id"),
+                "sender": "agent", "text": text})
+        except Exception:                                  # noqa: BLE001
+            pass
+
+    def send_agent_message(self, agent, text):
+        """User -> agent DM: record the message, then get a REAL reply by running a
+        fresh chat session with the agent (memory attached so it can consult its own
+        status/lessons; vault attached so read tools work). The agent's final message
+        becomes its reply. Async via chat_jobs[agent_id]; never raises — a platform
+        failure becomes an apologetic agent message so the thread never goes silent."""
+        root = self.sessions_root
+        aid, owner = agent.get("agent_id"), agent.get("owner_user_id")
+        registry.message_add(root, {"agent_id": aid, "owner_user_id": owner,
+                                    "sender": "user", "text": text, "read": True})
+        job = {"state": "running", "error": None}
+        self.chat_jobs[aid] = job
+
+        def run():
+            reply, err = "", None
+            try:
+                self._refresh_agent_binding(agent)
+                client = self._live_client()
+                history = registry.messages_for_agent(root, owner, aid, limit=12)
+                context = "\n".join(
+                    f"{'Them' if m.get('sender') == 'user' else 'You'}: {m.get('text')}"
+                    for m in history[:-1][-8:]) or "(no prior messages)"
+                instruction = (agent_config.CHAT_DIRECTIVE
+                               .replace("{context}", context).replace("{text}", text))
+                env = client.create_environment()
+                sid = client.create_session(
+                    aid, env, resources=agent_runner._memory_resources(agent),
+                    title="Trace direct message",
+                    vault_ids=[agent["vault_ref"]] if agent.get("vault_ref") else None)
+                events = client.send_trigger_and_collect(sid, instruction)
+                reply = (agent_runner._final_text(events) or "").strip()
+            except Exception as e:                          # noqa: BLE001
+                err = str(e)
+                reply = (f"I couldn't reply just now ({type(e).__name__}) — "
+                         "give me a minute and try again.")
+            if not reply:
+                reply = "I finished looking but had nothing to say — try rephrasing?"
+            registry.message_add(root, {"agent_id": aid, "owner_user_id": owner,
+                                        "sender": "agent", "text": reply})
+            # Flip the job LAST, after the reply is persisted — so anything polling
+            # `replying` (the UI, or a test) only sees "done" once the reply exists.
+            job.update(state=("error" if err else "done"), error=err)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    @staticmethod
+    def _epoch_of(iso):
+        try:
+            import datetime as _dt
+            return _dt.datetime.fromisoformat(str(iso)).timestamp()
+        except (TypeError, ValueError):
+            return None
+
+    def home_data(self, user):
+        """Everything the Instagram-style home needs in ONE fast read: the user's
+        agents ("accounts followed") each with their last-24h STORIES (brief activity
+        notes from run records + the cached session summaries — no model calls, no
+        platform calls), a chronological run FEED with inline staged proposals, and
+        unread DM counts."""
+        root = self.sessions_root
+        uid = user["user_id"]
+        now = time.time()
+        unread = registry.messages_unread_counts(root, uid)
+        pending_by_session = {}
+        for p in registry.pending_for_user(root, uid):
+            pending_by_session.setdefault(p.get("run_session_id"), []).append(
+                {"id": p.get("id"), "app": p.get("app"), "summary": p.get("summary")})
+        agents_out, feed = [], []
+        for a in registry.agents_for_user(root, uid):
+            aid = a.get("agent_id")
+            name = a.get("name") or aid
+            runs = registry.runs_for_agent(root, aid, 20)
+            stories = []
+            for r in runs:
+                ts = self._epoch_of(r.get("ran_at"))
+                if ts is None or now - ts > 24 * 3600:
+                    continue
+                note = None
+                if r.get("run_session_id"):
+                    note = (registry.summary_get(root, r["run_session_id"]) or {}).get("summary")
+                stories.append({"ran_at": r.get("ran_at"), "status": r.get("status"),
+                                "note": note or r.get("summary") or "Ran."})
+            agents_out.append({
+                "agent_id": aid, "name": name, "bundle_id": a.get("bundle_id"),
+                "deployed_at": a.get("deployed_at"),
+                "deployment": bool(a.get("deployment_id")),
+                "schedule": registry.schedule_get(root, aid),
+                "capture_present": bool(a.get("session_id")) and
+                os.path.isdir(sessions.session_dir(root, a.get("session_id"))),
+                "stories": stories, "unread": unread.get(aid, 0),
+                "replying": (self.chat_jobs.get(aid) or {}).get("state") == "running"})
+            for r in runs[:10]:
+                note = None
+                if r.get("run_session_id"):
+                    note = (registry.summary_get(root, r["run_session_id"]) or {}).get("summary")
+                feed.append({"agent_id": aid, "agent_name": name,
+                             "ran_at": r.get("ran_at"), "status": r.get("status"),
+                             "note": note or r.get("summary") or "",
+                             "details": r.get("details") or [],
+                             "run_session_id": r.get("run_session_id"),
+                             "proposals": pending_by_session.get(r.get("run_session_id"), [])})
+        feed.sort(key=lambda f: f.get("ran_at") or "", reverse=True)
+        return {"agents": agents_out, "feed": feed[:30],
+                "unread_total": sum(unread.values())}
 
     def apply_platform_schedule(self, agent, cadence):
         """Re-point a deployment agent at the requested cadence. Deployments are
-        immutable, so this ARCHIVES the current one and creates a fresh one — cron for
+        immutable, so this creates a fresh one and archives the old — cron for
         daily/weekly (config.cadence_to_cron), or a manual deployment when ``cadence``
         is None/unmappable so Run-now keeps working. Raises on platform rejection (the
-        caller surfaces the real error rather than phantom-succeeding)."""
-        client = self._live_client()
-        old_id = agent.get("deployment_id")
-        if old_id:
-            client.archive_deployment(old_id)              # tolerant of already-archived
-        trigger_text = agent_deploy.build_deployment_trigger(
-            agent.get("trigger"), [s for s in (agent.get("staged_apps") or []) if s])
-        store_id = agent.get("memory_store_id")
-        new_id = client.create_deployment(
-            name=f"trace-{agent.get('bundle_id') or agent.get('agent_id')}",
-            agent_id=agent.get("agent_id"),
-            environment_id=client.create_environment(),
-            trigger_text=trigger_text,
-            schedule=agent_config.cadence_to_cron(cadence) if cadence else None,
-            resources=[agent_config.memory_resource(store_id)] if store_id else None,
-            vault_ids=[agent.get("vault_ref")] if agent.get("vault_ref") else None,
-            metadata={"trace_bundle_id": str(agent.get("bundle_id") or "")})
-        registry.agent_set_deployment(self.sessions_root, agent.get("agent_id"), new_id)
-        return new_id
+        caller surfaces the real error rather than phantom-succeeding).
+
+        Ordering matters: CREATE the new deployment first, PERSIST it, and only THEN
+        archive the old one. If the create fails, the old (working) deployment stays
+        live and still registered — a failed schedule change never strands the agent
+        with an archived deployment. Serialized per-process so two concurrent schedule
+        POSTs can't each create a live cron deployment and orphan one."""
+        with self.lock:
+            client = self._live_client()
+            old_id = agent.get("deployment_id")
+            aid = agent.get("agent_id")
+            # re-read the row so a racing change's deployment_id is the one we archive
+            current = next((a for a in registry.agents_for_user(
+                root=self.sessions_root, owner_user_id=agent.get("owner_user_id"))
+                if a.get("agent_id") == aid), agent)
+            old_id = current.get("deployment_id") or old_id
+            trigger_text = agent_deploy.build_deployment_trigger(
+                agent.get("trigger"), [s for s in (agent.get("staged_apps") or []) if s])
+            store_id = agent.get("memory_store_id")
+            new_id = client.create_deployment(       # create BEFORE archive
+                name=f"trace-{agent.get('bundle_id') or aid}",
+                agent_id=aid,
+                environment_id=client.create_environment(),
+                trigger_text=trigger_text,
+                schedule=agent_config.cadence_to_cron(cadence) if cadence else None,
+                resources=[agent_config.memory_resource(store_id)] if store_id else None,
+                vault_ids=[agent.get("vault_ref")] if agent.get("vault_ref") else None,
+                metadata={"trace_bundle_id": str(agent.get("bundle_id") or "")})
+            registry.agent_set_deployment(self.sessions_root, aid, new_id)   # register first
+            if old_id and old_id != new_id:
+                client.archive_deployment(old_id)    # then retire the old one (tolerant)
+            return new_id
 
     def _refresh_agent_binding(self, agent):
         """Re-mint + rotate the Pipedream token in the agent's vault before a
@@ -1202,6 +1354,27 @@ class AppState:
             except Exception:
                 pass
         registry.schedule_mark_run(self.sessions_root, agent.get("agent_id"))
+        # Actionable outcomes arrive as a DM from the agent (routine completions
+        # surface as stories instead, so the inbox stays signal-only).
+        if rec["status"] == "failed":
+            self._agent_dm(agent, f"My last run hit a problem: {rec['summary']}")
+        else:
+            # Staged agents propose rather than perform: extract this run's proposals
+            # NOW (one session read) so they land in the feed + an approval DM without
+            # waiting for the user to open the activity view.
+            staged_props = []
+            if agent.get("staged_apps") and rec.get("run_session_id"):
+                try:
+                    events = self._live_client().list_session_events(rec["run_session_id"])
+                    staged_props = self._session_proposals(
+                        agent, rec["run_session_id"], events, agent.get("owner_user_id"))
+                except Exception:                          # noqa: BLE001 — view-time still covers it
+                    staged_props = []
+            n = (len(staged_props) or len(rec.get("pending") or [])
+                 or (1 if rec["status"] == "needs_approval" else 0))
+            if n:
+                self._agent_dm(agent, f"I've staged {n} action{'s' if n != 1 else ''} for "
+                                      "your approval — open my profile to review them.")
         return rec
 
     def approve_pending(self, item):
@@ -1563,9 +1736,22 @@ def make_handler(state):
             if rest == "/agents":                            # Spec 2/3: all my agents + activity
                 return self._json(200, {"agents": self._agents_for(user),
                                         "pending_count": registry.pending_count_for_user(root, user["user_id"])})
+            if rest == "/home":                              # Instagram-style home: stories + feed + DMs
+                return self._json(200, state.home_data(user))
             if rest == "/pending":                           # Spec 8: staged actions awaiting review
                 items = registry.pending_for_user(root, user["user_id"])
                 return self._json(200, {"pending": items, "pending_count": len(items)})
+            mdm = re.match(r"^/agents/([^/]+)/messages$", rest)
+            if mdm:                                          # one DM thread, oldest-first
+                agent = next((a for a in registry.agents_for_user(root, user["user_id"])
+                              if a.get("agent_id") == mdm.group(1)), None)
+                if not agent:
+                    return self._json(404, {"error": "not_found"})
+                aid = agent["agent_id"]
+                return self._json(200, {
+                    "messages": registry.messages_for_agent(root, user["user_id"], aid),
+                    "replying": (state.chat_jobs.get(aid) or {}).get("state") == "running",
+                    "agent": {"agent_id": aid, "name": agent.get("name") or aid}})
             maa = re.match(r"^/agents/([^/]+)/activity$", rest)
             if maa:                                          # real session activity (Haiku summaries)
                 agent = next((a for a in registry.agents_for_user(root, user["user_id"])
@@ -1596,6 +1782,23 @@ def make_handler(state):
             ma = re.match(r"^/agents/([^/]+)/(schedule|schedule/pause|run-now)$", rest)
             if ma:                                       # Spec 4: schedule / run-now
                 return self._agent_action(ma.group(1), ma.group(2), body, user)
+            mdm = re.match(r"^/agents/([^/]+)/messages(/read)?$", rest)
+            if mdm:                                      # DMs: send to the agent / mark read
+                agent = next((a for a in registry.agents_for_user(root, user["user_id"])
+                              if a.get("agent_id") == mdm.group(1)), None)
+                if not agent:
+                    return self._json(404, {"error": "not_found"})
+                aid = agent["agent_id"]
+                if mdm.group(2):                         # /read
+                    registry.messages_mark_read(root, user["user_id"], aid)
+                    return self._json(200, {"ok": True})
+                text = str((body or {}).get("text", "") or "").strip()
+                if not text:
+                    return self._json(400, {"error": "empty_message"})
+                if (state.chat_jobs.get(aid) or {}).get("state") == "running":
+                    return self._json(409, {"error": "already_replying"})
+                state.send_agent_message(agent, text)
+                return self._json(202, {"state": "running"})
             mp = re.match(r"^/pending/([^/]+)/(approve|reject)$", rest)
             if mp:                                       # Spec 8: approve/reject a staged action
                 return self._pending_action(mp.group(1), mp.group(2), user)
@@ -1691,9 +1894,8 @@ def make_handler(state):
             if p.startswith("/admin/"):
                 return self._serve_admin(p[len("/admin/"):])
             if p.startswith("/api/admin/"):                 # token-gated admin API (GET-only)
-                err = self._admin_gate()
-                if err is not None:
-                    return err
+                if self._admin_gate():                       # True => blocked (403 already sent)
+                    return
                 rest = p[len("/api/admin"):]
                 if rest == "/overview":
                     return self._admin_overview()
@@ -1865,16 +2067,20 @@ def make_handler(state):
 
         # --- admin portal API (token-gated; GET-only; never unauthenticated) ---
         def _admin_gate(self):
-            """403 unless the request carries the exact TRACE_ADMIN_TOKEN. Fail closed:
-            with the env var unset the whole admin surface is disabled. Constant-time
-            compare. Returns an error response to send, or None to proceed."""
+            """Sends a 403 and returns True when the request must be BLOCKED; returns
+            False (nothing sent) when it may proceed. Fail closed: with TRACE_ADMIN_TOKEN
+            unset the whole admin surface is disabled. Constant-time compare.
+            (Returning a truthy sentinel — not the _json result, which is None — is what
+            makes the caller's `if self._admin_gate(): return` actually block.)"""
             expected = (os.environ.get("TRACE_ADMIN_TOKEN") or "").strip()
             if not expected:
-                return self._json(403, {"error": "admin_disabled"})
+                self._json(403, {"error": "admin_disabled"})
+                return True
             supplied = (self.headers.get("X-Admin-Token") or "").strip()
             if not hmac.compare_digest(supplied.encode(), expected.encode()):
-                return self._json(403, {"error": "forbidden"})
-            return None
+                self._json(403, {"error": "forbidden"})
+                return True
+            return False
 
         def _admin_overview(self):
             sched = state._scheduler_thread

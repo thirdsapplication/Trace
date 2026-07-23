@@ -204,6 +204,20 @@ def memory_resource(memory_store_id):
             "instructions": MEMORY_STORE_DESCRIPTION}
 
 
+# Direct-message framing: the user chats with their agent from the "My agents" view.
+# One fresh session per user message; the agent's FINAL message is the reply. Reads are
+# fine (including its memory files, which are attached); outbound actions only when the
+# message explicitly asks. `{context}` = recent thread, `{text}` = the user's message.
+CHAT_DIRECTIVE = (
+    "DIRECT MESSAGE — the person you work for sent you a message (this is a chat, not "
+    "a scheduled run of your workflow). Write your reply to them as your FINAL message: "
+    "concise, friendly, plain language, no JSON or code fences. You may read your memory "
+    "files and use read-only tools to answer accurately, but do NOT send, create, or "
+    "change anything unless their message explicitly asks you to do so right now.\n\n"
+    "Recent conversation:\n{context}\n\n"
+    "Their message: {text}")
+
+
 # --- Platform (deployment) scheduling ---------------------------------------
 # Scheduled deployments use platform cron with an explicit IANA timezone; one zone
 # for the whole install (per-user timezones are future work). Default US Eastern per

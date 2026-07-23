@@ -422,7 +422,11 @@ class ManagedAgentsClient:
             kw["vault_ids"] = list(vault_ids)
         if metadata:
             kw["metadata"] = dict(metadata)
-        return _idof(_retry(lambda: self._agents_ns("deployments").create(**kw)))
+        # NOT wrapped in _retry: create is side-effecting and has no idempotency key,
+        # so a retry after a response-phase timeout would create a SECOND live cron
+        # deployment. A transient failure surfaces to the caller (schedule -> 502,
+        # deploy -> per-bundle error), which the user retries safely.
+        return _idof(self._agents_ns("deployments").create(**kw))
 
     def _drun_dict(self, run):
         """Normalize one deployment_run to ``{id, session_id, error_type,
@@ -436,9 +440,10 @@ class ManagedAgentsClient:
 
     def run_deployment(self, deployment_id):
         """Trigger one manual run of a deployment; returns the normalized
-        deployment_run (carrying the new session_id, or an error)."""
-        return self._drun_dict(_retry(
-            lambda: self._agents_ns("deployments").run(deployment_id)))
+        deployment_run (carrying the new session_id, or an error). NOT wrapped in
+        _retry: a retried run would execute the agent's workflow (real outbound
+        actions) twice. A transient failure is recorded as a failed run instead."""
+        return self._drun_dict(self._agents_ns("deployments").run(deployment_id))
 
     def pause_deployment(self, deployment_id):
         _retry(lambda: self._agents_ns("deployments").pause(deployment_id))

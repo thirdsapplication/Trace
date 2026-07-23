@@ -101,8 +101,14 @@ def read_meta(root, sid):
 
 
 def write_meta(root, sid, meta):
-    with open(path(root, sid, META), "w", encoding="utf-8") as f:
+    # Atomic: write a temp file then rename over META, so a concurrent read_meta
+    # (e.g. the ownership check on every /api/u/ request) never sees a truncated,
+    # half-written file — a background job's update_meta races those reads otherwise.
+    p = path(root, sid, META)
+    tmp = p + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
+    os.replace(tmp, p)
 
 
 def update_meta(root, sid, **fields):

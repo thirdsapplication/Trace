@@ -78,6 +78,29 @@ class AdminGateTest(AdminHTTPBase):
         self.assertEqual(data["db_mode"], "files")
         self.assertIn("users", data)
 
+    def test_blocked_request_sends_only_the_403_no_data_leak(self):
+        # A raw client reading to EOF must NOT receive a trailing 200 with admin data
+        # (the gate must actually stop the handler, not just send a 403 before it runs).
+        os.environ["TRACE_ADMIN_TOKEN"] = TOKEN
+        users.create_user("victim@example.com", "longenough1")
+        import socket
+        s = socket.create_connection(("127.0.0.1", self.port))
+        s.sendall(b"GET /api/admin/accounts HTTP/1.0\r\nHost: x\r\n\r\n")
+        raw = b""
+        s.settimeout(2)
+        try:
+            while True:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                raw += chunk
+        except socket.timeout:
+            pass
+        s.close()
+        self.assertIn(b"403", raw.split(b"\r\n", 1)[0])
+        self.assertNotIn(b"200 OK", raw)                   # no second response
+        self.assertNotIn(b"victim@example.com", raw)       # no admin data leaked
+
 
 class AdminEndpointsTest(AdminHTTPBase):
     def setUp(self):

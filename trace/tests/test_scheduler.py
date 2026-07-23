@@ -526,6 +526,49 @@ class DeploymentSyncTest(unittest.TestCase):
         self.state.apply_platform_schedule(_dep_agent(), None)
         self.assertIsNone(self.ma.created_deployments[0]["schedule"])  # manual: run-now works
 
+    def test_apply_platform_schedule_creates_before_archiving(self):
+        # create must succeed and be registered BEFORE the old one is archived, so a
+        # create failure can never strand the agent on an archived deployment.
+        registry.agent_upsert(self.root, _dep_agent())
+        order = []
+        real_archive, real_create = self.ma.archive_deployment, self.ma.create_deployment
+        self.ma.archive_deployment = lambda d: (order.append(("archive", d)), real_archive(d))[1]
+        self.ma.create_deployment = lambda **kw: (order.append(("create", None)), real_create(**kw))[1]
+        self.state.apply_platform_schedule(_dep_agent(), {"kind": "daily", "time": "09:00"})
+        self.assertEqual([o[0] for o in order], ["create", "archive"])   # create first
+
+    def test_failed_schedule_change_leaves_old_deployment_registered(self):
+        registry.agent_upsert(self.root, _dep_agent())          # deployment_id = dep_live
+        self.ma.list_deployment_runs("boot")                    # init the fake's stores
+        self.ma.create_deployment = lambda **kw: (_ for _ in ()).throw(RuntimeError("cron bad"))
+        with self.assertRaises(RuntimeError):
+            self.state.apply_platform_schedule(_dep_agent(), {"kind": "daily", "time": "09:00"})
+        # old deployment NOT archived and still registered -> the working schedule survives
+        self.assertEqual(self.ma.archived, [])
+        row = next(a for a in registry.agents_all(self.root) if a["agent_id"] == "agent-d1")
+        self.assertEqual(row["deployment_id"], "dep_live")
+
+    def test_run_now_and_sync_record_same_drun_once(self):
+        # the run-now drun is also visible to the sync pass; it must be recorded exactly once
+        registry.agent_upsert(self.root, _dep_agent())
+        self.state.run_deployment_now(_dep_agent())             # records drun_m1 for dep_sess_m1
+        # sync now lists that SAME drun; it must not double-record
+        self.ma.druns = [{"id": "drun_m1", "session_id": "dep_sess_m1", "error_type": None,
+                          "error_message": None, "created_at": "t"}]
+        self.state.sync_deployment_runs(now=time.time())
+        runs = registry.runs_for_agent(self.root, "agent-d1")
+        self.assertEqual([r["drun_id"] for r in runs], ["drun_m1"])   # exactly one
+
+    def test_interval_deployment_agent_falls_through_to_trace_scheduler(self):
+        # an interval cadence has no platform cron mapping; a deployment agent with it
+        # must still run (via the Trace scheduler), not silently never fire.
+        registry.agent_upsert(self.root, _dep_agent())
+        registry.schedule_set(self.root, "agent-d1", "usr_1",
+                              {"kind": "interval", "minutes": 15})
+        self.state.run_due_schedules(now=time.time())
+        # ran via the legacy path (a session was composed), not skipped
+        self.assertTrue(self.ma.sessions)
+
 
 class RunnerMemoryTest(unittest.TestCase):
     def test_run_once_attaches_memory_and_directive(self):
