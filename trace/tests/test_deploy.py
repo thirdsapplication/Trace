@@ -23,12 +23,18 @@ CONNECTION = {"external_user_id": "trace-s1", "vault_ref": "vlt-s1",
 
 
 class FakeDeployClient:
-    """Records the vault injected + the start config; returns a live session + canned held
-    outbound actions; supports approve/reject + deletion. NEVER acts on real data."""
+    """Records the vault injected + the deployment/memory-store creations; returns
+    canned held outbound actions; supports approve/reject + deletion. NEVER acts on
+    real data."""
 
-    def __init__(self, held=None):
+    def __init__(self, held=None, existing_stores=None):
         self.agents, self.sessions, self.deleted = [], [], []
         self.last_vault_ids, self.start = None, None
+        self.memory_stores = list(existing_stores or [])   # [{"id", "name"}]
+        self.seeded = []                                   # (store_id, path)
+        self.deployments = []                              # recorded create kwargs
+        self.archived, self.paused, self.unpaused = [], [], []
+        self.manual_runs = []
         self._held = {a["action_id"]: dict(a, status="held") for a in (held or [
             {"action_id": "act_1", "kind": "send", "summary": "reply to the customer"},
             {"action_id": "act_2", "kind": "write", "summary": "add a row to the sheet"}])}
@@ -49,6 +55,47 @@ class FakeDeployClient:
     def set_trigger(self, agent_id, trigger=None, schedule=None):
         self.start = {"trigger": trigger, "schedule": schedule}
         return "trig_0"
+
+    # --- memory stores + deployments (the platform-native start) ---
+    def create_or_reuse_memory_store(self, name, description):
+        for s in self.memory_stores:
+            if s["name"] == name:
+                return {"id": s["id"], "reused": True}
+        store = {"id": f"mem_{len(self.memory_stores)}", "name": name}
+        self.memory_stores.append(store)
+        self.seeded.append((store["id"], "/current_workflow_status.md"))
+        self.seeded.append((store["id"], "/lessons_learned.md"))
+        return {"id": store["id"], "reused": False}
+
+    def create_deployment(self, name, agent_id, environment_id, trigger_text,
+                          schedule=None, resources=None, vault_ids=None, metadata=None):
+        self.last_vault_ids = vault_ids
+        dep = {"id": f"dep_{len(self.deployments)}", "name": name, "agent_id": agent_id,
+               "environment_id": environment_id, "trigger_text": trigger_text,
+               "schedule": schedule, "resources": resources, "vault_ids": vault_ids,
+               "metadata": metadata}
+        self.deployments.append(dep)
+        return dep["id"]
+
+    def run_deployment(self, deployment_id):
+        self.manual_runs.append(deployment_id)
+        return {"id": f"drun_{len(self.manual_runs)}", "session_id": f"dep_sess_{len(self.manual_runs)}",
+                "error_type": None, "error_message": None, "created_at": "now"}
+
+    def archive_deployment(self, deployment_id):
+        self.archived.append(deployment_id)
+        return True
+
+    def pause_deployment(self, deployment_id):
+        self.paused.append(deployment_id)
+        return True
+
+    def unpause_deployment(self, deployment_id):
+        self.unpaused.append(deployment_id)
+        return True
+
+    def list_deployment_runs(self, deployment_id):
+        return []
 
     def list_pending_approvals(self, session_id):
         return [{"action_id": k, "kind": v["kind"], "summary": v["summary"]}
@@ -89,11 +136,12 @@ class DeployTest(unittest.TestCase):
         self.assertEqual(len(toolsets), len(servers))
         self.assertTrue(all(t["default_config"]["permission_policy"]["type"] == config.LIVE_PERMISSION_POLICY
                             for t in toolsets))
-        # the bound vault was injected at session creation (the single injection point)
+        # the bound vault rides on the DEPLOYMENT (injected into every run session)
         self.assertEqual(client.last_vault_ids, ["vlt-s1"])
+        self.assertEqual(client.deployments[0]["vault_ids"], ["vlt-s1"])
         self.assertEqual(rec["vault_ref"], "vlt-s1")
         self.assertEqual(rec["status"], "live")
-        self.assertEqual(rec["start"]["mode"], "trigger")
+        self.assertEqual(rec["start"]["mode"], "deployment-manual")
 
     # --- Spec 8: staging is PROMPT-LEVEL, never platform-gated -------------
     # Per-connector approval would gate read tools (find/list/get) exactly like writes
@@ -123,29 +171,77 @@ class DeployTest(unittest.TestCase):
                             for t in toolsets))
         self.assertEqual(rec["staged_apps"], ["gmail"])
 
-    def test_outbound_writes_and_sends_are_held(self):
-        bundle, live = _live_dict()
-        rec = deploy.deploy_live(bundle, live, CONNECTION, FakeDeployClient())
-        self.assertTrue(rec["held_actions"])                  # writes/sends held
-        self.assertTrue(all(a["status"] == "held" for a in rec["held_actions"]))
-        self.assertEqual({a["kind"] for a in rec["held_actions"]}, {"send", "write"})
-
     def test_one_tap_approve_and_reject(self):
-        bundle, live = _live_dict()
+        # held-action plumbing (for any always_ask toolset) still works against a session
         client = FakeDeployClient()
-        rec = deploy.deploy_live(bundle, live, CONNECTION, client)
-        sid = rec["session_id"]
+        sid = "live_sess_x"
         self.assertEqual(deploy.approve(client, sid, "act_1")["status"], "approved")
         self.assertEqual(deploy.reject(client, sid, "act_2")["status"], "rejected")
         # the held list drains as actions are resolved
         self.assertEqual(deploy.list_held(client, sid), [])
 
-    def test_schedule_mode(self):
+    # --- platform deployments + per-agent memory ---------------------------
+    def test_deploy_creates_memory_store_and_manual_deployment(self):
         bundle, live = _live_dict()
         client = FakeDeployClient()
-        rec = deploy.deploy_live(bundle, live, CONNECTION, client, schedule="0 9 * * *")
-        self.assertEqual(rec["start"]["mode"], "schedule")
-        self.assertEqual(client.start["schedule"], "0 9 * * *")
+        rec = deploy.deploy_live(bundle, live, CONNECTION, client, trigger="on a new inbound PO")
+        # one memory store, seeded with BOTH canonical documents
+        self.assertEqual(len(client.memory_stores), 1)
+        self.assertEqual(client.memory_stores[0]["name"],
+                         config.memory_store_name(bundle["id"], "trace-s1"))
+        self.assertEqual({p for _sid, p in client.seeded},
+                         {config.MEMORY_STATUS_DOC, config.MEMORY_LESSONS_DOC})
+        # one MANUAL deployment (no schedule at deploy; the dashboard attaches cron)
+        dep = client.deployments[0]
+        self.assertIsNone(dep["schedule"])
+        self.assertEqual(dep["agent_id"], "agent_live")
+        # the memory store is attached read-write via resources
+        self.assertEqual(dep["resources"][0]["type"], "memory_store")
+        self.assertEqual(dep["resources"][0]["memory_store_id"], rec["memory_store_id"])
+        self.assertEqual(dep["resources"][0]["access"], "read_write")
+        # record carries both platform ids; no deploy-time session is created
+        self.assertEqual(rec["deployment_id"], dep["id"])
+        self.assertTrue(rec["memory_store_id"])
+        self.assertIsNone(rec["session_id"])
+        self.assertEqual(client.sessions, [])
+
+    def test_deployment_initial_message_has_task_and_memory_directive(self):
+        bundle, live = _live_dict()
+        client = FakeDeployClient()
+        deploy.deploy_live(bundle, live, CONNECTION, client, trigger="on a new inbound PO")
+        text = client.deployments[0]["trigger_text"]
+        self.assertIn("Task: on a new inbound PO", text)
+        self.assertIn(config.MEMORY_UPDATE_DIRECTIVE, text)
+        self.assertNotIn("STAGING MODE", text)              # nothing staged here
+
+    def test_staged_deploy_message_contains_staging_directive(self):
+        bundle, live = _live_dict()
+        conn = {"external_user_id": "trace-s1", "vault_ref": "vlt-s1",
+                "apps": {"gmail": {"usable": True}}}
+        client = FakeDeployClient()
+        deploy.deploy_live(bundle, live, conn, client,
+                           trigger="on a new task", staged_apps=["gmail"])
+        text = client.deployments[0]["trigger_text"]
+        self.assertIn("STAGING MODE", text)
+        self.assertIn("Gmail", text)                        # staged app named
+        self.assertIn(config.MEMORY_UPDATE_DIRECTIVE, text)
+
+    def test_memory_store_reused_on_redeploy_keeps_lessons(self):
+        bundle, live = _live_dict()
+        name = config.memory_store_name(bundle["id"], "trace-s1")
+        client = FakeDeployClient(existing_stores=[{"id": "mem_prior", "name": name}])
+        rec = deploy.deploy_live(bundle, live, CONNECTION, client)
+        self.assertEqual(rec["memory_store_id"], "mem_prior")
+        self.assertTrue(rec["memory_store_reused"])
+        self.assertEqual(client.seeded, [])                 # reuse never re-seeds
+
+    def test_deploy_fails_loud_when_deployment_create_raises(self):
+        bundle, live = _live_dict()
+        client = FakeDeployClient()
+        client.create_deployment = lambda **kw: (_ for _ in ()).throw(
+            RuntimeError("schedule.expression is invalid"))
+        with self.assertRaises(RuntimeError):               # propagates — no phantom "live"
+            deploy.deploy_live(bundle, live, CONNECTION, client)
 
     def test_per_customer_isolation(self):
         bundle, live = _live_dict()
@@ -162,7 +258,8 @@ class DeployTest(unittest.TestCase):
             bundle, live = _live_dict(dom)
             rec = deploy.deploy_live(bundle, live, CONNECTION, FakeDeployClient())
             self.assertEqual(rec["status"], "live")
-            self.assertTrue(rec["session_id"])
+            self.assertTrue(rec["deployment_id"])
+            self.assertTrue(rec["memory_store_id"])
 
     def test_imports_no_platform_sdk(self):
         import inspect

@@ -53,6 +53,15 @@ class UsersModuleTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             users.create_user("not-an-email", "longenough1")
 
+    def test_list_users_public_shape_only(self):
+        users.create_user("a@b.com", "longenough1")
+        users.create_user("c@d.com", "longenough1")
+        out = users.list_users()
+        self.assertEqual({u["email"] for u in out}, {"a@b.com", "c@d.com"})
+        for u in out:
+            self.assertEqual(u["external_user_id"], f"trace-user-{u['user_id']}")
+            self.assertNotIn("password_hash", u)               # never password material
+
     def test_login_session_lifecycle_and_key(self):
         u = users.create_user("x@y.com", "longenough1")
         token = users.start_session(u["user_id"])

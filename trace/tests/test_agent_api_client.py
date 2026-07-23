@@ -146,5 +146,183 @@ class AgentCreateForwardsMcpServersTest(unittest.TestCase):
         self.assertEqual(created["mcp_servers"], self._ENV["mcp_servers"])
 
 
+class _NSClient:
+    """Client with per-namespace fakes: _agents_ns routes by name."""
+    @staticmethod
+    def build(ns_map):
+        c = api_client.ManagedAgentsClient.__new__(api_client.ManagedAgentsClient)
+        c._beta_version = "beta-x"
+        c._agents_ns = lambda name: ns_map[name]
+        return c
+
+
+class _FakeMemories:
+    def __init__(self, conflict_paths=()):
+        self.created = []                      # (store_id, path, content)
+        self.conflict_paths = set(conflict_paths)
+
+    def create(self, store_id, path=None, content=None):
+        if path in self.conflict_paths:
+            raise RuntimeError("memory_path_conflict_error: a memory already exists at this path")
+        self.created.append((store_id, path, content))
+        return {"id": f"memdoc_{len(self.created)}"}
+
+
+class _FakeMemoryStores:
+    def __init__(self, existing=None, conflict_paths=()):
+        self.existing = list(existing or [])   # [{"id","name"}]
+        self.created = []
+        self.deleted = []
+        self.memories = _FakeMemories(conflict_paths)
+
+    def list(self):
+        return list(self.existing)
+
+    def create(self, name=None, description=None):
+        store = {"id": f"mem_{len(self.created)}", "name": name, "description": description}
+        self.created.append(store)
+        return store
+
+    def delete(self, store_id):
+        self.deleted.append(store_id)
+
+
+class _FakeDeployments:
+    def __init__(self):
+        self.created, self.runs, self.archived = [], [], []
+
+    def create(self, **kw):
+        self.created.append(kw)
+        return {"id": f"dep_{len(self.created)}"}
+
+    def run(self, deployment_id):
+        self.runs.append(deployment_id)
+        return {"id": "drun_1", "session_id": "sess_1", "created_at": "t"}
+
+    def archive(self, deployment_id):
+        self.archived.append(deployment_id)
+
+
+class _FakeDeploymentRuns:
+    def __init__(self, runs=None):
+        self._runs = runs or []
+
+    def list(self, deployment_id=None):
+        return list(self._runs)
+
+
+class MemoryStoreClientTest(unittest.TestCase):
+    def test_fresh_store_created_and_seeded_with_both_docs(self):
+        stores = _FakeMemoryStores()
+        c = _NSClient.build({"memory_stores": stores})
+        out = c.create_or_reuse_memory_store("trace-B1-u1", "desc")
+        self.assertFalse(out["reused"])
+        from trace.agent import config
+        self.assertEqual({p for _s, p, _c in stores.memories.created},
+                         {config.MEMORY_STATUS_DOC, config.MEMORY_LESSONS_DOC})
+
+    def test_store_reused_by_name_and_not_reseeded(self):
+        stores = _FakeMemoryStores(existing=[{"id": "mem_prior", "name": "trace-B1-u1"}])
+        c = _NSClient.build({"memory_stores": stores})
+        out = c.create_or_reuse_memory_store("trace-B1-u1", "desc")
+        self.assertEqual(out, {"id": "mem_prior", "reused": True})
+        self.assertEqual(stores.memories.created, [])          # lessons survive redeploys
+
+    def test_seed_tolerates_path_conflict_but_raises_otherwise(self):
+        from trace.agent import config
+        stores = _FakeMemoryStores(conflict_paths={config.MEMORY_STATUS_DOC})
+        c = _NSClient.build({"memory_stores": stores})
+        self.assertIsNone(c.seed_memory("mem_1", config.MEMORY_STATUS_DOC, "x"))  # tolerated
+        stores.memories = _FakeMemories()
+        stores.memories.create = lambda *a, **k: (_ for _ in ()).throw(
+            RuntimeError("permission denied"))
+        with self.assertRaises(RuntimeError):
+            c.seed_memory("mem_1", "/other.md", "x")
+
+
+class DeploymentClientTest(unittest.TestCase):
+    def test_manual_deployment_omits_schedule(self):
+        deps = _FakeDeployments()
+        c = _NSClient.build({"deployments": deps})
+        c.create_deployment("trace-B1", "agent_1", "env_1", "Task: go", schedule=None)
+        kw = deps.created[0]
+        self.assertNotIn("schedule", kw)                       # manual: key entirely absent
+        self.assertEqual(kw["initial_events"],
+                         [{"type": "user.message",
+                           "content": [{"type": "text", "text": "Task: go"}]}])
+
+    def test_cron_deployment_shape(self):
+        deps = _FakeDeployments()
+        c = _NSClient.build({"deployments": deps})
+        c.create_deployment("trace-B1", "agent_1", "env_1", "Task: go",
+                            schedule={"expression": "0 9 * * *", "timezone": "America/New_York"},
+                            resources=[{"type": "memory_store", "memory_store_id": "mem_1"}],
+                            vault_ids=["vlt_1"], metadata={"trace_bundle_id": "B1"})
+        kw = deps.created[0]
+        self.assertEqual(kw["schedule"], {"type": "cron", "expression": "0 9 * * *",
+                                          "timezone": "America/New_York"})
+        self.assertEqual(kw["vault_ids"], ["vlt_1"])
+        self.assertEqual(kw["resources"][0]["memory_store_id"], "mem_1")
+
+    def test_run_deployment_normalizes(self):
+        c = _NSClient.build({"deployments": _FakeDeployments()})
+        drun = c.run_deployment("dep_1")
+        self.assertEqual(drun, {"id": "drun_1", "session_id": "sess_1",
+                                "error_type": None, "error_message": None, "created_at": "t"})
+
+    def test_list_deployment_runs_normalizes_nested_error(self):
+        runs = [{"id": "drun_ok", "session_id": "s1", "created_at": "t1"},
+                {"id": "drun_bad", "session_id": None, "created_at": "t2",
+                 "error": {"type": "vault_not_found", "message": "vault gone"}}]
+        c = _NSClient.build({"deployment_runs": _FakeDeploymentRuns(runs)})
+        out = c.list_deployment_runs("dep_1")
+        self.assertEqual(out[0]["error_type"], None)
+        self.assertEqual(out[1]["error_type"], "vault_not_found")
+        self.assertEqual(out[1]["error_message"], "vault gone")
+
+    def test_archive_tolerates_failure(self):
+        class BoomDeps:
+            def archive(self, dep_id):
+                raise RuntimeError("already archived")
+        c = _NSClient.build({"deployments": BoomDeps()})
+        self.assertFalse(c.archive_deployment("dep_1"))        # tolerant, returns False
+
+    def test_cleanup_sweeps_deployments_and_stores(self):
+        deps, stores = _FakeDeployments(), _FakeMemoryStores()
+
+        class EmptyAgents:
+            def list(self):
+                return []
+        c = _NSClient.build({"deployments": deps, "memory_stores": stores,
+                             "agents": EmptyAgents(), "sessions": None})
+        out = c.cleanup(deployment_ids=["dep_1"], memory_store_ids=["mem_1"])
+        self.assertEqual(deps.archived, ["dep_1"])
+        self.assertEqual(stores.deleted, ["mem_1"])
+        self.assertEqual(out["removed"]["deployments"], ["dep_1"])
+        self.assertEqual(out["removed"]["memory_stores"], ["mem_1"])
+        self.assertEqual(out["errors"], [])
+
+
+class SessionMemoryResourceTest(unittest.TestCase):
+    def test_create_session_passes_memory_resource_through(self):
+        captured = {}
+
+        class Sessions:
+            def create(self, **kw):
+                captured.update(kw)
+                return {"id": "sess_1"}
+        c = _NSClient.build({"sessions": Sessions()})
+        c.create_session("agent_1", "env_1",
+                         resources=[{"type": "memory_store", "memory_store_id": "mem_1",
+                                     "access": "read_write", "instructions": "i"},
+                                    {"file_id": "f1", "mount_path": "/workspace/files/a"}],
+                         vault_ids=["vlt_1"])
+        self.assertEqual(captured["resources"][0]["type"], "memory_store")   # untouched
+        self.assertEqual(captured["resources"][1],
+                         {"type": "file", "file_id": "f1",
+                          "mount_path": "/workspace/files/a"})               # legacy wrap kept
+        self.assertEqual(captured["vault_ids"], ["vlt_1"])
+
+
 if __name__ == "__main__":
     unittest.main()

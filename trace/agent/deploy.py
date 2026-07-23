@@ -51,11 +51,31 @@ def finalize_live_envelope(live_envelope_dict, connection_record, staged_apps=No
     return env
 
 
+def build_deployment_trigger(base_trigger, staged_slugs):
+    """The deployment's initial user.message: the (optionally staging-prefixed) task
+    plus the memory-maintenance directive. One composition point, reused whenever the
+    deployment is recreated (schedule changes)."""
+    from . import runner                                   # local import: runner imports deploy helpers' siblings
+    base = base_trigger or "on a new matching event"
+    if staged_slugs:
+        text = runner._staging_trigger(base, staged_slugs)
+    else:
+        text = f"Task: {base}"
+    return text + "\n\n" + config.MEMORY_UPDATE_DIRECTIVE
+
+
 def deploy_live(bundle, live_envelope_dict, connection_record, client,
                 trigger=None, schedule=None, staged_apps=None):
-    """Create + start the LIVE agent for one bundle over the bound connection. Returns a
-    ``live_record``. The customer's vault is injected at session creation (isolation).
-    ``staged_apps`` (Spec 8) marks which app slugs are staged for approval at deploy."""
+    """Create the LIVE agent for one bundle over the bound connection, plus its
+    per-agent MEMORY STORE (created-or-reused by name so lessons survive redeploys)
+    and a platform DEPLOYMENT whose initial message set carries the task + the
+    memory-update directive (+ the staging directive when apps are staged). The
+    deployment is created MANUAL (no schedule) — the dashboard cadence attaches a
+    cron schedule afterwards. Returns a ``live_record``. The customer's vault rides
+    on the deployment (injected into every run session). Memory-store and deployment
+    creation are NOT wrapped: a platform rejection propagates so the deploy job
+    surfaces the real API error instead of a phantom "live" (the always_ask lesson).
+    ``staged_apps`` (Spec 8) marks which app slugs are staged for approval."""
     vault_ref = (connection_record or {}).get("vault_ref")
     external_user_id = (connection_record or {}).get("external_user_id")
 
@@ -63,34 +83,38 @@ def deploy_live(bundle, live_envelope_dict, connection_record, client,
     agent = client.create_or_reuse_agent(live_envelope_dict)
     agent_id = agent.get("id") if isinstance(agent, dict) else agent
     environment_id = client.create_environment()
-    session_id = client.create_session(
-        agent_id, environment_id, resources=[],
-        title=f"Trace live — {bundle.get('id')}",
-        vault_ids=[vault_ref] if vault_ref else None)        # bound vault injected here
 
-    # Start mode is owned by Trace (no MA triggers API): a schedule feeds Trace's own
-    # scheduler; a trigger is registered as a Pipedream deployed trigger. set_trigger only
-    # records the descriptor — it makes no platform call and does not raise.
-    start = {"mode": "schedule" if schedule else "trigger",
-             "value": schedule or trigger or (bundle.get("trigger") or "on a new matching event")}
-    try:
-        client.set_trigger(agent_id, trigger=start["value"] if start["mode"] == "trigger" else None,
-                           schedule=start["value"] if start["mode"] == "schedule" else None)
-        status, error = "live", None
-    except Exception as e:
-        status, error = "errored", str(e)
+    store = client.create_or_reuse_memory_store(
+        name=config.memory_store_name(bundle.get("id"), external_user_id),
+        description=config.MEMORY_STORE_DESCRIPTION)
+    memory_store_id = store.get("id") if isinstance(store, dict) else store
 
+    base_trigger = trigger or (bundle.get("trigger") or "on a new matching event")
+    trigger_text = build_deployment_trigger(base_trigger, staged_apps)
+    deployment_id = client.create_deployment(
+        name=f"trace-{bundle.get('id')}",
+        agent_id=agent_id, environment_id=environment_id,
+        trigger_text=trigger_text,
+        schedule=None,                                     # manual at deploy; cadence attaches cron later
+        resources=[config.memory_resource(memory_store_id)],
+        vault_ids=[vault_ref] if vault_ref else None,
+        metadata={"trace_bundle_id": str(bundle.get("id"))})
+
+    start = {"mode": "deployment-manual", "value": base_trigger}
     return {
         "bundle_id": bundle.get("id"),
         "agent_id": agent_id,
-        "session_id": session_id,
+        "session_id": None,        # deployment runs create their sessions; kept for record-shape compat
+        "deployment_id": deployment_id,
+        "memory_store_id": memory_store_id,
+        "memory_store_reused": bool(isinstance(store, dict) and store.get("reused")),
         "vault_ref": vault_ref,
         "external_user_id": external_user_id,
         "start": start,
-        "status": status,
-        "error": error,
+        "status": "live",
+        "error": None,
         "staged_apps": list(staged_apps or []),
-        "held_actions": list_held(client, session_id),
+        "held_actions": [],
         "deployed_at": _now(),
         "isolation": "per-customer (vault scoped to external_user_id)",
     }

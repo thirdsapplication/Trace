@@ -29,7 +29,8 @@ class FakeMA:
     def create_session(self, agent_id, env, resources, title=None, vault_ids=None):
         if self.fail:
             raise RuntimeError("platform down")
-        self.sessions.append({"agent_id": agent_id, "vault_ids": vault_ids})
+        self.sessions.append({"agent_id": agent_id, "vault_ids": vault_ids,
+                              "resources": resources})
         return "run-sess-1"
 
     def send_trigger_and_collect(self, sid, trigger, timeout=None, max_events=None):
@@ -48,6 +49,48 @@ class FakeMA:
 
     def reject_action(self, sid, action_id, message=None):
         self.rejected.append(action_id)
+
+    # --- platform deployments (additive; used by the sync/run-now tests) ---
+    def __init_deployments(self):
+        if not hasattr(self, "druns"):
+            self.druns, self.manual_runs = [], []
+            self.archived, self.paused_deps, self.unpaused_deps = [], [], []
+            self.created_deployments = []
+
+    def run_deployment(self, deployment_id):
+        self.__init_deployments()
+        self.manual_runs.append(deployment_id)
+        return {"id": f"drun_m{len(self.manual_runs)}",
+                "session_id": f"dep_sess_m{len(self.manual_runs)}",
+                "error_type": None, "error_message": None, "created_at": "now"}
+
+    def list_deployment_runs(self, deployment_id):
+        self.__init_deployments()
+        return list(self.druns)
+
+    def archive_deployment(self, deployment_id):
+        self.__init_deployments()
+        self.archived.append(deployment_id)
+        return True
+
+    def pause_deployment(self, deployment_id):
+        self.__init_deployments()
+        self.paused_deps.append(deployment_id)
+        return True
+
+    def unpause_deployment(self, deployment_id):
+        self.__init_deployments()
+        self.unpaused_deps.append(deployment_id)
+        return True
+
+    def create_deployment(self, name, agent_id, environment_id, trigger_text,
+                          schedule=None, resources=None, vault_ids=None, metadata=None):
+        self.__init_deployments()
+        dep = {"id": f"dep_{len(self.created_deployments)}", "name": name,
+               "agent_id": agent_id, "trigger_text": trigger_text, "schedule": schedule,
+               "resources": resources, "vault_ids": vault_ids, "metadata": metadata}
+        self.created_deployments.append(dep)
+        return dep["id"]
 
 
 def _tool(name):
@@ -345,6 +388,195 @@ class SchedulerPassTest(unittest.TestCase):
         local.start_scheduler()
         self.assertIsNotNone(local._scheduler_thread)
         local.scheduler_stop.set()
+
+
+# --- MA deployments: cron mapping, sync loop, run-now, memory attachment ----
+from trace.agent import config as agent_config  # noqa: E402
+
+
+def _dep_agent(agent_id="agent-d1", deployment_id="dep_live", store="mem_live",
+               owner="usr_1", staged_apps=None):
+    return {**_agent(owner=owner, agent_id=agent_id, staged_apps=staged_apps),
+            "deployment_id": deployment_id, "memory_store_id": store}
+
+
+class CadenceToCronTest(unittest.TestCase):
+    def test_daily_and_weekly_honor_stored_time(self):
+        self.assertEqual(agent_config.cadence_to_cron({"kind": "daily", "time": "09:00"}),
+                         {"expression": "0 9 * * *",
+                          "timezone": agent_config.TRACE_SCHEDULE_TZ})
+        # Trace weekday 6 (Sunday) -> cron 0 (Sunday); stored time honored
+        self.assertEqual(
+            agent_config.cadence_to_cron({"kind": "weekly", "weekday": 6, "time": "07:30"}),
+            {"expression": "30 7 * * 0", "timezone": agent_config.TRACE_SCHEDULE_TZ})
+        self.assertEqual(
+            agent_config.cadence_to_cron({"kind": "weekly", "weekday": 0, "time": "09:00"})
+            ["expression"], "0 9 * * 1")                     # Monday -> cron 1
+
+    def test_legacy_and_unmappable(self):
+        self.assertEqual(agent_config.cadence_to_cron({"kind": "hourly"})["expression"],
+                         "0 * * * *")
+        self.assertIsNone(agent_config.cadence_to_cron({"kind": "interval", "minutes": 15}))
+        self.assertIsNone(agent_config.cadence_to_cron(None))
+
+    def test_tolerant_time_parsing(self):
+        self.assertEqual(agent_config.cadence_to_cron({"kind": "daily", "time": "junk"})
+                         ["expression"], "0 9 * * *")        # falls back to 09:00
+
+
+class DeploymentSyncTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = self._tmp.name
+        self.state = app.AppState(self.root, key_store=FakeKeystore())
+        self.ma = FakeMA()
+        self.state._live_client = lambda: self.ma
+        self.fc = FakeConnect()
+        self.state.connect_fn = lambda: self.fc
+
+    def tearDown(self):
+        self.state.scheduler_stop.set()
+        self._tmp.cleanup()
+
+    def test_run_due_skips_deployment_agents(self):
+        # the platform crons deployment agents; the legacy pass must not double-run them
+        registry.agent_upsert(self.root, _dep_agent())
+        registry.schedule_set(self.root, "agent-d1", "usr_1", {"kind": "hourly"})
+        self.state.run_due_schedules(now=time.time())
+        self.assertEqual(self.ma.sessions, [])               # no legacy run composed
+        self.assertEqual(self.ma.triggers, [])
+
+    def test_sync_records_unseen_druns_and_dedupes(self):
+        registry.agent_upsert(self.root, _dep_agent())
+        self.ma.list_deployment_runs("x")                    # init the fake's drun store
+        self.ma.druns = [
+            {"id": "drun_1", "session_id": "sess_a", "error_type": None,
+             "error_message": None, "created_at": "t1"},
+            {"id": "drun_2", "session_id": None, "error_type": "vault_not_found",
+             "error_message": "vault vlt-1 was deleted", "created_at": "t2"},
+        ]
+        self.state.sync_deployment_runs(now=time.time())
+        runs = registry.runs_for_agent(self.root, "agent-d1")
+        self.assertEqual(len(runs), 2)
+        by_drun = {r["drun_id"]: r for r in runs}
+        self.assertEqual(by_drun["drun_1"]["status"], "ran")
+        self.assertEqual(by_drun["drun_1"]["run_session_id"], "sess_a")
+        self.assertEqual(by_drun["drun_2"]["status"], "failed")
+        self.assertIn("vault", by_drun["drun_2"]["summary"])
+        # a second pass sees both drun ids as recorded -> no duplicates (failed too)
+        self.state.sync_deployment_runs(now=time.time())
+        self.assertEqual(len(registry.runs_for_agent(self.root, "agent-d1")), 2)
+
+    def test_sync_vault_refresh_throttled(self):
+        registry.agent_upsert(self.root, _dep_agent())
+        t0 = time.time()
+        self.state.sync_deployment_runs(now=t0)
+        self.state.sync_deployment_runs(now=t0 + 60)          # 1 min later: throttled
+        self.assertEqual(self.fc.refreshed, ["vlt-1"])
+        self.state.sync_deployment_runs(now=t0 + self.state.VAULT_REFRESH_SECONDS + 1)
+        self.assertEqual(self.fc.refreshed, ["vlt-1", "vlt-1"])  # window elapsed -> again
+
+    def test_sync_survives_one_bad_agent(self):
+        registry.agent_upsert(self.root, _dep_agent(agent_id="agent-bad", deployment_id="dep_bad"))
+        registry.agent_upsert(self.root, _dep_agent(agent_id="agent-ok", deployment_id="dep_ok"))
+        real = self.ma.list_deployment_runs
+        self.ma.druns = [{"id": "drun_9", "session_id": "s9", "error_type": None,
+                          "error_message": None, "created_at": "t"}]
+        def maybe_boom(dep_id):
+            if dep_id == "dep_bad":
+                raise RuntimeError("platform hiccup")
+            return real(dep_id)
+        self.ma.list_deployment_runs = maybe_boom
+        self.state.sync_deployment_runs(now=time.time())      # must not raise
+        self.assertEqual(len(registry.runs_for_agent(self.root, "agent-ok")), 1)
+
+    def test_run_now_uses_deployment_run(self):
+        registry.agent_upsert(self.root, _dep_agent())
+        rec = self.state.run_deployment_now(_dep_agent())
+        self.assertEqual(rec["status"], "ran")
+        self.assertEqual(self.ma.manual_runs, ["dep_live"])
+        runs = registry.runs_for_agent(self.root, "agent-d1")
+        self.assertEqual(len(runs), 1)
+        self.assertTrue(runs[0]["run_session_id"].startswith("dep_sess_"))
+        self.assertEqual(self.fc.refreshed, ["vlt-1"])        # vault refreshed first
+        self.assertEqual(self.ma.sessions, [])                # no legacy session composed
+
+    def test_run_now_failure_recorded_never_raises(self):
+        self.ma.run_deployment = lambda dep_id: (_ for _ in ()).throw(RuntimeError("boom"))
+        rec = self.state.run_deployment_now(_dep_agent())
+        self.assertEqual(rec["status"], "failed")
+        self.assertEqual(registry.runs_for_agent(self.root, "agent-d1")[0]["status"], "failed")
+
+    def test_apply_platform_schedule_archives_and_recreates(self):
+        registry.agent_upsert(self.root, _dep_agent())
+        new_id = self.state.apply_platform_schedule(
+            _dep_agent(), {"kind": "daily", "time": "09:00"})
+        self.assertEqual(self.ma.archived, ["dep_live"])      # old one archived
+        dep = self.ma.created_deployments[0]
+        self.assertEqual(dep["schedule"]["expression"], "0 9 * * *")
+        self.assertEqual(dep["vault_ids"], ["vlt-1"])
+        self.assertEqual(dep["resources"][0]["memory_store_id"], "mem_live")
+        self.assertIn(agent_config.MEMORY_UPDATE_DIRECTIVE, dep["trigger_text"])
+        # the registry row now points at the NEW deployment
+        row = next(a for a in registry.agents_all(self.root) if a["agent_id"] == "agent-d1")
+        self.assertEqual(row["deployment_id"], new_id)
+
+    def test_apply_platform_schedule_none_creates_manual(self):
+        registry.agent_upsert(self.root, _dep_agent())
+        self.state.apply_platform_schedule(_dep_agent(), None)
+        self.assertIsNone(self.ma.created_deployments[0]["schedule"])  # manual: run-now works
+
+
+class RunnerMemoryTest(unittest.TestCase):
+    def test_run_once_attaches_memory_and_directive(self):
+        ma = FakeMA()
+        runner.run_once(ma, _dep_agent())
+        self.assertEqual(ma.sessions[0]["resources"][0]["memory_store_id"], "mem_live")
+        self.assertIn(agent_config.MEMORY_UPDATE_DIRECTIVE, ma.triggers[0])
+
+    def test_run_once_without_store_unchanged(self):
+        ma = FakeMA()
+        runner.run_once(ma, _agent())
+        self.assertEqual(ma.sessions[0]["resources"], [])
+        self.assertNotIn(agent_config.MEMORY_UPDATE_DIRECTIVE, ma.triggers[0])
+
+    def test_execute_pending_attaches_memory_and_directive(self):
+        ma = FakeMA()
+        pending = {"summary": "send the reply", "payload": {"to": "a@b.com"}}
+        rec = runner.execute_pending(ma, _dep_agent(), pending)
+        self.assertEqual(rec["status"], "executed")
+        self.assertEqual(ma.sessions[0]["resources"][0]["type"], "memory_store")
+        self.assertIn(agent_config.MEMORY_UPDATE_DIRECTIVE, ma.triggers[0])
+
+
+class RegistryDeploymentFileModeTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = self._tmp.name
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_agents_all_and_with_deployments_and_set_deployment(self):
+        registry.agent_upsert(self.root, _agent(agent_id="legacy-1"))
+        registry.agent_upsert(self.root, _dep_agent(agent_id="dep-1"))
+        self.assertEqual({a["agent_id"] for a in registry.agents_all(self.root)},
+                         {"legacy-1", "dep-1"})
+        self.assertEqual([a["agent_id"] for a in registry.agents_with_deployments(self.root)],
+                         ["dep-1"])
+        registry.agent_set_deployment(self.root, "dep-1", "dep_new")
+        row = next(a for a in registry.agents_all(self.root) if a["agent_id"] == "dep-1")
+        self.assertEqual(row["deployment_id"], "dep_new")
+
+    def test_run_seen_drun_ids(self):
+        registry.run_add(self.root, {"agent_id": "a1", "owner_user_id": "u",
+                                     "status": "ran", "summary": "s", "details": [],
+                                     "run_session_id": "sess", "drun_id": "drun_1"})
+        registry.run_add(self.root, {"agent_id": "a1", "owner_user_id": "u",
+                                     "status": "completed", "summary": "s", "details": [],
+                                     "run_session_id": "sess2"})     # legacy run, no drun
+        self.assertEqual(registry.run_seen_drun_ids(self.root, "a1"), {"drun_1"})
+        self.assertEqual(registry.run_seen_drun_ids(self.root, "missing"), set())
 
 
 if __name__ == "__main__":

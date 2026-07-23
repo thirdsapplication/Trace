@@ -198,6 +198,14 @@ def _proposals_to_pending(agent_id, proposals, run_session_id):
     return items
 
 
+def _memory_resources(agent):
+    """The agent's memory-store attachment for a run session, or [] when the row has
+    no store (legacy agents). Attached everywhere a session is created for the agent
+    so memory stays consistent across scheduled runs and approval executions."""
+    store_id = agent.get("memory_store_id")
+    return [config.memory_resource(store_id)] if store_id else []
+
+
 def run_once(client, agent):
     """Run one agent once. ``agent`` is a registry row carrying ``agent_id``,
     ``vault_ref``, and ``trigger``. Returns a run record dict
@@ -210,10 +218,13 @@ def run_once(client, agent):
     vault_ref = agent.get("vault_ref")
     staged = [s for s in (agent.get("staged_apps") or []) if s]
     trigger = _staging_trigger(base_trigger, staged) if staged else base_trigger
+    if agent.get("memory_store_id"):
+        trigger = trigger + "\n\n" + config.MEMORY_UPDATE_DIRECTIVE
     try:
         environment_id = client.create_environment()
         run_session_id = client.create_session(
-            agent_id, environment_id, resources=[], title="Trace scheduled run",
+            agent_id, environment_id, resources=_memory_resources(agent),
+            title="Trace scheduled run",
             vault_ids=[vault_ref] if vault_ref else None)
     except Exception as e:                                  # noqa: BLE001
         return {"agent_id": agent_id, "status": "failed",
@@ -274,10 +285,13 @@ def execute_pending(client, agent, pending):
         "You are approved to perform this ONE action now, for real. Do NOT stage, "
         "propose, or describe it — actually carry it out using your tools, then stop. "
         f"Action: {summary}. Details: {json.dumps(payload, ensure_ascii=False, default=str)}")
+    if agent.get("memory_store_id"):
+        instruction = instruction + "\n\n" + config.MEMORY_UPDATE_DIRECTIVE
     try:
         environment_id = client.create_environment()
         run_session_id = client.create_session(
-            agent_id, environment_id, resources=[], title="Trace approved action",
+            agent_id, environment_id, resources=_memory_resources(agent),
+            title="Trace approved action",
             vault_ids=[vault_ref] if vault_ref else None)
         events = client.send_trigger_and_collect(run_session_id, instruction)
     except Exception as e:                                  # noqa: BLE001
@@ -307,10 +321,13 @@ def execute_actions(client, agent, items):
         "You are approved to perform these actions now, for real. Do NOT stage, propose, "
         "or describe them — actually carry each one out using your tools, then stop:\n"
         + "\n".join(lines))
+    if agent.get("memory_store_id"):
+        instruction = instruction + "\n\n" + config.MEMORY_UPDATE_DIRECTIVE
     try:
         environment_id = client.create_environment()
         run_session_id = client.create_session(
-            agent_id, environment_id, resources=[], title="Trace approved actions",
+            agent_id, environment_id, resources=_memory_resources(agent),
+            title="Trace approved actions",
             vault_ids=[vault_ref] if vault_ref else None)
         events = client.send_trigger_and_collect(run_session_id, instruction)
     except Exception as e:                                  # noqa: BLE001

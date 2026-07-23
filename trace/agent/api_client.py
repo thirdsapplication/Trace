@@ -250,11 +250,15 @@ class ManagedAgentsClient:
             name=d.get("name", "trace-test-env"), config=d.get("config", {}))))
 
     def create_session(self, agent_id, environment_id, resources, title=None, vault_ids=None):
-        """``resources`` is a list of ``{file_id, mount_path}``. ``vault_ids`` (Phase 6)
+        """``resources`` is a list of ``{file_id, mount_path}`` file mounts, or resource
+        dicts that already carry a ``type`` (e.g. a ``memory_store`` attachment from
+        ``config.memory_resource``) which pass through unchanged. ``vault_ids`` (Phase 6)
         attaches the customer's bound vault so the LIVE agent reaches their real apps;
         omitted for sandbox runs. vault_ids is settable at create ONLY (not via update)."""
         kw = dict(agent=agent_id, environment_id=environment_id, title=title or "Trace test",
-                  resources=[{"type": "file", "file_id": r["file_id"], "mount_path": r["mount_path"]}
+                  resources=[r if r.get("type")
+                             else {"type": "file", "file_id": r["file_id"],
+                                   "mount_path": r["mount_path"]}
                              for r in resources])
         if vault_ids:
             kw["vault_ids"] = list(vault_ids)              # the single vault-injection point
@@ -339,18 +343,126 @@ class ManagedAgentsClient:
         _retry(lambda: self._agents_ns("agents").list())
         return True
 
-    # --- Phase 6: live deployment (start mode + approval-required outbound) ---
-    # There is NO Managed Agents triggers/scheduler API and NO sessions.approvals API.
-    # Start is owned by Trace (its own scheduler) or a Pipedream deployed trigger;
-    # approval is the permission_policy {always_ask} on the toolset, resolved by replying
-    # to the session with a single tool_confirmation event over the event stream.
+    # --- Phase 6: live deployment ---------------------------------------
+    # Start is now platform-native: Managed Agents DEPLOYMENTS (manual `run` or cron
+    # schedule) create the run sessions; deployment_runs.list is how Trace learns about
+    # platform-initiated sessions. Approval remains the permission_policy {always_ask}
+    # on a toolset, resolved by replying with a single tool_confirmation event.
     def set_trigger(self, agent_id, trigger=None, schedule=None):
-        """Record how the LIVE agent starts. This makes NO platform call: a ``schedule``
-        is handed to Trace's own scheduler (which calls ``create_session`` on cadence) and
-        a ``trigger`` is registered as a Pipedream deployed trigger elsewhere. Returns the
-        start descriptor."""
+        """DEPRECATED legacy no-op kept for the pre-deployment agent path. Makes NO
+        platform call; returns the start descriptor. New deploys use
+        ``create_deployment`` instead."""
         return {"mode": "schedule" if schedule else "trigger",
                 "value": schedule or trigger}
+
+    # --- memory stores (agent memory beta) --------------------------------
+    # Beta shape — confirm against current Managed Agents memory docs: stores are
+    # created once, attached at session/deployment create via a memory_store resource,
+    # and mount at /mnt/memory/<store-name>/ inside the container.
+    def create_or_reuse_memory_store(self, name, description):
+        """One memory store per agent, keyed by its Trace-deterministic name. REUSED
+        when it already exists (unlike agents, which are recreated on redeploy) so
+        accumulated lessons survive redeploys. Fresh stores are seeded with the two
+        canonical documents; a seed failure raises (fail loud — a half-initialized
+        store is worse than a failed deploy). Returns ``{id, reused}``."""
+        stores = self._agents_ns("memory_stores")
+        try:
+            res = _retry(lambda: stores.list())
+            for s in _data(res):
+                if _attr(s, "name") == name:
+                    return {"id": _idof(s), "reused": True}
+        except Exception:                                  # noqa: BLE001 — list is best-effort
+            pass
+        store = _retry(lambda: stores.create(name=name, description=description))
+        store_id = _idof(store)
+        self.seed_memory(store_id, config.MEMORY_STATUS_DOC, config.MEMORY_STATUS_SEED)
+        self.seed_memory(store_id, config.MEMORY_LESSONS_DOC, config.MEMORY_LESSONS_SEED)
+        return {"id": store_id, "reused": False}
+
+    def seed_memory(self, store_id, path, content):
+        """Create one memory document at ``path``. Tolerates the document already
+        existing (a reused store keeps its content); other errors raise."""
+        try:
+            return _retry(lambda: self._agents_ns("memory_stores").memories.create(
+                store_id, path=path, content=content))
+        except Exception as exc:                          # noqa: BLE001
+            msg = str(exc).lower()
+            if "conflict" in msg or "already exists" in msg:
+                return None
+            raise
+
+    def delete_memory_store(self, store_id):
+        """Best-effort store deletion — used only by explicit cleanup."""
+        try:
+            _retry(lambda: self._agents_ns("memory_stores").delete(store_id))
+            return True
+        except Exception:                                  # noqa: BLE001
+            return False
+
+    # --- deployments (platform-native start) ------------------------------
+    # Beta shape — confirm against current Managed Agents docs: a deployment binds an
+    # agent + environment + initial_events (the per-run message set) + optional cron
+    # schedule; each trigger (cron or manual `run`) creates a deployment_run carrying
+    # the session_id. Deployments are immutable — a schedule change is archive+create.
+    def create_deployment(self, name, agent_id, environment_id, trigger_text,
+                          schedule=None, resources=None, vault_ids=None, metadata=None):
+        """Create one deployment whose every run starts from ``trigger_text`` (the
+        initial user.message). ``schedule`` is ``{expression, timezone}`` for cron or
+        None for a manual deployment. NO exception swallowing — a wrong shape must
+        surface the real API error (the `always_ask` lesson)."""
+        kw = dict(name=name, agent=agent_id, environment_id=environment_id,
+                  initial_events=[{"type": "user.message",
+                                   "content": [{"type": "text", "text": trigger_text}]}])
+        if schedule:
+            kw["schedule"] = {"type": "cron", "expression": schedule["expression"],
+                              "timezone": schedule["timezone"]}
+        if resources:
+            kw["resources"] = list(resources)
+        if vault_ids:
+            kw["vault_ids"] = list(vault_ids)
+        if metadata:
+            kw["metadata"] = dict(metadata)
+        return _idof(_retry(lambda: self._agents_ns("deployments").create(**kw)))
+
+    def _drun_dict(self, run):
+        """Normalize one deployment_run to ``{id, session_id, error_type,
+        error_message, created_at}`` (error is nested as error.type/error.message)."""
+        err = _attr(run, "error")
+        return {"id": _idof(run),
+                "session_id": _attr(run, "session_id"),
+                "error_type": _attr(err, "type") if err is not None else None,
+                "error_message": _attr(err, "message") if err is not None else None,
+                "created_at": _attr(run, "created_at")}
+
+    def run_deployment(self, deployment_id):
+        """Trigger one manual run of a deployment; returns the normalized
+        deployment_run (carrying the new session_id, or an error)."""
+        return self._drun_dict(_retry(
+            lambda: self._agents_ns("deployments").run(deployment_id)))
+
+    def pause_deployment(self, deployment_id):
+        _retry(lambda: self._agents_ns("deployments").pause(deployment_id))
+        return True
+
+    def unpause_deployment(self, deployment_id):
+        _retry(lambda: self._agents_ns("deployments").unpause(deployment_id))
+        return True
+
+    def archive_deployment(self, deployment_id):
+        """Archive (terminal). Tolerant of already-archived/missing deployments —
+        used at schedule changes and cleanup, where a stale id must not block."""
+        try:
+            _retry(lambda: self._agents_ns("deployments").archive(deployment_id))
+            return True
+        except Exception:                                  # noqa: BLE001
+            return False
+
+    def list_deployment_runs(self, deployment_id):
+        """Every run of one deployment (scheduled + manual), normalized — how Trace
+        learns about platform-initiated sessions."""
+        res = _retry(lambda: self._agents_ns("deployment_runs").list(
+            deployment_id=deployment_id))
+        return [self._drun_dict(r) for r in _data(res)]
 
     def list_pending_approvals(self, session_id):
         """Outbound writes/sends the agent is holding for approval. A held call surfaces as
@@ -417,18 +529,35 @@ class ManagedAgentsClient:
                     out.append(aid)
         return out
 
-    def cleanup(self, session_ids=None, file_ids=None, agent_ids=None, agent_names=None):
-        """Delete the given Trace-created sessions, files, and agents. NEVER called
-        automatically — only from the UI's 'Clean up platform' button. ``agent_names``
-        additionally sweeps any agents the platform still has under this session's
-        workflow names (orphaned/stale duplicates not in the records). Resilient: each
-        delete is isolated and the result reports exactly what was removed and errored."""
+    def cleanup(self, session_ids=None, file_ids=None, agent_ids=None, agent_names=None,
+                deployment_ids=None, memory_store_ids=None):
+        """Delete the given Trace-created sessions, files, agents, deployments, and
+        memory stores. NEVER called automatically — only from the UI's 'Clean up
+        platform' button. ``agent_names`` additionally sweeps any agents the platform
+        still has under this session's workflow names (orphaned/stale duplicates not in
+        the records). Resilient: each delete is isolated and the result reports exactly
+        what was removed and errored."""
         agent_ids = list(agent_ids or [])
         for aid in self._agent_ids_by_name(agent_names):
             if aid not in agent_ids:
                 agent_ids.append(aid)
-        removed = {"sessions": [], "files": [], "agents": []}
+        removed = {"sessions": [], "files": [], "agents": [],
+                   "deployments": [], "memory_stores": []}
         errors = []
+        for did in deployment_ids or []:
+            try:
+                if self.archive_deployment(did):
+                    removed["deployments"].append(did)
+            except Exception as exc:                  # noqa: BLE001
+                errors.append({"kind": "deployment", "id": did,
+                               "error": f"{type(exc).__name__}: {exc}"})
+        for mid in memory_store_ids or []:
+            try:
+                if self.delete_memory_store(mid):
+                    removed["memory_stores"].append(mid)
+            except Exception as exc:                  # noqa: BLE001
+                errors.append({"kind": "memory_store", "id": mid,
+                               "error": f"{type(exc).__name__}: {exc}"})
         for sid in session_ids or []:
             try:
                 _retry(lambda sid=sid: self._agents_ns("sessions").delete(sid))

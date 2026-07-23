@@ -8,6 +8,7 @@ import json
 import os
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -281,6 +282,107 @@ class ActivityEndpointTest(AgentsEndpointTest):
         status, _, _ = self._req("POST", "/api/u/agents/agent-1/approve-actions",
                                  {"pending_ids": [pend[0]["id"]]}, cookie=cookie)
         self.assertEqual(status, 202)
+
+
+class DeploymentAgentActionsTest(AgentsEndpointTest):
+    """Schedule/pause/run-now on an agent backed by a platform DEPLOYMENT re-point
+    the deployment instead of driving the legacy Trace scheduler."""
+
+    def _dep_agent_for(self, uid, agent_id="agent-d"):
+        registry.agent_upsert(self.root, {
+            "agent_id": agent_id, "owner_user_id": uid,
+            "external_user_id": users.external_user_id(uid),
+            "bundle_id": "wf", "name": "WF", "vault_ref": "vlt-1",
+            "trigger": "on a new task", "session_id": "sess-1",
+            "deployment_id": "dep_live", "memory_store_id": "mem_live"})
+
+    def _wire_ma(self):
+        from trace.tests.test_scheduler import FakeMA, FakeConnect
+        ma = FakeMA()
+        ma.list_deployment_runs("boot")                      # init the fake's stores
+        self.state._live_client = lambda: ma
+        self.state.connect_fn = lambda: FakeConnect()
+        return ma
+
+    def test_schedule_set_repoints_deployment(self):
+        uid, cookie = self._signup("dep@x.com")
+        self._dep_agent_for(uid)
+        ma = self._wire_ma()
+        status, data, _ = self._req("POST", "/api/u/agents/agent-d/schedule",
+                                    {"cadence": {"kind": "daily", "time": "09:00"}},
+                                    cookie=cookie)
+        self.assertEqual(status, 200, data)
+        self.assertEqual(ma.archived, ["dep_live"])           # old archived, new created
+        self.assertEqual(ma.created_deployments[0]["schedule"]["expression"], "0 9 * * *")
+        row = next(a for a in registry.agents_all(self.root) if a["agent_id"] == "agent-d")
+        self.assertEqual(row["deployment_id"], ma.created_deployments[0]["id"])
+
+    def test_schedule_clear_creates_manual_deployment(self):
+        uid, cookie = self._signup("dep2@x.com")
+        self._dep_agent_for(uid)
+        ma = self._wire_ma()
+        status, _, _ = self._req("POST", "/api/u/agents/agent-d/schedule",
+                                 {"cadence": None}, cookie=cookie)
+        self.assertEqual(status, 200)
+        self.assertIsNone(ma.created_deployments[0]["schedule"])
+
+    def test_schedule_platform_failure_surfaces_502(self):
+        uid, cookie = self._signup("dep3@x.com")
+        self._dep_agent_for(uid)
+        ma = self._wire_ma()
+        ma.create_deployment = lambda **kw: (_ for _ in ()).throw(
+            RuntimeError("cron expression rejected"))
+        status, data, _ = self._req("POST", "/api/u/agents/agent-d/schedule",
+                                    {"cadence": {"kind": "daily", "time": "09:00"}},
+                                    cookie=cookie)
+        self.assertEqual(status, 502)
+        self.assertEqual(data["error"], "platform_schedule_failed")
+        self.assertIn("cron expression rejected", data["detail"])
+
+    def test_pause_hits_platform(self):
+        uid, cookie = self._signup("dep4@x.com")
+        self._dep_agent_for(uid)
+        ma = self._wire_ma()
+        registry.schedule_set(self.root, "agent-d", uid, {"kind": "daily", "time": "09:00"})
+        status, _, _ = self._req("POST", "/api/u/agents/agent-d/schedule/pause",
+                                 {"paused": True}, cookie=cookie)
+        self.assertEqual(status, 200)
+        self.assertEqual(ma.paused_deps, ["dep_live"])
+        status, _, _ = self._req("POST", "/api/u/agents/agent-d/schedule/pause",
+                                 {"paused": False}, cookie=cookie)
+        self.assertEqual(status, 200)
+        self.assertEqual(ma.unpaused_deps, ["dep_live"])
+
+    def test_run_now_triggers_deployment_run(self):
+        uid, cookie = self._signup("dep5@x.com")
+        self._dep_agent_for(uid)
+        ma = self._wire_ma()
+        status, _, _ = self._req("POST", "/api/u/agents/agent-d/run-now", {}, cookie=cookie)
+        self.assertEqual(status, 202)
+        for _ in range(100):                                  # async thread
+            if ma.manual_runs:
+                break
+            time.sleep(0.02)
+        self.assertEqual(ma.manual_runs, ["dep_live"])
+        self.assertEqual(ma.sessions, [])                     # no legacy session composed
+        runs = registry.runs_for_agent(self.root, "agent-d")
+        self.assertEqual(runs[0]["status"], "ran")
+
+    def test_legacy_agent_run_now_unchanged(self):
+        uid, cookie = self._signup("leg@x.com")
+        registry.agent_upsert(self.root, {
+            "agent_id": "agent-l", "owner_user_id": uid,
+            "external_user_id": users.external_user_id(uid), "bundle_id": "wf",
+            "name": "WF", "vault_ref": "vlt-1", "trigger": "t", "session_id": "s"})
+        ma = self._wire_ma()
+        status, _, _ = self._req("POST", "/api/u/agents/agent-l/run-now", {}, cookie=cookie)
+        self.assertEqual(status, 202)
+        for _ in range(100):
+            if ma.sessions:
+                break
+            time.sleep(0.02)
+        self.assertTrue(ma.sessions)                          # legacy path composed a session
+        self.assertEqual(ma.manual_runs, [])
 
 
 if __name__ == "__main__":

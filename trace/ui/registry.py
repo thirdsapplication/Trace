@@ -64,6 +64,34 @@ def agents_for_user(root, owner_user_id):
                   key=lambda a: a.get("deployed_at") or "", reverse=True)
 
 
+def agents_all(root):
+    """Every deployed agent across all users (admin portal)."""
+    if db.is_configured():
+        return db.agents_all()
+    d = _load(root, "agents.json")
+    return sorted(d.values(), key=lambda a: a.get("deployed_at") or "", reverse=True)
+
+
+def agents_with_deployments(root):
+    """Agents backed by a platform deployment (the sync loop's work list)."""
+    if db.is_configured():
+        return db.agents_with_deployments()
+    d = _load(root, "agents.json")
+    return sorted((a for a in d.values() if a.get("deployment_id")),
+                  key=lambda a: a.get("deployed_at") or "", reverse=True)
+
+
+def agent_set_deployment(root, agent_id, deployment_id):
+    """Point one agent row at a new platform deployment (schedule changes recreate it)."""
+    if db.is_configured():
+        return db.agent_set_deployment(agent_id, deployment_id)
+    with _LOCK:
+        d = _load(root, "agents.json")
+        if agent_id in d:
+            d[agent_id]["deployment_id"] = deployment_id
+            _save(root, "agents.json", d)
+
+
 # --- schedules -------------------------------------------------------------
 def schedule_set(root, agent_id, owner_user_id, cadence, paused=False):
     if db.is_configured():
@@ -151,6 +179,18 @@ def runs_for_agent(root, agent_id, limit=20):
     except FileNotFoundError:
         return []
     return list(reversed(rows))[:limit]
+
+
+def run_seen_drun_ids(root, agent_id):
+    """The deployment_run ids already recorded for one agent (sync-loop dedupe)."""
+    if db.is_configured():
+        return db.run_seen_drun_ids(agent_id)
+    p = os.path.join(_dir(root), f"runs_{_safe(agent_id)}.jsonl")
+    try:
+        with open(p, encoding="utf-8") as f:
+            return {json.loads(line).get("drun_id") for line in f if line.strip()} - {None}
+    except FileNotFoundError:
+        return set()
 
 
 # --- pending (staged) actions — Spec 8 -------------------------------------

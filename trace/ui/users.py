@@ -167,6 +167,16 @@ def external_user_id(user_id):
     return f"trace-user-{user_id}"
 
 
+def list_users():
+    """Every account's public shape + external_user_id (admin portal only; served
+    exclusively through the token-gated admin API). Never returns password material."""
+    if db.is_configured():
+        return [{"user_id": r[0], "email": r[1], "external_user_id": r[2],
+                 "created_at": _iso(r[3])} for r in db.users_all()]
+    return [{**_public(u), "external_user_id": external_user_id(u["user_id"])}
+            for u in _load().values()]
+
+
 # --- login sessions (opaque token <-> user) -------------------------------
 # DB-backed when DATABASE_URL is set (durable across restarts), else in-process.
 def start_session(user_id):

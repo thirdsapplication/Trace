@@ -14,6 +14,8 @@ network: ``AppState.reconstruct_fn`` and ``AppState.controller_factory``.
 
 import argparse
 import calendar
+import collections
+import hmac
 import json
 import os
 import re
@@ -29,13 +31,16 @@ import yaml
 
 from ..capture.controller import CaptureController
 from ..reconstruct import chunking
+from ..reconstruct import reconstruct as reconstruct_mod
 from ..reconstruct.prompt import SYSTEM_PROMPT
 from ..reconstruct.reconstruct import reconstruct as _real_reconstruct
 from ..discovery import scorer as discovery_scorer
 from ..discovery import describe as discovery_describe
+from ..discovery import discover as discover_mod
 from ..discovery.discover import discover as _real_discover
 from ..discovery.discover import load_event_log, render_event_log
 from ..discovery.prompt import SYSTEM_PROMPT as DISCOVERY_SYSTEM_PROMPT
+from ..artifact import artifact as artifact_mod
 from ..artifact import review as artifact_review
 from ..artifact.artifact import build_prompt_material, write_spec_bundle
 from ..artifact.artifact import generate_specs as _real_generate_specs
@@ -79,6 +84,7 @@ def _interview_record(bid, questions, answers):
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")          # founder Test UI
 APP_STATIC_DIR = os.path.join(os.path.dirname(__file__), "app_static")  # end-user UI (WS2)
+ADMIN_STATIC_DIR = os.path.join(os.path.dirname(__file__), "admin_static")  # admin portal
 DISCOVERY_FIXTURES_DIR = os.path.join(
     os.path.dirname(os.path.dirname(__file__)), "discovery", "fixtures")
 SHORT_RECORDING_THRESHOLD = 5  # events; below this, warn before a paid run
@@ -209,13 +215,23 @@ class AppState:
         self.deploy_jobs = {}        # sid -> {state, error, deployed, errors}
         self.scheduler_stop = threading.Event()   # Spec 4: Trace-side scheduler
         self._scheduler_thread = None
+        self._vault_refreshed = {}   # vault_ref -> epoch of last rolling refresh (deployment sync)
+        # Admin portal: live-only LLM prompt log (a bounded in-memory ring; nothing is
+        # persisted — prompts embed capture-derived user data). Served exclusively
+        # through the token-gated /api/admin/ surface.
+        self.prompt_log = collections.deque(maxlen=200)
+        self.prompt_seq = 0
+        self.prompt_lock = threading.Lock()
+        self.started_at = time.time()
         self.lock = threading.Lock()
         os.makedirs(sessions_root, exist_ok=True)
 
-    def _default_cleanup(self, session_ids, file_ids, agent_ids, agent_names=None):
+    def _default_cleanup(self, session_ids, file_ids, agent_ids, agent_names=None,
+                         deployment_ids=None, memory_store_ids=None):
         """Real, human-initiated platform cleanup: requires a key; builds the client and
-        deletes the Trace-created ids it is given, plus any agents the platform still has
-        under this session's workflow names (``agent_names`` — sweeps orphaned/stale ones)."""
+        deletes the Trace-created ids it is given (sessions, files, agents, deployments,
+        memory stores), plus any agents the platform still has under this session's
+        workflow names (``agent_names`` — sweeps orphaned/stale ones)."""
         key = self.keystore.get_key()
         if not key:
             raise RuntimeError("no_api_key")
@@ -223,7 +239,9 @@ class AppState:
         from ..agent.api_client import ManagedAgentsClient
         client = ManagedAgentsClient(api_key=key)
         return client.cleanup(session_ids=session_ids, file_ids=file_ids,
-                              agent_ids=agent_ids, agent_names=agent_names)
+                              agent_ids=agent_ids, agent_names=agent_names,
+                              deployment_ids=deployment_ids,
+                              memory_store_ids=memory_store_ids)
 
     def _default_connect_client(self):
         """Real connection client (Pipedream Connect + MA vault). Requires a key;
@@ -274,7 +292,12 @@ class AppState:
                 def cb(done, total):
                     job["current"], job["total"] = done, total
 
-                log, report = self.reconstruct_fn(raw_path, progress_cb=cb)
+                kw = {}
+                if self.reconstruct_fn is _real_reconstruct:   # tap the real engine's calls
+                    kw["model_fn"] = self._tap(
+                        "reconstruct", sid, reconstruct_mod.DEFAULT_MODEL,
+                        lambda: reconstruct_mod._default_model_fn(reconstruct_mod.DEFAULT_MODEL))
+                log, report = self.reconstruct_fn(raw_path, progress_cb=cb, **kw)
                 with open(sessions.path(self.sessions_root, sid, sessions.EVENT_LOG),
                           "w", encoding="utf-8") as f:
                     json.dump(log, f, indent=2, ensure_ascii=False)
@@ -304,7 +327,12 @@ class AppState:
                 if not key:
                     raise RuntimeError("no_api_key")
                 os.environ["ANTHROPIC_API_KEY"] = key
-                discovery, report = self.discovery_fn(log_path)
+                kw = {}
+                if self.discovery_fn is _real_discover:        # tap the real engine's call
+                    kw["model_fn"] = self._tap(
+                        "discovery", sid, discover_mod.DEFAULT_MODEL,
+                        lambda: discover_mod._default_model_fn(discover_mod.DEFAULT_MODEL))
+                discovery, report = self.discovery_fn(log_path, **kw)
                 with open(sessions.path(self.sessions_root, sid, sessions.DISCOVERY),
                           "w", encoding="utf-8") as f:
                     json.dump(discovery, f, indent=2, ensure_ascii=False)
@@ -332,7 +360,12 @@ class AppState:
                 if not key:
                     raise RuntimeError("no_api_key")
                 os.environ["ANTHROPIC_API_KEY"] = key
-                discovery, report = self.describe_fn(description)
+                kw = {}
+                if self.describe_fn is discovery_describe.describe_workflows:
+                    kw["model_fn"] = self._tap(       # tap the real engine's call
+                        "describe", sid, discover_mod.DEFAULT_MODEL,
+                        lambda: discover_mod._default_model_fn(discover_mod.DEFAULT_MODEL))
+                discovery, report = self.describe_fn(description, **kw)
                 _write_json(sessions.path(self.sessions_root, sid, sessions.EVENT_LOG), [])
                 _write_json(sessions.path(self.sessions_root, sid, sessions.DISCOVERY),
                             discovery)
@@ -367,7 +400,12 @@ class AppState:
                 if key:
                     os.environ["ANTHROPIC_API_KEY"] = key
 
-                results, report = self.artifact_fn(reviewed_path, event_log_path)
+                kw = {}
+                if self.artifact_fn is _real_generate_specs:   # tap the real engine's calls
+                    kw["model_fn"] = self._tap(
+                        "specs", sid, artifact_mod.DEFAULT_MODEL,
+                        lambda: artifact_mod._default_model_fn(artifact_mod.DEFAULT_MODEL))
+                results, report = self.artifact_fn(reviewed_path, event_log_path, **kw)
                 specs_dir = sessions.path(self.sessions_root, sid, sessions.SPECS_DIR)
                 if os.path.isdir(specs_dir):    # clear stale specs + their _files/ bundles
                     shutil.rmtree(specs_dir)
@@ -397,38 +435,66 @@ class AppState:
             out.append({"id": b["id"], "name": b.get("name") or b["id"], "built": built})
         return out
 
-    def _build_model_fn(self):
-        """A Sonnet caller from the saved key, for the interview + config engines.
-        Raises ``no_api_key`` when no key is saved. The ``anthropic`` client is built
-        lazily on first call, so injected stubs that never call it run without the SDK."""
-        key = self.keystore.get_key()
-        if not key:
-            raise RuntimeError("no_api_key")
-        os.environ["ANTHROPIC_API_KEY"] = key
+    _PROMPT_CLIP = 20_000        # per-field cap so 200 entries stay bounded in memory
+
+    def _clip(self, text):
+        s = "" if text is None else str(text)
+        return s if len(s) <= self._PROMPT_CLIP else s[:self._PROMPT_CLIP] + "\n… [truncated]"
+
+    def _tap(self, engine, sid, model, make_fn):
+        """Wrap a model caller so every (system, user) -> response is recorded in the
+        in-memory prompt log for the admin portal. ``make_fn()`` builds the real caller
+        lazily on first use (preserving the lazy-SDK property of the default builders).
+        Errors are recorded AND re-raised — the tap never changes behavior."""
         holder = {}
 
         def call(system, user):
             if "fn" not in holder:
-                holder["fn"] = agent_configgen._default_model_fn(agent_configgen.DEFAULT_MODEL)
-            return holder["fn"](system, user)
+                holder["fn"] = make_fn()
+            t0 = time.monotonic()
+            entry = {"ts": sessions._now(), "engine": engine, "sid": sid, "model": model,
+                     "system": self._clip(system), "user": self._clip(user),
+                     "response": None, "error": None, "ms": None}
+            try:
+                out = holder["fn"](system, user)
+                entry["response"] = self._clip(out)
+                return out
+            except Exception as e:                        # noqa: BLE001
+                entry["error"] = f"{type(e).__name__}: {e}"
+                raise
+            finally:
+                entry["ms"] = int((time.monotonic() - t0) * 1000)
+                with self.prompt_lock:
+                    self.prompt_seq += 1
+                    entry["seq"] = self.prompt_seq
+                    self.prompt_log.append(entry)
         return call
+
+    def _build_model_fn(self, engine="config", sid=None):
+        """A Sonnet caller from the saved key, for the interview + config engines.
+        Raises ``no_api_key`` when no key is saved. The ``anthropic`` client is built
+        lazily on first call, so injected stubs that never call it run without the SDK.
+        Every call is recorded in the admin prompt log."""
+        key = self.keystore.get_key()
+        if not key:
+            raise RuntimeError("no_api_key")
+        os.environ["ANTHROPIC_API_KEY"] = key
+        return self._tap(engine, sid, agent_configgen.DEFAULT_MODEL,
+                         lambda: agent_configgen._default_model_fn(agent_configgen.DEFAULT_MODEL))
 
     def _summarize_model_fn(self):
         """The injected summarizer if present (tests), else a lazy Haiku caller from the
-        saved key. Raises ``no_api_key`` only if it actually needs to call the model."""
+        saved key. Raises ``no_api_key`` only if it actually needs to call the model.
+        Either way the call is recorded in the admin prompt log."""
         if self.summarize_fn:
-            return self.summarize_fn
+            return self._tap("activity", None, agent_config.SUMMARY_MODEL,
+                             lambda: self.summarize_fn)
         key = self.keystore.get_key()
         if not key:
             raise RuntimeError("no_api_key")
         os.environ["ANTHROPIC_API_KEY"] = key
-        holder = {}
-
-        def call(system, user):
-            if "fn" not in holder:
-                holder["fn"] = agent_configgen._default_model_fn(agent_config.SUMMARY_MODEL)
-            return holder["fn"](system, user)
-        return call
+        return self._tap("activity", None, agent_config.SUMMARY_MODEL,
+                         lambda: agent_configgen._default_model_fn(agent_config.SUMMARY_MODEL))
 
     def agent_activity(self, agent, limit=10):
         """The agent's recent runs as REAL session activity: for each run's session id,
@@ -548,7 +614,7 @@ class AppState:
                 approved, event_log = self._approved_for_stage4(sid)
                 if selected_ids is not None:
                     approved = [b for b in approved if b["id"] in set(selected_ids)]
-                model_fn = self._build_model_fn() if approved else None
+                model_fn = self._build_model_fn("interview", sid) if approved else None
                 for b in approved:
                     questions = self.interview_fn(b, event_log, model_fn=model_fn)["questions"]
                     # preserve any prior answer whose question id still maps
@@ -631,7 +697,7 @@ class AppState:
                 if selected_ids is not None:
                     approved = [b for b in approved if b["id"] in set(selected_ids)]
                 os.makedirs(specs_dir, exist_ok=True)
-                model_fn = self._build_model_fn() if approved else None
+                model_fn = self._build_model_fn("config", sid) if approved else None
                 for b in approved:
                     bid = b["id"]
                     try:
@@ -663,17 +729,22 @@ class AppState:
         under this session's workflow names (orphaned/stale duplicates from earlier
         rounds — e.g. test-era agents). Returns the removal summary."""
         session_ids, file_ids, agent_ids = [], [], []
+        deployment_ids, memory_store_ids = [], []
         # the agent names Trace uses for this session's bundles (matches configgen's
         # _envelope: name -> bundle name/id), so the sweep can reach stale duplicates.
         approved, _ = self._approved_for_stage4(sid)
         agent_names = list(dict.fromkeys(
             str(b.get("name") or b.get("id") or "Agent").strip() for b in approved))
-        # live deploy records (Phase 6): the live sessions + agents
+        # live deploy records (Phase 6): the live sessions + agents + deployments + memory
         for d in sessions.list_deploy_records(self.sessions_root, sid):
             if d.get("session_id"):
                 session_ids.append(d["session_id"])
             if d.get("agent_id"):
                 agent_ids.append(d["agent_id"])
+            if d.get("deployment_id"):
+                deployment_ids.append(d["deployment_id"])
+            if d.get("memory_store_id"):
+                memory_store_ids.append(d["memory_store_id"])
         # any manual-eval run records (dormant path)
         for r in sessions.list_runs(self.sessions_root, sid):
             for s in r.get("sessions", []):
@@ -686,9 +757,22 @@ class AppState:
         session_ids = list(dict.fromkeys(session_ids))
         file_ids = list(dict.fromkeys(file_ids))
         agent_ids = list(dict.fromkeys(agent_ids))
-        result = self.cleanup_fn(session_ids, file_ids, agent_ids, agent_names=agent_names)
+        deployment_ids = list(dict.fromkeys(deployment_ids))
+        memory_store_ids = list(dict.fromkeys(memory_store_ids))
+        kw = {}
+        if deployment_ids:
+            kw["deployment_ids"] = deployment_ids
+        if memory_store_ids:
+            kw["memory_store_ids"] = memory_store_ids
+        try:
+            result = self.cleanup_fn(session_ids, file_ids, agent_ids,
+                                     agent_names=agent_names, **kw)
+        except TypeError:          # injected stub with the pre-deployment signature
+            result = self.cleanup_fn(session_ids, file_ids, agent_ids, agent_names=agent_names)
         return {"requested": {"sessions": session_ids, "files": file_ids,
-                              "agents": agent_ids, "agent_names": agent_names},
+                              "agents": agent_ids, "agent_names": agent_names,
+                              "deployments": deployment_ids,
+                              "memory_stores": memory_store_ids},
                 **(result or {})}
 
     def delete_capture_data(self, sid, owner_user_id):
@@ -880,6 +964,20 @@ class AppState:
                         if rec.get("status") == "live" and rec.get("agent_id"):
                             owner = (sessions.read_meta(root, sid) or {}).get("owner_user_id")
                             if owner:
+                                # A redeploy deleted+recreated the agent, stranding any
+                                # prior deployment — archive it so the Console stays clean.
+                                try:
+                                    prior = next(
+                                        (a for a in registry.agents_for_user(root, owner)
+                                         if a.get("bundle_id") == bid
+                                         and a.get("deployment_id")
+                                         and a.get("deployment_id") != rec.get("deployment_id")),
+                                        None)
+                                    if prior:
+                                        self._live_client().archive_deployment(
+                                            prior["deployment_id"])
+                                except Exception:          # noqa: BLE001 — best-effort
+                                    pass
                                 registry.agent_upsert(root, {
                                     "agent_id": rec["agent_id"], "owner_user_id": owner,
                                     "external_user_id": rec.get("external_user_id"),
@@ -887,7 +985,9 @@ class AppState:
                                     "vault_ref": rec.get("vault_ref"),
                                     "trigger": (rec.get("start") or {}).get("value"),
                                     "session_id": sid,
-                                    "staged_apps": rec.get("staged_apps") or []})
+                                    "staged_apps": rec.get("staged_apps") or [],
+                                    "deployment_id": rec.get("deployment_id"),
+                                    "memory_store_id": rec.get("memory_store_id")})
                         job["deployed"] += 1
                     except Exception as e:
                         job["errors"][bid] = f"{type(e).__name__}: {e}"
@@ -948,12 +1048,115 @@ class AppState:
         self._scheduler_thread.start()
 
     def run_due_schedules(self, now=None):
-        """One scheduler pass: run every active schedule whose cadence is due. Pure
-        of any thread/HTTP state so it's unit-testable directly."""
+        """One scheduler pass: run every due LEGACY schedule (agents without a platform
+        deployment — the platform crons deployment agents itself, so running them here
+        would double-fire), then sync platform-initiated deployment runs into the run
+        log. Pure of any thread/HTTP state so it's unit-testable directly."""
         now = time.time() if now is None else now
         for agent in registry.schedule_list_active(self.sessions_root):
+            if agent.get("deployment_id"):
+                continue
             if agent_runner.schedule_due(agent.get("cadence"), agent.get("last_run_epoch"), now):
                 self.run_agent(agent)
+        self.sync_deployment_runs(now)
+
+    # Rolling vault-refresh throttle: platform cron fires without Trace in the loop,
+    # and the Pipedream dev token lives ~1h — refreshing each deployment agent's vault
+    # at most every 30 min keeps the credential inside its TTL for whenever a run fires.
+    VAULT_REFRESH_SECONDS = 30 * 60
+
+    def sync_deployment_runs(self, now=None):
+        """Deployment sync pass: for every agent backed by a platform deployment,
+        (a) keep its vault token fresh (throttled), and (b) harvest deployment_runs
+        Trace hasn't seen into the run log (keyed by drun_id), so the activity view —
+        and its proposal/staging extraction, which reads the real session events by
+        run_session_id — covers platform-initiated runs. Per-agent failures never
+        kill the pass."""
+        now = time.time() if now is None else now
+        agents = registry.agents_with_deployments(self.sessions_root)
+        if not agents:
+            return
+        for agent in agents:
+            try:
+                vault_ref = agent.get("vault_ref")
+                last = self._vault_refreshed.get(vault_ref, 0)
+                if vault_ref and now - last >= self.VAULT_REFRESH_SECONDS:
+                    self._refresh_agent_binding(agent)
+                    self._vault_refreshed[vault_ref] = now
+                client = self._live_client()
+                agent_id = agent.get("agent_id")
+                seen = registry.run_seen_drun_ids(self.sessions_root, agent_id)
+                fresh = False
+                for drun in client.list_deployment_runs(agent.get("deployment_id")):
+                    if not drun.get("id") or drun["id"] in seen:
+                        continue
+                    if drun.get("error_type"):
+                        status = "failed"
+                        summary = (f"Scheduled run couldn't start: "
+                                   f"{drun.get('error_message') or drun['error_type']}")
+                    else:
+                        status = "ran"
+                        summary = "Scheduled run started — open Activity for what it did."
+                    registry.run_add(self.sessions_root, {
+                        "agent_id": agent_id, "owner_user_id": agent.get("owner_user_id"),
+                        "status": status, "summary": summary, "details": [],
+                        "run_session_id": drun.get("session_id"), "drun_id": drun["id"]})
+                    fresh = True
+                if fresh:
+                    registry.schedule_mark_run(self.sessions_root, agent_id)
+            except Exception:                              # noqa: BLE001
+                pass                                       # one bad agent never kills the pass
+
+    def run_deployment_now(self, agent):
+        """Manual run of a deployment-backed agent: refresh the vault, trigger a
+        platform run, and record it. Never raises (a failure becomes a failed run)."""
+        self._refresh_agent_binding(agent)
+        self._vault_refreshed[agent.get("vault_ref")] = time.time()
+        try:
+            drun = self._live_client().run_deployment(agent.get("deployment_id"))
+            if drun.get("error_type"):
+                rec = {"status": "failed",
+                       "summary": (f"Couldn't start the run: "
+                                   f"{drun.get('error_message') or drun['error_type']}"),
+                       "run_session_id": drun.get("session_id"), "drun_id": drun.get("id")}
+            else:
+                rec = {"status": "ran",
+                       "summary": "Run started — open Activity for what it did.",
+                       "run_session_id": drun.get("session_id"), "drun_id": drun.get("id")}
+        except Exception as e:                              # noqa: BLE001
+            rec = {"status": "failed", "summary": f"Couldn't start the run: {type(e).__name__}",
+                   "run_session_id": None, "drun_id": None}
+        registry.run_add(self.sessions_root, {
+            "agent_id": agent.get("agent_id"), "owner_user_id": agent.get("owner_user_id"),
+            "status": rec["status"], "summary": rec["summary"], "details": [],
+            "run_session_id": rec.get("run_session_id"), "drun_id": rec.get("drun_id")})
+        registry.schedule_mark_run(self.sessions_root, agent.get("agent_id"))
+        return rec
+
+    def apply_platform_schedule(self, agent, cadence):
+        """Re-point a deployment agent at the requested cadence. Deployments are
+        immutable, so this ARCHIVES the current one and creates a fresh one — cron for
+        daily/weekly (config.cadence_to_cron), or a manual deployment when ``cadence``
+        is None/unmappable so Run-now keeps working. Raises on platform rejection (the
+        caller surfaces the real error rather than phantom-succeeding)."""
+        client = self._live_client()
+        old_id = agent.get("deployment_id")
+        if old_id:
+            client.archive_deployment(old_id)              # tolerant of already-archived
+        trigger_text = agent_deploy.build_deployment_trigger(
+            agent.get("trigger"), [s for s in (agent.get("staged_apps") or []) if s])
+        store_id = agent.get("memory_store_id")
+        new_id = client.create_deployment(
+            name=f"trace-{agent.get('bundle_id') or agent.get('agent_id')}",
+            agent_id=agent.get("agent_id"),
+            environment_id=client.create_environment(),
+            trigger_text=trigger_text,
+            schedule=agent_config.cadence_to_cron(cadence) if cadence else None,
+            resources=[agent_config.memory_resource(store_id)] if store_id else None,
+            vault_ids=[agent.get("vault_ref")] if agent.get("vault_ref") else None,
+            metadata={"trace_bundle_id": str(agent.get("bundle_id") or "")})
+        registry.agent_set_deployment(self.sessions_root, agent.get("agent_id"), new_id)
+        return new_id
 
     def _refresh_agent_binding(self, agent):
         """Re-mint + rotate the Pipedream token in the agent's vault before a
@@ -1106,7 +1309,7 @@ def make_handler(state):
             length = int(self.headers.get("Content-Length", 0) or 0)
             body = self.rfile.read(length) if length else None
             fwd = {}
-            for h in ("Cookie", "Content-Type", "Accept"):
+            for h in ("Cookie", "Content-Type", "Accept", "X-Admin-Token"):
                 if self.headers.get(h):
                     fwd[h] = self.headers.get(h)
             try:
@@ -1163,7 +1366,7 @@ def make_handler(state):
             length = int(self.headers.get("Content-Length", 0) or 0)
             body = self.rfile.read(length) if length else None
             fwd = {}
-            for h in ("Cookie", "Content-Type", "Accept"):
+            for h in ("Cookie", "Content-Type", "Accept", "X-Admin-Token"):
                 if self.headers.get(h):
                     fwd[h] = self.headers.get(h)
             try:
@@ -1275,18 +1478,42 @@ def make_handler(state):
                 cadence = (body or {}).get("cadence")
                 if cadence is None:                       # null cadence = turn scheduling off
                     registry.schedule_clear(root, agent_id)
-                    return self._json(200, {"schedule": None})
-                registry.schedule_set(root, agent_id, user["user_id"], cadence, paused=False)
+                else:
+                    registry.schedule_set(root, agent_id, user["user_id"], cadence, paused=False)
+                # Deployment agents: the platform schedules them — re-point the
+                # deployment at the new cadence (archive + create; deployments are
+                # immutable). A platform rejection is surfaced, never phantom-succeeded.
+                if agent.get("deployment_id"):
+                    try:
+                        state.apply_platform_schedule(agent, cadence)
+                    except Exception as e:                # noqa: BLE001
+                        return self._json(502, {"error": "platform_schedule_failed",
+                                                "detail": f"{type(e).__name__}: {e}"})
                 return self._json(200, {"schedule": registry.schedule_get(root, agent_id)})
             if action == "schedule/pause":
                 s = registry.schedule_get(root, agent_id)
                 if not s:
                     return self._json(404, {"error": "no_schedule"})
+                paused = bool((body or {}).get("paused", True))
                 registry.schedule_set(root, agent_id, user["user_id"], s["cadence"],
-                                      paused=bool((body or {}).get("paused", True)))
+                                      paused=paused)
+                if agent.get("deployment_id"):
+                    try:
+                        client = state._live_client()
+                        if paused:
+                            client.pause_deployment(agent["deployment_id"])
+                        else:
+                            client.unpause_deployment(agent["deployment_id"])
+                    except Exception as e:                # noqa: BLE001
+                        return self._json(502, {"error": "platform_schedule_failed",
+                                                "detail": f"{type(e).__name__}: {e}"})
                 return self._json(200, {"schedule": registry.schedule_get(root, agent_id)})
             if action == "run-now":
-                threading.Thread(target=lambda: state.run_agent(agent), daemon=True).start()
+                if agent.get("deployment_id"):
+                    threading.Thread(target=lambda: state.run_deployment_now(agent),
+                                     daemon=True).start()
+                else:                                     # legacy (pre-deployment) agent
+                    threading.Thread(target=lambda: state.run_agent(agent), daemon=True).start()
                 return self._json(202, {"state": "running"})
             return self._json(404, {"error": "not_found"})
 
@@ -1459,6 +1686,28 @@ def make_handler(state):
                 return self._serve_app("index.html")
             if p.startswith("/app/"):
                 return self._serve_app(p[len("/app/"):])
+            if p == "/admin" or p == "/admin/":             # admin portal (data is token-gated)
+                return self._serve_admin("index.html")
+            if p.startswith("/admin/"):
+                return self._serve_admin(p[len("/admin/"):])
+            if p.startswith("/api/admin/"):                 # token-gated admin API (GET-only)
+                err = self._admin_gate()
+                if err is not None:
+                    return err
+                rest = p[len("/api/admin"):]
+                if rest == "/overview":
+                    return self._admin_overview()
+                if rest == "/accounts":
+                    return self._admin_accounts()
+                if rest == "/pipeline":
+                    return self._admin_pipeline()
+                if rest == "/prompts":
+                    q = urllib.parse.parse_qs(self.path.split("?", 1)[1]) \
+                        if "?" in self.path else {}
+                    return self._admin_prompts(q)
+                if rest == "/architecture":
+                    return self._admin_architecture()
+                return self._json(404, {"error": "not_found"})
             if p == "/api/auth/me":                         # WS3
                 return self._json(200, {"user": self._current_user(),
                                         "signup_enabled": _signup_enabled()})
@@ -1598,6 +1847,142 @@ def make_handler(state):
             with open(full, "rb") as f:
                 self._text(200, f.read(), _CONTENT_TYPES.get(ext, "application/octet-stream"),
                            no_cache=True)
+
+        def _serve_admin(self, rel):
+            """Serve the admin portal from admin_static/ (same SPA fallback + no-store
+            as the end-user UI). The PAGE is public; every /api/admin/* data call it
+            makes is token-gated — so serving the shell leaks nothing."""
+            rel = (rel or "").lstrip("/") or "index.html"
+            full = os.path.normpath(os.path.join(ADMIN_STATIC_DIR, rel))
+            if not full.startswith(ADMIN_STATIC_DIR) or not os.path.isfile(full):
+                full = os.path.join(ADMIN_STATIC_DIR, "index.html")
+            if not os.path.isfile(full):
+                return self._json(404, {"error": "not_found"})
+            ext = os.path.splitext(full)[1]
+            with open(full, "rb") as f:
+                self._text(200, f.read(), _CONTENT_TYPES.get(ext, "application/octet-stream"),
+                           no_cache=True)
+
+        # --- admin portal API (token-gated; GET-only; never unauthenticated) ---
+        def _admin_gate(self):
+            """403 unless the request carries the exact TRACE_ADMIN_TOKEN. Fail closed:
+            with the env var unset the whole admin surface is disabled. Constant-time
+            compare. Returns an error response to send, or None to proceed."""
+            expected = (os.environ.get("TRACE_ADMIN_TOKEN") or "").strip()
+            if not expected:
+                return self._json(403, {"error": "admin_disabled"})
+            supplied = (self.headers.get("X-Admin-Token") or "").strip()
+            if not hmac.compare_digest(supplied.encode(), expected.encode()):
+                return self._json(403, {"error": "forbidden"})
+            return None
+
+        def _admin_overview(self):
+            sched = state._scheduler_thread
+            return self._json(200, {
+                "users": len(users.list_users()),
+                "agents": len(registry.agents_all(root)),
+                "sessions": len(sessions.list_sessions(root)),
+                "db_mode": "postgres" if db.is_configured() else "files",
+                "scheduler_alive": bool(sched and sched.is_alive()),
+                "cloud_backend": state.cloud_backend,
+                "signup_enabled": _signup_enabled(),
+                "prompt_entries": len(state.prompt_log),
+                "uptime_s": int(time.time() - state.started_at)})
+
+        def _admin_accounts(self):
+            """Every account with its sessions, agents (schedule + recent runs), and
+            pending count — the whole platform at a glance."""
+            all_sessions = sessions.list_sessions(root)
+            all_agents = registry.agents_all(root)
+            out = []
+            for u in users.list_users():
+                uid = u["user_id"]
+                mine_sessions = [
+                    {"id": s.get("id"), "label": s.get("label"),
+                     "created_at": s.get("created_at"), "described": bool(s.get("described")),
+                     "artifacts": {k: bool(v) for k, v in (s.get("artifacts") or {}).items()
+                                   if k in ("raw", "event_log", "discovery", "reviewed", "specs")},
+                     "deploy_at": s.get("deploy_at")}
+                    for s in all_sessions if s.get("owner_user_id") == uid]
+                mine_agents = []
+                for a in all_agents:
+                    if a.get("owner_user_id") != uid:
+                        continue
+                    aid = a.get("agent_id")
+                    mine_agents.append({
+                        "agent_id": aid, "name": a.get("name"),
+                        "bundle_id": a.get("bundle_id"),
+                        "deployed_at": a.get("deployed_at"),
+                        "deployment_id": a.get("deployment_id"),
+                        "memory_store_id": a.get("memory_store_id"),
+                        "staged_apps": a.get("staged_apps") or [],
+                        "schedule": registry.schedule_get(root, aid),
+                        "recent_runs": registry.runs_for_agent(root, aid, 5)})
+                out.append({"user": u, "sessions": mine_sessions, "agents": mine_agents,
+                            "pending_count": registry.pending_count_for_user(root, uid)})
+            return self._json(200, {"accounts": out})
+
+        def _admin_pipeline(self):
+            """Live snapshot of every in-process pipeline job, merged per session id —
+            the real-time 'follow the agent creation process' feed."""
+            stages = {"capture": None, "reconstruct": state.recon_jobs,
+                      "discover": state.discover_jobs, "describe": state.describe_jobs,
+                      "specs": state.spec_jobs, "interview": state.interview_jobs,
+                      "build": state.build_jobs, "connect": state.connection_jobs,
+                      "deploy": state.deploy_jobs}
+            by_sid = {}
+            for stage, jobs in stages.items():
+                for sid, job in (jobs or {}).items():
+                    by_sid.setdefault(sid, {})[stage] = job
+            meta = {sid: {"owner_user_id": (sessions.read_meta(root, sid) or {}).get("owner_user_id"),
+                          "label": (sessions.read_meta(root, sid) or {}).get("label")}
+                    for sid in by_sid}
+            return self._json(200, {"sessions": by_sid, "meta": meta,
+                                    "capture": state.current_sid})
+
+        def _admin_prompts(self, query):
+            try:
+                since = int((query.get("since") or ["0"])[0])
+            except (TypeError, ValueError):
+                since = 0
+            with state.prompt_lock:
+                entries = [e for e in state.prompt_log if e.get("seq", 0) > since]
+                latest = state.prompt_seq
+            return self._json(200, {"entries": entries, "latest_seq": latest})
+
+        def _admin_architecture(self):
+            """The system map, with live annotations so the diagram reflects THIS
+            running instance. Static content otherwise — no secrets."""
+            return self._json(200, {
+                "components": [
+                    {"id": "desktop", "label": "Desktop app (Tauri + trace-node sidecar)",
+                     "detail": "Local capture; proxies auth + pipeline to the cloud",
+                     "connects_to": ["cloud", "extension", "collector"]},
+                    {"id": "extension", "label": "Chrome extension",
+                     "detail": "Browser half of capture (clicks, targets, structured reads)",
+                     "connects_to": ["collector"]},
+                    {"id": "collector", "label": "Capture collector (127.0.0.1:8137)",
+                     "detail": "Merges browser + local events into raw_events.jsonl (redacted)",
+                     "connects_to": []},
+                    {"id": "cloud", "label": "Cloud node (Render)",
+                     "detail": "Pipeline engines, scheduler + deployment sync, this admin API",
+                     "connects_to": ["postgres", "anthropic", "pipedream"],
+                     "live": {"db_mode": "postgres" if db.is_configured() else "files",
+                              "scheduler_alive": bool(state._scheduler_thread
+                                                      and state._scheduler_thread.is_alive())}},
+                    {"id": "postgres", "label": "Postgres (Render managed)",
+                     "detail": "Accounts, login sessions, agents, schedules, runs, pending",
+                     "connects_to": []},
+                    {"id": "anthropic", "label": "Anthropic Managed Agents",
+                     "detail": "Agents, deployments (manual/cron), sessions, memory stores, vaults",
+                     "connects_to": ["pipedream"]},
+                    {"id": "pipedream", "label": "Pipedream Connect (MCP)",
+                     "detail": "OAuth to the customer's apps; per-customer MCP servers",
+                     "connects_to": []},
+                ],
+                "pipeline": ["capture", "reconstruct", "discover | describe", "review",
+                             "questions (mandatory)", "build", "connect", "deploy",
+                             "runs + approvals + memory"]})
 
         # --- settings ---
         def _save_key(self, body):

@@ -37,6 +37,14 @@ services:
       # invent one); Phase 2 uses it to sign restart-surviving sessions.
       - key: SESSION_SECRET
         generateValue: true
+      # Admin portal token — any long random string; leave BLANK/unset to keep the
+      # admin portal disabled (it fails closed).
+      - key: TRACE_ADMIN_TOKEN
+        sync: false
+      # IANA timezone for scheduled deployments' cron (e.g. America/New_York —
+      # the default when unset). "Daily · 9am" fires at 9am in this zone.
+      - key: TRACE_SCHEDULE_TZ
+        sync: false
       # Postgres connection string — wired automatically from the database below.
       - key: DATABASE_URL
         fromDatabase:

@@ -139,6 +139,109 @@ STAGING_DIRECTIVE = (
     "```\n")
 
 
+# --- Per-agent memory store (Managed Agents memory beta) ---------------------
+# Every deployed agent gets ONE memory store (created-or-REUSED by name, so redeploys
+# never wipe accumulated lessons) holding two documents the agent maintains itself.
+# The store is attached at deployment/session creation via a memory_store resource
+# and mounts at /mnt/memory/<store-name>/ where the agent uses ordinary file tools.
+# Beta shape — confirm against current Managed Agents memory docs.
+MEMORY_STATUS_DOC = "/current_workflow_status.md"
+MEMORY_LESSONS_DOC = "/lessons_learned.md"
+
+MEMORY_STATUS_SEED = (
+    "# Current workflow status\n\n"
+    "No runs yet. After each session the agent rewrites this file to reflect the "
+    "workflow's current state.\n\n"
+    "## Items processed\n\n(none yet)\n\n"
+    "## Items pending / in flight\n\n(none yet)\n\n"
+    "## Anomalies / needs attention\n\n(none yet)\n\n"
+    "## Next expected action\n\n(first run has not happened yet)\n")
+
+MEMORY_LESSONS_SEED = (
+    "# Lessons learned\n\n"
+    "Durable, generalizable lessons this agent has accumulated across sessions. "
+    "The agent appends here at the end of each session — corrections, confirmed "
+    "approaches, and edge cases; never routine run logs.\n")
+
+MEMORY_STORE_DESCRIPTION = (
+    "Persistent workflow memory for this Trace agent: current_workflow_status.md "
+    "(the workflow's live state) and lessons_learned.md (accumulated lessons). "
+    "Read both before starting work.")
+
+# Instruction appended to every deployment's initial message set (and to approval-
+# execution instructions), telling the agent to maintain its two memory documents.
+# NEVER asks for secrets in memory — the platform forbids credentials in memory stores.
+MEMORY_UPDATE_DIRECTIVE = (
+    "MEMORY — you have a persistent memory directory mounted under /mnt/memory/ "
+    "containing current_workflow_status.md and lessons_learned.md.\n"
+    "At the START of this session: read both files and factor them into how you work "
+    "(the status file tells you where the workflow stands; the lessons file tells you "
+    "what has already been learned the hard way).\n"
+    "At the END of this session, before finishing: carefully analyze everything that "
+    "happened in this session, then\n"
+    "1. REWRITE current_workflow_status.md so it accurately reflects the workflow's "
+    "current state — items processed this session, items pending or in flight, any "
+    "anomalies or things a human should look at, and the next expected action; and\n"
+    "2. APPEND to lessons_learned.md any durable, generalizable lessons from this "
+    "session — corrections you had to make, approaches that were confirmed to work, "
+    "edge cases and how to handle them. Do not append routine run logs; only lessons "
+    "that will make future sessions better.\n"
+    "Keep each file concise and well under 100KB (prune superseded content when "
+    "rewriting). NEVER write credentials, tokens, API keys, or any secret into memory.")
+
+
+def memory_store_name(bundle_id, external_user_id):
+    """The per-agent memory store name: stable across redeploys (create-or-reuse keys
+    on it) and unique per customer+workflow."""
+    return f"trace-{bundle_id}-{external_user_id}"[:100]
+
+
+def memory_resource(memory_store_id):
+    """The session/deployment ``resources`` entry attaching the agent's memory store
+    read-write. Beta shape — confirm against current Managed Agents memory docs."""
+    return {"type": "memory_store", "memory_store_id": memory_store_id,
+            "access": "read_write",
+            "instructions": MEMORY_STORE_DESCRIPTION}
+
+
+# --- Platform (deployment) scheduling ---------------------------------------
+# Scheduled deployments use platform cron with an explicit IANA timezone; one zone
+# for the whole install (per-user timezones are future work). Default US Eastern per
+# the founder's choice; override with TRACE_SCHEDULE_TZ on the server.
+TRACE_SCHEDULE_TZ = (os.environ.get("TRACE_SCHEDULE_TZ") or "").strip() or "America/New_York"
+
+
+def _cadence_time(cadence):
+    """(hh, mm) from a cadence dict's "time", tolerant like runner.schedule_due."""
+    try:
+        hh, mm = str((cadence or {}).get("time", "09:00")).split(":")
+        return int(hh), int(mm)
+    except (ValueError, AttributeError):
+        return 9, 0
+
+
+def cadence_to_cron(cadence):
+    """Map a Trace schedule cadence to a platform cron schedule, or None when the
+    cadence has no platform mapping (manual, or the legacy ``interval`` kind, which
+    stays on the Trace-side scheduler). Trace weekday 0=Monday..6=Sunday maps to cron
+    0=Sunday..6=Saturday via (weekday+1)%7."""
+    kind = (cadence or {}).get("kind")
+    hh, mm = _cadence_time(cadence)
+    if kind == "daily":
+        expr = f"{mm} {hh} * * *"
+    elif kind == "weekly":
+        try:
+            weekday = int((cadence or {}).get("weekday", 0))
+        except (TypeError, ValueError):
+            weekday = 0
+        expr = f"{mm} {hh} * * {(weekday + 1) % 7}"
+    elif kind == "hourly":                     # legacy cadence, still mappable
+        expr = "0 * * * *"
+    else:
+        return None
+    return {"expression": expr, "timezone": TRACE_SCHEDULE_TZ}
+
+
 # Observed-app substring -> Pipedream app {slug, label}. Domain-neutral; same match
 # idiom as APP_MCP_TABLE. Apps with no row are surfaced as 'unmapped', never guessed.
 # The exact Pipedream slugs are placeholders — confirm against the Pipedream app registry.

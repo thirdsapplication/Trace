@@ -67,6 +67,8 @@ CREATE TABLE IF NOT EXISTS agents (
     trigger          TEXT,
     session_id       TEXT,
     staged_apps      TEXT,                  -- Spec 8: JSON list of app slugs staged for approval
+    deployment_id    TEXT,                  -- MA platform deployment (manual or cron-scheduled)
+    memory_store_id  TEXT,                  -- MA per-agent memory store (status + lessons docs)
     deployed_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS agents_owner_idx ON agents (owner_user_id);
@@ -102,10 +104,11 @@ CREATE TABLE IF NOT EXISTS agent_runs (
     agent_id       TEXT NOT NULL,
     owner_user_id  TEXT NOT NULL,
     ran_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
-    status         TEXT NOT NULL,         -- completed | failed | needs_approval
+    status         TEXT NOT NULL,         -- completed | failed | needs_approval | ran
     summary        TEXT,
     details        TEXT,                  -- JSON list of in-Trace action labels
-    run_session_id TEXT
+    run_session_id TEXT,
+    drun_id        TEXT                   -- MA deployment_run id (platform-initiated runs)
 );
 CREATE INDEX IF NOT EXISTS agent_runs_agent_idx ON agent_runs (agent_id, ran_at DESC);
 
@@ -170,6 +173,10 @@ def init_db():
             cur.execute("ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS details TEXT")
             # Spec 8: add the staged-apps column to agents tables created before it.
             cur.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS staged_apps TEXT")
+            # MA deployments + per-agent memory (idempotent; no-op on fresh schemas).
+            cur.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS deployment_id TEXT")
+            cur.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS memory_store_id TEXT")
+            cur.execute("ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS drun_id TEXT")
         conn.commit()
     return True
 
@@ -208,6 +215,15 @@ def user_by_id(user_id):
         return cur.fetchone()
 
 
+def users_all():
+    """Every account (admin portal): (user_id, email, external_user_id, created_at)
+    rows — never the password hash."""
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT user_id, email, external_user_id, created_at "
+                    "FROM users ORDER BY created_at")
+        return cur.fetchall()
+
+
 def auth_start(token, user_id, ttl_seconds):
     """Persist a login token with a TTL so the session survives a restart."""
     with connect() as conn, conn.cursor() as cur:
@@ -236,7 +252,8 @@ def auth_end(token):
 # trace/ui/registry.py, which calls these only when is_configured().
 
 _AGENT_COLS = ("agent_id", "owner_user_id", "external_user_id", "bundle_id",
-               "name", "vault_ref", "trigger", "session_id", "staged_apps", "deployed_at")
+               "name", "vault_ref", "trigger", "session_id", "staged_apps",
+               "deployment_id", "memory_store_id", "deployed_at")
 
 
 def _agent_row(row):
@@ -254,23 +271,51 @@ def agent_upsert(a):
     """Insert-or-update one deployed agent (keyed by agent_id)."""
     p = dict(a)
     p["staged_apps"] = json.dumps(list(a.get("staged_apps") or []))
+    for k in ("external_user_id", "bundle_id", "name", "vault_ref", "trigger",
+              "session_id", "deployment_id", "memory_store_id"):
+        p.setdefault(k, None)                  # partial rows must not KeyError the named params
     with connect() as conn, conn.cursor() as cur:
         cur.execute(
             "INSERT INTO agents (agent_id, owner_user_id, external_user_id, bundle_id, "
-            "name, vault_ref, trigger, session_id, staged_apps) "
+            "name, vault_ref, trigger, session_id, staged_apps, deployment_id, memory_store_id) "
             "VALUES (%(agent_id)s, %(owner_user_id)s, %(external_user_id)s, %(bundle_id)s, "
-            "%(name)s, %(vault_ref)s, %(trigger)s, %(session_id)s, %(staged_apps)s) "
+            "%(name)s, %(vault_ref)s, %(trigger)s, %(session_id)s, %(staged_apps)s, "
+            "%(deployment_id)s, %(memory_store_id)s) "
             "ON CONFLICT (agent_id) DO UPDATE SET "
             "owner_user_id=EXCLUDED.owner_user_id, external_user_id=EXCLUDED.external_user_id, "
             "bundle_id=EXCLUDED.bundle_id, name=EXCLUDED.name, vault_ref=EXCLUDED.vault_ref, "
-            "trigger=EXCLUDED.trigger, session_id=EXCLUDED.session_id, staged_apps=EXCLUDED.staged_apps",
+            "trigger=EXCLUDED.trigger, session_id=EXCLUDED.session_id, "
+            "staged_apps=EXCLUDED.staged_apps, deployment_id=EXCLUDED.deployment_id, "
+            "memory_store_id=EXCLUDED.memory_store_id",
             p)
+
+
+def agent_set_deployment(agent_id, deployment_id):
+    """Point one agent row at a new platform deployment (schedule changes recreate it)."""
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute("UPDATE agents SET deployment_id = %s WHERE agent_id = %s",
+                    (deployment_id, agent_id))
 
 
 def agents_for_user(owner_user_id):
     with connect() as conn, conn.cursor() as cur:
         cur.execute(f"SELECT {', '.join(_AGENT_COLS)} FROM agents "
                     "WHERE owner_user_id = %s ORDER BY deployed_at DESC", (owner_user_id,))
+        return [_agent_row(r) for r in cur.fetchall()]
+
+
+def agents_all():
+    """Every deployed agent across all users (admin portal)."""
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(f"SELECT {', '.join(_AGENT_COLS)} FROM agents ORDER BY deployed_at DESC")
+        return [_agent_row(r) for r in cur.fetchall()]
+
+
+def agents_with_deployments():
+    """Agents backed by a platform deployment (the sync loop's work list)."""
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(f"SELECT {', '.join(_AGENT_COLS)} FROM agents "
+                    "WHERE deployment_id IS NOT NULL ORDER BY deployed_at DESC")
         return [_agent_row(r) for r in cur.fetchall()]
 
 
@@ -327,10 +372,19 @@ def run_add(rec):
     with connect() as conn, conn.cursor() as cur:
         cur.execute(
             "INSERT INTO agent_runs (agent_id, owner_user_id, status, summary, "
-            "details, run_session_id) VALUES (%s, %s, %s, %s, %s, %s)",
+            "details, run_session_id, drun_id) VALUES (%s, %s, %s, %s, %s, %s, %s)",
             (rec.get("agent_id"), rec.get("owner_user_id"), rec.get("status"),
              rec.get("summary"), json.dumps(rec.get("details") or []),
-             rec.get("run_session_id")))
+             rec.get("run_session_id"), rec.get("drun_id")))
+
+
+def run_seen_drun_ids(agent_id):
+    """The deployment_run ids already recorded for one agent — the sync loop's dedupe
+    set (covers failed druns too, which have no session)."""
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT drun_id FROM agent_runs WHERE agent_id = %s "
+                    "AND drun_id IS NOT NULL", (agent_id,))
+        return {r[0] for r in cur.fetchall()}
 
 
 def runs_for_agent(agent_id, limit=20):
