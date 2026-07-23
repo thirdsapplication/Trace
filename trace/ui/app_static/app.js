@@ -112,7 +112,6 @@ async function loadAndRender() { await refreshSession(); render(); }
 
 /* ---------------- auth ---------------- */
 function renderAuth(mode) {
-  document.body.classList.remove("ig-mode");
   mode = mode || "login";
   const isSignup = mode === "signup" && S.signupAllowed;
   root.innerHTML = `
@@ -144,7 +143,6 @@ function renderAuth(mode) {
 
 /* ---------------- shell ---------------- */
 function shell(inner) {
-  document.body.classList.remove("ig-mode");
   const reached = deriveStep();                 // furthest step the artifacts allow
   const chips = STEPS.map((st, i) => {
     const nav = i <= reached;                    // completed steps + the current one are navigable
@@ -177,17 +175,17 @@ const goStep = (i) => { S.step = i; render(); };
    creates a fresh dated session server-side). */
 function recordAnother() { S.session = null; S.step = 0; render(); }
 
-/* ============ MY AGENTS — Instagram-style (stories / feed / DMs) ============
-   Accounts you follow = the agents you own. Stories = brief notes on what each
-   agent did in the last 24h. Messages = real two-way DMs with each agent. */
+/* ============ MY AGENTS ============
+   Structure: stories = sessions you haven't reviewed yet (approve staged actions
+   where applicable; reviewing moves the session into the agent's history log);
+   each agent has a profile (bio + controls + session-history log) and a DM thread.
+   Trace's own look — normal width, no borrowed chrome. */
 const CADENCES = [
   { v: "", label: "manually" },
   { v: "daily", label: "daily · 9am" },
   { v: "weekly", label: "weekly · Mon 9am" },
 ];
 function cadenceToValue(c) {
-  // map only the supported cadences; anything else (none, or a legacy
-  // interval/hourly) shows as "manually" rather than a removed option.
   if (c && c.kind === "daily") return "daily";
   if (c && c.kind === "weekly") return "weekly";
   return "";
@@ -197,78 +195,7 @@ function valueToCadence(v) {
   if (v === "weekly") return { kind: "weekly", weekday: 0, time: "09:00" };
   return null;
 }
-
-/* deterministic gradient avatar per agent (initial on a color pair from the name) */
-const AV_GRADS = [["#f582ae", "#b8235a"], ["#8bd3dd", "#1f6f8b"], ["#ffd803", "#e16162"],
-                  ["#a786df", "#5f2da5"], ["#7ec4a2", "#2e6f4e"], ["#f3a712", "#c1440e"]];
-function avHash(s) { let h = 0; for (const c of String(s)) h = (h * 31 + c.charCodeAt(0)) >>> 0; return h; }
-function avatar(name, size, extraCls) {
-  const g = AV_GRADS[avHash(name || "?") % AV_GRADS.length];
-  const initial = (String(name || "?").trim()[0] || "?").toUpperCase();
-  return `<span class="ig-av ${extraCls || ""}" style="width:${size}px;height:${size}px;font-size:${Math.round(size * .42)}px;
-    background:linear-gradient(135deg,${g[0]},${g[1]});">${esc(initial)}</span>`;
-}
-function agentHandle(name) {
-  return String(name || "agent").toLowerCase().replace(/[^a-z0-9]+/g, ".").replace(/^\.+|\.+$/g, "") || "agent";
-}
-function ago(iso) {
-  const t = Date.parse(iso || "");
-  if (isNaN(t)) return "";
-  const s = Math.max(0, (Date.now() - t) / 1000);
-  if (s < 60) return "now";
-  if (s < 3600) return `${Math.floor(s / 60)}m`;
-  if (s < 86400) return `${Math.floor(s / 3600)}h`;
-  return `${Math.floor(s / 86400)}d`;
-}
-
-/* seen-story bookkeeping (client-side, like IG's grey ring) */
-function seenMap() { try { return JSON.parse(localStorage.getItem("trace_seen_stories") || "{}"); } catch (e) { return {}; } }
-function markSeen(agentId, latest) { const m = seenMap(); m[agentId] = latest; localStorage.setItem("trace_seen_stories", JSON.stringify(m)); }
-function hasUnseen(a) {
-  const latest = a.stories && a.stories.length ? a.stories[0].ran_at : null;
-  return !!latest && seenMap()[a.agent_id] !== latest;
-}
-
-const IG_ICONS = {
-  home: '<svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M3 10.5 12 3l9 7.5V21a1 1 0 0 1-1 1h-5v-7h-6v7H4a1 1 0 0 1-1-1z"/></svg>',
-  plus: '<svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="3" width="18" height="18" rx="5"/><path d="M12 8v8M8 12h8"/></svg>',
-  send: '<svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"><path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4z"/></svg>',
-  people: '<svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 3.5-6 8-6s8 2 8 6"/></svg>',
-  back: '<svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg>',
-};
-
-function igShell(content, tab, unread) {
-  document.body.classList.add("ig-mode");
-  root.innerHTML = `
-    <div class="ig-wrap">
-      <div class="ig-top">
-        <span class="ig-logo" id="igLogo">Trace</span>
-        <button class="ig-iconbtn" id="igDm" aria-label="Messages">${IG_ICONS.send}
-          ${unread ? `<span class="ig-badge">${unread > 9 ? "9+" : unread}</span>` : ""}</button>
-      </div>
-      <div class="ig-body">${content}</div>
-      <div class="ig-nav">
-        <button class="ig-iconbtn ${tab === "home" ? "on" : ""}" id="igNavHome">${IG_ICONS.home}</button>
-        <button class="ig-iconbtn" id="igNavNew">${IG_ICONS.plus}</button>
-        <button class="ig-iconbtn ${tab === "agents" ? "on" : ""}" id="igNavAgents">${IG_ICONS.people}</button>
-      </div>
-    </div>`;
-  $("#igLogo").onclick = renderHome;
-  $("#igNavHome").onclick = renderHome;
-  $("#igNavNew").onclick = recordAnother;
-  $("#igNavAgents").onclick = renderAgentsList;
-  $("#igDm").onclick = renderMessages;
-}
-
-async function loadHome() {
-  const { data } = await api("GET", "/api/u/home");
-  S.igHome = data || { agents: [], feed: [], unread_total: 0 };
-  return S.igHome;
-}
-
-/* ---------------- HOME: stories row + feed ---------------- */
 function runBadge(status) {
-  // completed | needs_approval/staged | running/ran | failed (+ older clean/halted)
   const ok = status === "completed" || status === "clean";
   const appr = status === "needs_approval" || status === "halted" || status === "staged";
   const pend = status === "running" || status === "ran";
@@ -278,150 +205,240 @@ function runBadge(status) {
   return `<span class="pill ${cls}">${label}</span>`;
 }
 
+/* deterministic soft-gradient initial avatar per agent (just an identicon) */
+const AV_GRADS = [["#f582ae", "#b8235a"], ["#8bd3dd", "#1f6f8b"], ["#ffd803", "#e16162"],
+                  ["#a786df", "#5f2da5"], ["#7ec4a2", "#2e6f4e"], ["#f3a712", "#c1440e"]];
+function avHash(s) { let h = 0; for (const c of String(s)) h = (h * 31 + c.charCodeAt(0)) >>> 0; return h; }
+function avatar(name, size) {
+  const g = AV_GRADS[avHash(name || "?") % AV_GRADS.length];
+  const initial = (String(name || "?").trim()[0] || "?").toUpperCase();
+  return `<span class="ag-av" style="width:${size}px;height:${size}px;font-size:${Math.round(size * .42)}px;
+    background:linear-gradient(135deg,${g[0]},${g[1]});">${esc(initial)}</span>`;
+}
+function ago(iso) {
+  const t = Date.parse(iso || "");
+  if (isNaN(t)) return "";
+  const s = Math.max(0, (Date.now() - t) / 1000);
+  if (s < 60) return "just now";
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+  return `${Math.floor(s / 86400)}d ago`;
+}
+
+// one proposed action (checkbox to include in an approve batch; processed = status pill)
+function proposalRow(p) {
+  const pl = p.payload || {};
+  const rows = Object.keys(pl).map(k => {
+    const v = pl[k];
+    const val = (v && typeof v === "object") ? JSON.stringify(v) : String(v);
+    return `<div class="sub" style="margin-top:2px;"><b>${esc(k)}:</b> ${esc(val)}</div>`;
+  }).join("");
+  const done = p.status && p.status !== "pending";
+  return `<div class="card" style="margin-top:8px;">
+    <div class="row" style="gap:8px;align-items:flex-start;">
+      ${done ? `<span class="pill ${p.status === "executed" ? "pill-on" : "pill-off"}">${esc(p.status)}</span>`
+             : `<input type="checkbox" class="prop" data-id="${esc(p.id)}" checked style="margin-top:4px;">`}
+      <div style="flex:1;">
+        <div class="title" style="font-size:14px;">${p.app ? `<span class="muted">${esc(p.app)} · </span>` : ""}${esc(p.summary || p.kind || "Action")}</div>
+        <div style="margin-top:4px;">${rows || `<div class="sub muted">No details captured.</div>`}</div>
+      </div>
+      ${done ? "" : `<button class="btn-link prop-no" data-id="${esc(p.id)}" style="color:var(--danger,#b3261e);">Reject</button>`}
+    </div>
+  </div>`;
+}
+
+async function loadHome() {
+  const { data } = await api("GET", "/api/u/home");
+  S.igHome = data || { agents: [], unread_total: 0 };
+  return S.igHome;
+}
+
+function agentsTopbar(unread, backFn) {
+  return {
+    html: `<div class="topbar">
+      <div class="row">${backFn ? `<button id="agBack" class="btn-link">← back</button>` : ""}
+        <div class="brand">● Trace</div></div>
+      <div class="row">
+        <button id="agMsgs" class="btn-link">Messages${unread ? ` <span class="ct-badge">${unread > 9 ? "9+" : unread}</span>` : ""}</button>
+        <span class="muted" style="font-size:13px;">${esc(S.user.email)}</span>
+        <button id="logout" class="btn-link">Sign out</button></div></div>`,
+    wire() {
+      $("#logout").onclick = async () => { await api("POST", "/api/auth/logout", {}); S.user = null; clearTimers(); renderAuth(); };
+      $("#agMsgs").onclick = renderMessages;
+      const b = $("#agBack");
+      if (b) b.onclick = backFn;
+    },
+  };
+}
+
+/* ---------------- HOME: stories to review + agents list ---------------- */
 async function renderHome() {
   clearTimers();
   const d = await loadHome();
   const agents = d.agents || [];
-  const stories = agents.map(a => `
-    <button class="ig-story ${a.stories.length ? (hasUnseen(a) ? "ring-new" : "ring-seen") : "ring-none"}"
-            data-agent="${esc(a.agent_id)}">
-      <span class="ig-ring">${avatar(a.name, 56)}</span>
-      <span class="ig-story-name">${esc(agentHandle(a.name).slice(0, 11))}</span>
+  const withStories = agents.filter(a => a.unreviewed > 0);
+  const stories = withStories.map(a => `
+    <button class="st-btn" data-agent="${esc(a.agent_id)}">
+      <span class="st-ring">${avatar(a.name, 52)}<span class="ct-badge st-ct">${a.unreviewed}</span></span>
+      <span class="st-name">${esc(a.name.length > 14 ? a.name.slice(0, 13) + "…" : a.name)}</span>
     </button>`).join("");
-  const post = (f) => {
-    const props = f.proposals || [];
-    return `<div class="ig-post" data-sess="${esc(f.run_session_id || "")}" data-agent="${esc(f.agent_id)}">
-      <div class="ig-post-head">
-        ${avatar(f.agent_name, 32)}
-        <span class="ig-user openprofile" data-agent="${esc(f.agent_id)}">${esc(agentHandle(f.agent_name))}</span>
-        <span class="ig-time">· ${ago(f.ran_at)}</span>
-        ${runBadge(f.status)}
+  const rows = agents.map(a => {
+    const sched = a.schedule || null;
+    const paused = sched && sched.paused;
+    const bits = [];
+    if (a.unreviewed) bits.push(`${a.unreviewed} to review`);
+    if (a.unread) bits.push(`${a.unread} new message${a.unread > 1 ? "s" : ""}`);
+    bits.push(sched ? (paused ? "schedule paused" : `runs ${cadenceToValue(sched.cadence) || "on its schedule"}`) : "runs when you say");
+    return `<button class="ag-row" data-agent="${esc(a.agent_id)}">
+      ${avatar(a.name, 44)}
+      <span class="ag-mid">
+        <span class="row" style="gap:8px;"><span class="title" style="font-size:14.5px;">${esc(a.name)}</span>
+          <span class="pill ${paused ? "pill-warn" : "pill-on"}">${paused ? "PAUSED" : "LIVE"}</span></span>
+        <span class="ag-bio">${esc(a.description || ("Runs when: " + (a.trigger || "you say so")))}</span>
+        <span class="sub muted">${esc(bits.join(" · "))}</span>
+      </span>
+      ${a.unreviewed ? `<span class="ct-badge">${a.unreviewed}</span>` : ""}
+    </button>`;
+  }).join("");
+  const tb = agentsTopbar(d.unread_total, null);
+  root.innerHTML = `${tb.html}
+    <div class="panel">
+      <div class="spread"><h2>Your agents</h2>
+        <button id="recAnother" class="btn-primary btn-sm">Record another workflow</button></div>
+      <p class="lead">Every workflow you've automated. Sessions wait under "To review" until you've seen them — then they move into the agent's history.</p>
+      ${withStories.length ? `<div class="label" style="margin-bottom:8px;">To review</div>
+        <div class="st-row">${stories}</div>` : ""}
+      <div class="stack" style="margin-top:${withStories.length ? "18" : "0"}px;">
+        ${rows || `<p class="muted">No agents yet. Record a workflow to build your first.</p>`}
       </div>
-      <div class="ig-media grad-${avHash(f.agent_name) % 6}">
-        <p>${esc(f.note || "Ran.")}</p>
-      </div>
-      <div class="ig-post-actions">
-        <button class="ig-iconbtn msgagent" data-agent="${esc(f.agent_id)}" title="Message">${IG_ICONS.send}</button>
-        ${props.length ? `<button class="ig-approve approve-all">Approve ${props.length} staged action${props.length > 1 ? "s" : ""}</button>` : ""}
-      </div>
-      ${f.details && f.details.length ? `<div class="ig-caption"><b>${esc(agentHandle(f.agent_name))}</b> ${esc(f.details.slice(0, 3).join(" · "))}</div>` : ""}
-      ${props.length ? `<div class="ig-caption muted">${props.map(p => esc(p.summary || "")).slice(0, 3).join(" · ")}</div>` : ""}
+      <button id="backFlow" class="btn-link" style="margin-top:16px;">← back to setup</button>
     </div>`;
-  };
-  const feed = (d.feed || []).map(post).join("");
-  igShell(`
-    ${agents.length ? `<div class="ig-stories">${stories}</div>` : ""}
-    ${feed || `<div class="ig-empty">
-       <p><b>Welcome to your agents' feed.</b></p>
-       <p class="muted">${agents.length ? "No runs yet — open an agent and hit Run now, or set a schedule."
-                                        : "No agents yet. Tap + to record or describe your first workflow."}</p>
-     </div>`}`, "home", d.unread_total);
-  root.querySelectorAll(".ig-story").forEach(b => b.onclick = () => renderStoryViewer(b.dataset.agent));
-  root.querySelectorAll(".openprofile").forEach(b => b.onclick = () => renderProfile(b.dataset.agent));
-  root.querySelectorAll(".msgagent").forEach(b => b.onclick = () => renderThread(b.dataset.agent));
-  root.querySelectorAll(".approve-all").forEach(b => b.onclick = async () => {
-    const card = b.closest(".ig-post");
-    const f = (S.igHome.feed || []).find(x => (x.run_session_id || "") === card.dataset.sess
-                                              && x.agent_id === card.dataset.agent);
-    const ids = ((f && f.proposals) || []).map(p => p.id);
-    if (!ids.length) return;
-    b.disabled = true; b.textContent = "Running…";
-    await api("POST", `/api/u/agents/${card.dataset.agent}/approve-actions`, { pending_ids: ids });
-    S._timers.push(setTimeout(renderHome, 4000));
-  });
+  tb.wire();
+  $("#recAnother").onclick = recordAnother;
+  $("#backFlow").onclick = () => loadAndRender();
+  root.querySelectorAll(".st-btn").forEach(b => b.onclick = () => renderReview(b.dataset.agent));
+  root.querySelectorAll(".ag-row").forEach(b => b.onclick = () => renderProfile(b.dataset.agent));
   S._timers.push(setTimeout(renderHome, 30000));            // gentle live refresh
 }
 const renderDashboard = renderHome;                          // legacy entry points
 
-/* ---------------- STORY VIEWER (24h notes) ---------------- */
-function renderStoryViewer(agentId) {
+/* ---------------- REVIEW (stories): unreviewed sessions, oldest first ------ */
+function renderReview(agentId, startAt) {
   clearTimers();
-  const agents = (S.igHome && S.igHome.agents) || [];
-  const a = agents.find(x => x.agent_id === agentId);
-  if (!a || !a.stories.length) { renderProfile(agentId); return; }
-  document.body.classList.add("ig-mode");
-  markSeen(agentId, a.stories[0].ran_at);
-  let i = 0;
+  const a = ((S.igHome && S.igHome.agents) || []).find(x => x.agent_id === agentId);
+  if (!a || !a.stories.length) { renderHome(); return; }
+  let i = Math.min(startAt || 0, a.stories.length - 1);
+  const close = () => { S.igHome = null; renderHome(); };
+  const markReviewed = (st) => api("POST", `/api/u/agents/${agentId}/reviews`, { key: st.key });
   const draw = () => {
     const st = a.stories[i];
+    const pending = (st.proposals || []).filter(p => !p.status || p.status === "pending");
     root.innerHTML = `
-      <div class="ig-story-view">
-        <div class="ig-story-progress">${a.stories.map((_, k) =>
-          `<span class="${k < i ? "done" : (k === i ? "cur" : "")}"></span>`).join("")}</div>
-        <div class="ig-story-head">
-          ${avatar(a.name, 32)}
-          <span class="ig-user light">${esc(agentHandle(a.name))}</span>
-          <span class="ig-time light">${ago(st.ran_at)}</span>
-          <button class="ig-story-x" id="stX">✕</button>
+      <div class="rv-view">
+        <div class="rv-inner">
+          <div class="rv-progress">${a.stories.map((_, k) =>
+            `<span class="${k < i ? "done" : (k === i ? "cur" : "")}"></span>`).join("")}</div>
+          <div class="rv-head">
+            ${avatar(a.name, 34)}
+            <span><b>${esc(a.name)}</b><span class="muted" style="margin-left:8px;font-size:12.5px;">${esc(st.ran_at || "")}</span></span>
+            ${runBadge(st.status)}
+            <button class="rv-x" id="rvX">✕</button>
+          </div>
+          <div class="rv-card">
+            <div class="label" style="margin-bottom:8px;">What happened</div>
+            <p class="rv-note">${esc(st.note)}</p>
+            ${st.proposals && st.proposals.length ? `
+              <div class="label" style="margin:16px 0 4px;">Proposed actions — approve to run them</div>
+              ${st.proposals.map(proposalRow).join("")}
+              ${pending.length ? `<button class="btn-accent approve-sel" style="margin-top:12px;">Approve &amp; run selected</button>` : ""}
+            ` : ""}
+          </div>
+          <div class="rv-nav">
+            <button class="btn-secondary btn-sm" id="rvPrev" ${i === 0 ? "disabled" : ""}>‹ Previous</button>
+            <span class="muted" style="font-size:12.5px;">${i + 1} of ${a.stories.length}</span>
+            <button class="btn-primary btn-sm" id="rvNext">${pending.length ? "Skip for now ›" : "Mark reviewed ›"}</button>
+          </div>
         </div>
-        <div class="ig-story-card grad-${avHash(a.name) % 6}">
-          <p>${esc(st.note)}</p>
-          <div class="ig-story-status">${runBadge(st.status)}</div>
-        </div>
-        <div class="ig-story-tap left" id="stPrev"></div>
-        <div class="ig-story-tap right" id="stNext"></div>
       </div>`;
-    $("#stX").onclick = renderHome;
-    $("#stPrev").onclick = () => { if (i > 0) { i--; draw(); } };
-    $("#stNext").onclick = advance;
-    clearTimers();
-    S._timers.push(setTimeout(advance, 6000));               // auto-advance like IG
-  };
-  const advance = () => {
-    if (i < a.stories.length - 1) { i++; draw(); return; }
-    // done with this agent -> next agent with unseen stories, else home
-    const next = agents.find(x => x.agent_id !== agentId && x.stories.length && hasUnseen(x));
-    if (next) renderStoryViewer(next.agent_id); else renderHome();
+    $("#rvX").onclick = close;
+    $("#rvPrev").onclick = () => { if (i > 0) { i--; draw(); } };
+    $("#rvNext").onclick = async () => {
+      await markReviewed(st);                     // stays a story server-side while pending remain
+      if (i < a.stories.length - 1) { i++; draw(); } else { close(); }
+    };
+    root.querySelectorAll(".approve-sel").forEach(b => b.onclick = async () => {
+      const ids = Array.from(root.querySelectorAll(".prop")).filter(c => c.checked).map(c => c.dataset.id);
+      if (!ids.length) { b.textContent = "Select at least one"; return; }
+      b.disabled = true; b.textContent = "Running…";
+      await api("POST", `/api/u/agents/${agentId}/approve-actions`, { pending_ids: ids });
+      await markReviewed(st);
+      S._timers.push(setTimeout(async () => {     // execution is async; refresh then continue
+        await loadHome();
+        const fresh = (S.igHome.agents || []).find(x => x.agent_id === agentId);
+        if (fresh && fresh.stories.length) renderReview(agentId, Math.min(i, fresh.stories.length - 1));
+        else close();
+      }, 3500));
+    });
+    root.querySelectorAll(".prop-no").forEach(b => b.onclick = async () => {
+      await api("POST", `/api/u/pending/${b.dataset.id}/reject`, {});
+      st.proposals = (st.proposals || []).filter(p => String(p.id) !== String(b.dataset.id));
+      draw();
+    });
   };
   draw();
 }
 
-/* ---------------- MESSAGES: thread list + chat ---------------- */
+/* ---------------- MESSAGES: chat with your agents ---------------- */
 async function renderMessages() {
   clearTimers();
   const d = S.igHome || await loadHome();
+  const tb = agentsTopbar(d.unread_total, renderHome);
+  root.innerHTML = `${tb.html}
+    <div class="panel">
+      <h2>Messages</h2>
+      <p class="lead">A direct line to each of your agents — ask what it's been doing, or tell it something it should know.</p>
+      <div class="stack" id="dmList"><p class="muted">Loading…</p></div>
+    </div>`;
+  tb.wire();
   const agents = d.agents || [];
-  igShell(`
-    <div class="ig-subhead"><button class="ig-iconbtn" id="igBack">${IG_ICONS.back}</button><h3>Messages</h3></div>
-    <div id="dmList"><p class="ig-empty muted">Loading…</p></div>`, "home", d.unread_total);
-  $("#igBack").onclick = renderHome;
   const threads = await Promise.all(agents.map(async a => {
     const r = await api("GET", `/api/u/agents/${a.agent_id}/messages`);
     const msgs = (r.data && r.data.messages) || [];
     return { a, last: msgs[msgs.length - 1] || null };
   }));
   const list = threads.map(({ a, last }) => `
-    <button class="ig-thread" data-agent="${esc(a.agent_id)}">
+    <button class="ag-row" data-agent="${esc(a.agent_id)}">
       ${avatar(a.name, 44)}
-      <span class="ig-thread-mid">
-        <span class="ig-user">${esc(agentHandle(a.name))}</span>
-        <span class="ig-thread-preview ${a.unread ? "unread" : ""}">${last
-          ? esc(((last.sender === "user" ? "You: " : "") + (last.text || "")).slice(0, 64))
-          : "Say hi to your agent"}</span>
+      <span class="ag-mid">
+        <span class="title" style="font-size:14.5px;">${esc(a.name)}</span>
+        <span class="ag-bio ${a.unread ? "unread" : ""}">${last
+          ? esc(((last.sender === "user" ? "You: " : "") + (last.text || "")).slice(0, 72))
+          : "No messages yet"}</span>
       </span>
-      <span class="ig-time">${last ? ago(last.created_at) : ""}</span>
-      ${a.unread ? `<span class="ig-dot"></span>` : ""}
+      <span class="sub muted">${last ? esc(ago(last.created_at)) : ""}</span>
+      ${a.unread ? `<span class="ct-badge">${a.unread}</span>` : ""}
     </button>`).join("");
   const el = $("#dmList");
-  if (el) el.innerHTML = list || `<p class="ig-empty muted">No agents yet — tap + to create your first.</p>`;
-  root.querySelectorAll(".ig-thread").forEach(b => b.onclick = () => renderThread(b.dataset.agent));
+  if (el) el.innerHTML = list || `<p class="muted">No agents yet.</p>`;
+  root.querySelectorAll(".ag-row").forEach(b => b.onclick = () => renderThread(b.dataset.agent));
 }
 
 async function renderThread(agentId) {
   clearTimers();
-  document.body.classList.add("ig-mode");
   await api("POST", `/api/u/agents/${agentId}/messages/read`, {});
   root.innerHTML = `
-    <div class="ig-wrap">
-      <div class="ig-subhead chat"><button class="ig-iconbtn" id="igBack">${IG_ICONS.back}</button>
-        <span id="thHead" class="row" style="gap:8px;align-items:center;"></span></div>
-      <div class="ig-chat" id="chat"><p class="ig-empty muted">Loading…</p></div>
-      <div class="ig-chatbar">
+    <div class="topbar"><div class="row"><button id="agBack" class="btn-link">← messages</button>
+      <span id="thHead" class="row" style="gap:8px;"></span></div>
+      <button id="logout" class="btn-link">Sign out</button></div>
+    <div class="panel dm-panel">
+      <div class="dm-chat" id="chat"><p class="muted">Loading…</p></div>
+      <div class="dm-bar">
         <input id="dmText" type="text" placeholder="Message…" autocomplete="off">
-        <button id="dmSend" class="ig-send">Send</button>
+        <button id="dmSend" class="btn-primary btn-sm">Send</button>
       </div>
     </div>`;
-  $("#igBack").onclick = renderMessages;
+  $("#agBack").onclick = renderMessages;
+  $("#logout").onclick = async () => { await api("POST", "/api/auth/logout", {}); S.user = null; clearTimers(); renderAuth(); };
   let name = "";
   const draw = async () => {
     const r = await api("GET", `/api/u/agents/${agentId}/messages`);
@@ -429,15 +446,15 @@ async function renderThread(agentId) {
     const msgs = r.data.messages || [];
     name = (r.data.agent && r.data.agent.name) || "";
     const head = $("#thHead");
-    if (head) head.innerHTML = `${avatar(name, 28)}<span class="ig-user">${esc(agentHandle(name))}</span>`;
+    if (head) head.innerHTML = `${avatar(name, 26)}<b style="font-size:14px;">${esc(name)}</b>`;
     const chat = $("#chat");
     if (chat) {
       chat.innerHTML = (msgs.map(m => `
-        <div class="ig-bubble ${m.sender === "user" ? "me" : "them"}">
-          <p>${esc(m.text || "")}</p><span class="ig-time">${ago(m.created_at)}</span>
+        <div class="dm-bubble ${m.sender === "user" ? "me" : "them"}">
+          <p>${esc(m.text || "")}</p><span class="dm-time">${esc(ago(m.created_at))}</span>
         </div>`).join("")
-        || `<p class="ig-empty muted">This is your line to ${esc(name || "your agent")} — ask what it's been doing, or tell it something it should know.</p>`)
-        + (r.data.replying ? `<div class="ig-bubble them typing"><span></span><span></span><span></span></div>` : "");
+        || `<p class="muted" style="text-align:center;padding:30px 10px;">Say hi to ${esc(name || "your agent")}.</p>`)
+        + (r.data.replying ? `<div class="dm-bubble them typing"><span></span><span></span><span></span></div>` : "");
       chat.scrollTop = chat.scrollHeight;
     }
     return r.data;
@@ -460,56 +477,7 @@ async function renderThread(agentId) {
   $("#dmText").onkeydown = e => { if (e.key === "Enter") send(); };
 }
 
-/* ---------------- AGENTS ("accounts you follow") + PROFILE ---------------- */
-async function renderAgentsList() {
-  clearTimers();
-  const d = await loadHome();
-  const agents = d.agents || [];
-  const rows = agents.map(a => `
-    <button class="ig-thread openprofile" data-agent="${esc(a.agent_id)}">
-      ${avatar(a.name, 44)}
-      <span class="ig-thread-mid">
-        <span class="ig-user">${esc(agentHandle(a.name))}</span>
-        <span class="ig-thread-preview">${esc(a.name)} · ${a.schedule
-          ? (a.schedule.paused ? "paused" : `runs ${cadenceToValue(a.schedule.cadence) || "manually"}`)
-          : "runs manually"}</span>
-      </span>
-      <span class="ig-following">Following</span>
-    </button>`).join("");
-  igShell(`
-    <div class="ig-subhead"><h3>${esc(S.user.email)}</h3>
-      <button id="logout" class="btn-link" style="margin-left:auto;">Sign out</button></div>
-    <p class="ig-count"><b>${agents.length}</b> following</p>
-    ${rows || `<p class="ig-empty muted">You're not following any agents yet — tap + to create one.</p>`}
-    <button id="backFlow" class="btn-link" style="margin:16px;">← back to setup</button>`,
-    "agents", d.unread_total);
-  $("#logout").onclick = async () => { await api("POST", "/api/auth/logout", {}); S.user = null; clearTimers(); renderAuth(); };
-  $("#backFlow").onclick = () => loadAndRender();
-  root.querySelectorAll(".openprofile").forEach(b => b.onclick = () => renderProfile(b.dataset.agent));
-}
-
-// one proposed action on a profile post (checkbox to include in an approve batch)
-function proposalRow(p) {
-  const pl = p.payload || {};
-  const rows = Object.keys(pl).map(k => {
-    const v = pl[k];
-    const val = (v && typeof v === "object") ? JSON.stringify(v) : String(v);
-    return `<div class="sub" style="margin-top:2px;"><b>${esc(k)}:</b> ${esc(val)}</div>`;
-  }).join("");
-  const done = p.status && p.status !== "pending";
-  return `<div class="card" style="margin-top:8px;">
-    <div class="row" style="gap:8px;align-items:flex-start;">
-      ${done ? `<span class="pill ${p.status === "executed" ? "pill-on" : "pill-off"}">${esc(p.status)}</span>`
-             : `<input type="checkbox" class="prop" data-id="${esc(p.id)}" checked style="margin-top:4px;">`}
-      <div style="flex:1;">
-        <div class="title" style="font-size:14px;">${p.app ? `<span class="muted">${esc(p.app)} · </span>` : ""}${esc(p.summary || p.kind || "Action")}</div>
-        <div style="margin-top:4px;">${rows || `<div class="sub muted">No details captured.</div>`}</div>
-      </div>
-      ${done ? "" : `<button class="btn-link prop-no" data-id="${esc(p.id)}" style="color:var(--danger,#b3261e);">Reject</button>`}
-    </div>
-  </div>`;
-}
-
+/* ---------------- AGENT PROFILE: bio + controls + session-history log ------ */
 async function renderProfile(agentId) {
   clearTimers();
   const home = S.igHome || await loadHome();
@@ -519,37 +487,44 @@ async function renderProfile(agentId) {
   const cur = cadenceToValue(sched && sched.cadence);
   const paused = sched && sched.paused;
   const opts = CADENCES.map(c => `<option value="${c.v}" ${c.v === cur ? "selected" : ""}>${c.label}</option>`).join("");
-  igShell(`
-    <div class="ig-subhead"><button class="ig-iconbtn" id="igBack">${IG_ICONS.back}</button>
-      <h3>${esc(agentHandle(name))}</h3>
-      <span class="pill ${paused ? "pill-warn" : "pill-on"}" style="margin-left:auto;">${paused ? "PAUSED" : "LIVE"}</span></div>
-    <div class="ig-profile-head">
-      ${avatar(name, 84)}
-      <div class="ig-stats" id="pStats">
-        <span><b id="stRuns">–</b>posts</span>
-        <span><b id="stPending">–</b>staged</span>
-        <span><b>${esc(ago(a.deployed_at) || "–")}</b>old</span>
+  const tb = agentsTopbar(home.unread_total, renderHome);
+  root.innerHTML = `${tb.html}
+    <div class="panel">
+      <div class="row" style="gap:16px;align-items:flex-start;">
+        ${avatar(name, 64)}
+        <div style="flex:1;">
+          <div class="row" style="gap:10px;"><h2 style="margin:0;">${esc(name)}</h2>
+            <span class="pill ${paused ? "pill-warn" : "pill-on"}">${paused ? "PAUSED" : "LIVE"}</span></div>
+          <p class="ag-bio" style="margin:6px 0 0;">${esc(a.description || ("Runs when: " + (a.trigger || "you say so")))}</p>
+          <p class="sub muted" style="margin-top:4px;"><span id="pStats">…</span>${a.deployed_at ? ` · live since ${esc(ago(a.deployed_at))}` : ""}</p>
+        </div>
+      </div>
+      <div class="row" style="margin-top:16px;gap:8px;flex-wrap:wrap;">
+        <button class="btn-secondary btn-sm" id="pMsg">Message</button>
+        <button class="btn-accent btn-sm" id="pRun">Run now</button>
+        <span class="label" style="margin-left:6px;">Runs</span>
+        <select class="sched" id="pSched">${opts}</select>
+        ${sched ? `<button class="btn-secondary btn-sm" id="pPause">${paused ? "Resume" : "Pause"}</button>` : ""}
+      </div>
+      <div class="row" style="margin-top:12px;">
+        ${a.capture_present
+          ? `<button id="pDelCap" class="btn-link" style="color:var(--danger,#b3261e);">Delete capture data</button>`
+          : `<span class="muted" style="font-size:12px;">Capture data deleted</span>`}
       </div>
     </div>
-    <div class="ig-bio"><b>${esc(name)}</b><span class="muted"> · runs when: ${esc((sched && sched.cadence && sched.cadence.kind) || "you say so")}</span></div>
-    <div class="ig-profile-actions">
-      <button class="ig-btn" id="pMsg">Message</button>
-      <button class="ig-btn primary" id="pRun">Run now</button>
-      <select class="ig-btn" id="pSched">${opts}</select>
-      ${sched ? `<button class="ig-btn" id="pPause">${paused ? "Resume" : "Pause"}</button>` : ""}
-    </div>
-    <div id="pPosts"><p class="ig-empty muted">Loading activity…</p></div>
-    <div style="padding:16px;">
-      ${a.capture_present
-        ? `<button class="btn-link" id="pDelCap" style="color:var(--danger,#b3261e);">Delete capture data</button>`
-        : `<span class="muted" style="font-size:12px;">Capture data deleted</span>`}
-    </div>`, "agents", home.unread_total);
-  $("#igBack").onclick = renderAgentsList;
+    <div class="panel">
+      <div class="spread"><h2>Session history</h2>
+        ${a.unreviewed ? `<button class="btn-secondary btn-sm" id="pReview">Review ${a.unreviewed} waiting →</button>` : ""}</div>
+      <div id="pLog"><p class="muted">Loading…</p></div>
+    </div>`;
+  tb.wire();
   $("#pMsg").onclick = () => renderThread(agentId);
+  const pr = $("#pReview");
+  if (pr) pr.onclick = () => renderReview(agentId);
   $("#pRun").onclick = async (e) => {
     e.target.disabled = true; e.target.textContent = "Running…";
     await api("POST", `/api/u/agents/${agentId}/run-now`, {});
-    S._timers.push(setTimeout(() => renderProfile(agentId), 4000));
+    S._timers.push(setTimeout(() => { S.igHome = null; renderProfile(agentId); }, 4000));
   };
   $("#pSched").onchange = async (e) => {
     await api("POST", `/api/u/agents/${agentId}/schedule`, { cadence: valueToCadence(e.target.value) });
@@ -567,42 +542,46 @@ async function renderProfile(agentId) {
     await api("POST", `/api/u/agents/${agentId}/delete-capture-data`, {});
     S.igHome = null; renderProfile(agentId);
   };
-  // posts = the real per-session activity (Haiku summaries + approvals)
+  // the log: real per-session activity (summaries + proposals), newest first
   const { data } = await api("GET", `/api/u/agents/${agentId}/activity`);
   const sessionsList = (data && data.activity) || [];
-  const runsEl = $("#stRuns"), pendEl = $("#stPending");
-  if (runsEl) runsEl.textContent = sessionsList.length;
-  if (pendEl) pendEl.textContent = sessionsList.reduce((n, s) =>
-    n + ((s.proposals || []).filter(p => !p.status || p.status === "pending").length), 0);
-  const sessionCard = (s) => {
+  const stats = $("#pStats");
+  if (stats) {
+    const staged = sessionsList.reduce((n, s) =>
+      n + ((s.proposals || []).filter(p => !p.status || p.status === "pending").length), 0);
+    stats.textContent = `${sessionsList.length} session${sessionsList.length === 1 ? "" : "s"}`
+      + (staged ? ` · ${staged} staged action${staged === 1 ? "" : "s"} waiting` : "");
+  }
+  const logRow = (s) => {
     const props = s.proposals || [];
     const approvable = props.filter(p => !p.status || p.status === "pending");
-    return `<div class="ig-post" data-sess="${esc(s.run_session_id || "")}">
-      <div class="ig-post-head">${avatar(name, 32)}
-        <span class="ig-user">${esc(agentHandle(name))}</span>
-        <span class="ig-time">· ${ago(s.ran_at)}</span>${runBadge(s.status)}</div>
-      <div class="ig-caption" style="padding-top:10px;">${esc(s.summary || "No summary yet — the run may still be in progress.")}</div>
-      ${props.length ? `<div style="padding:0 14px 12px;"><div class="label">Proposed actions</div>
+    return `<div class="log-row" data-sess="${esc(s.run_session_id || "")}">
+      <div class="row" style="gap:10px;">
+        <span class="mono muted" style="font-size:12px;white-space:nowrap;">${esc(s.ran_at || "")}</span>
+        ${runBadge(s.status)}
+      </div>
+      <div class="log-note">${esc(s.summary || "No summary yet — the run may still be in progress.")}</div>
+      ${props.length ? `<div style="margin-top:8px;"><div class="label">Proposed actions</div>
         ${props.map(proposalRow).join("")}
-        ${approvable.length ? `<button class="ig-approve approve-sel" style="margin-top:10px;">Approve &amp; run selected</button>` : ""}
+        ${approvable.length ? `<button class="btn-accent btn-sm approve-sel" style="margin-top:10px;">Approve &amp; run selected</button>` : ""}
       </div>` : ""}
     </div>`;
   };
-  const postsEl = $("#pPosts");
-  if (postsEl) postsEl.innerHTML = sessionsList.length
-    ? sessionsList.map(sessionCard).join("")
-    : `<p class="ig-empty muted">No posts yet — hit Run now or set a schedule.</p>`;
+  const log = $("#pLog");
+  if (log) log.innerHTML = sessionsList.length
+    ? sessionsList.map(logRow).join("")
+    : `<p class="muted">No sessions yet — hit Run now or set a schedule.</p>`;
   root.querySelectorAll(".approve-sel").forEach(b => b.onclick = async () => {
     const panel = b.closest("[data-sess]");
     const ids = Array.from(panel.querySelectorAll(".prop")).filter(c => c.checked).map(c => c.dataset.id);
     if (!ids.length) { b.textContent = "Select at least one"; return; }
     b.disabled = true; b.textContent = "Running…";
     await api("POST", `/api/u/agents/${agentId}/approve-actions`, { pending_ids: ids });
-    S._timers.push(setTimeout(() => renderProfile(agentId), 4000));
+    S._timers.push(setTimeout(() => { S.igHome = null; renderProfile(agentId); }, 4000));
   });
   root.querySelectorAll(".prop-no").forEach(b => b.onclick = async () => {
     await api("POST", `/api/u/pending/${b.dataset.id}/reject`, {});
-    renderProfile(agentId);
+    S.igHome = null; renderProfile(agentId);
   });
 }
 const renderActivity = renderProfile;                        // legacy entry point

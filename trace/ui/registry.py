@@ -250,6 +250,25 @@ def pending_count_for_user(root, owner_user_id):
                if it.get("owner_user_id") == owner_user_id and it.get("status") == "pending")
 
 
+# --- story review marks ------------------------------------------------------
+# A run (session) is a "story" until reviewed; marking it reviewed moves it into
+# the agent's session-history log. run_key = run_session_id, or agent:ran_at for
+# runs that never got a session.
+def review_mark(root, agent_id, owner_user_id, run_key):
+    if db.is_configured():
+        return db.review_mark(agent_id, owner_user_id, run_key)
+    with _LOCK:
+        d = _load(root, "run_reviews.json")
+        d.setdefault(agent_id, {})[run_key] = _now_iso()
+        _save(root, "run_reviews.json", d)
+
+
+def reviewed_keys(root, agent_id):
+    if db.is_configured():
+        return db.reviewed_keys(agent_id)
+    return set((_load(root, "run_reviews.json").get(agent_id) or {}).keys())
+
+
 # --- agent direct messages (Instagram-style "My agents") --------------------
 def message_add(root, rec):
     """rec: {agent_id, owner_user_id, sender ('user'|'agent'), text, read?}."""

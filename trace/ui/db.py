@@ -69,9 +69,22 @@ CREATE TABLE IF NOT EXISTS agents (
     staged_apps      TEXT,                  -- Spec 8: JSON list of app slugs staged for approval
     deployment_id    TEXT,                  -- MA platform deployment (manual or cron-scheduled)
     memory_store_id  TEXT,                  -- MA per-agent memory store (status + lessons docs)
+    description      TEXT,                  -- the agent's bio (the workflow description)
     deployed_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS agents_owner_idx ON agents (owner_user_id);
+
+-- "Stories" review state: a session (run) is a story until its owner reviews it
+-- (and processes any staged proposals); marking it reviewed moves it into the
+-- agent's session-history log. Keyed by run_key = run_session_id (or a synthetic
+-- agent:ran_at key for runs that never got a session).
+CREATE TABLE IF NOT EXISTS run_reviews (
+    agent_id      TEXT NOT NULL,
+    owner_user_id TEXT NOT NULL,
+    run_key       TEXT NOT NULL,
+    reviewed_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (agent_id, run_key)
+);
 
 -- Spec 8 ("stage, don't execute"): outbound actions the agent proposed but did NOT
 -- perform. Captured in full at run time, reviewed in Trace, and executed on approval.
@@ -192,6 +205,8 @@ def init_db():
             cur.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS deployment_id TEXT")
             cur.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS memory_store_id TEXT")
             cur.execute("ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS drun_id TEXT")
+            # Agent bio for the profile view (idempotent).
+            cur.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS description TEXT")
         conn.commit()
     return True
 
@@ -268,7 +283,7 @@ def auth_end(token):
 
 _AGENT_COLS = ("agent_id", "owner_user_id", "external_user_id", "bundle_id",
                "name", "vault_ref", "trigger", "session_id", "staged_apps",
-               "deployment_id", "memory_store_id", "deployed_at")
+               "deployment_id", "memory_store_id", "description", "deployed_at")
 
 
 def _agent_row(row):
@@ -287,21 +302,22 @@ def agent_upsert(a):
     p = dict(a)
     p["staged_apps"] = json.dumps(list(a.get("staged_apps") or []))
     for k in ("external_user_id", "bundle_id", "name", "vault_ref", "trigger",
-              "session_id", "deployment_id", "memory_store_id"):
+              "session_id", "deployment_id", "memory_store_id", "description"):
         p.setdefault(k, None)                  # partial rows must not KeyError the named params
     with connect() as conn, conn.cursor() as cur:
         cur.execute(
             "INSERT INTO agents (agent_id, owner_user_id, external_user_id, bundle_id, "
-            "name, vault_ref, trigger, session_id, staged_apps, deployment_id, memory_store_id) "
+            "name, vault_ref, trigger, session_id, staged_apps, deployment_id, "
+            "memory_store_id, description) "
             "VALUES (%(agent_id)s, %(owner_user_id)s, %(external_user_id)s, %(bundle_id)s, "
             "%(name)s, %(vault_ref)s, %(trigger)s, %(session_id)s, %(staged_apps)s, "
-            "%(deployment_id)s, %(memory_store_id)s) "
+            "%(deployment_id)s, %(memory_store_id)s, %(description)s) "
             "ON CONFLICT (agent_id) DO UPDATE SET "
             "owner_user_id=EXCLUDED.owner_user_id, external_user_id=EXCLUDED.external_user_id, "
             "bundle_id=EXCLUDED.bundle_id, name=EXCLUDED.name, vault_ref=EXCLUDED.vault_ref, "
             "trigger=EXCLUDED.trigger, session_id=EXCLUDED.session_id, "
             "staged_apps=EXCLUDED.staged_apps, deployment_id=EXCLUDED.deployment_id, "
-            "memory_store_id=EXCLUDED.memory_store_id",
+            "memory_store_id=EXCLUDED.memory_store_id, description=EXCLUDED.description",
             p)
 
 
@@ -493,6 +509,22 @@ def pending_count_for_user(owner_user_id):
                     "WHERE owner_user_id = %s AND status = 'pending'", (owner_user_id,))
         row = cur.fetchone()
         return int(row[0]) if row else 0
+
+
+# --- story review marks (a session leaves stories once reviewed) ------------
+
+def review_mark(agent_id, owner_user_id, run_key):
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO run_reviews (agent_id, owner_user_id, run_key) "
+            "VALUES (%s, %s, %s) ON CONFLICT (agent_id, run_key) DO NOTHING",
+            (agent_id, owner_user_id, run_key))
+
+
+def reviewed_keys(agent_id):
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT run_key FROM run_reviews WHERE agent_id = %s", (agent_id,))
+        return {r[0] for r in cur.fetchall()}
 
 
 # --- agent direct messages (Instagram-style "My agents") --------------------

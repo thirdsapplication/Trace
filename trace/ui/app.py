@@ -995,7 +995,8 @@ class AppState:
                                     "session_id": sid,
                                     "staged_apps": rec.get("staged_apps") or [],
                                     "deployment_id": rec.get("deployment_id"),
-                                    "memory_store_id": rec.get("memory_store_id")})
+                                    "memory_store_id": rec.get("memory_store_id"),
+                                    "description": b.get("description") or ""})
                         job["deployed"] += 1
                     except Exception as e:
                         job["errors"][bid] = f"{type(e).__name__}: {e}"
@@ -1220,64 +1221,59 @@ class AppState:
         threading.Thread(target=run, daemon=True).start()
 
     @staticmethod
-    def _epoch_of(iso):
-        try:
-            import datetime as _dt
-            return _dt.datetime.fromisoformat(str(iso)).timestamp()
-        except (TypeError, ValueError):
-            return None
+    def run_key(agent_id, run):
+        """The stable review key for one run: its session id, or a synthetic key for
+        runs that never got a session (they can still be reviewed away)."""
+        return run.get("run_session_id") or f"{agent_id}:{run.get('ran_at')}"
 
     def home_data(self, user):
-        """Everything the Instagram-style home needs in ONE fast read: the user's
-        agents ("accounts followed") each with their last-24h STORIES (brief activity
-        notes from run records + the cached session summaries — no model calls, no
-        platform calls), a chronological run FEED with inline staged proposals, and
-        unread DM counts."""
+        """Everything the agents home needs in ONE fast read (no model calls, no
+        platform calls): the user's agents, each with its STORIES — the sessions the
+        owner has NOT yet reviewed (or whose staged proposals are still pending),
+        oldest first, with the pending proposals inline so they can be approved from
+        the review view — plus the agent's bio and unread DM counts. Reviewing a
+        story (POST .../reviews) moves that session into the profile's history log."""
         root = self.sessions_root
         uid = user["user_id"]
-        now = time.time()
         unread = registry.messages_unread_counts(root, uid)
         pending_by_session = {}
         for p in registry.pending_for_user(root, uid):
             pending_by_session.setdefault(p.get("run_session_id"), []).append(
-                {"id": p.get("id"), "app": p.get("app"), "summary": p.get("summary")})
-        agents_out, feed = [], []
+                {"id": p.get("id"), "app": p.get("app"), "summary": p.get("summary"),
+                 "payload": p.get("payload") or {}})
+        agents_out = []
         for a in registry.agents_for_user(root, uid):
             aid = a.get("agent_id")
-            name = a.get("name") or aid
-            runs = registry.runs_for_agent(root, aid, 20)
+            reviewed = registry.reviewed_keys(root, aid)
             stories = []
-            for r in runs:
-                ts = self._epoch_of(r.get("ran_at"))
-                if ts is None or now - ts > 24 * 3600:
+            for r in registry.runs_for_agent(root, aid, 20):
+                key = self.run_key(aid, r)
+                props = (pending_by_session.get(r.get("run_session_id"), [])
+                         if r.get("run_session_id") else [])
+                if key in reviewed and not props:      # reviewed AND fully processed
                     continue
                 note = None
                 if r.get("run_session_id"):
                     note = (registry.summary_get(root, r["run_session_id"]) or {}).get("summary")
-                stories.append({"ran_at": r.get("ran_at"), "status": r.get("status"),
-                                "note": note or r.get("summary") or "Ran."})
+                stories.append({"key": key, "ran_at": r.get("ran_at"),
+                                "status": r.get("status"),
+                                "note": note or r.get("summary") or "Ran.",
+                                "proposals": props})
+            stories.reverse()                          # review oldest first
             agents_out.append({
-                "agent_id": aid, "name": name, "bundle_id": a.get("bundle_id"),
+                "agent_id": aid, "name": a.get("name") or aid,
+                "bundle_id": a.get("bundle_id"),
+                "description": a.get("description") or "",
+                "trigger": a.get("trigger") or "",
                 "deployed_at": a.get("deployed_at"),
                 "deployment": bool(a.get("deployment_id")),
                 "schedule": registry.schedule_get(root, aid),
                 "capture_present": bool(a.get("session_id")) and
                 os.path.isdir(sessions.session_dir(root, a.get("session_id"))),
-                "stories": stories, "unread": unread.get(aid, 0),
+                "stories": stories, "unreviewed": len(stories),
+                "unread": unread.get(aid, 0),
                 "replying": (self.chat_jobs.get(aid) or {}).get("state") == "running"})
-            for r in runs[:10]:
-                note = None
-                if r.get("run_session_id"):
-                    note = (registry.summary_get(root, r["run_session_id"]) or {}).get("summary")
-                feed.append({"agent_id": aid, "agent_name": name,
-                             "ran_at": r.get("ran_at"), "status": r.get("status"),
-                             "note": note or r.get("summary") or "",
-                             "details": r.get("details") or [],
-                             "run_session_id": r.get("run_session_id"),
-                             "proposals": pending_by_session.get(r.get("run_session_id"), [])})
-        feed.sort(key=lambda f: f.get("ran_at") or "", reverse=True)
-        return {"agents": agents_out, "feed": feed[:30],
-                "unread_total": sum(unread.values())}
+        return {"agents": agents_out, "unread_total": sum(unread.values())}
 
     def apply_platform_schedule(self, agent, cadence):
         """Re-point a deployment agent at the requested cadence. Deployments are
@@ -1789,6 +1785,17 @@ def make_handler(state):
             ma = re.match(r"^/agents/([^/]+)/(schedule|schedule/pause|run-now)$", rest)
             if ma:                                       # Spec 4: schedule / run-now
                 return self._agent_action(ma.group(1), ma.group(2), body, user)
+            mrv = re.match(r"^/agents/([^/]+)/reviews$", rest)
+            if mrv:                                      # mark one story (session) reviewed
+                agent = next((a for a in registry.agents_for_user(root, user["user_id"])
+                              if a.get("agent_id") == mrv.group(1)), None)
+                if not agent:
+                    return self._json(404, {"error": "not_found"})
+                key = str((body or {}).get("key", "") or "").strip()
+                if not key:
+                    return self._json(400, {"error": "missing_key"})
+                registry.review_mark(root, agent["agent_id"], user["user_id"], key)
+                return self._json(200, {"ok": True})
             mdm = re.match(r"^/agents/([^/]+)/messages(/read)?$", rest)
             if mdm:                                      # DMs: send to the agent / mark read
                 agent = next((a for a in registry.agents_for_user(root, user["user_id"])

@@ -165,7 +165,9 @@ class HomeAndMessagesEndpointTest(unittest.TestCase):
         registry.agent_upsert(self.root, {
             "agent_id": agent_id, "owner_user_id": uid,
             "external_user_id": users.external_user_id(uid), "bundle_id": "wf",
-            "name": name, "vault_ref": "vlt-1", "trigger": "t", "session_id": "s"})
+            "name": name, "vault_ref": "vlt-1", "trigger": "a new order arrives",
+            "session_id": "s",
+            "description": "Reads order emails and logs them in the tracker."})
 
     def _write_run(self, agent_id, uid, ran_at, status="completed", summary="Did the thing.",
                    run_session_id=None):
@@ -177,30 +179,78 @@ class HomeAndMessagesEndpointTest(unittest.TestCase):
                                 "status": status, "summary": summary, "details": [],
                                 "run_session_id": run_session_id, "ran_at": ran_at}) + "\n")
 
-    def test_home_stories_window_feed_and_unread(self):
+    def test_home_stories_are_unreviewed_sessions_and_review_moves_them_out(self):
         import datetime
         uid, cookie = self._signup("ig@x.com")
         self._seed_agent(uid)
         now = datetime.datetime.now().astimezone()
-        fresh = (now - datetime.timedelta(hours=2)).isoformat(timespec="seconds")
-        stale = (now - datetime.timedelta(hours=30)).isoformat(timespec="seconds")
-        self._write_run("agent-1", uid, stale, summary="Old news.")
-        self._write_run("agent-1", uid, fresh, summary="Fresh note.", run_session_id="sess-f")
+        older = (now - datetime.timedelta(hours=30)).isoformat(timespec="seconds")
+        newer = (now - datetime.timedelta(hours=2)).isoformat(timespec="seconds")
+        self._write_run("agent-1", uid, older, summary="Old run.")   # no session -> synthetic key
+        self._write_run("agent-1", uid, newer, summary="Fresh note.", run_session_id="sess-f")
         registry.summary_set(self.root, "sess-f", "Read 3 emails and logged 2 orders.", "completed")
         registry.message_add(self.root, {"agent_id": "agent-1", "owner_user_id": uid,
                                          "sender": "agent", "text": "hi"})
         status, data, _ = self._req("GET", "/api/u/home", cookie=cookie)
         self.assertEqual(status, 200)
         a = data["agents"][0]
-        # stories = last 24h only, and the cached session summary is the note
-        self.assertEqual(len(a["stories"]), 1)
-        self.assertEqual(a["stories"][0]["note"], "Read 3 emails and logged 2 orders.")
+        # BOTH sessions are stories (age is irrelevant — unreviewed is what counts),
+        # oldest first for review order; the cached summary is the newer one's note
+        self.assertEqual([s["note"] for s in a["stories"]],
+                         ["Old run.", "Read 3 emails and logged 2 orders."])
+        self.assertEqual(a["unreviewed"], 2)
+        self.assertEqual(a["description"], "Reads order emails and logs them in the tracker.")
         self.assertEqual(a["unread"], 1)
         self.assertEqual(data["unread_total"], 1)
-        # the feed carries BOTH runs (it is history, not a 24h window), newest first
-        self.assertEqual([f["note"] for f in data["feed"]][:2],
-                         ["Read 3 emails and logged 2 orders.", "Old news."])
-        self.assertEqual(data["feed"][0]["agent_name"], "Order intake")
+        self.assertNotIn("feed", data)                       # no global feed — history lives per agent
+        # reviewing one story (by its key) moves it out; the other remains
+        keys = [s["key"] for s in a["stories"]]
+        self.assertIn("sess-f", keys)                        # session-keyed story
+        status, _, _ = self._req("POST", "/api/u/agents/agent-1/reviews",
+                                 {"key": "sess-f"}, cookie=cookie)
+        self.assertEqual(status, 200)
+        _, data, _ = self._req("GET", "/api/u/home", cookie=cookie)
+        a = data["agents"][0]
+        self.assertEqual([s["note"] for s in a["stories"]], ["Old run."])
+        # reviewing the synthetic-keyed run empties the queue
+        self._req("POST", "/api/u/agents/agent-1/reviews",
+                  {"key": a["stories"][0]["key"]}, cookie=cookie)
+        _, data, _ = self._req("GET", "/api/u/home", cookie=cookie)
+        self.assertEqual(data["agents"][0]["unreviewed"], 0)
+
+    def test_story_with_pending_proposals_stays_until_processed(self):
+        uid, cookie = self._signup("staged@x.com")
+        self._seed_agent(uid)
+        self._write_run("agent-1", uid, "2026-07-01T09:00:00-04:00",
+                        status="ran", summary="Staged run.", run_session_id="sess-p")
+        registry.pending_add(self.root, {
+            "agent_id": "agent-1", "owner_user_id": uid, "run_session_id": "sess-p",
+            "app": "Gmail", "kind": "send", "summary": "Confirm PO-1",
+            "payload": {"to": "a@b.com"}, "content_hash": "h1"})
+        # marking it reviewed is NOT enough while a proposal is still pending
+        self._req("POST", "/api/u/agents/agent-1/reviews", {"key": "sess-p"}, cookie=cookie)
+        _, data, _ = self._req("GET", "/api/u/home", cookie=cookie)
+        a = data["agents"][0]
+        self.assertEqual(a["unreviewed"], 1)                 # still a story (unapproved)
+        self.assertEqual(a["stories"][0]["proposals"][0]["summary"], "Confirm PO-1")
+        self.assertEqual(a["stories"][0]["proposals"][0]["payload"], {"to": "a@b.com"})
+        # processing the proposal (approve->executed or reject) releases it
+        pend = registry.pending_for_user(self.root, uid)[0]
+        registry.pending_set_status(self.root, pend["id"], "executed")
+        _, data, _ = self._req("GET", "/api/u/home", cookie=cookie)
+        self.assertEqual(data["agents"][0]["unreviewed"], 0)
+
+    def test_reviews_endpoint_scoped_and_validated(self):
+        uid, cookie = self._signup("owner2@x.com")
+        self._seed_agent(uid)
+        status, data, _ = self._req("POST", "/api/u/agents/agent-1/reviews",
+                                    {}, cookie=cookie)
+        self.assertEqual((status, data["error"]), (400, "missing_key"))
+        other_cookie = self._req("POST", "/api/auth/signup",
+                                 {"email": "nosy@x.com", "password": "password1"})[2]
+        status, _, _ = self._req("POST", "/api/u/agents/agent-1/reviews",
+                                 {"key": "sess-x"}, cookie=other_cookie)
+        self.assertEqual(status, 404)
 
     def test_home_requires_auth_and_scopes(self):
         status, data, _ = self._req("GET", "/api/u/home")
