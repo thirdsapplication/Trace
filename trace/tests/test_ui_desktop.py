@@ -176,6 +176,34 @@ class DesktopProxyTest(unittest.TestCase):
         self.assertEqual([a["agent_id"] for a in registry.agents_for_user(self._cloud_tmp.name, uid)],
                          ["agent-x"])
 
+    def test_describe_workflow_proxies_to_cloud(self):
+        # Skip-recording path from the desktop app: the POST is NOT a capture route,
+        # so it proxies to the cloud, which owns the session + runs the describe job.
+        self.cloud_state.describe_fn = lambda description, model=None, model_fn=None: (
+            {"bundles": [{"id": "B1", "name": "Orders", "description": "d", "trigger": "t",
+                          "steps": ["Open Gmail"], "frequency": "daily",
+                          "evidence_event_ids": [], "why_automatable": "w",
+                          "rationale": "r", "confidence": "medium"}],
+             "anti_bundles": [], "unclustered_or_noise_event_ids": [], "notes": ""}, None)
+        _, _, cookie = self.desk("POST", "/api/auth/signup",
+                                 {"email": "desc@x.com", "password": "password1"})
+        status, data, _ = self.desk("POST", "/api/u/describe-workflow",
+                                    {"description": "orders in Gmail"}, cookie=cookie)
+        self.assertEqual(status, 202)
+        sid = data["session_id"]
+        for _ in range(100):
+            _, st, _ = self.desk("GET", f"/api/u/sessions/{sid}/describe/status", cookie=cookie)
+            if st["state"] in ("done", "error"):
+                break
+            import time
+            time.sleep(0.05)
+        self.assertEqual(st["state"], "done")
+        # the session materialized on the CLOUD node only; the desktop disk is untouched
+        self.assertTrue(os.path.isdir(sessions.session_dir(self._cloud_tmp.name, sid)))
+        self.assertFalse(os.path.isdir(sessions.session_dir(self._desk_tmp.name, sid)))
+        self.assertEqual(
+            sessions.read_json_artifact(self._cloud_tmp.name, sid, sessions.EVENT_LOG), [])
+
     def test_plain_node_unchanged_dual_run(self):
         # No cloud_backend → capture/stop returns the LOCAL sid, no upload, no proxy.
         self.assertIsNone(self.cloud_state.cloud_backend)

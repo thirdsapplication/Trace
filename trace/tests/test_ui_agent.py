@@ -120,7 +120,7 @@ class UIChainTest(unittest.TestCase):
         self.assertEqual(len(data["interviews"]["B1"]["questions"]), 2)
 
     def test_full_chain_config(self):
-        self._interview_and_answer({"q1": "Open_Orders"})                # q2 skipped
+        self._interview_and_answer({"q1": "Open_Orders", "q2": "the source wins"})
         st = self._build()
         self.assertEqual(st["state"], "done")
         self.assertEqual(st["generated"], 1)
@@ -129,21 +129,71 @@ class UIChainTest(unittest.TestCase):
         agent = next(a for a in data["agents"] if a["bundle_id"] == "B1")
         self.assertIn("system:", agent["live_yaml"])
         self.assertIn("mcp_server_name", agent["live_yaml"])     # live has Pipedream
-        # grounding carries the answered question as a user_answer source + the skip
+        # grounding carries the answered question as a user_answer source; a fully
+        # answered interview leaves no unresolved key (the unresolved->grounding
+        # pipe stays covered by test_interview.InterviewToConfigFeedTest)
         g = agent["grounding"]
         self.assertTrue(any(isinstance(i["source"], dict) and i["source"].get("type") == "user_answer"
                             for i in g["instructions"]))
-        self.assertEqual(g["unresolved"], ["q2"])
+        self.assertNotIn("unresolved", g)
 
     def test_build_bundles_status_before_and_after(self):
         _, data = self.req("GET", f"/api/sessions/{self.sid}/build-bundles")
         b = next(x for x in data["bundles"] if x["id"] == "B1")
         self.assertFalse(b["built"])
-        self._interview_and_answer({"q1": "x"})
+        self._interview_and_answer({"q1": "x", "q2": "y"})
         self._build()
         _, data = self.req("GET", f"/api/sessions/{self.sid}/build-bundles")
         b = next(x for x in data["bundles"] if x["id"] == "B1")
         self.assertTrue(b["built"])
+
+    # --- mandatory questions phase -----------------------------------------
+    def test_build_400_until_interview_complete(self):
+        # before any interview: build is refused
+        code, body = self.req("POST", f"/api/sessions/{self.sid}/build", {"bundle_ids": ["B1"]})
+        self.assertEqual(code, 400)
+        self.assertEqual(body["error"], "interview_incomplete")
+        # partial answers: still refused
+        self._interview_and_answer({"q1": "Open_Orders"})                # q2 skipped
+        code, body = self.req("POST", f"/api/sessions/{self.sid}/build", {"bundle_ids": ["B1"]})
+        self.assertEqual(code, 400)
+        self.assertEqual(body["error"], "interview_incomplete")
+        # every question answered: build proceeds
+        code, rec = self.req("POST", f"/api/sessions/{self.sid}/interview/B1",
+                             {"answers": {"q1": "Open_Orders", "q2": "the source wins"}})
+        self.assertEqual(rec["status"], "complete")
+        code, _ = self.req("POST", f"/api/sessions/{self.sid}/build", {"bundle_ids": ["B1"]})
+        self.assertEqual(code, 202)
+        self.assertEqual(self._await("build")["state"], "done")
+
+    def test_interview_complete_at_lifecycle(self):
+        # full answers set the meta flag
+        self._interview_and_answer({"q1": "a", "q2": "b"})
+        self.assertTrue(sessions.read_meta(self.root, self.sid).get("interview_complete_at"))
+        # re-review with a NEW approved bundle (no interview record) re-gates
+        reviewed = json.loads(json.dumps(REVIEWED))
+        b2 = json.loads(json.dumps(reviewed["bundles"][0]))
+        b2["id"] = "B2"
+        reviewed["bundles"].append(b2)
+        code, _ = self.req("POST", f"/api/sessions/{self.sid}/reviewed-bundles", reviewed)
+        self.assertEqual(code, 200)
+        meta = sessions.read_meta(self.root, self.sid)
+        self.assertIsNone(meta.get("interview_complete_at"))
+        self.assertIsNone(meta.get("interview_at"))              # UI regenerates questions
+        code, body = self.req("POST", f"/api/sessions/{self.sid}/build", {})
+        self.assertEqual((code, body["error"]), (400, "interview_incomplete"))
+
+    def test_interview_vacuously_complete_with_zero_approved(self):
+        reviewed = json.loads(json.dumps(REVIEWED))
+        reviewed["bundles"][0]["disposition"] = "reject"
+        code, _ = self.req("POST", f"/api/sessions/{self.sid}/reviewed-bundles", reviewed)
+        self.assertEqual(code, 200)
+        code, _ = self.req("POST", f"/api/sessions/{self.sid}/interview", {})
+        self.assertEqual(code, 202)
+        self.assertEqual(self._await("interview")["state"], "done")
+        self.assertTrue(sessions.read_meta(self.root, self.sid).get("interview_complete_at"))
+        code, _ = self.req("POST", f"/api/sessions/{self.sid}/build", {})
+        self.assertEqual(code, 202)                              # nothing to interview -> builds
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ future OAuth-client swap is a one-module change in ``connect_client.py``.
 """
 
 import datetime
+import re
 
 from . import config
 
@@ -42,13 +43,33 @@ def _apps_in_event(event):
     return out
 
 
+def _apps_in_text(text):
+    """Connectable apps NAMED in free text (a bundle's name/description/trigger/steps).
+    Word-boundary matching — unlike the event-field substring idiom — because prose
+    false-positives otherwise ('sales-driven' -> drive, 'spreadsheets' -> sheets).
+    Returns ``[{slug, label}]``, one per distinct slug, in table order."""
+    low = (text or "").lower()
+    out, seen = [], set()
+    for k, v in config.CONNECT_APP_TABLE.items():
+        if v["slug"] in seen:
+            continue
+        if re.search(r"(?<![a-z0-9])" + re.escape(k) + r"(?![a-z0-9])", low):
+            seen.add(v["slug"])
+            out.append({"slug": v["slug"], "label": v["label"]})
+    return out
+
+
 def app_union(approved_bundles, event_log):
     """The de-duplicated set of connectable apps across the customer's approved bundles.
     Returns ``(apps, unmapped)`` where ``apps`` is ``[{slug, label, observed_as}]`` in
     first-seen order and ``unmapped`` lists observed app names whose events matched
     nothing in the app table (surfaced, never silently dropped). Each evidence event is
     scanned across ``app``/``window``/``detail`` so a service named only in the window
-    title (browser captures) is still found."""
+    title (browser captures) is still found. Apps NAMED in the bundle's own text
+    (name/description/trigger/steps) are unioned in as well — this is how described
+    (no-recording) workflows get a connectable app list, and it also catches a capture
+    whose evidence events missed an app the steps clearly name. ``unmapped`` stays
+    event-driven: prose naming an unknown app is not deterministically detectable."""
     idx = {e.get("id"): e for e in (event_log or []) if isinstance(e, dict)}
     by_slug, unmapped, seen_unmapped = {}, [], set()
     for b in approved_bundles or []:
@@ -70,6 +91,14 @@ def app_union(approved_bundles, event_log):
             if app and app.lower() not in seen_unmapped:
                 seen_unmapped.add(app.lower())
                 unmapped.append(app)
+        text = " ".join([str(b.get("name") or ""), str(b.get("description") or ""),
+                         str(b.get("trigger") or "")] +
+                        [str(s) for s in (b.get("steps") or [])])
+        for m in _apps_in_text(text):
+            if m["slug"] not in by_slug:
+                by_slug[m["slug"]] = {"slug": m["slug"], "label": m["label"],
+                                      "observed_as": [f"named in workflow: "
+                                                      f"{b.get('name') or b.get('id') or '?'}"]}
     return list(by_slug.values()), unmapped
 
 

@@ -34,6 +34,36 @@ _QUESTION_STOPWORDS = frozenset((
 ))
 _DUP_THRESHOLD = 0.7        # token-set Jaccard at/above which two questions are duplicates
 
+# Canonical fallback interview. The questions phase is MANDATORY: if the model
+# returns no usable questions (or every one is filtered by normalization), these
+# deterministic, domain-neutral questions are asked instead — the same backstop
+# idiom as the canonical working rules in configgen. Raw-shaped so they pass
+# through the exact same _normalize_questions path (ids, cost ordering). Wordings
+# are deliberately distinct so _dedup_questions never collapses them.
+FALLBACK_QUESTIONS = [
+    {"unknown": "exception handling",
+     "lens": "undetermined_decision",
+     "why_it_matters": "Items that don't fit the pattern are where automation goes wrong.",
+     "question": "When an item doesn't fit the normal pattern, what should the agent do with it?",
+     "suggested_answers": ["Skip it and flag it for me", "Handle it like the normal ones",
+                           "Use your best judgment"],
+     "answer_type": "short_text", "cost_if_wrong": "high", "runtime_discoverable": False},
+    {"unknown": "escalation on uncertainty",
+     "lens": "undetermined_decision",
+     "why_it_matters": "Decides whether uncertain runs pause or proceed.",
+     "question": "If the agent is unsure mid-task, should it pause and ask you, or continue "
+                 "with its best call and leave a note?",
+     "suggested_answers": ["Pause and ask me", "Continue and leave a note"],
+     "answer_type": "short_text", "cost_if_wrong": "high", "runtime_discoverable": False},
+    {"unknown": "definition of done",
+     "lens": "capture_blind_spot",
+     "why_it_matters": "The agent needs a finish-line check to verify its own runs.",
+     "question": "How can the agent tell a run of this workflow finished correctly — what "
+                 "does 'done' look like?",
+     "suggested_answers": [],
+     "answer_type": "short_text", "cost_if_wrong": "medium", "runtime_discoverable": False},
+]
+
 
 def build_prompt_material(workflow_description, observed_events):
     """The gap detector's USER message: the workflow + observed events as JSON (also
@@ -105,10 +135,15 @@ def _normalize_questions(raw):
 
 
 def generate_questions(bundle, event_log, model=DEFAULT_MODEL, model_fn=None):
-    """Detect gaps for one bundle. Returns ``{"questions": [...]}`` (possibly empty)."""
+    """Detect gaps for one bundle. Returns ``{"questions": [...]}`` — never empty: if the
+    model returns no usable questions, the canonical FALLBACK_QUESTIONS are asked instead
+    (the questions phase is mandatory)."""
     workflow_description, observed_events, _ = make_engine_inputs(bundle, event_log)
     if model_fn is None:
         model_fn = _default_model_fn(model)
     user_msg = build_prompt_material(workflow_description, observed_events)
     model_out = _parse_json_object(model_fn(SYSTEM_PROMPT, user_msg))
-    return {"questions": _normalize_questions(model_out.get("questions"))}
+    qs = _normalize_questions(model_out.get("questions"))
+    if not qs:
+        qs = _normalize_questions(FALLBACK_QUESTIONS)
+    return {"questions": qs}

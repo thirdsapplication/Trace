@@ -93,7 +93,8 @@ function deriveStep() {
   if (!a.event_log) return a.raw ? 1 : 0;
   if (!a.discovery) return 1;
   if (!s.reviewed_at) return 2;
-  if (!s.build_at) return 3;                 // interview (optional) then build live at step 4
+  // the questions phase is mandatory before build (already-built sessions keep going)
+  if (!s.build_at) return s.interview_complete_at ? 4 : 3;
   if (!connectionUsable()) return 5;
   return 6;
 }
@@ -386,11 +387,47 @@ function renderRecBody(mode, started) {
     };
     return;
   }
+  if (mode === "describe") {
+    b.innerHTML = `
+      <div class="field">
+        <span class="label">Describe your workflow</span>
+        <textarea id="descText" rows="7" placeholder="In a few sentences: what kicks this work off, the steps you take, the apps you use — name them (e.g. Gmail, Google Sheets) — and what the finished result looks like."></textarea>
+      </div>
+      <p class="notice">The more concretely you name your apps and steps, the better your agent will be. You'll review and correct what Trace understood next.</p>
+      <p id="recMsg" class="msg err"></p>
+      <div class="row" style="gap:10px;">
+        <button id="descBack" class="btn-secondary">← Back</button>
+        <button id="descGo" class="btn-primary" style="flex:1;">Continue</button>
+      </div>`;
+    $("#descBack").onclick = () => renderRecBody("idle");
+    $("#descGo").onclick = async () => {
+      const text = $("#descText").value.trim();
+      if (!text) { $("#recMsg").textContent = friendly("empty_description"); return; }
+      $("#descGo").disabled = true; $("#descGo").textContent = "Reading your description…";
+      const { ok, data } = await api("POST", "/api/u/describe-workflow", { description: text });
+      if (!ok) {
+        $("#recMsg").textContent = friendly(data.error || "could not read the description");
+        $("#descGo").disabled = false; $("#descGo").textContent = "Continue";
+        return;
+      }
+      try {
+        await pollJob(data.session_id, "describe");
+        await loadAndRender();                 // lands on Review (event_log + discovery exist)
+      } catch (e) {
+        $("#recMsg").textContent = friendly(e.message);
+        $("#descGo").disabled = false; $("#descGo").textContent = "Try again";
+      }
+    };
+    return;
+  }
   b.innerHTML = `
     <div class="row" style="gap:10px;">
       <button id="recStart" class="btn-primary">Start recording</button>
       <span class="muted" style="font-size:13px;">or</span>
       <button id="recSample" class="btn-secondary">Use a sample day</button>
+    </div>
+    <div class="row" style="margin-top:10px;">
+      <button id="recDescribe" class="btn-link">Skip recording — describe it instead</button>
     </div>
     <p id="recMsg" class="msg err" style="margin-top:12px;"></p>`;
   $("#recStart").onclick = async () => {
@@ -407,6 +444,7 @@ function renderRecBody(mode, started) {
     if (!ok) { $("#recMsg").textContent = data.error || "could not load sample"; $("#recSample").disabled = false; return; }
     await loadAndRender();
   };
+  $("#recDescribe").onclick = () => renderRecBody("describe");
 }
 
 /* ---------------- 02 FIND WORKFLOWS (reconstruct + discover) ---------------- */
@@ -519,16 +557,24 @@ async function stepReview() {
 async function stepInterview() {
   const sid = S.session.id;
   shell(`<div class="panel"><div class="eyebrow">Step four</div><h2>A few quick questions</h2>
-    <p class="lead">Things your screen didn't show us — answer in a line, or skip any you're unsure about.</p>
+    <p class="lead">Things your screen didn't show us. Answer each in a line — not sure? Telling the agent what to do when it's unsure (even "use your best judgment and flag it") is a perfectly good answer.</p>
     <div id="ivBody"><p class="muted">Preparing questions…</p></div></div>`);
-  // generate if not yet present
-  const data0 = await uget(sid, "/interview-data");
-  const have = data0.ok && Object.keys(data0.data.interviews || {}).length;
-  if (!have) {
+  // Generate when the server hasn't finished a questions round for the current
+  // review (interview_at is set at generation end and cleared on re-review).
+  if (!(S.session && S.session.interview_at)) {
     try {
-      await upost(sid, "/interview", {});
+      const r = await upost(sid, "/interview", {});
+      if (!r.ok && r.status !== 409) {        // 409 = already running -> just poll
+        throw new Error((r.data && r.data.error) || "couldn't prepare the questions");
+      }
       await pollJob(sid, "interview");
-    } catch (e) { $("#ivBody").innerHTML = `<p class="msg err">${friendly(e.message)}</p>`; return; }
+      await refreshSession();                 // pick up interview_at / completeness
+    } catch (e) {
+      $("#ivBody").innerHTML = `<p class="msg err">${friendly(e.message)}</p>
+        <button id="ivRetry" class="btn-secondary" style="margin-top:10px;">Try again</button>`;
+      $("#ivRetry").onclick = () => stepInterview();
+      return;
+    }
   }
   const { data } = await uget(sid, "/interview-data");
   renderInterview(sid, data);
@@ -543,7 +589,7 @@ function renderInterview(sid, data) {
       <div class="field">
         <div class="title" style="margin-bottom:8px;">${esc(q.question)}</div>
         <input type="text" class="iv-a" data-bid="${esc(bid)}" data-q="${esc(q.id)}"
-          value="${esc(prior[q.id] || "")}" placeholder="one line — or leave blank to skip">
+          value="${esc(prior[q.id] || "")}" placeholder="one line — every question needs an answer">
         ${(q.suggested_answers || []).length ? `<div class="chips" style="margin-top:8px;">${
           q.suggested_answers.map(s => `<button class="suggest" data-q="${esc(q.id)}" data-bid="${esc(bid)}">${esc(s)}</button>`).join("")}</div>` : ""}
       </div>`).join("");
@@ -554,23 +600,43 @@ function renderInterview(sid, data) {
     ${blocks || `<p class="muted">No questions needed — you're good to go.</p>`}
     <p id="ivMsg" class="msg ok" style="margin-top:12px;"></p>
     <div class="row" style="margin-top:6px;gap:10px;">
-      <button id="ivSkip" class="btn-secondary">Skip</button>
       <button id="ivGo" class="btn-primary" style="flex:1;">Save & continue</button>
     </div>`;
+  // mandatory: continue only once EVERY question has a non-empty answer
+  const updateGo = () => {
+    const inputs = Array.from(root.querySelectorAll(".iv-a"));
+    $("#ivGo").disabled = inputs.some(inp => !inp.value.trim());
+  };
+  root.querySelectorAll(".iv-a").forEach(inp => inp.oninput = updateGo);
   root.querySelectorAll(".suggest").forEach(btn => btn.onclick = () => {
     const inp = root.querySelector(`.iv-a[data-bid="${btn.dataset.bid}"][data-q="${btn.dataset.q}"]`);
-    if (inp) inp.value = btn.textContent;
+    if (inp) { inp.value = btn.textContent; updateGo(); }
   });
+  updateGo();
   const saveAll = async () => {
     const byB = {};
     root.querySelectorAll(".iv-a").forEach(inp => {
       const v = inp.value.trim(); if (!v) return;
       (byB[inp.dataset.bid] = byB[inp.dataset.bid] || {})[inp.dataset.q] = v;
     });
-    for (const bid of Object.keys(byB)) await upost(sid, `/interview/${bid}`, { answers: byB[bid] });
+    for (const bid of Object.keys(byB)) {
+      const r = await upost(sid, `/interview/${bid}`, { answers: byB[bid] });
+      if (!r.ok || (r.data && r.data.status && r.data.status !== "complete")) {
+        throw new Error((r.data && r.data.error) || "answers didn't save — try again");
+      }
+    }
   };
-  $("#ivGo").onclick = async () => { $("#ivGo").disabled = true; $("#ivGo").textContent = "Saving…"; await saveAll(); goStep(4); };
-  $("#ivSkip").onclick = () => goStep(4);
+  $("#ivGo").onclick = async () => {
+    $("#ivGo").disabled = true; $("#ivGo").textContent = "Saving…";
+    try {
+      await saveAll();
+      await refreshSession();                 // pick up interview_complete_at
+      goStep(4);
+    } catch (e) {
+      const m = $("#ivMsg"); m.className = "msg err"; m.textContent = friendly(e.message);
+      $("#ivGo").textContent = "Save & continue"; updateGo();
+    }
+  };
 }
 
 /* ---------------- 05 BUILD ---------------- */
@@ -588,7 +654,10 @@ async function runBuild(sid) {
   b.innerHTML = `<div class="card"><div class="row"><span class="spinner"></span>
     <span class="title">Building…</span></div></div><div id="buildErr" class="msg err" style="margin-top:12px;"></div>`;
   try {
-    await upost(sid, "/build", {});
+    const r = await upost(sid, "/build", {});
+    if (!r.ok && r.status !== 409) {          // 409 = already running -> just poll
+      throw new Error((r.data && r.data.error) || "build failed to start");
+    }
     await pollJob(sid, "build");
     await refreshSession();
     b.innerHTML = builtSummary(); wireBuiltContinue();
@@ -772,6 +841,8 @@ function friendly(err) {
   if (e.includes("no_api_key")) return "the service isn't configured yet — please contact your administrator";
   if (e.includes("not_eligible")) return "finish the previous step first";
   if (e.includes("auth_required")) return "please sign in again";
+  if (e.includes("interview_incomplete")) return "please answer the remaining questions first";
+  if (e.includes("empty_description")) return "tell us a bit about the work first";
   return err || "something went wrong";
 }
 

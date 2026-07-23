@@ -262,6 +262,9 @@ class UIDeployTest(unittest.TestCase):
         self.root = self._tmp.name
         self.state = app.AppState(self.root, key_store=FakeKeystore("sk-ant-test"),
                                   config_fn=fake_config_fn,
+                                  # zero questions => records land "complete", satisfying
+                                  # the mandatory-interview build gate offline
+                                  interview_fn=lambda b, ev, model_fn=None: {"questions": []},
                                   connect_fn=lambda: StubConnectClient(identity_email="worker@acme.com"),
                                   deploy_fn=_fake_deploy_fn)
         self.httpd, _ = app.build_server(port=0, state=self.state)
@@ -296,6 +299,8 @@ class UIDeployTest(unittest.TestCase):
         return st
 
     def _full_chain(self):
+        self.req("POST", f"/api/sessions/{self.sid}/interview", {})   # mandatory before build
+        self._await("interview")
         self.req("POST", f"/api/sessions/{self.sid}/build", {"bundle_ids": ["B1"]})
         self._await("build")
         self.req("POST", f"/api/sessions/{self.sid}/connection-identity", {"email": "worker@acme.com"})

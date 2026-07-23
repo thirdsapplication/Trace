@@ -95,6 +95,47 @@ class AppUnionTest(unittest.TestCase):
         self.assertIn("Preview", unmapped)             # truly unrecognized, surfaced
         self.assertNotIn("Google Chrome", unmapped)    # not surfaced — its events matched
 
+    def test_union_from_bundle_text_without_events(self):
+        # A described (no-recording) workflow: zero events, apps named in the
+        # bundle's own text still yield a connectable union.
+        bundle = {"id": "B1", "name": "Order intake",
+                  "description": "Read each new order email in Gmail.",
+                  "trigger": "A new order email arrives.",
+                  "steps": ["Open the order email in Gmail",
+                            "Add one row to the tracker in Google Sheets"],
+                  "evidence_event_ids": []}
+        apps, unmapped = connect.app_union([bundle], [])
+        slugs = {a["slug"] for a in apps}
+        self.assertEqual(slugs, {"gmail", "google_sheets"})
+        self.assertEqual(unmapped, [])                 # unmapped stays event-driven
+        named = next(a for a in apps if a["slug"] == "gmail")
+        self.assertEqual(named["observed_as"], ["named in workflow: Order intake"])
+
+    def test_union_text_word_boundaries(self):
+        # prose must not substring-match ('sales-driven' -> drive, 'spreadsheets' -> sheets)
+        bundle = {"id": "B1", "name": "Weekly report",
+                  "description": "A sales-driven workflow; update the spreadsheets.",
+                  "trigger": "", "steps": [], "evidence_event_ids": []}
+        apps, _ = connect.app_union([bundle], [])
+        self.assertEqual(apps, [])
+        # but a real word match works, case-insensitive, at sentence edges
+        bundle["steps"] = ["Post the summary to Slack."]
+        apps, _ = connect.app_union([bundle], [])
+        self.assertEqual({a["slug"] for a in apps}, {"slack"})
+
+    def test_union_text_and_events_dedupe(self):
+        # the same app observed in an event AND named in text -> one entry, with the
+        # event observation kept (first-seen wins)
+        event_log = [{"id": "e1", "app": "Gmail", "window": "Inbox",
+                      "action": "read_email", "detail": "read the order"}]
+        bundle = {"id": "B1", "name": "Orders", "description": "Handle Gmail orders",
+                  "trigger": "", "steps": ["Reply in Gmail"], "evidence_event_ids": ["e1"]}
+        apps, unmapped = connect.app_union([bundle], event_log)
+        self.assertEqual(len(apps), 1)
+        self.assertEqual(apps[0]["slug"], "gmail")
+        self.assertEqual(apps[0]["observed_as"], ["Gmail"])   # event-derived, not the text tag
+        self.assertEqual(unmapped, [])
+
 
 class VerifyIdentityTest(unittest.TestCase):
     def test_three_states(self):

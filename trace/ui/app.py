@@ -32,6 +32,7 @@ from ..reconstruct import chunking
 from ..reconstruct.prompt import SYSTEM_PROMPT
 from ..reconstruct.reconstruct import reconstruct as _real_reconstruct
 from ..discovery import scorer as discovery_scorer
+from ..discovery import describe as discovery_describe
 from ..discovery.discover import discover as _real_discover
 from ..discovery.discover import load_event_log, render_event_log
 from ..discovery.prompt import SYSTEM_PROMPT as DISCOVERY_SYSTEM_PROMPT
@@ -154,7 +155,7 @@ def _apply_pipedream_settings(key_store):
 class AppState:
     def __init__(self, sessions_root, collector_port=8137,
                  reconstruct_fn=None, controller_factory=None, key_store=None,
-                 discovery_fn=None, score_fn=None, artifact_fn=None,
+                 discovery_fn=None, describe_fn=None, score_fn=None, artifact_fn=None,
                  interview_fn=None, config_fn=None, cleanup_fn=None,
                  connect_fn=None, deploy_fn=None, cloud_backend=None, proxy_fn=None,
                  summarize_fn=None):
@@ -171,6 +172,8 @@ class AppState:
         self.local_to_cloud_sid = {}                   # desktop: local capture sid -> cloud sid
         self.reconstruct_fn = reconstruct_fn or _real_reconstruct
         self.discovery_fn = discovery_fn or _real_discover
+        # Skip-recording path: typed description -> discovery contract (injectable).
+        self.describe_fn = describe_fn or discovery_describe.describe_workflows
         self.score_fn = score_fn or discovery_scorer.score
         self.artifact_fn = artifact_fn or _real_generate_specs
         # Phase 2: the interview (gap detector) + the Phase-1 config engine. All
@@ -198,6 +201,7 @@ class AppState:
         _apply_pipedream_settings(self.keystore)
         self.recon_jobs = {}         # sid -> {state, current, total, error, flags, errors}
         self.discover_jobs = {}      # sid -> {state, error, bundles, anti_bundles}
+        self.describe_jobs = {}      # sid -> {state, error, bundles, anti_bundles}
         self.spec_jobs = {}          # sid -> {state, error, built, notes}
         self.interview_jobs = {}     # sid -> {state, error, generated}
         self.build_jobs = {}         # sid -> {state, error, generated, errors}
@@ -306,6 +310,35 @@ class AppState:
                     json.dump(discovery, f, indent=2, ensure_ascii=False)
                 sessions.update_meta(self.sessions_root, sid,
                                      discovered_at=sessions._now())
+                job.update(state="done", bundles=len(discovery["bundles"]),
+                           anti_bundles=len(discovery["anti_bundles"]))
+            except Exception as e:
+                job.update(state="error", error=str(e))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    # --- describe job (skip-recording path) -------------------------------
+    def start_describe(self, sid, description):
+        """Turn a typed workflow description into this session's discovery artifacts.
+        Writes ``event_log.json = []`` and ``discovery.json`` TOGETHER at job end so a
+        mid-job reload never lands on the Workflows step and races an empty ``/discover``
+        against the real result (an empty log short-circuits discovery to nothing)."""
+        job = {"state": "running", "error": None, "bundles": 0, "anti_bundles": 0}
+        self.describe_jobs[sid] = job
+
+        def run():
+            try:
+                key = self.keystore.get_key()
+                if not key:
+                    raise RuntimeError("no_api_key")
+                os.environ["ANTHROPIC_API_KEY"] = key
+                discovery, report = self.describe_fn(description)
+                _write_json(sessions.path(self.sessions_root, sid, sessions.EVENT_LOG), [])
+                _write_json(sessions.path(self.sessions_root, sid, sessions.DISCOVERY),
+                            discovery)
+                sessions.update_meta(self.sessions_root, sid,
+                                     describe_at=sessions._now(),
+                                     discovered_at=sessions._now(), event_count=0)
                 job.update(state="done", bundles=len(discovery["bundles"]),
                            anti_bundles=len(discovery["anti_bundles"]))
             except Exception as e:
@@ -528,6 +561,7 @@ class AppState:
                     _write_json(sessions.path(root, sid, sessions.interview_filename(b["id"])), rec)
                     job["generated"] += 1
                 sessions.update_meta(root, sid, interview_at=sessions._now())
+                self._sync_interview_complete(sid)   # zero-approved => vacuously complete
                 job.update(state="done")
             except Exception as e:
                 job.update(state="error", error=str(e))
@@ -559,7 +593,28 @@ class AppState:
                 answers.append({"q": q["id"], "question": q.get("question", ""), "answer": text})
         rec = _interview_record(bid, questions, answers)
         _write_json(sessions.path(self.sessions_root, sid, sessions.interview_filename(bid)), rec)
+        self._sync_interview_complete(sid)
         return rec
+
+    def _interview_all_complete(self, sid):
+        """True when EVERY approved bundle's interview record exists with status
+        'complete' (vacuously true with zero approved bundles). The questions phase
+        is mandatory: this is the build gate, always recomputed from disk."""
+        approved, _ = self._approved_for_stage4(sid)
+        for b in approved:
+            rec = sessions.read_json_artifact(self.sessions_root, sid,
+                                              sessions.interview_filename(b["id"]))
+            if not rec or rec.get("status") != "complete":
+                return False
+        return True
+
+    def _sync_interview_complete(self, sid):
+        """Mirror the completeness state into meta ``interview_complete_at`` so the UI's
+        step derivation can gate on it (presentation only — the build gate recomputes)."""
+        done = self._interview_all_complete(sid)
+        sessions.update_meta(self.sessions_root, sid,
+                             interview_complete_at=(sessions._now() if done else None))
+        return done
 
     # --- Build agents: config (Phase 1) ---
     def start_build(self, sid, selected_ids=None):
@@ -1331,6 +1386,8 @@ def make_handler(state):
                 return self._json(202, {"state": "running"})
             if rest == "/load-fixture":
                 return self._load_fixture(body, owner=uid)
+            if rest == "/describe-workflow":                 # skip-recording path
+                return self._describe_workflow(body, owner=uid)
             m = re.match(r"^/sessions/([^/]+)/(.+)$", rest)
             if m:
                 sid, sub = m.group(1), m.group(2)
@@ -1672,6 +1729,8 @@ def make_handler(state):
             if sub == "/discover/status":
                 job = state.discover_jobs.get(sid)
                 return self._json(200, job or {"state": "idle"})
+            if sub == "/describe/status":                    # skip-recording path
+                return self._json(200, state.describe_jobs.get(sid) or {"state": "idle"})
             if sub == "/review-data":
                 return self._review_data(sid)
             if sub == "/reviewed-bundles":
@@ -1741,6 +1800,24 @@ def make_handler(state):
                 if existing and existing.get("state") == "running":
                     return self._json(409, {"error": "already_running"})
                 state.start_reconstruction(sid)
+            return self._json(202, {"state": "running", "session_id": sid})
+
+        # --- describe (skip-recording path) ---
+        def _describe_workflow(self, body, owner):
+            """Create a session from a TYPED workflow description (no capture). The
+            describe job then writes the same artifacts the capture path produces
+            (event_log=[] + discovery.json), so review -> questions -> build -> connect
+            -> deploy run unchanged."""
+            description = str((body or {}).get("description", "") or "").strip()
+            if not description:
+                return self._json(400, {"error": "empty_description"})
+            if not state.keystore.get_key():
+                return self._json(400, {"error": "no_api_key"})
+            sid = sessions.create_session(root, label="described")
+            sessions.update_meta(root, sid, owner_user_id=owner,
+                                 described=True, description=description)
+            with state.lock:
+                state.start_describe(sid, description)
             return self._json(202, {"state": "running", "session_id": sid})
 
         # --- discovery (Stage 2) ---
@@ -1843,7 +1920,11 @@ def make_handler(state):
                 body or {}, set(artifact_review.event_index(event_log)), report)
             with open(sessions.path(root, sid, sessions.REVIEWED), "w", encoding="utf-8") as f:
                 json.dump(cleaned, f, indent=2, ensure_ascii=False)
-            sessions.update_meta(root, sid, reviewed_at=sessions._now())
+            # The approved set may have changed: clear interview_at so the UI
+            # regenerates questions (prior answers whose qid still maps survive),
+            # then resync — an unchanged, fully-answered set re-passes immediately.
+            sessions.update_meta(root, sid, reviewed_at=sessions._now(), interview_at=None)
+            state._sync_interview_complete(sid)
             return self._json(200, {"saved": True, "reviewed": cleaned,
                                     "errors": report.errors, "flags": report.flags})
 
@@ -1885,6 +1966,10 @@ def make_handler(state):
         def _build(self, sid, body=None):
             if not sessions.artifacts(root, sid)["reviewed"]:
                 return self._json(400, {"error": "not_reviewed"})
+            # The questions phase is mandatory: no build until every approved
+            # bundle's interview is complete (recomputed from disk, never the meta flag).
+            if not state._interview_all_complete(sid):
+                return self._json(400, {"error": "interview_incomplete"})
             approved, _ = state._approved_for_stage4(sid)
             if approved and not state.keystore.get_key():
                 return self._json(400, {"error": "no_api_key"})

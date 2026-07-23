@@ -78,10 +78,11 @@ button:disabled { opacity: 0.45; cursor: default; }
 .full { width: 100%; }
 
 /* --- inputs --- */
-input[type=text], input[type=email], input[type=password] {
+input[type=text], input[type=email], input[type=password], textarea {
   font-family: inherit; font-size: 14px; padding: 11px 13px; width: 100%;
   border: 1.5px solid var(--line-2); border-radius: 11px; background: #fff; color: var(--ink); }
-input:focus { outline: none; border-color: var(--accent); background: var(--accent-bg); }
+textarea { resize: vertical; min-height: 120px; }
+input:focus, textarea:focus { outline: none; border-color: var(--accent); background: var(--accent-bg); }
 .field { margin-bottom: 12px; }
 .field > .label { display: block; margin-bottom: 6px; }
 

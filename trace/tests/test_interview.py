@@ -96,11 +96,25 @@ class InterviewEngineTest(unittest.TestCase):
         qs = interview.generate_questions(b, ev, model_fn=fenced)["questions"]
         self.assertEqual(len(qs), 4)
 
-    def test_empty_questions_ok(self):
+    def test_empty_model_output_falls_back_to_canonical_questions(self):
+        # The questions phase is mandatory: a model that returns nothing usable
+        # yields the deterministic FALLBACK_QUESTIONS, normalized like any other set.
         ev, ak = _load("marcy")
         b = _bundle(ak["bundles"][0])
         qs = interview.generate_questions(b, ev, model_fn=lambda s, u: '{"questions": []}')["questions"]
-        self.assertEqual(qs, [])
+        self.assertEqual(len(qs), len(interview.FALLBACK_QUESTIONS))
+        self.assertEqual([q["id"] for q in qs], ["q1", "q2", "q3"])
+        self.assertEqual([q["cost_if_wrong"] for q in qs], ["high", "high", "medium"])
+        for q in qs:
+            self.assertTrue(q["question"].strip())
+            self.assertEqual(q["answer_type"], "short_text")
+            self.assertFalse(q["runtime_discoverable"])
+
+    def test_fallback_not_used_when_model_returns_questions(self):
+        qs = self._questions()                                  # CANNED stub -> 4 kept
+        fallback_texts = {f["question"] for f in interview.FALLBACK_QUESTIONS}
+        self.assertEqual(len(qs), 4)
+        self.assertFalse(any(q["question"] in fallback_texts for q in qs))
 
     def test_system_prompt_domain_neutral(self):
         low = SYSTEM_PROMPT.lower()
