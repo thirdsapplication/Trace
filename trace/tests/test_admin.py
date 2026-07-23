@@ -217,6 +217,44 @@ class PromptTapTest(AdminHTTPBase):
         self.assertEqual(fn("S", "U"), "summary text")
         self.assertEqual(list(st.prompt_log)[-1]["engine"], "activity")
 
+    def test_tap_model_tiers_are_strings_not_functions(self):
+        # Regression: the tap wiring must read DEFAULT_MODEL off the engine MODULES,
+        # not the package-reexported functions (which have no DEFAULT_MODEL — the
+        # "Find work" AttributeError). Guards all four Pattern-B sites at once.
+        for tier in (app._RECON_MODEL, app._DISCOVER_MODEL, app._SPECS_MODEL):
+            self.assertIsInstance(tier, str)
+        for builder in (app._recon_model_fn, app._discover_model_fn, app._specs_model_fn):
+            self.assertTrue(callable(builder))
+
+    def test_real_discovery_engine_tap_path_runs(self):
+        # Drive the REAL discovery engine (default discovery_fn) through start_discovery
+        # so the actual tap branch executes — the stub-injected chain tests never hit it,
+        # which is how the module-vs-function import bug slipped through. Stub only the
+        # network model call.
+        from trace.agent import configgen
+        ks = FakeKeystore(); ks.save_key("sk-ant-test")
+        st = app.AppState(self.root, key_store=ks)
+        sid = sessions.create_session(self.root)
+        with open(sessions.path(self.root, sid, sessions.EVENT_LOG), "w") as f:
+            json.dump([{"id": "e1", "app": "Gmail", "window": "Inbox", "action": "read",
+                        "detail": "read an email", "ts_start": "2026-01-01T00:00:00"}], f)
+        orig = app._discover_model_fn
+        app._discover_model_fn = lambda model: (lambda s, u:
+            '{"bundles": [], "anti_bundles": [], "unclustered_or_noise_event_ids": [], "notes": ""}')
+        try:
+            st.start_discovery(sid)
+            for _ in range(200):
+                job = st.discover_jobs.get(sid) or {}
+                if job.get("state") in ("done", "error"):
+                    break
+                import time
+                time.sleep(0.02)
+        finally:
+            app._discover_model_fn = orig
+        self.assertEqual(st.discover_jobs[sid]["state"], "done")   # no AttributeError
+        self.assertIsNotNone(sessions.read_json_artifact(self.root, sid, sessions.DISCOVERY))
+        self.assertEqual(list(st.prompt_log)[-1]["engine"], "discovery")   # tapped
+
 
 class AdminStaticTest(AdminHTTPBase):
     def test_admin_shell_served_without_token(self):

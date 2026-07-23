@@ -31,19 +31,26 @@ import yaml
 
 from ..capture.controller import CaptureController
 from ..reconstruct import chunking
-from ..reconstruct import reconstruct as reconstruct_mod
 from ..reconstruct.prompt import SYSTEM_PROMPT
 from ..reconstruct.reconstruct import reconstruct as _real_reconstruct
+# The prompt tap needs each engine's model tier + lazy caller. Import the NAMES from
+# the engine MODULES directly — NOT `from ..reconstruct import reconstruct`, which the
+# package __init__ re-exports as the function (so `.DEFAULT_MODEL` would AttributeError,
+# the "Find work" breakage).
+from ..reconstruct.reconstruct import (DEFAULT_MODEL as _RECON_MODEL,
+                                       _default_model_fn as _recon_model_fn)
 from ..discovery import scorer as discovery_scorer
 from ..discovery import describe as discovery_describe
-from ..discovery import discover as discover_mod
 from ..discovery.discover import discover as _real_discover
+from ..discovery.discover import (DEFAULT_MODEL as _DISCOVER_MODEL,
+                                  _default_model_fn as _discover_model_fn)
 from ..discovery.discover import load_event_log, render_event_log
 from ..discovery.prompt import SYSTEM_PROMPT as DISCOVERY_SYSTEM_PROMPT
-from ..artifact import artifact as artifact_mod
 from ..artifact import review as artifact_review
 from ..artifact.artifact import build_prompt_material, write_spec_bundle
 from ..artifact.artifact import generate_specs as _real_generate_specs
+from ..artifact.artifact import (DEFAULT_MODEL as _SPECS_MODEL,
+                                 _default_model_fn as _specs_model_fn)
 from ..artifact.prompt import SYSTEM_PROMPT as ARTIFACT_SYSTEM_PROMPT
 from ..agent import configgen as agent_configgen
 from ..agent import interview as agent_interview
@@ -296,8 +303,8 @@ class AppState:
                 kw = {}
                 if self.reconstruct_fn is _real_reconstruct:   # tap the real engine's calls
                     kw["model_fn"] = self._tap(
-                        "reconstruct", sid, reconstruct_mod.DEFAULT_MODEL,
-                        lambda: reconstruct_mod._default_model_fn(reconstruct_mod.DEFAULT_MODEL))
+                        "reconstruct", sid, _RECON_MODEL,
+                        lambda: _recon_model_fn(_RECON_MODEL))
                 log, report = self.reconstruct_fn(raw_path, progress_cb=cb, **kw)
                 with open(sessions.path(self.sessions_root, sid, sessions.EVENT_LOG),
                           "w", encoding="utf-8") as f:
@@ -331,8 +338,8 @@ class AppState:
                 kw = {}
                 if self.discovery_fn is _real_discover:        # tap the real engine's call
                     kw["model_fn"] = self._tap(
-                        "discovery", sid, discover_mod.DEFAULT_MODEL,
-                        lambda: discover_mod._default_model_fn(discover_mod.DEFAULT_MODEL))
+                        "discovery", sid, _DISCOVER_MODEL,
+                        lambda: _discover_model_fn(_DISCOVER_MODEL))
                 discovery, report = self.discovery_fn(log_path, **kw)
                 with open(sessions.path(self.sessions_root, sid, sessions.DISCOVERY),
                           "w", encoding="utf-8") as f:
@@ -364,8 +371,8 @@ class AppState:
                 kw = {}
                 if self.describe_fn is discovery_describe.describe_workflows:
                     kw["model_fn"] = self._tap(       # tap the real engine's call
-                        "describe", sid, discover_mod.DEFAULT_MODEL,
-                        lambda: discover_mod._default_model_fn(discover_mod.DEFAULT_MODEL))
+                        "describe", sid, _DISCOVER_MODEL,     # describe reuses discover's caller
+                        lambda: _discover_model_fn(_DISCOVER_MODEL))
                 discovery, report = self.describe_fn(description, **kw)
                 _write_json(sessions.path(self.sessions_root, sid, sessions.EVENT_LOG), [])
                 _write_json(sessions.path(self.sessions_root, sid, sessions.DISCOVERY),
@@ -404,8 +411,8 @@ class AppState:
                 kw = {}
                 if self.artifact_fn is _real_generate_specs:   # tap the real engine's calls
                     kw["model_fn"] = self._tap(
-                        "specs", sid, artifact_mod.DEFAULT_MODEL,
-                        lambda: artifact_mod._default_model_fn(artifact_mod.DEFAULT_MODEL))
+                        "specs", sid, _SPECS_MODEL,
+                        lambda: _specs_model_fn(_SPECS_MODEL))
                 results, report = self.artifact_fn(reviewed_path, event_log_path, **kw)
                 specs_dir = sessions.path(self.sessions_root, sid, sessions.SPECS_DIR)
                 if os.path.isdir(specs_dir):    # clear stale specs + their _files/ bundles
