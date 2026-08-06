@@ -32,3 +32,8 @@ psycopg[binary]>=3.1
 # CA bundle for the stdlib Pipedream Connect HTTPS calls (connect_client.py), so TLS
 # verification doesn't depend on the OS cert store. Also pulled in transitively by anthropic.
 certifi>=2024.0
+
+# Phase 2 (Supabase backend). The supabase-py client wraps Auth, Postgres (PostgREST),
+# and Storage behind a single client object. Imported lazily so a fully-local run
+# never needs it at runtime.
+supabase>=2.0

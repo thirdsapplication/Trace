@@ -1,14 +1,16 @@
 """Specs 2/3/4 — the durable per-user index of deployed agents, their schedules,
-and their run history, with the same dual-run switch as Spec 1:
+and their run history, with the same dual-run switch:
 
-- when ``DATABASE_URL`` is set (cloud), delegate to Postgres (``db.py``) so the
-  state survives Render's ephemeral disk being wiped on restart/redeploy;
+- when Supabase is configured, delegate to PostgREST via ``supabase_client``;
 - otherwise (local dev / offline tests), persist to small JSON files under the
-  sessions root, so nothing requires a database to run.
+  sessions root.
 
 Callers pass ``root`` (the sessions root) for the file-mode path; it is ignored
-in Postgres mode. ``cadence`` is handled here as a Python dict (serialized to
-JSON text for Postgres) so callers never touch storage encoding.
+in Supabase mode. ``cadence`` is handled here as a Python dict (serialized to
+JSON for storage) so callers never touch storage encoding.
+
+Callers use the legacy dict shape with ``agent_id`` and ``owner_user_id`` keys;
+this module translates to/from the Supabase column names (``id``, ``owner_id``).
 """
 
 import json
@@ -16,9 +18,77 @@ import os
 import threading
 import time
 
-from . import db
+from . import supabase_client as supa
 
 _LOCK = threading.Lock()
+
+
+# --- column mapping (caller shape ↔ Supabase shape) ------------------------
+
+def _agent_to_caller(row):
+    """Convert a Supabase agents row to the dict shape callers expect."""
+    d = {
+        "agent_id": str(row.get("id")),
+        "owner_user_id": str(row.get("owner_id")) if row.get("owner_id") else None,
+        "external_user_id": row.get("external_user_id"),
+        "bundle_id": row.get("bundle_id"),
+        "name": row.get("name"),
+        "vault_ref": row.get("vault_ref"),
+        "trigger": row.get("trigger"),
+        "session_id": str(row.get("session_id")) if row.get("session_id") else None,
+        "staged_apps": row.get("staged_apps") or [],
+        "deployment_id": row.get("deployment_id"),
+        "memory_store_id": row.get("memory_store_id"),
+        "description": row.get("description"),
+        "deployed_at": row.get("deployed_at") or row.get("created_at"),
+    }
+    return d
+
+
+def _agent_to_sb(agent):
+    """Convert a caller-shape agent dict to Supabase column names for upsert."""
+    sb = {}
+    if "agent_id" in agent:
+        sb["id"] = agent["agent_id"]
+    if "owner_user_id" in agent:
+        sb["owner_id"] = agent["owner_user_id"]
+    for key in ("external_user_id", "bundle_id", "name", "vault_ref", "trigger",
+                "session_id", "deployment_id", "memory_store_id", "description"):
+        if key in agent:
+            sb[key] = agent[key]
+    if "staged_apps" in agent:
+        sb["staged_apps"] = list(agent.get("staged_apps") or [])
+    return sb
+
+
+def _run_to_caller(row):
+    """Convert a Supabase agent_runs row to the dict shape callers expect."""
+    return {
+        "ran_at": row.get("started_at"),
+        "status": row.get("status"),
+        "summary": row.get("summary"),
+        "details": row.get("details") or [],
+        "run_session_id": row.get("run_session_id"),
+        "drun_id": row.get("drun_id"),
+    }
+
+
+def _pending_to_caller(row):
+    """Convert a Supabase pending_actions row to the dict shape callers expect."""
+    return {
+        "id": str(row.get("id")),
+        "agent_id": str(row.get("agent_id")),
+        "owner_user_id": str(row.get("owner_id")) if row.get("owner_id") else None,
+        "run_session_id": row.get("run_session_id"),
+        "app": row.get("app"),
+        "kind": row.get("kind"),
+        "summary": row.get("summary"),
+        "payload": row.get("payload") or {},
+        "content_hash": row.get("content_hash"),
+        "status": row.get("status"),
+        "created_at": row.get("created_at"),
+        "processed_at": row.get("processed_at"),
+    }
 
 
 # --- file-mode helpers (local dev / tests) ---------------------------------
@@ -40,16 +110,19 @@ def _save(root, name, obj):
     p = os.path.join(_dir(root), name)
     tmp = p + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(obj, f, default=str)          # default=str: a non-JSON-native payload can't crash persistence
+        json.dump(obj, f, default=str)
     os.replace(tmp, p)
 
 
 # --- agents ----------------------------------------------------------------
 def agent_upsert(root, agent):
     """agent: {agent_id, owner_user_id, external_user_id, bundle_id, name,
-    vault_ref, trigger, session_id}."""
-    if db.is_configured():
-        return db.agent_upsert(agent)
+    vault_ref, trigger, session_id, ...}."""
+    if supa.is_configured():
+        admin = supa.get_admin()
+        sb = _agent_to_sb(agent)
+        admin.table("agents").upsert(sb, on_conflict="id").execute()
+        return
     with _LOCK:
         d = _load(root, "agents.json")
         d[agent["agent_id"]] = {**agent, "deployed_at": _now_iso()}
@@ -57,8 +130,12 @@ def agent_upsert(root, agent):
 
 
 def agents_for_user(root, owner_user_id):
-    if db.is_configured():
-        return db.agents_for_user(owner_user_id)
+    if supa.is_configured():
+        admin = supa.get_admin()
+        r = admin.table("agents").select("*") \
+            .eq("owner_id", owner_user_id) \
+            .order("created_at", desc=True).execute()
+        return [_agent_to_caller(row) for row in (r.data or [])]
     d = _load(root, "agents.json")
     return sorted((a for a in d.values() if a.get("owner_user_id") == owner_user_id),
                   key=lambda a: a.get("deployed_at") or "", reverse=True)
@@ -66,25 +143,35 @@ def agents_for_user(root, owner_user_id):
 
 def agents_all(root):
     """Every deployed agent across all users (admin portal)."""
-    if db.is_configured():
-        return db.agents_all()
+    if supa.is_configured():
+        admin = supa.get_admin()
+        r = admin.table("agents").select("*") \
+            .order("created_at", desc=True).execute()
+        return [_agent_to_caller(row) for row in (r.data or [])]
     d = _load(root, "agents.json")
     return sorted(d.values(), key=lambda a: a.get("deployed_at") or "", reverse=True)
 
 
 def agents_with_deployments(root):
     """Agents backed by a platform deployment (the sync loop's work list)."""
-    if db.is_configured():
-        return db.agents_with_deployments()
+    if supa.is_configured():
+        admin = supa.get_admin()
+        r = admin.table("agents").select("*") \
+            .not_.is_("deployment_id", "null") \
+            .order("created_at", desc=True).execute()
+        return [_agent_to_caller(row) for row in (r.data or [])]
     d = _load(root, "agents.json")
     return sorted((a for a in d.values() if a.get("deployment_id")),
                   key=lambda a: a.get("deployed_at") or "", reverse=True)
 
 
 def agent_set_deployment(root, agent_id, deployment_id):
-    """Point one agent row at a new platform deployment (schedule changes recreate it)."""
-    if db.is_configured():
-        return db.agent_set_deployment(agent_id, deployment_id)
+    """Point one agent row at a new platform deployment."""
+    if supa.is_configured():
+        admin = supa.get_admin()
+        admin.table("agents").update({"deployment_id": deployment_id}) \
+            .eq("id", agent_id).execute()
+        return
     with _LOCK:
         d = _load(root, "agents.json")
         if agent_id in d:
@@ -94,8 +181,15 @@ def agent_set_deployment(root, agent_id, deployment_id):
 
 # --- schedules -------------------------------------------------------------
 def schedule_set(root, agent_id, owner_user_id, cadence, paused=False):
-    if db.is_configured():
-        return db.schedule_set(agent_id, owner_user_id, json.dumps(cadence), paused)
+    if supa.is_configured():
+        admin = supa.get_admin()
+        admin.table("schedules").upsert({
+            "agent_id": agent_id,
+            "owner_id": owner_user_id,
+            "cadence": cadence,
+            "paused": paused,
+        }, on_conflict="agent_id").execute()
+        return
     with _LOCK:
         d = _load(root, "schedules.json")
         prev = d.get(agent_id) or {}
@@ -105,8 +199,10 @@ def schedule_set(root, agent_id, owner_user_id, cadence, paused=False):
 
 
 def schedule_clear(root, agent_id):
-    if db.is_configured():
-        return db.schedule_clear(agent_id)
+    if supa.is_configured():
+        admin = supa.get_admin()
+        admin.table("schedules").delete().eq("agent_id", agent_id).execute()
+        return
     with _LOCK:
         d = _load(root, "schedules.json")
         d.pop(agent_id, None)
@@ -114,11 +210,15 @@ def schedule_clear(root, agent_id):
 
 
 def schedule_get(root, agent_id):
-    if db.is_configured():
-        s = db.schedule_get(agent_id)
-        if s and isinstance(s.get("cadence"), str):
-            s["cadence"] = json.loads(s["cadence"])
-        return s
+    if supa.is_configured():
+        admin = supa.get_admin()
+        r = admin.table("schedules").select("cadence, paused, last_run_at") \
+            .eq("agent_id", agent_id).maybe_single().execute()
+        if not r.data:
+            return None
+        s = r.data
+        return {"cadence": s["cadence"], "paused": s["paused"],
+                "last_run_at": s.get("last_run_at")}
     s = _load(root, "schedules.json").get(agent_id)
     if not s:
         return None
@@ -127,13 +227,29 @@ def schedule_get(root, agent_id):
 
 
 def schedule_list_active(root):
-    """Active (not paused) schedules joined with their agent row, each carrying
-    ``cadence`` (dict) and ``last_run_epoch`` (float|None) — what the scheduler needs."""
-    if db.is_configured():
-        out = db.schedule_list_active()
-        for s in out:
-            if isinstance(s.get("cadence"), str):
-                s["cadence"] = json.loads(s["cadence"])
+    """Active (not paused) schedules joined with their agent row."""
+    if supa.is_configured():
+        admin = supa.get_admin()
+        r = admin.table("schedules").select("*, agents(*)") \
+            .eq("paused", False).execute()
+        out = []
+        for s in (r.data or []):
+            agent_data = s.get("agents")
+            if not agent_data:
+                continue
+            d = _agent_to_caller(agent_data)
+            d["cadence"] = s["cadence"]
+            lr = s.get("last_run_at")
+            if lr:
+                from datetime import datetime, timezone
+                try:
+                    dt = datetime.fromisoformat(lr.replace("Z", "+00:00"))
+                    d["last_run_epoch"] = dt.timestamp()
+                except (ValueError, TypeError):
+                    d["last_run_epoch"] = None
+            else:
+                d["last_run_epoch"] = None
+            out.append(d)
         return out
     agents = _load(root, "agents.json")
     scheds = _load(root, "schedules.json")
@@ -149,8 +265,11 @@ def schedule_list_active(root):
 
 
 def schedule_mark_run(root, agent_id):
-    if db.is_configured():
-        return db.schedule_mark_run(agent_id)
+    if supa.is_configured():
+        admin = supa.get_admin()
+        admin.table("schedules").update({"last_run_at": _now_iso()}) \
+            .eq("agent_id", agent_id).execute()
+        return
     with _LOCK:
         d = _load(root, "schedules.json")
         if agent_id in d:
@@ -160,9 +279,20 @@ def schedule_mark_run(root, agent_id):
 
 # --- runs ------------------------------------------------------------------
 def run_add(root, rec):
-    """rec: {agent_id, owner_user_id, status, summary, details, run_session_id}."""
-    if db.is_configured():
-        return db.run_add(rec)
+    """rec: {agent_id, owner_user_id, status, summary, details, run_session_id, drun_id}."""
+    if supa.is_configured():
+        admin = supa.get_admin()
+        row = {
+            "agent_id": rec.get("agent_id"),
+            "owner_id": rec.get("owner_user_id"),
+            "status": rec.get("status"),
+            "summary": rec.get("summary"),
+            "details": rec.get("details") or [],
+            "run_session_id": rec.get("run_session_id"),
+            "drun_id": rec.get("drun_id"),
+        }
+        admin.table("agent_runs").insert(row).execute()
+        return
     with _LOCK:
         p = os.path.join(_dir(root), f"runs_{_safe(rec['agent_id'])}.jsonl")
         with open(p, "a", encoding="utf-8") as f:
@@ -170,8 +300,13 @@ def run_add(root, rec):
 
 
 def runs_for_agent(root, agent_id, limit=20):
-    if db.is_configured():
-        return db.runs_for_agent(agent_id, limit)
+    if supa.is_configured():
+        admin = supa.get_admin()
+        r = admin.table("agent_runs").select("*") \
+            .eq("agent_id", agent_id) \
+            .order("started_at", desc=True) \
+            .limit(limit).execute()
+        return [_run_to_caller(row) for row in (r.data or [])]
     p = os.path.join(_dir(root), f"runs_{_safe(agent_id)}.jsonl")
     try:
         with open(p, encoding="utf-8") as f:
@@ -183,8 +318,12 @@ def runs_for_agent(root, agent_id, limit=20):
 
 def run_seen_drun_ids(root, agent_id):
     """The deployment_run ids already recorded for one agent (sync-loop dedupe)."""
-    if db.is_configured():
-        return db.run_seen_drun_ids(agent_id)
+    if supa.is_configured():
+        admin = supa.get_admin()
+        r = admin.table("agent_runs").select("drun_id") \
+            .eq("agent_id", agent_id) \
+            .not_.is_("drun_id", "null").execute()
+        return {row["drun_id"] for row in (r.data or [])}
     p = os.path.join(_dir(root), f"runs_{_safe(agent_id)}.jsonl")
     try:
         with open(p, encoding="utf-8") as f:
@@ -195,12 +334,29 @@ def run_seen_drun_ids(root, agent_id):
 
 # --- pending (staged) actions — Spec 8 -------------------------------------
 def pending_add(root, rec):
-    """rec: {agent_id, owner_user_id, run_session_id, app, kind, summary, payload,
-    content_hash}. Deduped on (agent_id, content_hash) against pending/executed items
-    so a repeated scheduled run never re-stages the same proposal. Returns True if
-    inserted, False if deduped."""
-    if db.is_configured():
-        return db.pending_add(rec)
+    """Deduped on (agent_id, content_hash) against pending/executed items.
+    Returns True if inserted, False if deduped."""
+    if supa.is_configured():
+        admin = supa.get_admin()
+        # Check for existing
+        r = admin.table("pending_actions").select("id") \
+            .eq("agent_id", rec.get("agent_id")) \
+            .eq("content_hash", rec.get("content_hash")) \
+            .in_("status", ["pending", "executed"]) \
+            .limit(1).execute()
+        if r.data:
+            return False
+        admin.table("pending_actions").insert({
+            "agent_id": rec.get("agent_id"),
+            "owner_id": rec.get("owner_user_id"),
+            "run_session_id": rec.get("run_session_id"),
+            "app": rec.get("app"),
+            "kind": rec.get("kind"),
+            "summary": rec.get("summary"),
+            "payload": rec.get("payload") or {},
+            "content_hash": rec.get("content_hash"),
+        }).execute()
+        return True
     with _LOCK:
         d = _load(root, "pending.json")
         for it in d.values():
@@ -216,8 +372,13 @@ def pending_add(root, rec):
 
 
 def pending_for_user(root, owner_user_id, status="pending"):
-    if db.is_configured():
-        return db.pending_for_user(owner_user_id, status)
+    if supa.is_configured():
+        admin = supa.get_admin()
+        r = admin.table("pending_actions").select("*") \
+            .eq("owner_id", owner_user_id) \
+            .eq("status", status) \
+            .order("created_at", desc=True).execute()
+        return [_pending_to_caller(row) for row in (r.data or [])]
     d = _load(root, "pending.json")
     return sorted((it for it in d.values()
                    if it.get("owner_user_id") == owner_user_id and it.get("status") == status),
@@ -225,14 +386,21 @@ def pending_for_user(root, owner_user_id, status="pending"):
 
 
 def pending_get(root, pending_id):
-    if db.is_configured():
-        return db.pending_get(pending_id)
+    if supa.is_configured():
+        admin = supa.get_admin()
+        r = admin.table("pending_actions").select("*") \
+            .eq("id", str(pending_id)).maybe_single().execute()
+        return _pending_to_caller(r.data) if r.data else None
     return _load(root, "pending.json").get(str(pending_id))
 
 
 def pending_set_status(root, pending_id, status):
-    if db.is_configured():
-        return db.pending_set_status(pending_id, status)
+    if supa.is_configured():
+        admin = supa.get_admin()
+        admin.table("pending_actions").update({
+            "status": status, "processed_at": _now_iso()
+        }).eq("id", str(pending_id)).execute()
+        return
     with _LOCK:
         d = _load(root, "pending.json")
         it = d.get(str(pending_id))
@@ -243,20 +411,27 @@ def pending_set_status(root, pending_id, status):
 
 
 def pending_count_for_user(root, owner_user_id):
-    if db.is_configured():
-        return db.pending_count_for_user(owner_user_id)
+    if supa.is_configured():
+        admin = supa.get_admin()
+        r = admin.table("pending_actions").select("id", count="exact") \
+            .eq("owner_id", owner_user_id) \
+            .eq("status", "pending").execute()
+        return r.count or 0
     d = _load(root, "pending.json")
     return sum(1 for it in d.values()
                if it.get("owner_user_id") == owner_user_id and it.get("status") == "pending")
 
 
 # --- story review marks ------------------------------------------------------
-# A run (session) is a "story" until reviewed; marking it reviewed moves it into
-# the agent's session-history log. run_key = run_session_id, or agent:ran_at for
-# runs that never got a session.
 def review_mark(root, agent_id, owner_user_id, run_key):
-    if db.is_configured():
-        return db.review_mark(agent_id, owner_user_id, run_key)
+    if supa.is_configured():
+        admin = supa.get_admin()
+        admin.table("run_reviews").upsert({
+            "agent_id": agent_id,
+            "owner_id": owner_user_id,
+            "run_key": run_key,
+        }, on_conflict="agent_id,run_key").execute()
+        return
     with _LOCK:
         d = _load(root, "run_reviews.json")
         d.setdefault(agent_id, {})[run_key] = _now_iso()
@@ -264,16 +439,27 @@ def review_mark(root, agent_id, owner_user_id, run_key):
 
 
 def reviewed_keys(root, agent_id):
-    if db.is_configured():
-        return db.reviewed_keys(agent_id)
+    if supa.is_configured():
+        admin = supa.get_admin()
+        r = admin.table("run_reviews").select("run_key") \
+            .eq("agent_id", agent_id).execute()
+        return {row["run_key"] for row in (r.data or [])}
     return set((_load(root, "run_reviews.json").get(agent_id) or {}).keys())
 
 
 # --- agent direct messages (Instagram-style "My agents") --------------------
 def message_add(root, rec):
     """rec: {agent_id, owner_user_id, sender ('user'|'agent'), text, read?}."""
-    if db.is_configured():
-        return db.message_add(rec)
+    if supa.is_configured():
+        admin = supa.get_admin()
+        admin.table("agent_messages").insert({
+            "agent_id": rec.get("agent_id"),
+            "owner_id": rec.get("owner_user_id"),
+            "sender": rec.get("sender"),
+            "text": rec.get("text"),
+            "read": bool(rec.get("read", False)),
+        }).execute()
+        return
     with _LOCK:
         d = _load(root, "messages.json")
         nid = str(max((int(k) for k in d), default=0) + 1)
@@ -286,8 +472,25 @@ def message_add(root, rec):
 
 def messages_for_agent(root, owner_user_id, agent_id, limit=50):
     """One thread, oldest-first."""
-    if db.is_configured():
-        return db.messages_for_agent(owner_user_id, agent_id, limit)
+    if supa.is_configured():
+        admin = supa.get_admin()
+        r = admin.table("agent_messages").select("*") \
+            .eq("owner_id", owner_user_id) \
+            .eq("agent_id", agent_id) \
+            .order("created_at", desc=True) \
+            .order("id", desc=True) \
+            .limit(limit).execute()
+        rows = r.data or []
+        out = []
+        for row in reversed(rows):
+            out.append({
+                "id": str(row["id"]),
+                "sender": row["sender"],
+                "text": row["text"],
+                "read": bool(row["read"]),
+                "created_at": row["created_at"],
+            })
+        return out
     d = _load(root, "messages.json")
     mine = [m for m in d.values()
             if m.get("owner_user_id") == owner_user_id and m.get("agent_id") == agent_id]
@@ -296,8 +499,13 @@ def messages_for_agent(root, owner_user_id, agent_id, limit=50):
 
 
 def messages_mark_read(root, owner_user_id, agent_id):
-    if db.is_configured():
-        return db.messages_mark_read(owner_user_id, agent_id)
+    if supa.is_configured():
+        admin = supa.get_admin()
+        admin.table("agent_messages").update({"read": True}) \
+            .eq("owner_id", owner_user_id) \
+            .eq("agent_id", agent_id) \
+            .eq("sender", "agent").execute()
+        return
     with _LOCK:
         d = _load(root, "messages.json")
         changed = False
@@ -312,8 +520,17 @@ def messages_mark_read(root, owner_user_id, agent_id):
 
 def messages_unread_counts(root, owner_user_id):
     """{agent_id: unread agent-sent count}."""
-    if db.is_configured():
-        return db.messages_unread_counts(owner_user_id)
+    if supa.is_configured():
+        admin = supa.get_admin()
+        r = admin.table("agent_messages").select("agent_id") \
+            .eq("owner_id", owner_user_id) \
+            .eq("sender", "agent") \
+            .eq("read", False).execute()
+        out = {}
+        for row in (r.data or []):
+            aid = str(row["agent_id"])
+            out[aid] = out.get(aid, 0) + 1
+        return out
     d = _load(root, "messages.json")
     out = {}
     for m in d.values():
@@ -325,14 +542,23 @@ def messages_unread_counts(root, owner_user_id):
 
 # --- session-summary cache (activity view) ---------------------------------
 def summary_get(root, session_id):
-    if db.is_configured():
-        return db.summary_get(session_id)
+    if supa.is_configured():
+        admin = supa.get_admin()
+        r = admin.table("session_summaries").select("summary, status") \
+            .eq("session_id", session_id).maybe_single().execute()
+        return {"summary": r.data["summary"], "status": r.data["status"]} if r.data else None
     return _load(root, "session_summaries.json").get(session_id)
 
 
 def summary_set(root, session_id, summary, status):
-    if db.is_configured():
-        return db.summary_set(session_id, summary, status)
+    if supa.is_configured():
+        admin = supa.get_admin()
+        admin.table("session_summaries").upsert({
+            "session_id": session_id,
+            "summary": summary,
+            "status": status,
+        }, on_conflict="session_id").execute()
+        return
     with _LOCK:
         d = _load(root, "session_summaries.json")
         d[session_id] = {"summary": summary, "status": status, "created_at": _now_iso()}

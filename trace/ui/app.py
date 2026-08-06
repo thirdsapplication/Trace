@@ -59,7 +59,7 @@ from ..agent import config as agent_config
 from ..agent import deploy as agent_deploy
 from ..agent import runner as agent_runner
 from ..agent import activity as agent_activity
-from . import cloud, db, keystore, permissions, registry, sessions, users
+from . import cloud, keystore, permissions, registry, sessions, supabase_client, users
 
 
 def _write_json(path, obj):
@@ -316,6 +316,17 @@ class AppState:
                 sessions.update_meta(self.sessions_root, sid,
                                      reconstructed_at=sessions._now(),
                                      event_count=len(log))
+                # Sync to Supabase: validation + event_log
+                val_data = {"errors": report.errors, "flags": report.flags}
+                sessions.write_json_artifact(self.sessions_root, sid,
+                                             "validation_report", val_data)
+                sessions.sync_to_supabase(self.sessions_root, sid,
+                                          reconstructed_at=sessions._now(),
+                                          event_count=len(log))
+                meta = sessions.read_meta(self.sessions_root, sid)
+                sessions._upload_to_storage(self.sessions_root, sid,
+                                            sessions.EVENT_LOG,
+                                            meta.get("owner_user_id") or "")
                 job.update(state="done", flags=len(report.flags),
                            errors=len(report.errors))
             except Exception as e:  # surface real detail (handoff §4.5)
@@ -346,6 +357,11 @@ class AppState:
                     json.dump(discovery, f, indent=2, ensure_ascii=False)
                 sessions.update_meta(self.sessions_root, sid,
                                      discovered_at=sessions._now())
+                # Sync discovery to Supabase
+                sessions.write_json_artifact(self.sessions_root, sid,
+                                             "discovery", discovery)
+                sessions.sync_to_supabase(self.sessions_root, sid,
+                                          discovered_at=sessions._now())
                 job.update(state="done", bundles=len(discovery["bundles"]),
                            anti_bundles=len(discovery["anti_bundles"]))
             except Exception as e:
@@ -1609,16 +1625,16 @@ def make_handler(state):
             if not _signup_enabled():
                 return self._json(403, {"error": "signup_disabled"})
             try:
-                u = users.create_user((body or {}).get("email"), (body or {}).get("password"))
+                u, token = users.create_user((body or {}).get("email"), (body or {}).get("password"))
             except ValueError as e:
                 return self._json(400, {"error": str(e)})
-            return self._json_auth(200, {"user": u}, set_token=users.start_session(u["user_id"]))
+            return self._json_auth(200, {"user": u}, set_token=users.start_session(u["user_id"], token))
 
         def _auth_login(self, body):
-            u = users.verify((body or {}).get("email"), (body or {}).get("password"))
+            u, token = users.verify((body or {}).get("email"), (body or {}).get("password"))
             if not u:
                 return self._json(401, {"error": "invalid_credentials"})
-            return self._json_auth(200, {"user": u}, set_token=users.start_session(u["user_id"]))
+            return self._json_auth(200, {"user": u}, set_token=users.start_session(u["user_id"], token))
 
         def _auth_logout(self):
             users.end_session(self._cookie(users.COOKIE_NAME))
@@ -1728,8 +1744,7 @@ def make_handler(state):
             if rest in ("/me", ""):
                 return self._json(200, {"user": user, "signup_enabled": _signup_enabled()})
             if rest == "/sessions":
-                mine = [s for s in sessions.list_sessions(root)
-                        if s.get("owner_user_id") == user["user_id"]]
+                mine = sessions.list_sessions(root, owner_id=user["user_id"])
                 return self._json(200, {"sessions": mine})
             if rest == "/fixtures":                          # demo entry without mac capture
                 return self._json(200, {"fixtures": [
@@ -1893,7 +1908,7 @@ def make_handler(state):
                 # Dependency-free on purpose: Render's health check and the
                 # human's first smoke test must pass even before keys/DB are set.
                 return self._json(200, {"status": "ok", "service": "trace-backend",
-                                        "database": "configured" if db.is_configured()
+                                        "database": "supabase" if supabase_client.is_configured()
                                         else "local"})
             if p == "/" or p == "/index.html":
                 return self._serve_static("index.html")
@@ -2102,7 +2117,7 @@ def make_handler(state):
                 "users": len(users.list_users()),
                 "agents": len(registry.agents_all(root)),
                 "sessions": len(sessions.list_sessions(root)),
-                "db_mode": "postgres" if db.is_configured() else "files",
+                "db_mode": "supabase" if supabase_client.is_configured() else "files",
                 "scheduler_alive": bool(sched and sched.is_alive()),
                 "cloud_backend": state.cloud_backend,
                 "signup_enabled": _signup_enabled(),
@@ -2187,7 +2202,7 @@ def make_handler(state):
                     {"id": "cloud", "label": "Cloud node (Render)",
                      "detail": "Pipeline engines, scheduler + deployment sync, this admin API",
                      "connects_to": ["postgres", "anthropic", "pipedream"],
-                     "live": {"db_mode": "postgres" if db.is_configured() else "files",
+                     "live": {"db_mode": "supabase" if supabase_client.is_configured() else "files",
                               "scheduler_alive": bool(state._scheduler_thread
                                                       and state._scheduler_thread.is_alive())}},
                     {"id": "postgres", "label": "Postgres (Render managed)",
@@ -2242,7 +2257,7 @@ def make_handler(state):
                 if state.controller and state.controller.running:
                     return self._json(409, {"error": "already_running",
                                             "session_id": state.current_sid})
-                sid = sessions.create_session(root)
+                sid = sessions.create_session(root, owner_id=owner)
                 if owner:                                   # WS3: tag the owning end-user
                     sessions.update_meta(root, sid, owner_user_id=owner)
                 out = sessions.path(root, sid, sessions.RAW)
@@ -2272,6 +2287,14 @@ def make_handler(state):
                                      raw_event_count=count,
                                      source_summary=health["by_source"],
                                      capture_warning=health["message"])
+                # Sync to Supabase: capture stopped + upload raw_events
+                meta = sessions.read_meta(root, sid)
+                sessions.sync_to_supabase(root, sid,
+                                          stopped_at=sessions._now(),
+                                          status="stopped",
+                                          event_count=count)
+                sessions._upload_to_storage(root, sid, sessions.RAW,
+                                            meta.get("owner_user_id") or "")
                 state.controller = None
                 state.current_sid = None
             # Desktop mode: the pipeline lives in the cloud, so push the captured
@@ -2418,7 +2441,7 @@ def make_handler(state):
                 return self._json(400, {"error": "empty_description"})
             if not state.keystore.get_key():
                 return self._json(400, {"error": "no_api_key"})
-            sid = sessions.create_session(root, label="described")
+            sid = sessions.create_session(root, label="described", owner_id=owner)
             sessions.update_meta(root, sid, owner_user_id=owner,
                                  described=True, description=description)
             with state.lock:
@@ -2431,7 +2454,7 @@ def make_handler(state):
             fx = next((f for f in list_fixtures() if f["name"] == name), None)
             if not fx:
                 return self._json(404, {"error": "unknown_fixture"})
-            sid = sessions.create_session(root, label=f"fixture:{name}")
+            sid = sessions.create_session(root, label=f"fixture:{name}", owner_id=owner)
             if owner:                                       # WS3: tag the owning end-user
                 sessions.update_meta(root, sid, owner_user_id=owner)
             with open(fx["event_log"], "r", encoding="utf-8") as src, \
@@ -2491,6 +2514,7 @@ def make_handler(state):
             with open(sessions.path(root, sid, sessions.SCORECARD), "w", encoding="utf-8") as f:
                 json.dump(sc, f, indent=2, ensure_ascii=False)
             sessions.update_meta(root, sid, scored_at=sessions._now())
+            sessions.write_json_artifact(root, sid, "scorecard", sc)
             return self._json(200, sc)
 
         # --- review step (Stage 3) ---
@@ -2529,6 +2553,7 @@ def make_handler(state):
             # regenerates questions (prior answers whose qid still maps survive),
             # then resync — an unchanged, fully-answered set re-passes immediately.
             sessions.update_meta(root, sid, reviewed_at=sessions._now(), interview_at=None)
+            sessions.write_json_artifact(root, sid, "reviewed_bundles", cleaned)
             state._sync_interview_complete(sid)
             return self._json(200, {"saved": True, "reviewed": cleaned,
                                     "errors": report.errors, "flags": report.flags})
@@ -2749,9 +2774,8 @@ def _preflight(state):
 
 def build_server(host="127.0.0.1", port=8765, sessions_root="captures/sessions",
                  collector_port=8137, state=None, cloud_backend=None):
-    # Phase 1: ensure the Postgres schema when a database is configured
-    # (DATABASE_URL set); a no-op on a local run so boot stays the same path.
-    db.init_db()
+    # Supabase schema is managed via migrations (001+002 already deployed).
+    # No init_db() needed — Supabase handles this externally.
     state = state or AppState(sessions_root, collector_port=collector_port,
                               cloud_backend=cloud_backend)
     httpd = ThreadingHTTPServer((host, port), make_handler(state))

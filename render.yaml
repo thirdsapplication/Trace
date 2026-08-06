@@ -1,14 +1,12 @@
-# Render blueprint for the Trace cloud backend (Phase 1).
+# Render blueprint for the Trace cloud backend.
 #
-# "New → Blueprint" in Render reads this file and provisions both the web service
-# (built from the Dockerfile) and a managed Postgres database in roughly one
-# click. Render then prompts for the secret values marked `sync: false` — paste
-# the values from .env.example. DATABASE_URL and SESSION_SECRET are filled in
-# automatically (see below), so do not paste those.
+# "New → Blueprint" in Render reads this file and provisions the web service
+# (built from the Dockerfile). Database is hosted on Supabase (external).
+# Render prompts for the secret values marked `sync: false` — paste the values
+# from your Supabase project settings + .env.example.
 #
 # Tier note: Starter (paid) is chosen deliberately — a free web service sleeps
-# after ~15 min idle and free Postgres is expired after a set period. Downgrade
-# to free only for a throwaway one-off test.
+# after ~15 min idle. Downgrade to free only for a throwaway one-off test.
 
 services:
   - type: web
@@ -33,8 +31,7 @@ services:
         sync: false
       - key: PIPEDREAM_ENVIRONMENT
         sync: false
-      # App session secret — Render generates a strong random value (no need to
-      # invent one); Phase 2 uses it to sign restart-surviving sessions.
+      # App session secret — Render generates a strong random value.
       - key: SESSION_SECRET
         generateValue: true
       # Admin portal token — any long random string; leave BLANK/unset to keep the
@@ -45,12 +42,11 @@ services:
       # the default when unset). "Daily · 9am" fires at 9am in this zone.
       - key: TRACE_SCHEDULE_TZ
         sync: false
-      # Postgres connection string — wired automatically from the database below.
-      - key: DATABASE_URL
-        fromDatabase:
-          name: trace-db
-          property: connectionString
-
-databases:
-  - name: trace-db
-    plan: basic-256mb
+      # Supabase — Auth + Postgres (PostgREST) + Storage. Set these from your
+      # Supabase project settings (Settings → API).
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
