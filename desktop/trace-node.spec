@@ -2,14 +2,14 @@
 #
 # Build (run from the repo root):
 #     pyinstaller desktop/trace-node.spec
-# Output: dist/trace-node  (a single self-contained binary; no Python install
-# needed on the user's machine).
+# Output: dist/trace-node/  (a directory bundle; no decompression on startup,
+# so the app launches in seconds instead of 30-60s for onefile mode).
 #
 # This freezes the existing `trace.ui.app` server. In desktop mode it runs
 # capture locally and proxies auth + pipeline to the cloud, so the heavy
 # cloud-only deps (anthropic, psycopg) are EXCLUDED — they're imported lazily and
 # only on code paths that, in the app, are proxied to the cloud. This keeps the
-# binary small. pynput + pyobjc are macOS capture deps and MUST be bundled.
+# bundle small. pynput + pyobjc are macOS capture deps and MUST be bundled.
 
 import os
 
@@ -52,21 +52,31 @@ a = Analysis(
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
+# onedir mode: EXE is just the bootloader + script; COLLECT gathers everything
+# into dist/trace-node/ as loose files. No decompression on launch.
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
     [],
+    exclude_binaries=True,
     name="trace-node",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
-    console=True,          # logs go to stdout/stderr, which Tauri captures
+    console=True,
     disable_windowed_traceback=False,
-    target_arch=None,      # build per-arch on the target Mac (arm64 / x86_64)
-    codesign_identity=None,  # unsigned for the insider build
+    target_arch=None,
+    codesign_identity=None,
     entitlements_file=None,
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    strip=False,
+    upx=False,
+    name="trace-node",
 )

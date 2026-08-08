@@ -2279,24 +2279,30 @@ def make_handler(state):
                     return self._json(409, {"error": "not_running"})
                 sid = state.current_sid
                 controller = state.controller
+                # Always clear state so the user can start a new session,
+                # even if the stop/sync below throws.
+                state.controller = None
+                state.current_sid = None
+            # Outside the lock: stop capture and sync (non-blocking for state).
+            try:
                 controller.stop()
                 count = sessions.artifacts(root, sid)["raw_event_count"]
-                # Completed-session observability + fail-loud signal (Item 3).
                 health = controller.summary()
                 sessions.update_meta(root, sid, stopped_at=sessions._now(),
                                      raw_event_count=count,
                                      source_summary=health["by_source"],
                                      capture_warning=health["message"])
-                # Sync to Supabase: capture stopped + upload raw_events
-                meta = sessions.read_meta(root, sid)
                 sessions.sync_to_supabase(root, sid,
                                           stopped_at=sessions._now(),
                                           status="stopped",
                                           event_count=count)
+                meta = sessions.read_meta(root, sid)
                 sessions._upload_to_storage(root, sid, sessions.RAW,
                                             meta.get("owner_user_id") or "")
-                state.controller = None
-                state.current_sid = None
+            except Exception:
+                import traceback; traceback.print_exc()
+                count = count if 'count' in dir() else 0
+                health = health if 'health' in dir() else {}
             # Desktop mode: the pipeline lives in the cloud, so push the captured
             # stream up and hand the UI back the CLOUD session id — its subsequent
             # (proxied) reconstruct/discover then target the cloud session.

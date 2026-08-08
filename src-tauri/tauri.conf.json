@@ -27,7 +27,7 @@
     "targets": ["app", "dmg"],
     "category": "Productivity",
     "shortDescription": "Capture your work; Trace builds the agents.",
-    "externalBin": ["binaries/trace-node"],
+    "resources": ["binaries/trace-node/**/*"],
     "icon": ["icons/icon.icns"],
     "macOS": {
       "minimumSystemVersion": "11.0"
