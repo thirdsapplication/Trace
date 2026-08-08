@@ -1,44 +1,57 @@
 """Active-window capturer (macOS) — the capture "spine".
 
-Polls the frontmost app + window title via AppleScript (``osascript``), as in the
-Appendix A prototype, and emits a normalized ``window`` raw event
-``{app, title}`` only when it changes. The window stream is the cheap, reliable
-carrier of document/app/email identity (subjects, filenames, sheet names).
+Polls the frontmost app + window title and emits a normalized ``window`` raw
+event ``{app, title}`` only when it changes. The window stream is the cheap,
+reliable carrier of document/app/email identity (subjects, filenames, sheet
+names).
+
+Uses the Quartz CGWindowList API + NSWorkspace for reliable window title
+access on macOS Sequoia (15+). The older AppleScript/System Events approach
+broke in Sequoia — ``name of front window`` returns empty for most apps.
+Quartz works with Screen Recording permission.
 
 On each change we (1) flush the keystroke buffer so the just-finished typed
 segment is attributed to the window it was typed in, then (2) emit the window
 event, then (3) point the coalescer at the new window.
 """
 
-import subprocess
-
 from .raw_writer import now_iso
-
-_FRONTMOST_SCRIPT = (
-    'tell application "System Events"\n'
-    ' set frontApp to name of first process whose frontmost is true\n'
-    ' set winTitle to ""\n'
-    ' try\n'
-    '  tell process frontApp to set winTitle to name of front window\n'
-    ' end try\n'
-    ' return frontApp & " | " & winTitle\n'
-    'end tell'
-)
 
 
 def frontmost():
     """Return ``(app, title)`` for the active window, or ``None`` on failure."""
     try:
-        raw = subprocess.check_output(
-            ["osascript", "-e", _FRONTMOST_SCRIPT],
-            stderr=subprocess.DEVNULL, text=True,
-        ).strip()
+        from AppKit import NSWorkspace
+        from Quartz import (
+            CGWindowListCopyWindowInfo,
+            kCGWindowListOptionOnScreenOnly,
+            kCGWindowListExcludeDesktopElements,
+            kCGNullWindowID,
+        )
+
+        ws = NSWorkspace.sharedWorkspace()
+        active = ws.frontmostApplication()
+        if active is None:
+            return None
+
+        app_name = active.localizedName() or ""
+        pid = active.processIdentifier()
+
+        # Find the frontmost normal-layer window for this app.
+        windows = CGWindowListCopyWindowInfo(
+            kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
+            kCGNullWindowID,
+        )
+        title = ""
+        for w in windows:
+            if w.get("kCGWindowOwnerPID") == pid and w.get("kCGWindowLayer", -1) == 0:
+                title = w.get("kCGWindowName") or ""
+                if title:
+                    break  # take the first named window
+
+        return (app_name, title)
     except Exception:
         return None
-    if not raw:
-        return None
-    app, _, title = raw.partition(" | ")
-    return app.strip(), title.strip()
 
 
 def window_loop(stop, writer, coalescer, interval=0.5):
