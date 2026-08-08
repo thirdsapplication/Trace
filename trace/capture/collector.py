@@ -136,7 +136,9 @@ def make_handler(writer, stats=None):
 def serve(out_path, port=8137):
     writer = RawWriter(out_path, reset=False)
     stats = CollectorStats()
-    httpd = ThreadingHTTPServer(("127.0.0.1", port), make_handler(writer, stats))
+    class _ReuseServer(ThreadingHTTPServer):
+        allow_reuse_address = True
+    httpd = _ReuseServer(("127.0.0.1", port), make_handler(writer, stats))
     print(f"Trace collector listening on http://127.0.0.1:{port}  ->  {out_path}")
     print("Browser extension should POST normalized events to /event. Ctrl-C to stop.")
     try:

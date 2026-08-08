@@ -116,7 +116,9 @@ class CaptureController:
             self._listener.start()
 
             # browser-event collector, in-process, on its own thread
-            self._httpd = ThreadingHTTPServer(
+            class _ReuseServer(ThreadingHTTPServer):
+                allow_reuse_address = True
+            self._httpd = _ReuseServer(
                 ("127.0.0.1", self.collector_port),
                 make_handler(self._writer, self._stats),
             )
