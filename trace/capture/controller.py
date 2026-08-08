@@ -118,10 +118,18 @@ class CaptureController:
             # browser-event collector, in-process, on its own thread
             class _ReuseServer(ThreadingHTTPServer):
                 allow_reuse_address = True
-            self._httpd = _ReuseServer(
-                ("127.0.0.1", self.collector_port),
-                make_handler(self._writer, self._stats),
-            )
+            try:
+                self._httpd = _ReuseServer(
+                    ("127.0.0.1", self.collector_port),
+                    make_handler(self._writer, self._stats),
+                )
+            except OSError:
+                # Port busy (stale process or TIME_WAIT) — pick a free one
+                self._httpd = _ReuseServer(
+                    ("127.0.0.1", 0),
+                    make_handler(self._writer, self._stats),
+                )
+                self.collector_port = self._httpd.server_address[1]
             threading.Thread(target=self._httpd.serve_forever, daemon=True).start()
 
             self._started_at = now_iso()

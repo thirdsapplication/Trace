@@ -28,7 +28,7 @@ use tauri_plugin_shell::ShellExt;
 
 // EDIT ME: the product owner's Render backend URL. Overridable at runtime via the
 // TRACE_CLOUD_BACKEND environment variable. Public URL — never a secret.
-const DEFAULT_CLOUD_BACKEND: &str = "https://trace-backend.onrender.com";
+const DEFAULT_CLOUD_BACKEND: &str = "https://trace-backend-6nd8.onrender.com";
 
 // Holds the running sidecar so we can kill it on exit.
 struct Sidecar(Mutex<Option<CommandChild>>);
