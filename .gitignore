@@ -23,6 +23,6 @@ build/
 dist/
 src-tauri/target/
 src-tauri/binaries/
-src-tauri/icons/
+# src-tauri/icons/ — tracked; required for Tauri build
 src-tauri/gen/
 node_modules/

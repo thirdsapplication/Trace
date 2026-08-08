@@ -42,7 +42,8 @@ a = Analysis(
     # Cloud-only deps: imported lazily and only on proxied code paths, so the
     # desktop node never needs them. (Note: `yaml` is imported at app module top,
     # so it must NOT be excluded.)
-    excludes=["anthropic", "psycopg", "psycopg_binary"],
+    excludes=["anthropic", "psycopg", "psycopg_binary", "supabase", "supabase_auth",
+              "postgrest", "storage3", "supafunc", "realtime"],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,
