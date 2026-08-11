@@ -333,6 +333,63 @@ class FeedbackToConfigTest(unittest.TestCase):
         self.assertNotIn("test_feedback", configgen.build_prompt_material({}, [], []))
 
 
+class UserDescriptionTest(unittest.TestCase):
+    """The worker's review-step correction (user_description) enters the engine inputs
+    only when present, reaches the prompt material verbatim, and can ground content
+    as an authoritative user_description source."""
+
+    def test_key_absent_when_no_correction(self):
+        # pins the no-correction path: prompt material stays byte-identical
+        ev, ak = _load("marcy")
+        wd, _, _ = configgen.make_engine_inputs(_bundle(ak["bundles"][0]), ev)
+        self.assertNotIn("user_description", wd)
+
+    def test_whitespace_only_correction_ignored(self):
+        ev, ak = _load("marcy")
+        b = _bundle(ak["bundles"][0])
+        b["user_description"] = "   "
+        wd, _, _ = configgen.make_engine_inputs(b, ev)
+        self.assertNotIn("user_description", wd)
+
+    def test_correction_reaches_prompt_material_verbatim(self):
+        ev, ak = _load("marcy")
+        b = _bundle(ak["bundles"][0])
+        b["user_description"] = "I add each tracking number to the matching record."
+        seen = {}
+
+        def spy(system, user):
+            seen["user"] = user
+            return json.dumps(CANNED)
+
+        _, observed, _ = configgen.make_engine_inputs(b, ev)
+        configgen.compile_config(b, observed, [], spy)
+        self.assertIn("I add each tracking number to the matching record.", seen["user"])
+        self.assertIn("user_description", seen["user"])
+
+    def test_user_description_source_reaches_grounding(self):
+        canned = {
+            "description": "x", "role": "y", "tools_and_artifacts": ["Email"],
+            "steps": [{"text": "Enter each tracking number into the destination record.",
+                       "source": {"type": "user_description"}}],
+            "working_rules": [], "requirements": [],
+        }
+        ev, ak = _load("marcy")
+        b = _bundle(ak["bundles"][0])
+        b["user_description"] = "I enter each tracking number into the destination."
+        _, observed, _ = configgen.make_engine_inputs(b, ev)
+        compiled = configgen.compile_config(b, observed, [], lambda s, u: json.dumps(canned))
+        ud = [i for i in compiled["grounding"]["instructions"]
+              if isinstance(i["source"], dict) and i["source"].get("type") == "user_description"]
+        self.assertTrue(ud)
+        self.assertFalse(ud[0]["observed"])
+
+    def test_config_prompt_declares_correction_authoritative(self):
+        from trace.agent.config_prompt import SYSTEM_PROMPT
+        self.assertIn("user_description", SYSTEM_PROMPT)
+        self.assertIn("AUTHORITATIVE", SYSTEM_PROMPT)
+        self.assertIn("{type:'user_description'}", SYSTEM_PROMPT.replace('"', "'"))
+
+
 def _retag(out, bid):
     """Replace the bundle id in the live yaml so two runs with different ids compare equal
     on everything structural."""

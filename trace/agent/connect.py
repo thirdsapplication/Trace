@@ -66,9 +66,11 @@ def app_union(approved_bundles, event_log):
     nothing in the app table (surfaced, never silently dropped). Each evidence event is
     scanned across ``app``/``window``/``detail`` so a service named only in the window
     title (browser captures) is still found. Apps NAMED in the bundle's own text
-    (name/description/trigger/steps) are unioned in as well — this is how described
+    (name/description/trigger/steps and the worker's review-step correction,
+    ``user_description``) are unioned in as well — this is how described
     (no-recording) workflows get a connectable app list, and it also catches a capture
-    whose evidence events missed an app the steps clearly name. ``unmapped`` stays
+    whose evidence events missed an app the steps or the worker's correction clearly
+    name. ``unmapped`` stays
     event-driven: prose naming an unknown app is not deterministically detectable."""
     idx = {e.get("id"): e for e in (event_log or []) if isinstance(e, dict)}
     by_slug, unmapped, seen_unmapped = {}, [], set()
@@ -92,7 +94,7 @@ def app_union(approved_bundles, event_log):
                 seen_unmapped.add(app.lower())
                 unmapped.append(app)
         text = " ".join([str(b.get("name") or ""), str(b.get("description") or ""),
-                         str(b.get("trigger") or "")] +
+                         str(b.get("trigger") or ""), str(b.get("user_description") or "")] +
                         [str(s) for s in (b.get("steps") or [])])
         for m in _apps_in_text(text):
             if m["slug"] not in by_slug:

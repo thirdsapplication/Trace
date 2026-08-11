@@ -1068,7 +1068,7 @@ async function runWorkflows(sid, a) {
 async function stepReview() {
   const sid = S.session.id;
   shell(`<div class="panel"><div class="eyebrow">Step three</div><h2>Review what we found</h2>
-    <p class="lead">Here's what we saw and why. If we got one wrong, flip it — what you mark <b>Automate</b> gets built; <b>Manual</b> stays yours to handle.</p>
+    <p class="lead">Here's what we think each workflow is. Check our description of each one — confirm it, or fix it in your own words. Your words win. What you mark <b>Automate</b> gets built; <b>Manual</b> stays yours to handle.</p>
     <div id="revBody"><p class="muted">Loading…</p></div></div>`);
   const { ok, data } = await uget(sid, "/review-data");
   if (!ok) { $("#revBody").innerHTML = `<p class="msg err">${friendly(data.error)}</p>`; return; }
@@ -1078,8 +1078,28 @@ async function stepReview() {
   const items = [...(reviewed.bundles || []), ...(reviewed.anti_bundles || [])];
   const orig = {}, cls = {};
   items.forEach(it => { orig[it.id] = it.classification; cls[it.id] = it.classification; });
+  // Forced approve/correct of the understanding: every card must be confirmed or
+  // corrected (non-empty text) before Continue enables. Rehydrates from a prior save.
+  const und = {}, corr = {};
+  items.forEach(it => {
+    und[it.id] = (it.understanding === "confirmed" || it.understanding === "corrected") ? it.understanding : "";
+    corr[it.id] = it.user_description || "";
+  });
+  const resolved = (id) => und[id] === "confirmed" || (und[id] === "corrected" && corr[id].trim());
   // the one-line reason the engine gave (fall back to the internal "why" fields)
   const reasonOf = (it) => it.rationale || it.why_automatable || it.why_judgment || "";
+  // plain-language summary of what Trace thinks this workflow is (anti_bundles
+  // have no trigger/steps; they carry why_judgment instead)
+  const summary = (it) => {
+    const rows = [];
+    if (it.description) rows.push(`<div class="sub">${esc(it.description)}</div>`);
+    if (it.trigger) rows.push(`<div class="sub"><b>Starts when:</b> ${esc(it.trigger)}</div>`);
+    if ((it.steps || []).length)
+      rows.push(`<ol class="sub" style="margin:6px 0 0 18px;">${it.steps.map(s => `<li>${esc(s)}</li>`).join("")}</ol>`);
+    if (it.why_judgment) rows.push(`<div class="sub"><b>Why we'd leave it to you:</b> ${esc(it.why_judgment)}</div>`);
+    if (!rows.length) rows.push(`<div class="sub muted">${esc(reasonOf(it) || "no description")}</div>`);
+    return rows.join("");
+  };
 
   const card = (it) => {
     const id = it.id, auto = cls[id] === "bundle";
@@ -1090,11 +1110,29 @@ async function stepReview() {
         <span class="pill ${auto ? "pill-on" : "pill-off"}">${auto ? "AUTOMATE" : "MANUAL"}</span>
       </div>
       <div class="sub" style="margin-top:6px;">${reason ? esc(reason) : `<span class="muted">no reason given</span>`}</div>
+      <div class="sub" style="margin-top:10px;"><b>What we think this workflow is</b></div>
+      ${summary(it)}
+      <div class="row" style="margin-top:10px;gap:6px;">
+        <button class="und ${und[id] === "confirmed" ? "btn-accent" : "btn-secondary"} btn-sm" data-id="${esc(id)}" data-act="confirmed">Looks right</button>
+        <button class="und ${und[id] === "corrected" ? "btn-accent" : "btn-secondary"} btn-sm" data-id="${esc(id)}" data-act="corrected">Not quite — fix it</button>
+      </div>
+      ${und[id] === "corrected" ? `<div class="field" style="margin-top:8px;">
+        <textarea class="corr" data-id="${esc(id)}" rows="3" placeholder="In a line or two: what actually happens — what kicks it off, what you do, and where the result ends up.">${esc(corr[id])}</textarea>
+      </div>` : ""}
       <div class="row" style="margin-top:10px;gap:6px;">
         <button class="flip ${auto ? "btn-accent" : "btn-secondary"} btn-sm" data-id="${esc(id)}" data-to="bundle">Automate</button>
         <button class="flip ${auto ? "btn-secondary" : "btn-accent"} btn-sm" data-id="${esc(id)}" data-to="anti_bundle">Manual</button>
       </div>
     </div>`;
+  };
+
+  const gate = () => {
+    const left = items.filter(it => !resolved(it.id)).length;
+    const n = items.filter(it => cls[it.id] === "bundle").length;
+    $("#revGo").disabled = !!left;
+    $("#revGo").textContent = left
+      ? `Confirm or fix ${left} more`
+      : (n ? `Continue with ${n} to automate` : "Continue");
   };
 
   const paint = () => {
@@ -1103,8 +1141,14 @@ async function stepReview() {
     root.querySelectorAll(".flip").forEach(b => b.onclick = () => {
       cls[b.dataset.id] = b.dataset.to; paint();
     });
-    const n = items.filter(it => cls[it.id] === "bundle").length;
-    $("#revGo").textContent = n ? `Continue with ${n} to automate` : "Continue";
+    root.querySelectorAll(".und").forEach(b => b.onclick = () => {
+      und[b.dataset.id] = b.dataset.act; paint();
+    });
+    // update state + gating without repainting, so typing is never interrupted
+    root.querySelectorAll(".corr").forEach(t => t.oninput = () => {
+      corr[t.dataset.id] = t.value; gate();
+    });
+    gate();
   };
 
   $("#revBody").innerHTML = `
@@ -1119,6 +1163,10 @@ async function stepReview() {
     items.forEach(it => {
       const id = it.id, finalCls = cls[id], changed = finalCls !== orig[id];
       const o = { ...it, classification: finalCls, reclassified_from: changed ? orig[id] : null };
+      // the forced approve/correct outcome; never send stale text with a confirm
+      // (the backend coerces any non-empty user_description to "corrected")
+      o.understanding = und[id];
+      o.user_description = und[id] === "corrected" ? corr[id].trim() : "";
       if (finalCls === "bundle") {
         o.disposition = "approve_for_build";
         if (orig[id] === "anti_bundle")            // carry the prior reason for the record

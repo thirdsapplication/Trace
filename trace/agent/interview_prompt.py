@@ -21,8 +21,16 @@ Separately, some things are not in the data at all because they are decisions,
 not observable facts: conflict-resolution rules, what counts as a duplicate,
 when to stop and ask a human.
 
-You receive workflow_description and observed_events. Find unknowns with two
-lenses:
+You receive workflow_description and observed_events. When workflow_description
+contains user_description, that is the worker's OWN correction of what this
+workflow really is, written after reading Trace's understanding. It is
+AUTHORITATIVE: where it conflicts with the discovered name, description,
+trigger, or steps — or with anything you would infer from the events — believe
+the worker's text. Ask about the workflow the worker described: the unknowns
+that remain AFTER taking their correction as ground truth. Never ask the worker
+to re-confirm something their correction already settles.
+
+Find unknowns with two lenses:
 - Lens A (capture blind spots): mechanical facts capture could not see
   (destination tab, layout, one-vs-many rows, columns).
 - Lens B (undetermined decisions): choices the workflow requires that the data

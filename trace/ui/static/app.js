@@ -627,7 +627,8 @@ function itemCard(item, isAnti) {
   return `
   <div class="review-item ${isAnti ? "anti" : "bundle"}" data-id="${ESC(item.id)}"
        data-orig-class="${isAnti ? "anti_bundle" : "bundle"}"
-       data-orig-why="${ESC(item.why_judgment || "")}">
+       data-orig-why="${ESC(item.why_judgment || "")}"
+       data-understanding="${ESC(item.understanding || "")}">
     <h4>${ESC(item.id)} · <span class="muted">${item.confidence || ""}</span></h4>
     <div class="field"><label>name</label><input type="text" class="f-name" value="${ESC(item.name)}"/></div>
     <div class="field"><label>classification</label>
@@ -642,6 +643,7 @@ function itemCard(item, isAnti) {
       </select>
     </div>
     <div class="field"><label>description</label><textarea class="f-desc">${ESC(item.description)}</textarea></div>
+    <div class="field"><label>worker correction (authoritative)</label><textarea class="f-userdesc" placeholder="(the worker's own description of the workflow, from the review step)">${ESC(item.user_description || "")}</textarea></div>
     <div class="field"><label>trigger</label><input type="text" class="f-trigger" value="${ESC(item.trigger || "")}"/></div>
     <div class="field"><label>why judgment</label><textarea class="f-why" placeholder="(for anti-bundle / reclassification)">${ESC(item.why_judgment || "")}</textarea></div>
     <div class="field"><label>handling</label><input type="text" class="f-handling" value="${ESC(item.recommended_handling || "")}"/></div>
@@ -706,6 +708,9 @@ function scrapeReview() {
       preferred_output: el.querySelector(".f-prefout").value.trim(),
       why_judgment: el.querySelector(".f-why").value.trim(),
       recommended_handling: el.querySelector(".f-handling").value.trim(),
+      user_description: el.querySelector(".f-userdesc").value.trim(),
+      understanding: el.querySelector(".f-userdesc").value.trim() ? "corrected"
+        : (el.dataset.understanding === "confirmed" ? "confirmed" : ""),
       evidence_event_ids: incl.slice(),  // provenance kept; server filters to known ids
       reclassified_from: cls !== origClass ? origClass : null,
       original_reason_for_judgment: (cls === "bundle" && origClass === "anti_bundle")

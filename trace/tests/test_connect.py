@@ -123,6 +123,16 @@ class AppUnionTest(unittest.TestCase):
         apps, _ = connect.app_union([bundle], [])
         self.assertEqual({a["slug"] for a in apps}, {"slack"})
 
+    def test_union_includes_apps_named_in_correction(self):
+        # a worker's review-step correction naming an app makes it connectable,
+        # even when neither the events nor the discovered text mention it
+        bundle = {"id": "B1", "name": "Daily update", "description": "",
+                  "trigger": "", "steps": [], "evidence_event_ids": [],
+                  "user_description": "Post each day's shipping updates to Slack."}
+        apps, unmapped = connect.app_union([bundle], [])
+        self.assertEqual({a["slug"] for a in apps}, {"slack"})
+        self.assertEqual(unmapped, [])
+
     def test_union_text_and_events_dedupe(self):
         # the same app observed in an event AND named in text -> one entry, with the
         # event observation kept (first-seen wins)

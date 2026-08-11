@@ -181,6 +181,24 @@ class DescribeEndpointTest(DescribeHTTPBase):
         self.assertIsNone(sessions.read_json_artifact(self.root, sid, sessions.EVENT_LOG))
         self.assertIsNone(sessions.read_json_artifact(self.root, sid, sessions.DISCOVERY))
 
+    def test_describe_correction_adds_connectable_app(self):
+        # a review-step correction naming an app makes it connectable on the
+        # described (zero-event) path too
+        cookie, _ = self.signup()
+        sid = self.describe(cookie)
+        reviewed = json.loads(json.dumps(REVIEWED_FROM_DESCRIBE))
+        reviewed["bundles"][0]["understanding"] = "corrected"
+        reviewed["bundles"][0]["user_description"] = \
+            "I also post the day's summary to Slack when I'm done."
+        code, _, _ = self.req("POST", f"/api/u/sessions/{sid}/reviewed-bundles",
+                              reviewed, cookie=cookie)
+        self.assertEqual(code, 200)
+        code, conn, _ = self.req("GET", f"/api/u/sessions/{sid}/connection-data",
+                                 cookie=cookie)
+        self.assertEqual(code, 200)
+        self.assertIn("slack", conn["record"]["apps"])
+        self.assertIn("gmail", conn["record"]["apps"])    # discovered text still counts
+
     def test_full_describe_to_deploy_chain(self):
         cookie, _ = self.signup()
         sid = self.describe(cookie)

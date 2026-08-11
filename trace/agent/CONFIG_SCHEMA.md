@@ -7,7 +7,9 @@ builds a grounding record.
 
 ## Inputs (per approved bundle)
 - **workflow_description** `{name, description, trigger, steps[], evidence_event_ids[]}`
-  — from the reviewed bundle.
+  — from the reviewed bundle. Carries `user_description` (the worker's verbatim
+  review-step correction of what the workflow really is — **AUTHORITATIVE** over the
+  other fields and over event inference) only when the worker corrected it.
 - **observed_events** `[{id, description}]` — one per `evidence_event_id`; `description`
   is the event log's plain `detail`.
 - **user_answers** `[{q, question, answer}]` — the worker's one-line answers about
@@ -23,7 +25,8 @@ builds a grounding record.
   "requirements":  [{"text": "...", "source": {...}}] }
 ```
 Each `source` is `{type:"events", ids:[...]}` | `{type:"discovery"}` |
-`{type:"user_answer", q:"..."}`. The model never writes structural fields.
+`{type:"user_answer", q:"..."}` | `{type:"user_description"}` |
+`{type:"user_test_feedback", note:"..."}`. The model never writes structural fields.
 
 ## Outputs (per approved bundle)
 - **agent_&lt;id&gt;.test.yaml** — sandbox variant: `mcp_servers: []`, the agent toolset only.

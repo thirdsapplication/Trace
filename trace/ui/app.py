@@ -809,12 +809,15 @@ class AppState:
                 model_fn = self._build_model_fn("interview", sid) if approved else None
                 for b in approved:
                     questions = self.interview_fn(b, event_log, model_fn=model_fn)["questions"]
-                    # preserve any prior answer whose question id still maps
+                    # preserve any prior answer whose question still maps — ids are
+                    # positional (q1..qN), so the stored question text must match too
+                    # or an old answer could silently attach to a different question
                     prior = sessions.read_json_artifact(
                         root, sid, sessions.interview_filename(b["id"])) or {}
-                    qids = {q["id"] for q in questions}
+                    qtext = {q["id"]: q.get("question", "") for q in questions}
                     answers = [a for a in (prior.get("answers") or [])
-                               if a.get("q") in qids and str(a.get("answer", "")).strip()]
+                               if a.get("q") in qtext and str(a.get("answer", "")).strip()
+                               and a.get("question", "") == qtext[a.get("q")]]
                     rec = _interview_record(b["id"], questions, answers)
                     _write_json(sessions.path(root, sid, sessions.interview_filename(b["id"])), rec)
                     job["generated"] += 1
@@ -1180,10 +1183,13 @@ class AppState:
                                     "staged_apps": rec.get("staged_apps") or [],
                                     "deployment_id": rec.get("deployment_id"),
                                     "memory_store_id": rec.get("memory_store_id"),
-                                    "description": b.get("description") or ""})
+                                    # the worker's review-step correction is the truer bio
+                                    "description": b.get("user_description")
+                                                   or b.get("description") or ""})
                                 self._embed_agent_kind({          # Phase B: agent-kind gate
                                     "agent_id": rec["agent_id"], "name": b.get("name") or bid,
-                                    "description": b.get("description") or "",
+                                    "description": b.get("user_description")
+                                                   or b.get("description") or "",
                                     "trigger": (rec.get("start") or {}).get("value")})
                         job["deployed"] += 1
                     except Exception as e:

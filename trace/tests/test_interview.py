@@ -223,5 +223,25 @@ class InterviewToConfigFeedTest(unittest.TestCase):
         self.assertNotIn("unresolved", g)        # additive extension stays non-breaking
 
 
+class UserDescriptionToInterviewTest(unittest.TestCase):
+    """The worker's review-step correction reaches the gap detector's prompt material
+    (so questions target the workflow the worker described), and only when present."""
+
+    def test_correction_in_gap_material_only_when_present(self):
+        ev, ak = _load("marcy")
+        b = _bundle(ak["bundles"][0])
+        wf, obs, _ = configgen.make_engine_inputs(b, ev)
+        self.assertNotIn("user_description", interview.build_prompt_material(wf, obs))
+        b["user_description"] = "I enter each tracking number into the destination record."
+        wf2, obs2, _ = configgen.make_engine_inputs(b, ev)
+        material = interview.build_prompt_material(wf2, obs2)
+        self.assertIn("user_description", material)
+        self.assertIn("I enter each tracking number into the destination record.", material)
+
+    def test_system_prompt_declares_correction_authoritative(self):
+        self.assertIn("user_description", SYSTEM_PROMPT)
+        self.assertIn("AUTHORITATIVE", SYSTEM_PROMPT)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -88,6 +88,8 @@ def seed_review(discovery):
             "rationale": (b.get("rationale") or b.get("why_automatable") or "").strip(),
             "reclassified_from": None,
             "original_reason_for_judgment": "",
+            "user_description": "",
+            "understanding": "",
         })
     anti = []
     for a in discovery.get("anti_bundles", []) or []:
@@ -104,6 +106,8 @@ def seed_review(discovery):
             "evidence_event_ids": ev,
             "confidence": a.get("confidence", "medium"),
             "reclassified_from": None,
+            "user_description": "",
+            "understanding": "",
         })
     return {"bundles": bundles, "anti_bundles": anti,
             "notes": discovery.get("notes", "")}
@@ -142,6 +146,25 @@ def _norm_conf(c):
     return c if c in VALID_CONFIDENCE else "medium"
 
 
+def _norm_understanding(raw, report, where):
+    """The review step's approve/correct marker. A non-empty correction is the
+    signal: it forces ``understanding="corrected"``; ``"corrected"`` with no text
+    is repaired to unresolved. The correction text is kept VERBATIM (stripped
+    only) — it is the worker's authoritative description of the workflow."""
+    ud = str(raw.get("user_description", "") or "").strip()
+    und = raw.get("understanding")
+    if ud:
+        und = "corrected"
+    elif und == "corrected":
+        report.error(f"{where} marked corrected but had no correction text (cleared)")
+        und = ""
+    if und not in ("confirmed", "corrected"):
+        und = ""
+    if len(ud) > 2000:
+        report.flag(f"{where} correction is very long ({len(ud)} chars); kept verbatim")
+    return ud, und
+
+
 def validate_reviewed(obj, valid_event_ids, report):
     """Validate/repair a ``reviewed_bundles`` object. Items are routed to the right
     list by their ``classification`` (so reclassification in either direction is
@@ -164,6 +187,7 @@ def validate_reviewed(obj, valid_event_ids, report):
         where = f"{raw.get('id', '?')}"
         ev = _clean_ids(raw.get("evidence_event_ids"), valid_event_ids, report, where)
         incl = _clean_ids(raw.get("included_example_event_ids"), valid_event_ids, report, where)
+        ud, und = _norm_understanding(raw, report, where)
 
         if cls == "bundle":
             steps = [str(s) for s in _as_list(raw.get("steps"))]
@@ -193,6 +217,8 @@ def validate_reviewed(obj, valid_event_ids, report):
                 "rationale": str(raw.get("rationale", "") or "").strip(),
                 "reclassified_from": recl if recl in VALID_CLASSIFICATION else None,
                 "original_reason_for_judgment": str(raw.get("original_reason_for_judgment", "") or "").strip(),
+                "user_description": ud,
+                "understanding": und,
             })
         else:
             anti.append({
@@ -208,6 +234,8 @@ def validate_reviewed(obj, valid_event_ids, report):
                 "confidence": _norm_conf(raw.get("confidence")),
                 "reclassified_from": (raw.get("reclassified_from")
                                       if raw.get("reclassified_from") in VALID_CLASSIFICATION else None),
+                "user_description": ud,
+                "understanding": und,
             })
 
     return {"bundles": bundles, "anti_bundles": anti,

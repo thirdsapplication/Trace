@@ -69,16 +69,27 @@ def _parse_json_object(text):
 # --------------------------------------------------------------------------
 # Inputs: reviewed bundle (+ event log + answers) -> the three engine inputs
 # --------------------------------------------------------------------------
-def make_engine_inputs(bundle, event_log, user_answers=None):
-    """Build ``(workflow_description, observed_events, user_answers)`` for one bundle.
-    ``observed_events`` carries each evidence event's id + plain ``detail`` text."""
-    workflow_description = {
+def _workflow_description(bundle):
+    """The ``workflow_description`` engine input for one reviewed bundle. Carries the
+    worker's review-step correction (``user_description``) ONLY when present, so the
+    prompt material is unchanged for uncorrected bundles."""
+    wd = {
         "name": bundle.get("name", ""),
         "description": bundle.get("description", ""),
         "trigger": bundle.get("trigger", ""),
         "steps": list(bundle.get("steps", []) or []),
         "evidence_event_ids": list(bundle.get("evidence_event_ids", []) or []),
     }
+    ud = str(bundle.get("user_description", "") or "").strip()
+    if ud:
+        wd["user_description"] = ud
+    return wd
+
+
+def make_engine_inputs(bundle, event_log, user_answers=None):
+    """Build ``(workflow_description, observed_events, user_answers)`` for one bundle.
+    ``observed_events`` carries each evidence event's id + plain ``detail`` text."""
+    workflow_description = _workflow_description(bundle)
     observed_events = [{"id": ex["id"], "description": ex.get("detail", "")}
                        for ex in review.fetch_examples(event_log, workflow_description["evidence_event_ids"])]
     return workflow_description, observed_events, list(user_answers or [])
@@ -295,11 +306,7 @@ def compile_config(bundle, observed_events, user_answers, model_fn, model=DEFAUL
     that want the default should construct it; tests inject a stub). ``unresolved``
     (skipped interview questions) is recorded in the grounding record.
     ``test_feedback`` (worker corrections) is AUTHORITATIVE and folded in."""
-    workflow_description = {
-        "name": bundle.get("name", ""), "description": bundle.get("description", ""),
-        "trigger": bundle.get("trigger", ""), "steps": list(bundle.get("steps", []) or []),
-        "evidence_event_ids": list(bundle.get("evidence_event_ids", []) or []),
-    }
+    workflow_description = _workflow_description(bundle)
     user_msg = build_prompt_material(workflow_description, observed_events, user_answers,
                                      test_feedback)
     model_out = _parse_json_object(model_fn(SYSTEM_PROMPT, user_msg))
