@@ -6,6 +6,7 @@ keys on application identity, not on any workflow's content.
 """
 
 import os
+import re
 import urllib.parse
 
 # --- platform pins (also mirrored in api_client; keep in sync) -------------
@@ -141,9 +142,17 @@ STAGING_DIRECTIVE = (
     "verbatim (e.g. to/subject/body for an email, or every column value for a row). Put "
     "ONLY real action parameters here — no commentary, no rationale, nothing the "
     "executor would have to re-derive. Whoever approves will run it exactly as given.\n"
-    "If there are no outbound actions to take, output an empty array. Take outbound "
-    "actions normally in any app NOT listed above.\n\n"
-    "Example final message:\n"
+    "If there are no outbound actions to take, output an EMPTY array `[]`. That is a "
+    "complete, correct answer — a run with nothing to do is normal and expected. Never "
+    "invent an action to fill the block. Take outbound actions normally in any app NOT "
+    "listed above.\n\n"
+    "EVERY value you output must come from what you actually read in THIS run. If you did "
+    "not read it this run, do not write it.\n\n"
+    "The example below shows only the SHAPE of the output. Its contents are FICTIONAL — "
+    "there is no PO-1234 and no buyer@acme.com. Never copy those values, or any part of "
+    "them, into a real proposal; if your output resembles the example, you have made a "
+    "mistake and should output `[]` instead.\n"
+    "Example final message (FICTIONAL — shape only):\n"
     "```proposed_actions\n"
     "[{\"app\": \"Gmail\", \"action\": \"send email\", \"summary\": \"Confirm PO-1234 to "
     "buyer@acme.com ($4,200, ships Aug 15)\", \"rationale\": \"Inbound email from "
@@ -171,8 +180,15 @@ UNCERTAINTY_DIRECTIVE = (
     "and why you're stuck, concretely>\", \"options\": [\"<option A>\", \"<option B>\"]}. "
     "`options` is optional (omit or leave empty for an open question). Ask only what you "
     "truly need; fewer, sharper questions are better. If nothing blocks you, do NOT output "
-    "this block at all.\n"
-    "Example:\n"
+    "this block at all — that is the normal case.\n"
+    "Every question and its context must describe something you ACTUALLY encountered this "
+    "run. Never raise a question about data you did not read. A fabricated question wastes "
+    "a human's attention and its answer becomes a reusable lesson, so an invented one "
+    "corrupts what other agents learn.\n"
+    "The example below shows only the SHAPE. Its contents are FICTIONAL — there is no "
+    "PO-1234. Never copy those values; if your question resembles the example, you have "
+    "made a mistake and should omit the block entirely.\n"
+    "Example (FICTIONAL — shape only):\n"
     "```needs_input\n"
     "[{\"question\": \"Order PO-1234 has no ship date — assume standard 5-day or ask the "
     "buyer?\", \"context\": \"The inbound email requests confirmation but omits a ship "
@@ -232,10 +248,22 @@ MEMORY_UPDATE_DIRECTIVE = (
     "rewriting). NEVER write credentials, tokens, API keys, or any secret into memory.")
 
 
-def memory_store_name(bundle_id, external_user_id):
-    """The per-agent memory store name: stable across redeploys (create-or-reuse keys
-    on it) and unique per customer+workflow."""
-    return f"trace-{bundle_id}-{external_user_id}"[:100]
+def memory_store_name(agent_name, external_user_id):
+    """The per-agent memory store name: keyed on the AGENT'S OWN NAME — the same key
+    ``create_or_reuse_agent`` uses — so memory follows the agent across redeploys and a
+    DIFFERENT workflow can never inherit it.
+
+    It used to key on the bundle id, which is unique only WITHIN a session: discovery
+    labels bundles B1, B2, B3 per recording, so ``trace-B1-<user>`` was the name for the
+    first workflow of EVERY recording that user ever made. A brand-new agent therefore
+    mounted an older, unrelated agent's notes and read them as fact about its own
+    workflow (observed in the wild as ``memory_store_reused: true`` on a first deploy).
+
+    ``external_user_id`` comes FIRST so the 100-char clamp can never truncate it away and
+    let two customers collide on one store.
+    """
+    slug = re.sub(r"[^a-z0-9]+", "-", (agent_name or "agent").lower()).strip("-")
+    return f"trace-{external_user_id}-{slug or 'agent'}"[:100]
 
 
 def memory_resource(memory_store_id):

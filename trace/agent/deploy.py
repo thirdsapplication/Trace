@@ -85,7 +85,7 @@ def deploy_live(bundle, live_envelope_dict, connection_record, client,
     environment_id = client.create_environment()
 
     store = client.create_or_reuse_memory_store(
-        name=config.memory_store_name(bundle.get("id"), external_user_id),
+        name=config.memory_store_name(live_envelope_dict.get("name"), external_user_id),
         description=config.MEMORY_STORE_DESCRIPTION)
     memory_store_id = store.get("id") if isinstance(store, dict) else store
 

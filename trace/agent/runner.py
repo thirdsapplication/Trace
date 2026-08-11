@@ -85,11 +85,30 @@ def _action_labels(events):
     return out
 
 
+_SUMMARY_CHARS = 600
+
+
+def _clip(text, limit=_SUMMARY_CHARS):
+    """Trim to ``limit`` on a WORD boundary, marking the cut with an ellipsis.
+
+    A hard slice cut mid-word ("Verification steps performed: 1. R"), which reads as a
+    broken app rather than an abridged summary. 280 was also too tight for the
+    verification narratives agents actually write; the activity view keeps more of each
+    message than the feed summary does, so this only bounds the feed line.
+    """
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    space = cut.rfind(" ")
+    return (cut[:space] if space > limit * 0.6 else cut).rstrip(" ,;:.") + "…"
+
+
 def _last_text(events):
     for ev in reversed(events):
         text = (ev.get("text") or "").strip()
         if text:
-            return text[:280]
+            return _clip(text)
     return ""
 
 
