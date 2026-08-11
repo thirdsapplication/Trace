@@ -125,12 +125,15 @@ class DeployTest(unittest.TestCase):
         client = FakeDeployClient()
         rec = deploy.deploy_live(bundle, live, CONNECTION, client, trigger="on a new inbound PO")
         # the LIVE config was deployed with the customer's per-app Pipedream MCP server(s),
-        # baked at create time: the URL carries THIS customer's externalUserId + the app.
+        # baked at create time: the URL path carries THIS customer's external_user_id +
+        # the app (the documented per-user format — NOT the old /v3 query-param surface,
+        # which served a reduced toolset).
         servers = client.agents[0].get("mcp_servers")
         self.assertTrue(servers)
         urls = " ".join(s["url"] for s in servers)
-        self.assertIn("externalUserId=trace-s1", urls)
-        self.assertIn("app=gmail", urls)
+        self.assertIn("/trace-s1/gmail", urls)
+        self.assertNotIn("/v3", urls)
+        self.assertNotIn("externalUserId=", urls)
         # and exactly one mcp_toolset per server, on the configured (default) permission policy
         toolsets = [t for t in client.agents[0]["tools"] if t.get("type") == "mcp_toolset"]
         self.assertEqual(len(toolsets), len(servers))

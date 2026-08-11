@@ -275,12 +275,11 @@ class RealBindCredentialTest(unittest.TestCase):
         auth = rec["auth"]
         self.assertEqual(auth["type"], "mcp_oauth")
         self.assertEqual(auth["access_token"], "pdtok_abc")          # Trace's own token
-        # external_user_id + app live in the URL, never as credential keys
+        # external_user_id + app live in the URL path, never as credential keys
         self.assertNotIn("external_user_id", auth)
         self.assertNotIn("app", auth)
-        self.assertIn("externalUserId=trace-s1", auth["mcp_server_url"])
-        self.assertIn("app=gmail", auth["mcp_server_url"])
-        self.assertTrue(auth["mcp_server_url"].startswith(config.PIPEDREAM_MCP_BASE))
+        self.assertEqual(auth["mcp_server_url"],
+                         f"{config.PIPEDREAM_MCP_BASE}/trace-s1/gmail")
 
     def test_409_update_rotates_token_without_immutable_url(self):
         c, vaults, _ = self._client(_FakeVaults(credentials=_FakeCreds(create_conflicts=True)))

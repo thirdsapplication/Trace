@@ -55,9 +55,16 @@ APPROVAL_PERMISSION_POLICY = "always_ask"
 # the per-customer, per-app MCP server URL is built by ``pipedream_mcp_url`` below.
 # Outbound writes/sends are approval-required.
 #
-# The MCP server is v3 (remote.mcp.pipedream.net); the Connect REST API is v1
-# (api.pipedream.com) — two DIFFERENT services, kept as separate constants on purpose.
-PIPEDREAM_MCP_BASE = "https://remote.mcp.pipedream.net/v3"
+# The MCP server is remote.mcp.pipedream.net (per-user, per-app paths); the Connect
+# REST API is v1 (api.pipedream.com) — two DIFFERENT services, kept as separate
+# constants on purpose.
+#
+# NOTE: do NOT pin an MCP API version segment (the old "/v3" query-param surface).
+# That surface served a stale, curated tool subset — for google_sheets it exposed a
+# read/append-only toolset with NO update tool, which broke any workflow that edits
+# existing rows (verified live 2026-08-11: /v3 served 7 tools; the documented
+# per-user URL served the full 38-action catalog including google_sheets-update-row).
+PIPEDREAM_MCP_BASE = "https://remote.mcp.pipedream.net"
 PIPEDREAM_MCP_NAME = "pipedream"        # the mcp_server_name the live toolset references
 # Nested object (NOT a bare string). Default: every live toolset (the agent toolset and
 # the per-app Pipedream MCP toolsets) runs WITHOUT an approval gate.
@@ -73,24 +80,26 @@ PIPEDREAM_CLIENT_SECRET = os.environ.get("PIPEDREAM_CLIENT_SECRET", "")
 PIPEDREAM_ENVIRONMENT = os.environ.get("PIPEDREAM_ENVIRONMENT", "production")  # development|production
 PIPEDREAM_API_BASE = "https://api.pipedream.com/v1"   # Connect REST + OAuth (v1)
 PIPEDREAM_CONNECT_BASE = PIPEDREAM_API_BASE           # paths are project-scoped: /connect/{project_id}/...
-# The vault credential holds a ~1h Pipedream token. Before a deploy/run we re-mint and
-# rotate it if it is past, or within this margin of, its expiry — so a run long after
-# Connect still authenticates (WS5).
-TOKEN_REFRESH_MARGIN_SECONDS = 300
+# The vault credential holds a ~1h Pipedream token. Deploy re-mints and rotates it
+# for every usable app (see app._refresh_stale_bindings), and the scheduler refreshes
+# the whole vault before each run (refresh_vault) — so a run long after Connect still
+# authenticates (WS5).
 
 
 def pipedream_mcp_url(external_user_id, app, project=None, environment=None):
-    """The per-customer, per-app Pipedream MCP server URL. All routing rides in the
-    query string (MA injects only the bearer token, matched to the server by URL); one
-    app per URL. ``projectId``, ``environment``, ``externalUserId``, ``app`` are all
-    required."""
-    q = urllib.parse.urlencode({
-        "projectId": project or PIPEDREAM_PROJECT,
-        "environment": environment or PIPEDREAM_ENVIRONMENT,
-        "externalUserId": external_user_id or "",
-        "app": app,
-    })
-    return f"{PIPEDREAM_MCP_BASE}?{q}"
+    """The per-customer, per-app Pipedream MCP server URL — the documented
+    ``/{external_user_id}/{app}`` format, one app per URL. MA injects only the bearer
+    token, matched to the server by URL; the token is project-scoped
+    (client_credentials), so the project and its environment ride in the token, not
+    the URL. ``project``/``environment`` are accepted and ignored for call-site
+    compatibility (same idiom as ``staged_slugs`` in ``pipedream_mcp_servers``).
+
+    ``external_user_id`` is load-bearing here (it routes to the customer's connected
+    account), so an empty value is an error, not an empty query param."""
+    if not external_user_id:
+        raise ValueError("pipedream_mcp_url: external_user_id is required")
+    uid = urllib.parse.quote(str(external_user_id), safe="")
+    return f"{PIPEDREAM_MCP_BASE}/{uid}/{app}"
 
 
 def pipedream_mcp_servers(external_user_id, app_slugs, staged_slugs=None):

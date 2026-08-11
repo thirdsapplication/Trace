@@ -17,7 +17,7 @@ confirm against current docs before live use.
 import copy
 import datetime
 
-from . import config
+from . import config, mcp_preflight
 
 
 def _now():
@@ -65,7 +65,7 @@ def build_deployment_trigger(base_trigger, staged_slugs):
 
 
 def deploy_live(bundle, live_envelope_dict, connection_record, client,
-                trigger=None, schedule=None, staged_apps=None):
+                trigger=None, schedule=None, staged_apps=None, connect_client=None):
     """Create the LIVE agent for one bundle over the bound connection, plus its
     per-agent MEMORY STORE (created-or-reused by name so lessons survive redeploys)
     and a platform DEPLOYMENT whose initial message set carries the task + the
@@ -75,9 +75,25 @@ def deploy_live(bundle, live_envelope_dict, connection_record, client,
     on the deployment (injected into every run session). Memory-store and deployment
     creation are NOT wrapped: a platform rejection propagates so the deploy job
     surfaces the real API error instead of a phantom "live" (the always_ask lesson).
-    ``staged_apps`` (Spec 8) marks which app slugs are staged for approval."""
+    ``staged_apps`` (Spec 8) marks which app slugs are staged for approval.
+
+    ``connect_client`` (a ConnectClient, optional): when provided, each per-app MCP
+    server's served TOOLS are listed before the agent is created (see
+    ``mcp_preflight``) and recorded on the live record (``toolsets`` /
+    ``preflight_warnings`` / ``preflight_errors``) — the guard against a server
+    silently serving a toolset that can't perform the workflow (e.g. a sheets
+    toolset with no update tool). Best-effort: preflight problems are recorded,
+    never raised, and never block."""
     vault_ref = (connection_record or {}).get("vault_ref")
     external_user_id = (connection_record or {}).get("external_user_id")
+
+    pf = {"toolsets": {}, "warnings": [], "errors": {}}
+    if connect_client is not None and external_user_id:
+        try:
+            pf = mcp_preflight.preflight_apps(connect_client, external_user_id,
+                                              _usable_app_slugs(connection_record))
+        except Exception as exc:                     # never block a deploy on preflight
+            pf = {"toolsets": {}, "warnings": [], "errors": {"*": str(exc)}}
 
     live_envelope_dict = finalize_live_envelope(live_envelope_dict, connection_record, staged_apps)
     agent = client.create_or_reuse_agent(live_envelope_dict)
@@ -121,6 +137,9 @@ def deploy_live(bundle, live_envelope_dict, connection_record, client,
         "error": None,
         "staged_apps": list(staged_apps or []),
         "held_actions": [],
+        "toolsets": pf["toolsets"],
+        "preflight_warnings": pf["warnings"],
+        "preflight_errors": pf["errors"],
         "deployed_at": _now(),
         "isolation": "per-customer (vault scoped to external_user_id)",
     }

@@ -161,8 +161,16 @@ reviewed/interview/build/deploy_at), `raw_events.jsonl`, `event_log.json`, `vali
 ## 6. Integration & safety model (what the worker actually touches)
 
 - A live agent reaches each app through a **per-app Pipedream MCP server URL**
-  (`remote.mcp.pipedream.net/v3?projectId=…&environment=…&externalUserId=…&app=…`), authenticated by
-  Trace's project token stored in the customer's **vault**, **injected at session create**.
+  (`remote.mcp.pipedream.net/{external_user_id}/{app}` — the documented per-user format),
+  authenticated by Trace's project-scoped token stored in the customer's **vault**,
+  **injected at session create**. The project and environment ride in the token, not the URL.
+  **Never pin an MCP version segment**: the old `/v3` query-param surface served a reduced,
+  stale tool subset — for Google Sheets, a read/append toolset with **no update tool**, which
+  stranded a live workflow in Aug 2026. The public per-app catalog (mcp.pipedream.com) is the
+  registry, *not* a promise of what a given server URL serves — deploy now runs a `tools/list`
+  preflight and records each app's served toolset on the deploy record, warning when a sheets
+  toolset can append but not update. Note the full catalog also includes destructive tools
+  (delete/clear); staging remains prompt-level.
 - **Every outbound write/send is held** (`always_ask`) — the agent goes idle awaiting a
   `tool_confirmation`; the held action's **kind + summary** is surfaced for one-tap **Approve/Reject**.
   **Reads proceed.** This is the single most important worker-facing safety surface.
@@ -256,4 +264,4 @@ plus these domain-specific states:
   (`configgen.py`, `interview.py`, `connect.py`, `connect_client.py`, `deploy.py`, `api_client.py`,
   `config.py`)
 - Platform config/constants: `trace/agent/config.py` (e.g. `PIPEDREAM_MCP_BASE =
-  https://remote.mcp.pipedream.net/v3`, `LIVE_PERMISSION_POLICY = always_ask`, model ids)
+  https://remote.mcp.pipedream.net`, `LIVE_PERMISSION_POLICY = always_ask`, model ids)
