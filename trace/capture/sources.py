@@ -42,30 +42,55 @@ def summarize_sources(rows):
     return counts
 
 
-def capture_health(counts, min_browser_events=1):
-    """Summarize a completed session and flag (non-blocking) when browser capture
-    looks inactive: local events present but fewer than ``min_browser_events`` of
-    the browser-only source types. Threshold is configurable, not tuned to any
-    run's specific numbers."""
+def capture_health(counts, min_browser_events=1, rows=None):
+    """Summarize a completed session and flag (non-blocking) two silent failures.
+
+    1. Browser capture inactive: local events present but fewer than
+       ``min_browser_events`` of the browser-only source types.
+    2. Blank window titles: ``window`` events present but none carries a title.
+       ``kCGWindowName`` is only populated for a process holding Screen Recording,
+       so without it the poller keeps emitting events that say nothing about where
+       the work happened — and since it only emits on CHANGE, a whole session inside
+       one browser collapses to a single blank event. Needs ``rows`` to detect.
+
+    Thresholds are configurable, not tuned to any run's specific numbers.
+    """
     browser_only = browser_only_sources()
     local_sources = local_capable_sources()
 
     browser_only_count = sum(counts.get(s, 0) for s in browser_only)
     local_count = sum(counts.get(s, 0) for s in local_sources)
 
-    warning = local_count > 0 and browser_only_count < min_browser_events
-    message = None
-    if warning:
-        message = ("Browser capture may not have been active this session: "
-                   f"{local_count} local event(s) but {browser_only_count} "
-                   "browser-only event(s). Check that the Chrome extension is "
-                   "installed and connected to the collector.")
+    messages = []
+    if local_count > 0 and browser_only_count < min_browser_events:
+        messages.append("Browser capture may not have been active this session: "
+                        f"{local_count} local event(s) but {browser_only_count} "
+                        "browser-only event(s). Check that the Chrome extension is "
+                        "installed and connected to the collector.")
+
+    window_count = titled_window_count = 0
+    if rows:
+        for r in rows:
+            if not isinstance(r, dict) or r.get("source") != "window":
+                continue
+            window_count += 1
+            if str((r.get("payload") or {}).get("title") or "").strip():
+                titled_window_count += 1
+        if window_count and not titled_window_count:
+            messages.append(f"Window titles are blank ({window_count} window event(s), "
+                            "none titled), so Trace cannot tell which app or page the "
+                            "work happened in. Grant Screen Recording to the Trace app "
+                            "in System Settings → Privacy & Security, then fully quit "
+                            "and relaunch it.")
+
     return {
         "by_source": counts,
         "total": sum(counts.values()),
         "local_count": local_count,
         "browser_only_count": browser_only_count,
         "browser_only_sources": sorted(browser_only),
-        "warning": warning,
-        "message": message,
+        "window_count": window_count,
+        "titled_window_count": titled_window_count,
+        "warning": bool(messages),
+        "message": " ".join(messages) or None,
     }

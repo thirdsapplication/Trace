@@ -18,6 +18,27 @@ _client = None
 _admin = None
 
 
+class _NoRow:
+    """Stand-in for "no row matched".
+
+    ``maybe_single().execute()`` returns **None** rather than a response object when the
+    filter matches nothing, so the idiomatic ``r.data`` raises
+    ``AttributeError: 'NoneType' object has no attribute 'data'`` before any
+    ``if not r.data`` guard can run. Every such call site therefore reads
+    ``....maybe_single().execute() or supa.NO_ROW``, so a miss yields ``data = None``
+    instead of exploding.
+
+    This bit hard: an agent with no schedule row crashed ``schedule_get``, which took the
+    whole ``home_data`` request down with it, so the agents home rendered empty for a user
+    whose agent had in fact deployed perfectly.
+    """
+
+    data = None
+
+
+NO_ROW = _NoRow()
+
+
 def is_configured():
     """True when Supabase credentials are present in the environment."""
     return bool(

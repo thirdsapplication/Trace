@@ -190,7 +190,7 @@ def get(user_id):
     if supa.is_configured():
         admin = supa.get_admin()
         row = admin.table("profiles").select("id, email, created_at") \
-            .eq("id", user_id or "").maybe_single().execute()
+            .eq("id", user_id or "").maybe_single().execute() or supa.NO_ROW
         if not row.data:
             return None
         d = row.data

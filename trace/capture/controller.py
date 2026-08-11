@@ -196,7 +196,9 @@ class CaptureController:
 
     def summary(self, min_browser_events=1):
         """Completed-session observability (Item 3): raw-event counts by source
-        type plus a non-blocking warning if browser-only sources are absent."""
+        type plus a non-blocking warning if browser-only sources are absent or the
+        window titles came back blank (see sources.capture_health)."""
         rows = read_raw_rows(self.out_path)
         return sources.capture_health(sources.summarize_sources(rows),
-                                      min_browser_events=min_browser_events)
+                                      min_browser_events=min_browser_events,
+                                      rows=rows)

@@ -1,8 +1,14 @@
 """macOS permission + browser-capture status checks (handoff §4.1).
 
-Capture needs two macOS permissions that tripped up earlier manual runs:
-- **Accessibility** — to read active-window titles (the ``osascript`` spine).
+Capture needs three macOS permissions that tripped up earlier manual runs:
+- **Accessibility** — legacy window-title path (the ``osascript`` spine).
 - **Input Monitoring** — to read keystrokes.
+- **Screen Recording** — to read window TITLES. Since window capture moved to the
+  Quartz CGWindowList API, ``kCGWindowName`` is only populated for a process that
+  holds Screen Recording; without it the API still returns every window, just with
+  an empty name. That failure is silent: events keep flowing with ``title: ""``,
+  and because ``window_loop`` only emits on change, a whole session inside one
+  browser collapses to a single event.
 
 We detect them best-effort via pyobjc if present, and degrade gracefully to
 ``granted: None`` ("can't auto-detect") with fix-it instructions otherwise. These
@@ -23,6 +29,12 @@ ACCESSIBILITY_FIX = (
 INPUT_MONITORING_FIX = (
     "Grant in System Settings → Privacy & Security → Input Monitoring, then add/enable "
     "the app running Trace. You may need to quit and relaunch it afterward."
+)
+SCREEN_RECORDING_FIX = (
+    "Grant in System Settings → Privacy & Security → Screen Recording, then add/enable "
+    "the app running Trace and FULLY QUIT AND RELAUNCH it — macOS does not apply this "
+    "permission to an already-running process. Without it window titles are blank, so "
+    "Trace cannot tell which app or page you were working in."
 )
 
 
@@ -74,9 +86,38 @@ def check_input_monitoring():
                 "fix": INPUT_MONITORING_FIX}
 
 
+def check_screen_recording():
+    """Screen Recording (window titles via kCGWindowName). Uses the preflight call so
+    this never triggers the system prompt as a side effect of a status check."""
+    if not _is_macos():
+        return {"name": "Screen Recording", "granted": None,
+                "detail": "Not macOS — capture is macOS-only.", "fix": SCREEN_RECORDING_FIX}
+    try:
+        from Quartz import CGPreflightScreenCaptureAccess
+        granted = bool(CGPreflightScreenCaptureAccess())
+        return {"name": "Screen Recording", "granted": granted,
+                "detail": "CGPreflightScreenCaptureAccess",
+                "fix": None if granted else SCREEN_RECORDING_FIX}
+    except Exception:
+        pass
+    # Fallback: a non-empty title from the poller means kCGWindowName is readable,
+    # which is only true when the permission is held.
+    try:
+        from ..capture.window import frontmost
+        cur = frontmost()
+        ok = bool(cur and cur[1])
+        return {"name": "Screen Recording", "granted": True if ok else None,
+                "detail": "probed active-window title",
+                "fix": None if ok else SCREEN_RECORDING_FIX}
+    except Exception as e:
+        return {"name": "Screen Recording", "granted": None,
+                "detail": f"could not auto-detect ({e})", "fix": SCREEN_RECORDING_FIX}
+
+
 def check_all():
     return {
         "platform": sys.platform,
         "accessibility": check_accessibility(),
         "input_monitoring": check_input_monitoring(),
+        "screen_recording": check_screen_recording(),
     }

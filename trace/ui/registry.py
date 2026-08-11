@@ -232,7 +232,7 @@ def schedule_get(root, agent_id):
     if supa.is_configured():
         admin = supa.get_admin()
         r = admin.table("schedules").select("cadence, paused, last_run_at") \
-            .eq("agent_id", agent_id).maybe_single().execute()
+            .eq("agent_id", agent_id).maybe_single().execute() or supa.NO_ROW
         if not r.data:
             return None
         s = r.data
@@ -409,7 +409,7 @@ def pending_get(root, pending_id):
     if supa.is_configured():
         admin = supa.get_admin()
         r = admin.table("pending_actions").select("*") \
-            .eq("id", str(pending_id)).maybe_single().execute()
+            .eq("id", str(pending_id)).maybe_single().execute() or supa.NO_ROW
         return _pending_to_caller(r.data) if r.data else None
     return _load(root, "pending.json").get(str(pending_id))
 
@@ -522,7 +522,7 @@ def decision_get(root, decision_id):
     if supa.is_configured():
         admin = supa.get_admin()
         r = admin.table("agent_decisions").select("*") \
-            .eq("id", str(decision_id)).maybe_single().execute()
+            .eq("id", str(decision_id)).maybe_single().execute() or supa.NO_ROW
         return _decision_to_caller(r.data) if r.data else None
     return _load(root, "decisions.json").get(str(decision_id))
 
@@ -614,7 +614,7 @@ def decision_embedding_get(root, decision_id):
     if supa.is_configured():
         admin = supa.get_admin()
         r = admin.table("decision_embeddings").select("embedding") \
-            .eq("decision_id", str(decision_id)).maybe_single().execute()
+            .eq("decision_id", str(decision_id)).maybe_single().execute() or supa.NO_ROW
         return (r.data or {}).get("embedding") if r.data else None
     return _load(root, "decision_embeddings.json").get(str(decision_id))
 
@@ -737,7 +737,7 @@ def user_consent_get(root, uid):
         admin = supa.get_admin()
         r = admin.table("profiles") \
             .select("lesson_contribute_scope, lesson_consume_scope") \
-            .eq("id", uid).maybe_single().execute()
+            .eq("id", uid).maybe_single().execute() or supa.NO_ROW
         d = r.data or {}
     else:
         d = _load(root, "consents.json").get(str(uid)) or {}
@@ -807,7 +807,7 @@ def lesson_promotion_get(root, agent_id, decision_id):
     if supa.is_configured():
         admin = supa.get_admin()
         r = admin.table("lesson_promotions").select("*") \
-            .eq("agent_id", agent_id).eq("decision_id", decision_id).maybe_single().execute()
+            .eq("agent_id", agent_id).eq("decision_id", decision_id).maybe_single().execute() or supa.NO_ROW
         return r.data or None
     return _load(root, "promotions.json").get(_promo_key(agent_id, decision_id))
 
@@ -915,7 +915,7 @@ def agent_embedding_get(root, agent_id):
     if supa.is_configured():
         admin = supa.get_admin()
         r = admin.table("agent_embeddings").select("embedding") \
-            .eq("agent_id", agent_id).maybe_single().execute()
+            .eq("agent_id", agent_id).maybe_single().execute() or supa.NO_ROW
         return (r.data or {}).get("embedding") if r.data else None
     return _load(root, "agent_embeddings.json").get(str(agent_id))
 
@@ -987,7 +987,7 @@ def group_get(root, group_id):
     if supa.is_configured():
         admin = supa.get_admin()
         r = admin.table("chat_groups").select("*, chat_group_members(agent_id)") \
-            .eq("id", str(group_id)).maybe_single().execute()
+            .eq("id", str(group_id)).maybe_single().execute() or supa.NO_ROW
         return _group_to_caller(r.data) if r.data else None
     return _load(root, "groups.json").get(str(group_id))
 
@@ -1149,7 +1149,7 @@ def summary_get(root, session_id):
     if supa.is_configured():
         admin = supa.get_admin()
         r = admin.table("session_summaries").select("summary, status") \
-            .eq("session_id", session_id).maybe_single().execute()
+            .eq("session_id", session_id).maybe_single().execute() or supa.NO_ROW
         return {"summary": r.data["summary"], "status": r.data["status"]} if r.data else None
     return _load(root, "session_summaries.json").get(session_id)
 

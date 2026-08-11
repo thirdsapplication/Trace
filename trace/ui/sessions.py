@@ -89,7 +89,7 @@ def _get_db_id(root, sid):
     if not supa.is_configured():
         return None
     admin = supa.get_admin()
-    r = admin.table("sessions").select("id").eq("local_sid", sid).maybe_single().execute()
+    r = admin.table("sessions").select("id").eq("local_sid", sid).maybe_single().execute() or supa.NO_ROW
     return str(r.data["id"]) if r.data else None
 
 
