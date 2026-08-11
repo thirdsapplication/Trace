@@ -1049,7 +1049,12 @@ class AppState:
                 client = self.connect_fn()
                 tok = agent_connect.connect_app(client, rec, slug)
                 self._save_connection(sid, rec)
-                job.update(state="done", connect_url=tok.get("connect_url"))
+                # `reused` = this customer already authorized the app (Pipedream accounts
+                # are per external_user_id, stable across sessions), so there is no
+                # connect_url to open — the UI goes straight to Verify.
+                job.update(state="done", connect_url=tok.get("connect_url"),
+                           reused=bool(tok.get("reused")),
+                           identity_email=tok.get("identity_email"))
             except Exception as e:
                 job.update(state="error", error=str(e))
 

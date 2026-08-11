@@ -747,7 +747,7 @@ async function renderProfile(agentId) {
         <div style="flex:1;">
           <div class="row" style="gap:10px;"><h2 style="margin:0;">${esc(name)}</h2>
             <span class="pill ${paused ? "pill-warn" : "pill-on"}">${paused ? "PAUSED" : "LIVE"}</span></div>
-          <p class="ag-bio" style="margin:6px 0 0;">${esc(a.description || ("Runs when: " + (a.trigger || "you say so")))}</p>
+          <p class="ag-bio wrap" style="margin:6px 0 0;">${esc(a.description || ("Runs when: " + (a.trigger || "you say so")))}</p>
           <p class="sub muted" style="margin-top:4px;"><span id="pStats">…</span>${a.deployed_at ? ` · live since ${esc(ago(a.deployed_at))}` : ""}</p>
         </div>
       </div>
@@ -1382,12 +1382,18 @@ async function renderConnect(sid) {
 async function connectApp(sid, slug) {
   $("#connMsg").className = "msg"; $("#connMsg").textContent = "opening sign-in…";
   await upost(sid, `/connect/${slug}`, {});
-  let url = null;
+  let url = null, reused = false, reusedEmail = "";
   try {
     const d = await pollJob(sid, "connect", () => {});
-    url = d.connect_url;
+    url = d.connect_url; reused = !!d.reused; reusedEmail = d.identity_email || "";
   } catch (e) { $("#connMsg").textContent = friendly(e.message); return; }
-  if (url) {
+  if (reused) {
+    // This person already approved the app for another agent — approvals are per
+    // account, so they carry over. No browser round trip needed; just verify.
+    $("#connMsg").innerHTML =
+      `<b>${esc(slug)}</b> is already connected${reusedEmail ? ` as ${esc(reusedEmail)}` : ""}. ` +
+      `Click verify to use it for this agent.`;
+  } else if (url) {
     openExternal(url);
     $("#connMsg").innerHTML =
       `Approve <b>${esc(slug)}</b> in your browser, then click verify below.` +

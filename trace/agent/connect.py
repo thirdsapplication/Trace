@@ -148,13 +148,41 @@ def merge_union(record, union, unmapped):
 
 
 def connect_app(client, record, slug):
-    """Start the Connect flow for one app. Returns ``{token, connect_url}`` for the UI;
-    marks the per-app entry in-progress."""
-    tok = client.create_connect_token(record["external_user_id"], slug)
+    """Start the Connect flow for one app. Returns ``{token, connect_url}`` for the UI,
+    or ``{reused: True, identity_email}`` when this customer ALREADY has the app
+    authorized and no browser round trip is needed.
+
+    Pipedream accounts are scoped to ``external_user_id``, which is stable per Trace user
+    across every session and agent — so a worker who connected Gmail for one agent is
+    still connected for the next one. This used to mint a fresh Connect token
+    unconditionally and reset the entry to unconnected, forcing the whole OAuth dance
+    again for an authorization that already existed.
+
+    Reuse is NOT a shortcut past the identity check: the caller still runs
+    ``bind_and_verify``, so a reused account whose email doesn't match the session's
+    expected identity is flagged and left ``usable=False`` exactly as a fresh one is.
+    """
     entry = record["apps"].setdefault(slug, {})
+    existing = None
+    try:                                                # probe: already authorized?
+        existing = client.get_account(record["external_user_id"], slug)
+    except Exception:                                   # noqa: BLE001 — treat as absent
+        existing = None
+    if existing and existing.get("connected"):
+        # Stash the account so the Verify step doesn't re-fetch it. Safe ONLY on the
+        # reuse path: nobody re-authorizes in between, so it can't go stale. The fresh
+        # path must always fetch, since the account doesn't exist until the worker
+        # approves in the browser.
+        entry.update({"connected": True, "verified": "unverified", "flag": None,
+                      "reused_account": existing})
+        record["updated_at"] = _now()
+        return {"reused": True, "identity_email": existing.get("identity_email"),
+                "connect_url": None, "token": None}
+
+    tok = client.create_connect_token(record["external_user_id"], slug)
     entry.update({"connected": False, "verified": "unverified", "flag": None})
     record["updated_at"] = _now()
-    return tok
+    return dict(tok or {}, reused=False)
 
 
 def bind_and_verify(client, record, slug, expected_email):
@@ -163,13 +191,16 @@ def bind_and_verify(client, record, slug, expected_email):
     worker-confirmed email. A mismatch is FLAGGED and left ``usable=False`` — never
     proceed silently. Mutates and returns the record."""
     uid = record["external_user_id"]
+    entry = record["apps"].setdefault(slug, {"label": slug, "observed_as": []})
     if not record.get("vault_ref"):                      # ensure once per customer
         record["vault_ref"] = client.ensure_vault(uid)["vault_ref"]
     binding = client.bind_connection(record["vault_ref"], uid, slug)
-    account = client.get_account(uid, slug)
+    # On the reuse path connect_app already fetched the account; skip the second
+    # round trip (each one is a real hop to Pipedream and Verify felt broken at
+    # three of them). Always re-fetch on the fresh path.
+    account = entry.pop("reused_account", None) or client.get_account(uid, slug)
     v = verify_identity(account.get("identity_email"), expected_email)
 
-    entry = record["apps"].setdefault(slug, {"label": slug, "observed_as": []})
     entry["binding_ref"] = binding.get("binding_ref")
     entry["token_expires_at"] = binding.get("expires_at")   # for refresh-before-run (WS5)
     entry["connected"] = bool(account.get("connected"))

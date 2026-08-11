@@ -171,6 +171,12 @@ input:focus, textarea:focus { outline: none; border-color: var(--accent); backgr
 .ag-bio { font-size: 13px; color: var(--ink-2); overflow: hidden;
   text-overflow: ellipsis; white-space: nowrap; }
 .ag-bio.unread { color: var(--ink); font-weight: 700; }
+/* Same bio on the agent PROFILE, where there is room to read it in full: wrap instead
+   of truncating. A discovered trigger is often a whole sentence ("When a payment
+   notification email arrives referencing an invoice, ...") and nowrap ran it off the
+   side of the screen. `anywhere` so an unbroken id or URL cannot force a scrollbar. */
+.ag-bio.wrap { white-space: normal; overflow: visible; text-overflow: clip;
+  overflow-wrap: anywhere; line-height: 1.5; }
 
 /* review overlay (stories): one unreviewed session at a time */
 .rv-view { position: fixed; inset: 0; background: rgba(20, 18, 16, .92); z-index: 50;

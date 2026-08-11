@@ -22,13 +22,21 @@ from trace.ui import app, sessions
 class StubConnectClient:
     """Records calls; returns a controllable simulated account email."""
 
-    def __init__(self, identity_email="worker@acme.com"):
+    def __init__(self, identity_email="worker@acme.com", authorized=None):
         self.calls = []
         self.identity_email = identity_email
         self._vaults = {}
+        # Apps this customer has already authorized. Pipedream accounts are scoped to
+        # external_user_id, so an app stays connected across sessions once approved —
+        # which is what lets connect_app skip the OAuth round trip on later agents.
+        # None = "already authorized" (the legacy stub behaviour, used by tests that
+        # call bind_and_verify directly). A set models real authorization state.
+        self.authorized = None if authorized is None else set(authorized)
 
     def create_connect_token(self, external_user_id, app):
         self.calls.append(("token", external_user_id, app))
+        if self.authorized is not None:
+            self.authorized.add(app)  # the worker approves in the browser
         return {"token": "tok", "connect_url": f"https://connect/{external_user_id}/{app}"}
 
     def ensure_vault(self, external_user_id):
@@ -47,6 +55,8 @@ class StubConnectClient:
 
     def get_account(self, external_user_id, app):
         self.calls.append(("account", external_user_id, app))
+        if self.authorized is not None and app not in self.authorized:
+            return {"connected": False}
         return {"connected": True, "account_id": f"acc-{app}",
                 "identity_email": self.identity_email}
 
@@ -479,8 +489,12 @@ class UIConnectTest(unittest.TestCase):
         self.root = self._tmp.name
         self.ks = FakeKeystore("sk-ant-test")
         self.identity = "worker@acme.com"
+        # ONE stub for the whole flow (a fresh instance per call would forget that the
+        # worker just authorized), starting with nothing authorized so the first connect
+        # takes the real OAuth path.
+        self.stub = StubConnectClient(identity_email=self.identity, authorized=())
         self.state = app.AppState(self.root, key_store=self.ks,
-                                  connect_fn=lambda: StubConnectClient(identity_email=self.identity))
+                                  connect_fn=lambda: self.stub)
         self.httpd, _ = app.build_server(port=0, state=self.state)
         self.port = self.httpd.server_address[1]
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
@@ -538,7 +552,10 @@ class UIConnectTest(unittest.TestCase):
 
     def test_mismatch_is_flagged_not_usable(self):
         self.req("POST", f"/api/sessions/{self.sid}/connection-identity", {"email": "worker@acme.com"})
-        self.identity = "intruder@gmail.com"     # the connected account differs
+        # The worker DID authorize, but with a different Google account than the session
+        # expects — the case the flag exists to catch.
+        self.stub.identity_email = "intruder@gmail.com"
+        self.stub.authorized.add("gmail")
         self.req("POST", f"/api/sessions/{self.sid}/connect/gmail/callback", {})
         self.assertEqual(self._await_connect()["state"], "done")
         _, data = self.req("GET", f"/api/sessions/{self.sid}/connection-data")
