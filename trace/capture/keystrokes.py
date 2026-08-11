@@ -24,6 +24,17 @@ SPECIAL = {
     "Key.tab": " [TAB] ",
 }
 
+# Modifiers that make a character key a SHORTCUT rather than typed text. Without
+# this, Cmd+C / Cmd+V arrive as the bare chars 'c' and 'v' and land in the buffer,
+# so copy-paste-heavy work records as `cvcvcvcv` — which reads to discovery as
+# garbled input and has made it refuse to automate an otherwise clean workflow.
+# Shift is deliberately absent: it produces ordinary uppercase characters.
+SHORTCUT_MODIFIERS = {
+    "Key.cmd", "Key.cmd_l", "Key.cmd_r",
+    "Key.ctrl", "Key.ctrl_l", "Key.ctrl_r",
+    "Key.alt", "Key.alt_l", "Key.alt_r", "Key.alt_gr",
+}
+
 
 class KeystrokeCoalescer:
     """Coalesces individual key events into typed segments and emits one
@@ -38,6 +49,7 @@ class KeystrokeCoalescer:
         self._buf = []
         self._window = ""          # window title the current segment is being typed into
         self._seg_start_ts = None  # arrival ts of the first key in the buffer
+        self._mods = set()         # shortcut modifiers currently held down
         self._lock = threading.Lock()
 
     def set_window(self, window_title):
@@ -51,6 +63,14 @@ class KeystrokeCoalescer:
         """Feed one key. ``key_repr`` is the pynput-style string
         (e.g. ``'a'``, ``'Key.space'``, ``'Key.backspace'``)."""
         with self._lock:
+            if key_repr in SHORTCUT_MODIFIERS:
+                self._mods.add(key_repr)
+                return
+            # A character typed while cmd/ctrl/alt is held is a shortcut (Cmd+C,
+            # Cmd+V, Cmd+Tab), not text the worker entered. Drop it rather than
+            # letting it pollute the segment.
+            if self._mods and not key_repr.startswith("Key."):
+                return
             if not self._buf:
                 self._seg_start_ts = ts
             if key_repr == "Key.backspace":
@@ -62,6 +82,13 @@ class KeystrokeCoalescer:
                 pass  # ignore other modifier/special keys
             else:
                 self._buf.append(key_repr)
+
+    def on_key_release(self, key_repr):
+        """Release half of shortcut-modifier tracking. Listeners that register only
+        ``on_press`` still work — a held modifier is simply never cleared, so wire
+        this up wherever ``on_key`` is wired."""
+        with self._lock:
+            self._mods.discard(key_repr)
 
     def flush(self, ts_end=None):
         """Emit the buffered segment (if any) as a ``keystroke`` raw event and

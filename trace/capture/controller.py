@@ -112,7 +112,12 @@ class CaptureController:
                 if not self._writer.paused:
                     self._coalescer.on_key(_key_to_repr(key), now_iso())
 
-            self._listener = keyboard.Listener(on_press=on_press)
+            def on_release(key):
+                # Needed so a held cmd/ctrl/alt is cleared; without it every key
+                # after the first shortcut would be swallowed as part of one.
+                self._coalescer.on_key_release(_key_to_repr(key))
+
+            self._listener = keyboard.Listener(on_press=on_press, on_release=on_release)
             self._listener.start()
 
             # browser-event collector, in-process, on its own thread

@@ -91,6 +91,7 @@ def main():
 
     def on_release(key):
         pressed.discard(key)
+        coalescer.on_key_release(_key_to_repr(key))
 
     print("Trace local capture running: keystrokes + window changes + clipboard.")
     print("Ctrl-Shift-P pauses/resumes. Ctrl-C stops. Work normally.")

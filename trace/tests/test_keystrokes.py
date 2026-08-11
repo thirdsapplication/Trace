@@ -36,9 +36,33 @@ class KeystrokeCoalescingTest(unittest.TestCase):
         self.assertIn("[ENTER]", text)
 
     def test_modifier_keys_dropped(self):
-        self.feed(["a", "Key.shift", "Key.ctrl", "b"])
+        # Shift is not a shortcut modifier — it produces ordinary uppercase, so a
+        # character typed while it is held is still typed text.
+        self.feed(["a", "Key.shift", "b"])
         self.c.flush(ts_end="t")
         self.assertEqual(self.w.events[0]["payload"]["text"], "ab")
+
+    def test_shortcut_chars_not_recorded_as_text(self):
+        """Cmd+C / Cmd+V must not land in the buffer as 'c' and 'v'. Copy-paste-heavy
+        work used to record as `cvcvcvcv`, which reads as garbled input downstream and
+        has made discovery refuse to automate an otherwise clean workflow."""
+        self.feed(["S", "h", "i", "p"])
+        self.c.on_key("Key.cmd", ts="t")
+        self.feed(["c", "v", "v"])
+        self.c.on_key_release("Key.cmd")
+        self.feed(["p", "e", "d"])
+        self.c.flush(ts_end="t")
+        self.assertEqual(self.w.events[0]["payload"]["text"], "Shipped")
+
+    def test_modifier_release_restores_typing(self):
+        """A held modifier must be cleared on release, or every subsequent keystroke
+        would be swallowed as part of a shortcut."""
+        self.c.on_key("Key.cmd", ts="t")
+        self.feed(["c"])
+        self.c.on_key_release("Key.cmd")
+        self.feed(["h", "i"])
+        self.c.flush(ts_end="t")
+        self.assertEqual(self.w.events[0]["payload"]["text"], "hi")
 
     def test_empty_segment_not_emitted(self):
         self.c.flush(ts_end="t")
