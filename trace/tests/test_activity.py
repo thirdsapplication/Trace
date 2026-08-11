@@ -92,5 +92,43 @@ class ActivityEngineTest(unittest.TestCase):
         self.assertEqual(activity.summarize_session(_staged_session(), "a", boom), "")
 
 
+class ProposalParsingTest(unittest.TestCase):
+    """The agent wraps its answer in commentary. Only real actions may reach the human."""
+
+    def _parse(self, text):
+        from trace.agent import runner
+        return runner._parse_proposals(text)
+
+    def test_prose_around_the_block_is_ignored(self):
+        text = ("# Summary\nI checked three payment emails and cross-referenced the sheet.\n\n"
+                "| Invoice | Status |\n|---|---|\n| INV-1 | unpaid |\n\n"
+                "Now let me output the final proposed actions.\n\n" + _PROPOSAL)
+        got = self._parse(text)
+        self.assertEqual([p["summary"] for p in got],
+                         ["Add ERP row for ORD-029", "Confirm order to Field Oak Bistro"])
+
+    def test_narration_shaped_like_an_action_is_dropped(self):
+        """A summary is one line a human approves at a glance; an essay in that field is
+        the tell that the object is narration, not an action."""
+        essay = "The lessons_learned.md file has already been updated by a concurrent " * 8
+        text = ('```proposed_actions\n[{"summary": "' + essay + '", "details": "no new lessons"}]\n```')
+        self.assertEqual(self._parse(text), [])
+
+    def test_last_block_wins(self):
+        """An earlier draft the agent talked itself out of must not be approvable."""
+        first = ('```proposed_actions\n[{"app": "Gmail", "action": "send email", '
+                 '"summary": "Draft I reconsidered", "details": {"to": "x@y.com"}}]\n```')
+        text = first + "\n\nOn reflection that was wrong. Here are the real actions:\n\n" + _PROPOSAL
+        got = self._parse(text)
+        self.assertEqual([p["summary"] for p in got],
+                         ["Add ERP row for ORD-029", "Confirm order to Field Oak Bistro"])
+
+    def test_empty_array_is_a_valid_answer(self):
+        self.assertEqual(self._parse('```proposed_actions\n[]\n```'), [])
+
+    def test_no_block_at_all(self):
+        self.assertIsNone(self._parse("I read the inbox and there was nothing to do."))
+
+
 if __name__ == "__main__":
     unittest.main()

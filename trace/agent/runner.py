@@ -214,24 +214,51 @@ def _parse_needs_input(text):
     return [q for q in data if isinstance(q, dict)][:_uncertainty_max_questions()]
 
 
+def _looks_like_proposal(p):
+    """Whether a parsed object is plausibly a staged action rather than stray prose.
+
+    Agents wrap their answer in commentary — headings, findings tables, "let me now
+    output the final actions". A loose parse can capture that narration as a proposal,
+    and it then renders as an approve card made of paragraphs (observed 2026-08-11: a
+    card whose summary was "The lessons_learned.md file has already been updated…").
+    A summary is ONE line a human approves at a glance, so an essay in that field is the
+    tell that this object is not an action.
+    """
+    if not isinstance(p, dict):
+        return False
+    summary = p.get("summary")
+    if not isinstance(summary, str) or not summary.strip() or len(summary) > 400:
+        return False
+    return bool(p.get("app") or p.get("action") or p.get("details"))
+
+
 def _parse_proposals(text):
     """Parse the agent's ``proposed_actions`` JSON array out of its final message.
     Returns a list (possibly empty) on success, or None if no array could be parsed
-    (the caller then falls back so a proposal is never silently dropped)."""
+    (the caller then falls back so a proposal is never silently dropped).
+
+    Prefers the explicitly tagged fence, and among several takes the LAST — the model's
+    final answer, not an earlier draft it talked itself out of. Items that don't look
+    like actions are dropped rather than shown to a human as approvable.
+    """
     if not text:
         return None
-    m = re.search(r"```(?:proposed_actions|json)?\s*(\[.*?\])\s*```", text, re.DOTALL)
-    blob = m.group(1) if m else None
-    if blob is None:                                   # no fence — try a bare top-level array
-        m2 = re.search(r"(\[.*\])", text, re.DOTALL)
-        blob = m2.group(1) if m2 else None
-    if blob is None:
-        return None
-    try:
-        data = json.loads(blob)
-    except (ValueError, TypeError):
-        return None
-    return data if isinstance(data, list) else None
+    candidates = [m.group(1) for m in
+                  re.finditer(r"```proposed_actions\s*(.*?)```", text, re.DOTALL)]
+    if not candidates:                                 # untagged or ```json fence
+        candidates = [m.group(1) for m in
+                      re.finditer(r"```(?:json)?\s*(\[.*?\])\s*```", text, re.DOTALL)]
+    if not candidates:                                 # no fence — bare top-level array
+        m = re.search(r"(\[.*\])", text, re.DOTALL)
+        candidates = [m.group(1)] if m else []
+    for blob in reversed(candidates):                  # last block wins
+        try:
+            data = json.loads(blob.strip())
+        except (ValueError, TypeError):
+            continue
+        if isinstance(data, list):
+            return [p for p in data if _looks_like_proposal(p)]
+    return None
 
 
 def _proposals_to_pending(agent_id, proposals, run_session_id):

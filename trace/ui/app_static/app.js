@@ -230,14 +230,20 @@ function proposalRow(p) {
   const pl = p.payload || {};
   // Long values and nested objects render pre-wrapped (multi-line) so email bodies and
   // row payloads stay readable instead of collapsing to a one-line JSON blob.
+  // Short values sit inline; anything long (an email body, a row payload) folds into a
+  // disclosure. Dumping a full body inline turned an approve card into a wall of text —
+  // you couldn't see WHAT you were approving without scrolling past the message itself.
   const rows = Object.keys(pl).map(k => {
     const v = pl[k];
     const val = (v && typeof v === "object") ? JSON.stringify(v, null, 2) : String(v);
-    const multi = val.length > 60 || val.includes("\n");
-    return `<div class="sub" style="margin-top:3px;"><b>${esc(k)}:</b> `
-      + (multi ? `<span style="display:block;white-space:pre-wrap;margin-top:1px;">${esc(val)}</span>`
-               : esc(val))
-      + `</div>`;
+    if (val.length <= 90 && !val.includes("\n")) {
+      return `<div class="sub" style="margin-top:3px;"><b>${esc(k)}:</b> ${esc(val)}</div>`;
+    }
+    const firstLine = val.split("\n")[0].slice(0, 70);
+    return `<details style="margin-top:3px;">
+      <summary class="sub" style="cursor:pointer;"><b>${esc(k)}:</b> ${esc(firstLine)}… <span class="muted">(show)</span></summary>
+      <span class="sub" style="display:block;white-space:pre-wrap;margin-top:4px;">${esc(val)}</span>
+    </details>`;
   }).join("");
   const done = p.status && p.status !== "pending";
   const why = (p.rationale || "").trim();
