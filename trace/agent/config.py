@@ -248,10 +248,12 @@ MEMORY_UPDATE_DIRECTIVE = (
     "rewriting). NEVER write credentials, tokens, API keys, or any secret into memory.")
 
 
-def memory_store_name(agent_name, external_user_id):
-    """The per-agent memory store name: keyed on the AGENT'S OWN NAME — the same key
-    ``create_or_reuse_agent`` uses — so memory follows the agent across redeploys and a
-    DIFFERENT workflow can never inherit it.
+def memory_store_name(agent_id, external_user_id):
+    """The per-agent memory store name: keyed on the platform AGENT ID, which is
+    immutable, unique, and stable across redeploys (``create_or_reuse_agent`` reuses by
+    name and returns the same agent), so memory follows the agent and a DIFFERENT
+    workflow can never inherit it. Keying on the agent's *name* would work until someone
+    renames the agent, which would silently orphan everything it had learned.
 
     It used to key on the bundle id, which is unique only WITHIN a session: discovery
     labels bundles B1, B2, B3 per recording, so ``trace-B1-<user>`` was the name for the
@@ -262,7 +264,7 @@ def memory_store_name(agent_name, external_user_id):
     ``external_user_id`` comes FIRST so the 100-char clamp can never truncate it away and
     let two customers collide on one store.
     """
-    slug = re.sub(r"[^a-z0-9]+", "-", (agent_name or "agent").lower()).strip("-")
+    slug = re.sub(r"[^a-z0-9]+", "-", (str(agent_id) or "agent").lower()).strip("-")
     return f"trace-{external_user_id}-{slug or 'agent'}"[:100]
 
 

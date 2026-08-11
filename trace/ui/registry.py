@@ -946,6 +946,19 @@ def agent_set_color(root, agent_id, color):
             _save(root, "agents.json", d)
 
 
+def agent_set_name(root, agent_id, name):
+    """Rename an agent. Display only: the memory store is keyed on the platform agent id
+    (config.memory_store_name), so a rename never orphans what the agent has learned."""
+    if supa.is_configured():
+        supa.get_admin().table("agents").update({"name": name}).eq("id", agent_id).execute()
+        return
+    with _LOCK:
+        d = _load(root, "agents.json")
+        if agent_id in d:
+            d[agent_id]["name"] = name
+            _save(root, "agents.json", d)
+
+
 def _group_to_caller(row):
     return {"id": str(row.get("id")),
             "owner_user_id": str(row.get("owner_id")) if row.get("owner_id") else None,

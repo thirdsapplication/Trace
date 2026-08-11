@@ -788,6 +788,27 @@ class GroupChatTest(HomeAndMessagesEndpointTest):
         # (no groups yet, but the color persisted on the agent row)
         self.assertEqual(registry.agents_for_user(self.root, uid)[0]["color"], "#123456")
 
+    def test_rename_agent_endpoint(self):
+        uid, cookie = self._signup("grp-rename@x.com")
+        self._seed_agent(uid)
+        status, data, _ = self._req("POST", "/api/u/agents/agent-1/name",
+                                    {"name": "Operations — EOD shipping"}, cookie=cookie)
+        self.assertEqual((status, data["name"]), (200, "Operations — EOD shipping"))
+        self.assertEqual(registry.agents_for_user(self.root, uid)[0]["name"],
+                         "Operations — EOD shipping")
+
+    def test_rename_agent_rejects_empty_and_foreign(self):
+        uid, cookie = self._signup("grp-rename2@x.com")
+        self._seed_agent(uid)
+        status, _, _ = self._req("POST", "/api/u/agents/agent-1/name",
+                                 {"name": "   "}, cookie=cookie)
+        self.assertEqual(status, 400)
+        _, other = self._signup("grp-rename3@x.com")          # another owner cannot rename it
+        status, _, _ = self._req("POST", "/api/u/agents/agent-1/name",
+                                 {"name": "hijacked"}, cookie=other)
+        self.assertEqual(status, 404)
+        self.assertNotEqual(registry.agents_for_user(self.root, uid)[0]["name"], "hijacked")
+
 
 class GroupBroadcastTest(HomeAndMessagesEndpointTest):
     """Group chat G2: read-only broadcast — every member answers grounded in its own run

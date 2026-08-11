@@ -188,7 +188,7 @@ class DeployTest(unittest.TestCase):
         # one memory store, seeded with BOTH canonical documents
         self.assertEqual(len(client.memory_stores), 1)
         self.assertEqual(client.memory_stores[0]["name"],
-                         config.memory_store_name(live.get("name"), "trace-s1"))
+                         config.memory_store_name("agent_live", "trace-s1"))
         self.assertEqual({p for _sid, p in client.seeded},
                          {config.MEMORY_STATUS_DOC, config.MEMORY_LESSONS_DOC})
         # one MANUAL deployment (no schedule at deploy; the dashboard attaches cron)
@@ -237,7 +237,7 @@ class DeployTest(unittest.TestCase):
 
     def test_memory_store_reused_on_redeploy_keeps_lessons(self):
         bundle, live = _live_dict()
-        name = config.memory_store_name(live.get("name"), "trace-s1")
+        name = config.memory_store_name("agent_live", "trace-s1")
         client = FakeDeployClient(existing_stores=[{"id": "mem_prior", "name": name}])
         rec = deploy.deploy_live(bundle, live, CONNECTION, client)
         self.assertEqual(rec["memory_store_id"], "mem_prior")

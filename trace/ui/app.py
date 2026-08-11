@@ -2236,6 +2236,20 @@ def make_handler(state):
             registry.agent_set_color(root, agent_id, color)
             return self._json(200, {"agent_id": agent_id, "color": color})
 
+        def _set_agent_name(self, agent_id, body, user):
+            """Rename an agent. The deployed name on the platform is unchanged — this is
+            the label the owner sees, and the memory store keys on the agent id, so a
+            rename cannot orphan the agent's accumulated lessons."""
+            if agent_id not in self._owned_agent_ids(user):
+                return self._json(404, {"error": "not_found"})
+            name = str((body or {}).get("name", "") or "").strip()
+            if not name:
+                return self._json(400, {"error": "empty_name"})
+            if len(name) > 80:
+                return self._json(400, {"error": "name_too_long"})
+            registry.agent_set_name(root, agent_id, name)
+            return self._json(200, {"agent_id": agent_id, "name": name})
+
         def _delete_capture_data(self, agent_id, user):
             """Delete one workflow's capture data (the origin session). Resolves the
             agent owner-scoped, then removes its capture session; the agent stays live."""
@@ -2401,6 +2415,9 @@ def make_handler(state):
             mcol = re.match(r"^/agents/([^/]+)/color$", rest)
             if mcol:                                     # set an agent's bubble color
                 return self._set_agent_color(mcol.group(1), body, user)
+            mnm = re.match(r"^/agents/([^/]+)/name$", rest)
+            if mnm:                                      # rename an agent (display only)
+                return self._set_agent_name(mnm.group(1), body, user)
             if rest == "/load-fixture":
                 return self._load_fixture(body, owner=uid)
             if rest == "/describe-workflow":                 # skip-recording path

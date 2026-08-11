@@ -374,6 +374,10 @@ async function renderSettings() {
 
 /* ---------------- GROUP CHAT: agents as contacts in a group ---------------- */
 const colorDot = (c) => `<span style="display:inline-block;width:9px;height:9px;border-radius:50%;background:${esc(c)};margin-right:4px;vertical-align:middle;"></span>`;
+// Mirrors registry._AGENT_COLORS — the palette the server falls back to when an agent
+// has no explicit color, so the picker offers exactly the same choices.
+const AGENT_COLORS = ["#F26A1B", "#2D7FF9", "#12B886", "#E8590C", "#7048E8",
+                      "#E64980", "#1098AD", "#F59F00", "#4263EB", "#0CA678"];
 
 async function renderGroups() {
   clearTimers();
@@ -754,6 +758,21 @@ async function renderProfile(agentId) {
         <select class="sched" id="pSched">${opts}</select>
         ${sched ? `<button class="btn-secondary btn-sm" id="pPause">${paused ? "Resume" : "Pause"}</button>` : ""}
       </div>
+      <div class="row" style="margin-top:14px;gap:8px;align-items:center;flex-wrap:wrap;">
+        <span class="label">Name</span>
+        <input id="pName" type="text" value="${esc(a.name || "")}" maxlength="80"
+               style="flex:1;min-width:180px;" />
+        <button class="btn-secondary btn-sm" id="pNameSave">Save</button>
+      </div>
+      <div class="row" style="margin-top:10px;gap:8px;align-items:center;flex-wrap:wrap;">
+        <span class="label">Color</span>
+        ${AGENT_COLORS.map(c => `
+          <button class="ag-swatch" data-color="${esc(c)}" title="${esc(c)}"
+                  style="width:20px;height:20px;border-radius:50%;background:${esc(c)};
+                         border:${c.toLowerCase() === String(a.color || "").toLowerCase()
+                                   ? "2px solid var(--fg,#111)" : "1px solid rgba(0,0,0,.15)"};
+                         cursor:pointer;padding:0;"></button>`).join("")}
+      </div>
       <div class="row" style="margin-top:12px;">
         ${a.capture_present
           ? `<button id="pDelCap" class="btn-link" style="color:var(--danger,#b3261e);">Delete capture data</button>`
@@ -811,6 +830,20 @@ async function renderProfile(agentId) {
     await api("POST", `/api/u/agents/${agentId}/schedule/pause`, { paused: !paused });
     S.igHome = null; renderProfile(agentId);
   };
+  const nameSave = $("#pNameSave");
+  if (nameSave) nameSave.onclick = async () => {
+    const name = ($("#pName").value || "").trim();
+    if (!name) return;
+    nameSave.disabled = true; nameSave.textContent = "Saving…";
+    await api("POST", `/api/u/agents/${agentId}/name`, { name });
+    S.igHome = null; renderProfile(agentId);
+  };
+  document.querySelectorAll(".ag-swatch").forEach(sw => {
+    sw.onclick = async () => {
+      await api("POST", `/api/u/agents/${agentId}/color`, { color: sw.dataset.color });
+      S.igHome = null; renderProfile(agentId);
+    };
+  });
   const dc = $("#pDelCap");
   if (dc) dc.onclick = async () => {
     if (!confirm("Delete all recorded data for this workflow from your device and the cloud? Your agent keeps running. This can't be undone.")) return;
