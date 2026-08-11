@@ -745,7 +745,7 @@ async function renderProfile(agentId) {
       <div class="row" style="gap:16px;align-items:flex-start;">
         ${avatar(name, 64)}
         <div style="flex:1;">
-          <div class="row" style="gap:10px;"><h2 style="margin:0;">${esc(name)}</h2>
+          <div class="row" style="gap:10px;"><h2 id="pTitle" style="margin:0;">${esc(name)}</h2>
             <span class="pill ${paused ? "pill-warn" : "pill-on"}">${paused ? "PAUSED" : "LIVE"}</span></div>
           <p class="ag-bio wrap" style="margin:6px 0 0;">${esc(a.description || ("Runs when: " + (a.trigger || "you say so")))}</p>
           <p class="sub muted" style="margin-top:4px;"><span id="pStats">…</span>${a.deployed_at ? ` · live since ${esc(ago(a.deployed_at))}` : ""}</p>
@@ -830,18 +830,38 @@ async function renderProfile(agentId) {
     await api("POST", `/api/u/agents/${agentId}/schedule/pause`, { paused: !paused });
     S.igHome = null; renderProfile(agentId);
   };
+  // Both of these update the page IN PLACE. Re-rendering the profile would refetch the
+  // activity log (session summaries), which is far too slow for picking a colour.
+  // S.igHome is dropped so the home list shows the new value next time it loads.
   const nameSave = $("#pNameSave");
   if (nameSave) nameSave.onclick = async () => {
-    const name = ($("#pName").value || "").trim();
-    if (!name) return;
+    const newName = ($("#pName").value || "").trim();
+    if (!newName) return;
     nameSave.disabled = true; nameSave.textContent = "Saving…";
-    await api("POST", `/api/u/agents/${agentId}/name`, { name });
-    S.igHome = null; renderProfile(agentId);
+    try {
+      await api("POST", `/api/u/agents/${agentId}/name`, { name: newName });
+      const title = $("#pTitle");
+      if (title) title.textContent = newName;
+      S.igHome = null;
+      nameSave.textContent = "Saved";
+    } catch (e) {
+      nameSave.textContent = "Couldn't save";
+    }
+    setTimeout(() => { nameSave.disabled = false; nameSave.textContent = "Save"; }, 1200);
   };
-  document.querySelectorAll(".ag-swatch").forEach(sw => {
+  const swatches = Array.from(document.querySelectorAll(".ag-swatch"));
+  swatches.forEach(sw => {
     sw.onclick = async () => {
-      await api("POST", `/api/u/agents/${agentId}/color`, { color: sw.dataset.color });
-      S.igHome = null; renderProfile(agentId);
+      const chosen = sw.dataset.color;
+      swatches.forEach(o => {                       // optimistic: show the pick at once
+        o.style.border = (o === sw) ? "2px solid var(--fg,#111)" : "1px solid rgba(0,0,0,.15)";
+      });
+      try {
+        await api("POST", `/api/u/agents/${agentId}/color`, { color: chosen });
+        S.igHome = null;
+      } catch (e) {
+        swatches.forEach(o => { o.style.border = "1px solid rgba(0,0,0,.15)"; });
+      }
     };
   });
   const dc = $("#pDelCap");

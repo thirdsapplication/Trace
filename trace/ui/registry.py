@@ -41,6 +41,11 @@ def _agent_to_caller(row):
         "memory_store_id": row.get("memory_store_id"),
         "description": row.get("description"),
         "deployed_at": row.get("deployed_at") or row.get("created_at"),
+        # Without this the column is written and never read back: agent_color() falls
+        # through to the deterministic default every time, so a user's chosen colour has
+        # no effect anywhere in Supabase mode. File-mode returns the raw stored dict, so
+        # it kept working and the tests never caught it.
+        "color": row.get("color"),
     }
     return d
 
