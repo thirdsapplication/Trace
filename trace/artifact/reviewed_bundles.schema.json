@@ -41,7 +41,9 @@
           "confidence": { "type": "string", "enum": ["high", "medium", "low"] },
           "rationale": { "type": "string" },
           "reclassified_from": { "type": ["string", "null"], "enum": ["bundle", "anti_bundle", null] },
-          "original_reason_for_judgment": { "type": "string" }
+          "original_reason_for_judgment": { "type": "string" },
+          "user_description": { "type": "string" },
+          "understanding": { "type": "string", "enum": ["", "confirmed", "corrected"] }
         }
       }
     },
@@ -63,7 +65,9 @@
           "included_example_event_ids": { "type": "array", "items": { "type": "string" } },
           "evidence_event_ids": { "type": "array", "items": { "type": "string" } },
           "confidence": { "type": "string", "enum": ["high", "medium", "low"] },
-          "reclassified_from": { "type": ["string", "null"], "enum": ["bundle", "anti_bundle", null] }
+          "reclassified_from": { "type": ["string", "null"], "enum": ["bundle", "anti_bundle", null] },
+          "user_description": { "type": "string" },
+          "understanding": { "type": "string", "enum": ["", "confirmed", "corrected"] }
         }
       }
     },

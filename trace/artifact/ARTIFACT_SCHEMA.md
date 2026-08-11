@@ -20,6 +20,10 @@ because reclassification moves items between them. Full shape in
 - `evidence_event_ids` — original provenance.
 - `reclassified_from` + `original_reason_for_judgment` — if reclassified anti→bundle,
   the judgment reason is carried into the spec as context.
+- `user_description` + `understanding` — the review step's approve/correct outcome.
+  `understanding` is `confirmed` | `corrected` | `""` (unresolved). When `corrected`,
+  `user_description` holds the worker's own VERBATIM description of the workflow and
+  is AUTHORITATIVE over the discovered name/description/trigger/steps downstream.
 
 ## Input B: `event_log.json`
 Read-only, only to fetch the **verbatim** text of cited examples. Examples are

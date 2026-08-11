@@ -114,6 +114,34 @@ class UIArtifactTest(unittest.TestCase):
         self.assertEqual(saved["bundles"][0]["description"], "EDITED description")
         self.assertEqual(saved["bundles"][0]["human_checkpoints"][0]["note"], "verify totals")
 
+    def test_save_reviewed_persists_understanding(self):
+        _, rd = self.req("GET", f"/api/sessions/{self.sid}/review-data")
+        reviewed = rd["reviewed"]
+        # seeded unresolved on both shapes
+        self.assertEqual(reviewed["bundles"][0]["understanding"], "")
+        self.assertEqual(reviewed["anti_bundles"][0]["understanding"], "")
+        reviewed["bundles"][0]["understanding"] = "corrected"
+        reviewed["bundles"][0]["user_description"] = \
+            "I also enter each tracking number into the destination record."
+        reviewed["anti_bundles"][0]["understanding"] = "confirmed"
+        code, data = self.req("POST", f"/api/sessions/{self.sid}/reviewed-bundles", reviewed)
+        self.assertEqual(code, 200)
+        self.assertTrue(data["saved"])
+        code, saved = self.req("GET", f"/api/sessions/{self.sid}/reviewed-bundles")
+        self.assertEqual(saved["bundles"][0]["user_description"],
+                         "I also enter each tracking number into the destination record.")
+        self.assertEqual(saved["bundles"][0]["understanding"], "corrected")
+        self.assertEqual(saved["anti_bundles"][0]["understanding"], "confirmed")
+
+    def test_corrected_without_text_repaired_on_save(self):
+        _, rd = self.req("GET", f"/api/sessions/{self.sid}/review-data")
+        reviewed = rd["reviewed"]
+        reviewed["bundles"][0]["understanding"] = "corrected"    # no correction text
+        code, data = self.req("POST", f"/api/sessions/{self.sid}/reviewed-bundles", reviewed)
+        self.assertEqual(code, 200)
+        self.assertEqual(data["reviewed"]["bundles"][0]["understanding"], "")
+        self.assertTrue(any("corrected" in e for e in data["errors"]))
+
     def test_reclassification_routes_item(self):
         _, rd = self.req("GET", f"/api/sessions/{self.sid}/review-data")
         reviewed = rd["reviewed"]

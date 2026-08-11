@@ -14,7 +14,12 @@ worker's real apps through connected tools.
 
 You will receive a JSON object with:
 - workflow_description: the discovered workflow (name, description, trigger,
-  high-level steps).
+  high-level steps). When it contains user_description, that is the worker's
+  own correction of what this workflow really is, written during review. It is
+  AUTHORITATIVE over the rest of workflow_description and over anything you
+  would infer from the events: build the agent for the workflow the worker
+  described, and keep only the discovered details (apps, values, steps) that do
+  not contradict it.
 - observed_events: the specific captured moments evidencing it, each with an
   id and a plain description of what the worker did.
 - user_answers: the worker's one-line answers about things that could not be
@@ -51,8 +56,9 @@ Rules for the content you write:
 - Do NOT invent any step, value, or rule that has no source.
 - Every step, working rule, and requirement MUST carry a source tag:
   {type:'events', ids:[...]} or {type:'discovery'} or {type:'user_answer', q:'..'}
-  or {type:'user_test_feedback', note:'..'} (for content folded in from a
-  test_feedback correction).
+  or {type:'user_description'} (for content grounded in the worker's own
+  correction of the workflow) or {type:'user_test_feedback', note:'..'} (for
+  content folded in from a test_feedback correction).
 
 Output ONLY this JSON, nothing else:
 {

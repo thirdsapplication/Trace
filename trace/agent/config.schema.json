@@ -30,7 +30,12 @@
         {"type": "object", "required": ["type"],
          "properties": {"type": {"const": "discovery"}}},
         {"type": "object", "required": ["type", "q"],
-         "properties": {"type": {"const": "user_answer"}, "q": {"type": "string"}}}
+         "properties": {"type": {"const": "user_answer"}, "q": {"type": "string"}}},
+        {"type": "object", "required": ["type"],
+         "properties": {"type": {"const": "user_description"}}},
+        {"type": "object", "required": ["type"],
+         "properties": {"type": {"const": "user_test_feedback"},
+                        "note": {"type": "string"}}}
       ]
     }
   }

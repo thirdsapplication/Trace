@@ -328,5 +328,72 @@ class EnvironmentIntegrationTest(unittest.TestCase):
         self.assertEqual(spec["environment_status"], "missing")
 
 
+class UnderstandingTest(unittest.TestCase):
+    """The review step's forced approve/correct: ``user_description`` is the worker's
+    verbatim, authoritative correction of what the workflow really is; ``understanding``
+    tracks confirmed/corrected/unresolved. Both survive validate_reviewed on both
+    shapes, so a correction written on a Manual card survives a later flip."""
+    def setUp(self):
+        self.ids = {"e1", "e2", "e3"}
+        self.rep = review.ReviewReport()
+
+    def test_seed_defaults_understanding_unset(self):
+        r = review.seed_review(DISCOVERY)
+        self.assertEqual(r["bundles"][0]["user_description"], "")
+        self.assertEqual(r["bundles"][0]["understanding"], "")
+        self.assertEqual(r["anti_bundles"][0]["user_description"], "")
+        self.assertEqual(r["anti_bundles"][0]["understanding"], "")
+
+    def test_correction_whitelisted_both_shapes(self):
+        obj = {"bundles": [{"id": "B1", "classification": "bundle", "steps": ["s"],
+                            "disposition": "approve_for_build",
+                            "understanding": "corrected",
+                            "user_description": "I enter each tracking number into the ERP."}],
+               "anti_bundles": [{"id": "A1", "classification": "anti_bundle", "name": "n",
+                                 "why_judgment": "j", "understanding": "confirmed",
+                                 "user_description": ""}],
+               "notes": ""}
+        out = review.validate_reviewed(obj, self.ids, self.rep)
+        self.assertEqual(out["bundles"][0]["user_description"],
+                         "I enter each tracking number into the ERP.")
+        self.assertEqual(out["bundles"][0]["understanding"], "corrected")
+        self.assertEqual(out["anti_bundles"][0]["understanding"], "confirmed")
+        self.assertEqual(out["anti_bundles"][0]["user_description"], "")
+
+    def test_corrected_without_text_repaired(self):
+        obj = {"bundles": [{"id": "B1", "classification": "bundle", "steps": ["s"],
+                            "disposition": "approve_for_build",
+                            "understanding": "corrected", "user_description": "   "}],
+               "anti_bundles": [], "notes": ""}
+        out = review.validate_reviewed(obj, self.ids, self.rep)
+        self.assertEqual(out["bundles"][0]["understanding"], "")
+        self.assertEqual(out["bundles"][0]["user_description"], "")
+        self.assertTrue(any("corrected" in e for e in self.rep.errors))
+
+    def test_nonempty_text_forces_corrected(self):
+        # a stale "confirmed" (or missing) marker never wins over actual correction text
+        obj = {"bundles": [{"id": "B1", "classification": "bundle", "steps": ["s"],
+                            "disposition": "approve_for_build",
+                            "understanding": "confirmed",
+                            "user_description": "  Actually I update the ERP.  "}],
+               "anti_bundles": [], "notes": ""}
+        out = review.validate_reviewed(obj, self.ids, self.rep)
+        self.assertEqual(out["bundles"][0]["understanding"], "corrected")
+        self.assertEqual(out["bundles"][0]["user_description"], "Actually I update the ERP.")
+
+    def test_correction_survives_reclassification(self):
+        obj = {"anti_bundles": [{"id": "Y", "classification": "bundle", "name": "n",
+                                 "steps": ["a"], "disposition": "approve_for_build",
+                                 "reclassified_from": "anti_bundle",
+                                 "user_description": "This is really data entry, not judgment.",
+                                 "evidence_event_ids": ["e1"],
+                                 "included_example_event_ids": ["e1"]}],
+               "bundles": [], "notes": ""}
+        out = review.validate_reviewed(obj, self.ids, self.rep)
+        self.assertEqual(out["bundles"][0]["user_description"],
+                         "This is really data entry, not judgment.")
+        self.assertEqual(out["bundles"][0]["understanding"], "corrected")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -110,6 +110,56 @@ class UIChainTest(unittest.TestCase):
         self.assertEqual(code, 202)
         return self._await("build")
 
+    def test_correction_threads_to_interview_and_build(self):
+        # a worker correction saved at review reaches BOTH downstream engines'
+        # bundle input (through _approved_for_stage4's re-validation)
+        p = sessions.path(self.root, self.sid, sessions.REVIEWED)
+        with open(p) as f:
+            rb = json.load(f)
+        rb["bundles"][0]["understanding"] = "corrected"
+        rb["bundles"][0]["user_description"] = \
+            "I enter each tracking number into the destination record."
+        with open(p, "w") as f:
+            json.dump(rb, f)
+        captured = {}
+        real_iv, real_cf = self.state.interview_fn, self.state.config_fn
+
+        def iv_spy(bundle, event_log, model_fn=None):
+            captured["interview"] = bundle
+            return real_iv(bundle, event_log, model_fn=model_fn)
+
+        def cf_spy(bundle, observed, answers, model_fn, unresolved=None, test_feedback=None):
+            captured["config"] = bundle
+            return real_cf(bundle, observed, answers, model_fn,
+                           unresolved=unresolved, test_feedback=test_feedback)
+
+        self.state.interview_fn, self.state.config_fn = iv_spy, cf_spy
+        self._interview_and_answer({"q1": "x", "q2": "y"})
+        self.assertEqual(self._build()["state"], "done")
+        self.assertEqual(captured["interview"]["user_description"],
+                         "I enter each tracking number into the destination record.")
+        self.assertEqual(captured["config"]["user_description"],
+                         "I enter each tracking number into the destination record.")
+
+    def test_stale_answers_dropped_when_question_text_changes(self):
+        # ids are positional (q1..qN): after a regenerate that rewrites a question,
+        # the old answer must not silently attach to the different new q1
+        self._interview_and_answer({"q1": "Open_Orders", "q2": "the source wins"})
+
+        def new_iv(bundle, event_log, model_fn=None):
+            qs = fake_interview_fn(bundle, event_log, model_fn=model_fn)["questions"]
+            qs[0]["question"] = "Where does each tracking number go?"   # q1 rewritten
+            return {"questions": qs}                                    # q2 unchanged
+
+        self.state.interview_fn = new_iv
+        code, _ = self.req("POST", f"/api/sessions/{self.sid}/interview", {})
+        self.assertEqual(code, 202)
+        self.assertEqual(self._await("interview")["state"], "done")
+        _, data = self.req("GET", f"/api/sessions/{self.sid}/interview-data")
+        rec = data["interviews"]["B1"]
+        self.assertEqual([a["q"] for a in rec["answers"]], ["q2"])   # q1's stale answer dropped
+        self.assertEqual(rec["status"], "incomplete")
+
     def test_interview_generate_and_skip(self):
         code, rec = self._interview_and_answer({"q1": "Open_Orders"})    # q2 skipped
         self.assertEqual(code, 200)
