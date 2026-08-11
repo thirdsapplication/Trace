@@ -23,6 +23,7 @@ import shutil
 import ssl
 import threading
 import time
+import traceback
 import urllib.parse
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -1144,6 +1145,7 @@ class AppState:
                     eligible = [b for b in eligible if b["id"] in set(selected_ids)]
                 for b in eligible:
                     bid = b["id"]
+                    rec = None                       # set once the platform agent exists
                     try:
                         with open(os.path.join(specs_dir, sessions.agent_yaml_name(bid, "live")),
                                   encoding="utf-8") as f:
@@ -1181,13 +1183,29 @@ class AppState:
                                     "deployment_id": rec.get("deployment_id"),
                                     "memory_store_id": rec.get("memory_store_id"),
                                     "description": b.get("description") or ""})
-                                self._embed_agent_kind({          # Phase B: agent-kind gate
-                                    "agent_id": rec["agent_id"], "name": b.get("name") or bid,
-                                    "description": b.get("description") or "",
-                                    "trigger": (rec.get("start") or {}).get("value")})
+                                try:                  # Phase B: agent-kind gate. Best-effort
+                                    self._embed_agent_kind({   # — an embedding hiccup must
+                                        "agent_id": rec["agent_id"],   # never fail a deploy
+                                        "name": b.get("name") or bid,
+                                        "description": b.get("description") or "",
+                                        "trigger": (rec.get("start") or {}).get("value")})
+                                except Exception:      # noqa: BLE001 — best-effort
+                                    traceback.print_exc()
                         job["deployed"] += 1
                     except Exception as e:
-                        job["errors"][bid] = f"{type(e).__name__}: {e}"
+                        # Anything that fails AFTER deploy_fn leaves a REAL agent live on
+                        # the platform, so say so instead of reporting a plain failure.
+                        # Log the traceback too: job["errors"] is in-memory and reaches
+                        # neither the logs nor the UI, which makes this class of failure
+                        # invisible (a uuid/text column mismatch cost an hour this way).
+                        detail = f"{type(e).__name__}: {e}"
+                        orphan = (rec or {}).get("agent_id")
+                        if orphan:
+                            detail += (f" — platform agent {orphan} IS LIVE but was not "
+                                       "registered, so it will not appear in the UI")
+                        job["errors"][bid] = detail
+                        print(f"[deploy] bundle {bid} failed: {detail}", flush=True)
+                        traceback.print_exc()
                 # Only mark the session deployed if at least one agent was actually
                 # created; never report a total failure as "live" (the per-bundle
                 # platform error is surfaced so the real cause is visible).
