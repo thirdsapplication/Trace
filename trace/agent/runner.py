@@ -161,6 +161,40 @@ def _staging_trigger(base_trigger, staged_slugs):
     return f"{directive}\nTask: {base_trigger}"
 
 
+def _uncertainty_max_questions():
+    """The cap on questions in one needs_input pause — mirrors the initial-setup
+    interview's limit so both stages behave the same (per product decision)."""
+    from .interview import _MAX_QUESTIONS
+    return _MAX_QUESTIONS
+
+
+def _uncertainty_trigger(base_trigger):
+    """Append the uncertainty directive so the agent can pause on a genuinely blocking
+    edge case (Gap #3). Applies to every run, staged or autonomous."""
+    directive = config.UNCERTAINTY_DIRECTIVE.replace(
+        "{max_questions}", str(_uncertainty_max_questions()))
+    return f"{base_trigger}\n\n{directive}"
+
+
+def _parse_needs_input(text):
+    """Parse the agent's ``needs_input`` question array out of its final message. Requires
+    the explicit ``needs_input`` fence (never a bare array — we don't want to misread a
+    proposals block or other JSON as questions). Returns a list capped at the interview
+    limit; [] when none/unparseable."""
+    if not text:
+        return []
+    m = re.search(r"```needs_input\s*(\[.*?\])\s*```", text, re.DOTALL)
+    if not m:
+        return []
+    try:
+        data = json.loads(m.group(1))
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(data, list):
+        return []
+    return [q for q in data if isinstance(q, dict)][:_uncertainty_max_questions()]
+
+
 def _parse_proposals(text):
     """Parse the agent's ``proposed_actions`` JSON array out of its final message.
     Returns a list (possibly empty) on success, or None if no array could be parsed
@@ -191,8 +225,13 @@ def _proposals_to_pending(agent_id, proposals, run_session_id):
             details = {"description": str(details)} if details is not None else {}
         kind = str(p.get("action") or p.get("app") or "action")
         summary = str(p.get("summary") or kind)
+        rationale = p.get("rationale")
+        rationale = str(rationale) if rationale is not None else ""
         items.append({"action_id": None, "kind": kind, "summary": summary,
+                      "rationale": rationale,
                       "app": p.get("app") or "", "payload": details,
+                      # content_hash keys on the action itself (agent+kind+details) so the
+                      # same proposal dedups regardless of how the rationale is worded.
                       "content_hash": _content_hash(agent_id, kind, details),
                       "run_session_id": run_session_id})
     return items
@@ -206,20 +245,47 @@ def _memory_resources(agent):
     return [config.memory_resource(store_id)] if store_id else []
 
 
-def run_once(client, agent):
+def _resume_preamble(resume):
+    """Prepend the paused question + the human's answer so an auto-resumed run continues
+    where it left off (Gap #3 B2). ``resume`` is ``{question, context, answer}``."""
+    q = str(resume.get("question") or "").strip()
+    ctx = str(resume.get("context") or "").strip()
+    ans = str(resume.get("answer") or "").strip()
+    return (f"You previously paused on this task and asked: \"{q}\".\n"
+            + (f"What you'd found: {ctx}\n" if ctx else "")
+            + f"The human has now answered: \"{ans}\".\n"
+            "Use that answer to proceed and complete the task now.\n\nOriginal task: ")
+
+
+def _guidance_preamble(lessons):
+    """Lead the trigger with reusable lessons from past human decisions (Gap #3 B4) so the
+    agent applies them instead of re-asking. ``lessons`` is a list of de-identified rules."""
+    body = "\n".join(f"- {str(x).strip()}" for x in lessons if str(x).strip())
+    return ("LESSONS FROM PAST HUMAN DECISIONS — apply these where they fit so you don't "
+            "have to ask again:\n" + body + "\n\n") if body else ""
+
+
+def run_once(client, agent, resume=None, guidance=None):
     """Run one agent once. ``agent`` is a registry row carrying ``agent_id``,
     ``vault_ref``, and ``trigger``. Returns a run record dict
     ``{agent_id, status, summary, details, run_session_id}`` where ``status`` is
-    ``completed`` | ``needs_approval`` | ``failed`` and ``details`` is the in-Trace
-    list of actions. Never raises (a platform failure becomes a ``failed`` record).
-    """
+    ``completed`` | ``needs_approval`` | ``needs_input`` | ``failed`` and ``details`` is
+    the in-Trace list of actions. Never raises (a platform failure becomes ``failed``).
+    ``resume`` (Gap #3) seeds the trigger with a prior paused question + human answer so
+    the agent continues where it stopped. ``guidance`` (Gap #3 B4) is a list of retrieved
+    reusable lessons injected as leading context."""
     agent_id = agent.get("agent_id")
     base_trigger = agent.get("trigger") or "on a new matching task"
+    if resume:
+        base_trigger = _resume_preamble(resume) + base_trigger
     vault_ref = agent.get("vault_ref")
     staged = [s for s in (agent.get("staged_apps") or []) if s]
     trigger = _staging_trigger(base_trigger, staged) if staged else base_trigger
+    trigger = _uncertainty_trigger(trigger)            # Gap #3: agent may pause when stuck
     if agent.get("memory_store_id"):
         trigger = trigger + "\n\n" + config.MEMORY_UPDATE_DIRECTIVE
+    if guidance:                                       # Gap #3 B4: retrieved lessons up top
+        trigger = _guidance_preamble(guidance) + trigger
     try:
         environment_id = client.create_environment()
         run_session_id = client.create_session(
@@ -254,6 +320,12 @@ def _build_run_record(agent_id, events, run_session_id, client):
         return {"agent_id": agent_id, "status": "failed",
                 "summary": _last_text(events) or "The run stopped before finishing.",
                 "details": actions, "run_session_id": run_session_id}
+    questions = _parse_needs_input(_final_text(events))   # Gap #3: agent paused for input
+    if questions:
+        return {"agent_id": agent_id, "status": "needs_input",
+                "summary": f"I need your input on {_plural(len(questions), 'thing')}.",
+                "details": [str(q.get("question") or "") for q in questions],
+                "questions": questions, "run_session_id": run_session_id}
     if _needs_approval(events):                        # always_allow shouldn't hold, but be safe
         try:
             held = deploy.list_held(client, run_session_id)

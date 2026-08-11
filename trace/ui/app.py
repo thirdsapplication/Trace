@@ -59,6 +59,8 @@ from ..agent import config as agent_config
 from ..agent import deploy as agent_deploy
 from ..agent import runner as agent_runner
 from ..agent import activity as agent_activity
+from ..agent import embeddings as agent_embeddings
+from ..agent import generalize as agent_generalize
 from . import cloud, keystore, permissions, registry, sessions, supabase_client, users
 
 
@@ -91,6 +93,17 @@ def _interview_record(bid, questions, answers):
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")          # founder Test UI
 APP_STATIC_DIR = os.path.join(os.path.dirname(__file__), "app_static")  # end-user UI (WS2)
+# Phase B (B5d): a cross-user lesson confirmed by this many DISTINCT users graduates to a
+# global auto-trusted default — it then injects without the per-agent confirm checkpoint.
+FLEET_DEFAULT_CONFIRMATIONS = 5
+
+# Group-chat guardrails (credit protection). Each group message can trigger model calls
+# (a broadcast = one per member; an @mention = a full agent session), so cap the blast
+# radius and rate-limit per user. Tune via env if needed.
+GROUP_MSG_RATE = int(os.environ.get("TRACE_GROUP_MSG_RATE", "20"))     # messages
+GROUP_MSG_WINDOW = int(os.environ.get("TRACE_GROUP_MSG_WINDOW", "60"))  # ...per this many seconds
+MAX_MENTIONS_PER_MESSAGE = 3     # bound the expensive @mention session fan-out
+MAX_BROADCAST_MEMBERS = 10       # bound the read-only Haiku fan-out
 ADMIN_STATIC_DIR = os.path.join(os.path.dirname(__file__), "admin_static")  # admin portal
 DISCOVERY_FIXTURES_DIR = os.path.join(
     os.path.dirname(os.path.dirname(__file__)), "discovery", "fixtures")
@@ -224,6 +237,7 @@ class AppState:
         self._scheduler_thread = None
         self._vault_refreshed = {}   # vault_ref -> epoch of last rolling refresh (deployment sync)
         self.chat_jobs = {}          # agent_id -> {state, error} (a DM reply in flight)
+        self._msg_rate = {}          # uid -> [recent message epochs] (group-chat rate limit)
         # Admin portal: live-only LLM prompt log (a bounded in-memory ring; nothing is
         # persisted — prompts embed capture-derived user data). Served exclusively
         # through the token-gated /api/admin/ surface.
@@ -520,6 +534,22 @@ class AppState:
         return self._tap("activity", None, agent_config.SUMMARY_MODEL,
                          lambda: agent_configgen._default_model_fn(agent_config.SUMMARY_MODEL))
 
+    def agent_available_apps(self, agent):
+        """The agent's usable connected apps, each flagged whether it's currently staged
+        (held for approval). Drives the post-deploy staging toggle. Reads the agent's
+        session connection record; on any failure falls back to the currently-staged set
+        so the toggle can still render what's staged."""
+        staged = set(s for s in (agent.get("staged_apps") or []) if s)
+        try:
+            rec, _ = self._load_connection(agent.get("session_id"))
+            usable = agent_deploy._usable_app_slugs(rec)
+        except Exception:                                  # noqa: BLE001 — best-effort
+            usable = sorted(staged)
+        # keep any staged slug even if the connection record no longer lists it as usable
+        slugs = list(dict.fromkeys(list(usable) + sorted(staged)))
+        return [{"slug": s, "label": agent_runner._app_label(s), "staged": s in staged}
+                for s in slugs]
+
     def agent_activity(self, agent, limit=10):
         """The agent's recent runs as REAL session activity: for each run's session id,
         read the session's events from the platform, summarize them in plain language
@@ -543,7 +573,7 @@ class AppState:
             sid = run.get("run_session_id")
             entry = {"ran_at": run.get("ran_at"), "run_session_id": sid,
                      "status": run.get("status"), "summary": run.get("summary") or "",
-                     "proposals": []}
+                     "proposals": [], "decisions": []}
             if not sid or sid in seen or client is None:
                 out.append(entry)
                 continue
@@ -564,6 +594,8 @@ class AppState:
                     registry.summary_set(root, sid, summ, entry["status"])
             if staged:                                     # surface proposals as approvable items
                 entry["proposals"] = self._session_proposals(agent, sid, events, owner)
+            if entry["status"] == "needs_input":           # Gap #3: surface open questions
+                entry["decisions"] = self._session_decisions(agent, sid, events, owner)
             out.append(entry)
         return out
 
@@ -585,9 +617,145 @@ class AppState:
                 "agent_id": agent_id, "owner_user_id": owner,
                 "run_session_id": run_session_id, "app": it.get("app"),
                 "kind": it.get("kind"), "summary": it.get("summary"),
+                "rationale": it.get("rationale"),
                 "payload": it.get("payload"), "content_hash": it.get("content_hash")})
         return [p for p in registry.pending_for_user(root, owner, status="pending")
                 if p.get("run_session_id") == run_session_id]
+
+    def _persist_decisions(self, agent, run_session_id, questions, owner):
+        """Gap #3: persist a run's needs_input questions as answerable decision records
+        (deduped), returning the still-open ones for this session for the UI."""
+        root = self.sessions_root
+        tags = {"bundle_id": agent.get("bundle_id") or "",
+                "workflow": agent.get("name") or agent.get("bundle_id") or ""}
+        for q in questions or []:
+            if not isinstance(q, dict):
+                continue
+            qt = str(q.get("question") or "").strip()
+            if not qt:
+                continue
+            registry.decision_add(root, {
+                "agent_id": agent.get("agent_id"), "owner_user_id": owner,
+                "run_session_id": run_session_id, "question": qt,
+                "context": {"context": str(q.get("context") or ""),
+                            "options": [str(o) for o in (q.get("options") or [])]},
+                "tags": tags})
+        return [d for d in registry.decisions_for_user(root, owner, status="pending")
+                if d.get("run_session_id") == run_session_id]
+
+    def _session_decisions(self, agent, run_session_id, events, owner):
+        """Persist + return this session's needs_input questions (activity-view path)."""
+        return self._persist_decisions(
+            agent, run_session_id, agent_activity.extract_questions(events), owner)
+
+    def resume_after_answer(self, agent, decision, answer):
+        """Gap #3 auto-immediate resume: re-run the agent seeded with the paused question
+        and the human's answer so it continues where it stopped, then mark the decision
+        resolved and learn a reusable lesson from it. Never raises (a run failure is
+        already recorded by run_agent)."""
+        ctx = decision.get("context")
+        resume = {"question": decision.get("question"),
+                  "context": ctx.get("context") if isinstance(ctx, dict) else "",
+                  "answer": answer}
+        try:
+            rec = self.run_agent(agent, resume=resume)
+        except Exception:                                  # noqa: BLE001
+            rec = None
+        registry.decision_set_status(self.sessions_root, decision.get("id"), "resolved")
+        self._learn_from_decision(decision, answer, agent)
+        return rec
+
+    @staticmethod
+    def _agent_kind_text(agent):
+        """A short description of an agent's KIND (workflow), used for the agent-similarity
+        gate so a shipping lesson never reaches an invoice agent."""
+        return (f"{agent.get('name') or ''}. {agent.get('description') or ''}. "
+                f"Does: {agent.get('trigger') or ''}").strip()
+
+    def _embed_agent_kind(self, agent):
+        """Phase B: embed + store an agent's kind vector (best-effort; no-op without key)."""
+        vecs = agent_embeddings.embed(self._agent_kind_text(agent), input_type="document")
+        if vecs:
+            registry.agent_embedding_upsert(self.sessions_root, agent.get("agent_id"), vecs[0])
+
+    def _retrieve_guidance(self, agent):
+        """Gap #3 B4/B5c: retrieve reusable lessons relevant to this agent and return the
+        ones to INJECT now. OWN lessons and already-CONFIRMED cross-user lessons inject
+        (provenance logged). A matched-but-unconfirmed CROSS-user lesson is NOT injected —
+        it's recorded as a provisional promotion so it surfaces as a 'confirm this lesson?'
+        checkpoint; confirming it (once) promotes it and it injects on later runs. This is
+        the trust gate: a stranger's lesson never silently drives your agent on first sight.
+        Best-effort — [] with no embeddings/key."""
+        root = self.sessions_root
+        aid, owner = agent.get("agent_id"), agent.get("owner_user_id")
+        query = f"{agent.get('name') or ''}: {agent.get('trigger') or ''}".strip()
+        svecs = agent_embeddings.embed(query, input_type="query")
+        if not svecs:
+            return []
+        scopes = registry.agent_lesson_scopes(root, agent)
+        kind_emb = registry.agent_embedding_get(root, aid)
+        if kind_emb is None:                               # lazily compute + store if missing
+            kvecs = agent_embeddings.embed(self._agent_kind_text(agent), input_type="document")
+            if kvecs:
+                kind_emb = kvecs[0]
+                registry.agent_embedding_upsert(root, aid, kind_emb)
+        hits = registry.retrieve_lessons(root, svecs[0], agent, agent_kind_embedding=kind_emb,
+                                         consume_scope=scopes["consume_scope"])
+        inject = []
+        for h in hits:
+            if h["tier"] == "own":
+                inject.append(h)
+                continue
+            promo = registry.lesson_promotion_get(root, aid, h["decision_id"])
+            status = (promo or {}).get("status")
+            if status == "confirmed":
+                inject.append(h)
+            elif status == "retired":
+                continue
+            elif registry.lesson_confirmed_user_count(root, h["decision_id"]) >= FLEET_DEFAULT_CONFIRMATIONS:
+                # fleet-default: confirmed by many distinct users -> auto-trust, skip checkpoint
+                if promo:
+                    registry.lesson_promotion_set_status(root, aid, h["decision_id"], "confirmed")
+                else:
+                    registry.lesson_promotion_upsert(root, aid, owner, h["decision_id"],
+                                                     status="confirmed", lesson=h["lesson"])
+                inject.append(h)
+            else:                                          # surface a one-time confirm checkpoint
+                registry.lesson_promotion_upsert(root, aid, owner, h["decision_id"],
+                                                 lesson=h["lesson"])
+        for h in inject:                                   # provenance: what influenced this run
+            registry.lesson_application_add(root, aid, owner, h["decision_id"], None)
+        return [h["lesson"] for h in inject]
+
+    def _learn_from_decision(self, decision, answer, agent=None):
+        """Gap #3 B3/B5d: distill a de-identified, reusable lesson from an answered decision
+        and embed it. If the source consents to share GLOBALLY (contribute scope) AND the
+        lesson passes a second scrub-verify pass, mark it globally shareable so OTHER users'
+        agents can retrieve it. Best-effort — any failure silently skips and never blocks
+        the resume; the global gate FAILS CLOSED (unverified => owner-only)."""
+        root = self.sessions_root
+        try:
+            model_fn = self._summarize_model_fn()
+        except Exception:                                  # noqa: BLE001 — no key in dev
+            return
+        try:
+            result = agent_generalize.generalize_decision({**decision, "answer": answer},
+                                                          model_fn)
+        except Exception:                                  # noqa: BLE001
+            return
+        did = decision.get("id")
+        registry.decision_set_generalization(root, did, result["reusable"], result["lesson"])
+        if not (result["reusable"] and result["lesson"]):
+            return
+        vecs = agent_embeddings.embed(result["lesson"], input_type="document")
+        if vecs:
+            registry.decision_embedding_add(root, did, vecs[0])
+        # T3 gate: only cross-user-shareable if the source consents to global AND it scrubs clean
+        contribute = (registry.agent_lesson_scopes(root, agent)["contribute_scope"] if agent
+                      else registry.user_consent_get(root, decision.get("owner_user_id"))["contribute_scope"])
+        global_ok = (contribute == "global"
+                     and agent_generalize.verify_lesson_scrub(result["lesson"], model_fn))
+        registry.decision_set_global_verified(root, did, global_ok)
 
     def approve_actions(self, agent, pending_ids):
         """Approve a chosen set of staged actions: perform them in ONE fresh session and
@@ -1013,6 +1181,10 @@ class AppState:
                                     "deployment_id": rec.get("deployment_id"),
                                     "memory_store_id": rec.get("memory_store_id"),
                                     "description": b.get("description") or ""})
+                                self._embed_agent_kind({          # Phase B: agent-kind gate
+                                    "agent_id": rec["agent_id"], "name": b.get("name") or bid,
+                                    "description": b.get("description") or "",
+                                    "trigger": (rec.get("start") or {}).get("value")})
                         job["deployed"] += 1
                     except Exception as e:
                         job["errors"][bid] = f"{type(e).__name__}: {e}"
@@ -1236,6 +1408,104 @@ class AppState:
 
         threading.Thread(target=run, daemon=True).start()
 
+    # --- group chat: read-only broadcast Q&A -------------------------------
+    def msg_rate_ok(self, uid):
+        """Per-user group-message rate limit (credit guard). Sliding window; returns False
+        when the user has sent GROUP_MSG_RATE messages within GROUP_MSG_WINDOW seconds."""
+        now = time.time()
+        recent = [t for t in self._msg_rate.get(uid, []) if now - t < GROUP_MSG_WINDOW]
+        if len(recent) >= GROUP_MSG_RATE:
+            self._msg_rate[uid] = recent
+            return False
+        recent.append(now)
+        self._msg_rate[uid] = recent
+        return True
+
+    def _agent_run_context(self, agent, limit=8):
+        """A compact text digest of an agent's recent runs (cached summaries + statuses) —
+        the grounding for a read-only Q&A. No platform calls; uses stored run records."""
+        root = self.sessions_root
+        lines = []
+        for r in registry.runs_for_agent(root, agent.get("agent_id"), limit):
+            sid = r.get("run_session_id")
+            summ = (registry.summary_get(root, sid) or {}).get("summary") if sid else None
+            note = summ or r.get("summary") or ""
+            lines.append(f"- [{r.get('ran_at', '')}] {r.get('status', '')}: {note}")
+        return "\n".join(lines) or "(no runs yet)"
+
+    def _agent_qa(self, agent, question, model_fn):
+        """One agent's read-only answer about its own recent work — a SINGLE bounded model
+        call over its run digest, no tools/session/vault. Best-effort; never raises."""
+        if model_fn is None:
+            return "I can't answer right now."
+        user = (f"Your recent activity:\n{self._agent_run_context(agent)}\n\n"
+                f"Their message: {question}")
+        try:
+            return (model_fn(agent_config.GROUP_QA_SYSTEM, user) or "").strip() \
+                or "Nothing to report."
+        except Exception:                                  # noqa: BLE001
+            return "I couldn't answer just now."
+
+    def group_broadcast(self, group, text, owner):
+        """Read-only group broadcast: every member agent answers the question grounded in
+        its own recent run data. One bounded model call per member — NO tools, NO session,
+        so it structurally cannot act. Returns [{agent_id, name, color, reply}]."""
+        root = self.sessions_root
+        try:
+            model_fn = self._summarize_model_fn()
+        except Exception:                                  # noqa: BLE001 — no key in dev
+            model_fn = None
+        by_id = {a.get("agent_id"): a for a in registry.agents_for_user(root, owner)}
+        out = []
+        for aid in group.get("member_agent_ids", [])[:MAX_BROADCAST_MEMBERS]:   # bound fan-out
+            agent = by_id.get(aid)
+            if not agent:
+                continue
+            out.append({"agent_id": aid, "name": agent.get("name") or aid,
+                        "color": registry.agent_color(agent),
+                        "reply": self._agent_qa(agent, text, model_fn)})
+        return out
+
+    @staticmethod
+    def parse_mentions(text, members):
+        """Agent ids @-mentioned in ``text``. Matches a member by its name, its no-space
+        form, or its first word (case-insensitive): @Operations, @invoicing, @ops-bot."""
+        low = (text or "").lower()
+        hit = []
+        for m in members:
+            name = (m.get("name") or "").lower().strip()
+            handles = {name, name.replace(" ", ""), name.split(" ")[0] if name else ""}
+            handles.discard("")
+            if any(("@" + h) in low for h in handles):
+                hit.append(m.get("agent_id"))
+        return hit
+
+    def group_direct(self, agent, text, owner):
+        """@mention in a group: run the agent on the user's message in a REAL session (so it
+        CAN act), but respect staging — outbound actions in staged apps are PROPOSED for
+        approval, not performed. Returns {agent_id, name, color, reply, staged}. Never raises."""
+        aid = agent.get("agent_id")
+        base = {"agent_id": aid, "name": agent.get("name") or aid,
+                "color": registry.agent_color(agent), "staged": []}
+        self._refresh_agent_binding(agent)
+        staged_apps = [s for s in (agent.get("staged_apps") or []) if s]
+        directive = agent_config.GROUP_DIRECT_DIRECTIVE.replace("{text}", text)
+        trigger = agent_runner._staging_trigger(directive, staged_apps) if staged_apps else directive
+        try:
+            client = self._live_client()
+            env = client.create_environment()
+            sid = client.create_session(
+                aid, env, resources=agent_runner._memory_resources(agent),
+                title="Trace group message",
+                vault_ids=[agent["vault_ref"]] if agent.get("vault_ref") else None)
+            events = client.send_trigger_and_collect(sid, trigger)
+        except Exception:                                  # noqa: BLE001
+            return {**base, "reply": "I couldn't respond just now — try again in a moment."}
+        human = agent_runner._final_text(events).split("```")[0].strip()   # drop any proposal fence
+        reply = agent_runner._first_line(human) or "Done."
+        staged = self._session_proposals(agent, sid, events, owner) if staged_apps else []
+        return {**base, "reply": reply, "staged": staged}
+
     @staticmethod
     def run_key(agent_id, run):
         """The stable review key for one run: its session id, or a synthetic key for
@@ -1257,6 +1527,21 @@ class AppState:
             pending_by_session.setdefault(p.get("run_session_id"), []).append(
                 {"id": p.get("id"), "app": p.get("app"), "summary": p.get("summary"),
                  "payload": p.get("payload") or {}})
+        decisions_by_session = {}                           # Gap #3: unanswered questions
+        for d in registry.decisions_for_user(root, uid, status="pending"):
+            ctx = d.get("context") or {}
+            decisions_by_session.setdefault(d.get("run_session_id"), []).append(
+                {"id": d.get("id"), "question": d.get("question"),
+                 "context": ctx.get("context") if isinstance(ctx, dict) else "",
+                 "options": ctx.get("options") if isinstance(ctx, dict) else []})
+        confirms_by_agent = {}                              # Phase B: shared lessons to confirm
+        for p in registry.lesson_promotions_for_user(root, uid, status="provisional"):
+            confirms_by_agent.setdefault(p.get("agent_id"), []).append(
+                {"decision_id": p.get("decision_id"), "lesson": p.get("lesson")})
+        active_by_agent = {}                                # Phase B: confirmed lessons (retirable)
+        for p in registry.lesson_promotions_for_user(root, uid, status="confirmed"):
+            active_by_agent.setdefault(p.get("agent_id"), []).append(
+                {"decision_id": p.get("decision_id"), "lesson": p.get("lesson")})
         agents_out = []
         for a in registry.agents_for_user(root, uid):
             aid = a.get("agent_id")
@@ -1264,18 +1549,25 @@ class AppState:
             stories = []
             for r in registry.runs_for_agent(root, aid, 20):
                 key = self.run_key(aid, r)
-                props = (pending_by_session.get(r.get("run_session_id"), [])
-                         if r.get("run_session_id") else [])
-                if key in reviewed and not props:      # reviewed AND fully processed
+                sid = r.get("run_session_id")
+                props = pending_by_session.get(sid, []) if sid else []
+                decs = decisions_by_session.get(sid, []) if sid else []
+                if key in reviewed and not props and not decs:   # reviewed AND fully processed
                     continue
                 note = None
-                if r.get("run_session_id"):
-                    note = (registry.summary_get(root, r["run_session_id"]) or {}).get("summary")
+                if sid:
+                    note = (registry.summary_get(root, sid) or {}).get("summary")
                 stories.append({"key": key, "ran_at": r.get("ran_at"),
                                 "status": r.get("status"),
                                 "note": note or r.get("summary") or "Ran.",
-                                "proposals": props})
+                                "proposals": props, "decisions": decs})
             stories.reverse()                          # review oldest first
+            # Gap #4: split the open work into ACTIONABLE (needs a decision) vs FYI.
+            open_decisions = sum(len(s["decisions"]) for s in stories)   # blocking questions
+            pending_approvals = sum(len(s["proposals"]) for s in stories)  # awaiting a yes
+            lesson_confirmations = confirms_by_agent.get(aid, [])         # Phase B: confirm to use
+            needs_you = open_decisions + pending_approvals + len(lesson_confirmations)
+            fyi_reviews = sum(1 for s in stories if not s["decisions"] and not s["proposals"])
             agents_out.append({
                 "agent_id": aid, "name": a.get("name") or aid,
                 "bundle_id": a.get("bundle_id"),
@@ -1287,9 +1579,14 @@ class AppState:
                 "capture_present": bool(a.get("session_id")) and
                 os.path.isdir(sessions.session_dir(root, a.get("session_id"))),
                 "stories": stories, "unreviewed": len(stories),
+                "open_decisions": open_decisions, "pending_approvals": pending_approvals,
+                "lesson_confirmations": lesson_confirmations,
+                "active_lessons": active_by_agent.get(aid, []),
+                "needs_you": needs_you, "fyi_reviews": fyi_reviews,
                 "unread": unread.get(aid, 0),
                 "replying": (self.chat_jobs.get(aid) or {}).get("state") == "running"})
-        return {"agents": agents_out, "unread_total": sum(unread.values())}
+        return {"agents": agents_out, "unread_total": sum(unread.values()),
+                "needs_you_total": sum(a["needs_you"] for a in agents_out)}
 
     def apply_platform_schedule(self, agent, cadence):
         """Re-point a deployment agent at the requested cadence. Deployments are
@@ -1345,14 +1642,16 @@ class AppState:
         except Exception:
             pass
 
-    def run_agent(self, agent):
+    def run_agent(self, agent, resume=None):
         """Run one agent once (scheduled or "Run now"), persist the run record, and
         advance its last_run. Reuses the Deployer's run path via agent_runner; a
-        missing key / platform error is recorded as a failed run, never raised."""
+        missing key / platform error is recorded as a failed run, never raised.
+        ``resume`` (Gap #3) seeds the run with a prior paused question + human answer."""
         self._refresh_agent_binding(agent)   # WS5: fresh Pipedream token before the run
+        guidance = self._retrieve_guidance(agent)   # Gap #3 B4: lessons from past decisions
         try:
             client = self._live_client()
-            rec = agent_runner.run_once(client, agent)
+            rec = agent_runner.run_once(client, agent, resume=resume, guidance=guidance)
         except Exception:
             rec = {"agent_id": agent.get("agent_id"), "status": "failed",
                    "summary": "Couldn't start the run.", "details": [], "run_session_id": None}
@@ -1377,6 +1676,17 @@ class AppState:
         # surface as stories instead, so the inbox stays signal-only).
         if rec["status"] == "failed":
             self._agent_dm(agent, f"My last run hit a problem: {rec['summary']}")
+        elif rec["status"] == "needs_input":
+            # Gap #3: the agent paused on a blocking edge case — persist the question(s)
+            # as answerable decisions, then surface them.
+            self._persist_decisions(agent, rec.get("run_session_id"),
+                                    rec.get("questions"), agent.get("owner_user_id"))
+            qs = rec.get("questions") or []
+            first = (qs[0].get("question") if qs and isinstance(qs[0], dict) else "") \
+                or "something I wasn't sure about"
+            more = f" (+{len(qs) - 1} more)" if len(qs) > 1 else ""
+            self._agent_dm(agent, f"I hit something I need your call on: {first}{more} — "
+                                  "open my profile to answer.")
         else:
             # Staged agents propose rather than perform: extract this run's proposals
             # NOW (one session read) so they land in the feed + an approval DM without
@@ -1724,6 +2034,184 @@ def make_handler(state):
             threading.Thread(target=lambda: state.approve_pending(item), daemon=True).start()
             return self._json(202, {"id": pending_id, "state": "running"})
 
+        def _set_staging(self, agent_id, body, user):
+            """Spec 8: edit which of the agent's apps are staged (held for approval).
+            Owner-scoped. Two shapes: ``{staged_apps: [...]}`` replaces the whole set
+            (profile toggle), or ``{unstage: "<slug>"}`` drops one app (the per-proposal
+            "auto-approve this app" quick action) computed server-side so it's race-free.
+            The posted set is validated against the agent's usable apps; an empty result is
+            allowed (fully autonomous — the UI confirms first). Takes effect next run."""
+            agent = next((a for a in registry.agents_for_user(root, user["user_id"])
+                          if a.get("agent_id") == agent_id), None)
+            if not agent:
+                return self._json(404, {"error": "not_found"})
+            b = body or {}
+            if b.get("unstage"):                           # drop one app from the current set
+                current = [s for s in (agent.get("staged_apps") or []) if s]
+                staged = [s for s in current if s != b.get("unstage")]
+            else:                                          # replace the whole set
+                requested = [s for s in (b.get("staged_apps") or []) if s]
+                available = {a["slug"] for a in state.agent_available_apps(agent)}
+                # keep only verifiable slugs; if the app list can't be loaded, trust the request
+                staged = [s for s in requested if s in available] if available else requested
+            registry.set_staged_apps(root, agent_id, staged)
+            return self._json(200, {"agent_id": agent_id, "staged_apps": staged})
+
+        def _answer_decision(self, decision_id, body, user):
+            """Gap #3: record the human's answer to a paused question, then auto-immediately
+            resume the agent (fresh run seeded with Q+A) so it continues where it stopped.
+            Owner-scoped; the resume runs async like approve."""
+            item = registry.decision_get(root, decision_id)
+            if not item or item.get("owner_user_id") != user["user_id"]:
+                return self._json(404, {"error": "not_found"})
+            if item.get("status") != "pending":
+                return self._json(409, {"error": "already_answered"})
+            answer = str((body or {}).get("answer", "") or "").strip()
+            if not answer:
+                return self._json(400, {"error": "empty_answer"})
+            registry.decision_answer(root, decision_id, answer)
+            agent = next((a for a in registry.agents_for_user(root, user["user_id"])
+                          if a.get("agent_id") == item.get("agent_id")), None)
+            if agent:
+                threading.Thread(
+                    target=lambda: state.resume_after_answer(agent, item, answer),
+                    daemon=True).start()
+            return self._json(202, {"id": decision_id, "status": "answered", "state": "running"})
+
+        def _confirm_lesson(self, body, user):
+            """Phase B: confirm (promote), or dismiss/retire (revoke) a shared lesson for one
+            agent. Owner-scoped. A confirmed lesson injects on later runs; dismiss (a
+            provisional one) or retire (an already-confirmed one) both stop it and it never
+            resurfaces for this agent."""
+            b = body or {}
+            agent_id, decision_id = str(b.get("agent_id") or ""), str(b.get("decision_id") or "")
+            action = b.get("action")
+            agent = next((a for a in registry.agents_for_user(root, user["user_id"])
+                          if a.get("agent_id") == agent_id), None)
+            if not agent:
+                return self._json(404, {"error": "not_found"})
+            if not decision_id or action not in ("confirm", "dismiss", "retire"):
+                return self._json(400, {"error": "bad_request"})
+            promo = registry.lesson_promotion_get(root, agent_id, decision_id)
+            if not promo:
+                return self._json(404, {"error": "not_found"})
+            new_status = "confirmed" if action == "confirm" else "retired"
+            registry.lesson_promotion_set_status(root, agent_id, decision_id, new_status)
+            return self._json(200, {"agent_id": agent_id, "decision_id": decision_id,
+                                    "status": new_status})
+
+        def _set_agent_consent(self, agent_id, body, user):
+            """Phase B: set/clear an agent's per-field sharing override (owner-scoped).
+            Returns the agent's effective scopes after the change."""
+            agent = next((a for a in registry.agents_for_user(root, user["user_id"])
+                          if a.get("agent_id") == agent_id), None)
+            if not agent:
+                return self._json(404, {"error": "not_found"})
+            b = body or {}
+            registry.agent_set_consent(root, agent_id,
+                contribute_scope=b.get("contribute_scope"), consume_scope=b.get("consume_scope"))
+            fresh = next((a for a in registry.agents_for_user(root, user["user_id"])
+                          if a.get("agent_id") == agent_id), agent)
+            eff = registry.agent_lesson_scopes(root, fresh)
+            return self._json(200, {"agent_id": agent_id, "effective": eff,
+                "override": {"contribute_scope": fresh.get("lesson_contribute_scope"),
+                             "consume_scope": fresh.get("lesson_consume_scope")}})
+
+        # --- group chat (color-coded groups of agents) -------------------------
+        def _owned_agent_ids(self, user):
+            return {a.get("agent_id") for a in registry.agents_for_user(root, user["user_id"])}
+
+        def _groups_with_members(self, user):
+            """The user's groups, each member resolved to {agent_id, name, color} so the UI
+            can render color bubbles. Stale member ids (deleted agents) are dropped."""
+            by_id = {a.get("agent_id"): a for a in registry.agents_for_user(root, user["user_id"])}
+            out = []
+            for g in registry.groups_for_user(root, user["user_id"]):
+                members = [{"agent_id": aid, "name": by_id[aid].get("name") or aid,
+                            "color": registry.agent_color(by_id[aid])}
+                           for aid in g.get("member_agent_ids", []) if aid in by_id]
+                out.append({"id": g["id"], "name": g.get("name"), "members": members})
+            return out
+
+        def _create_group(self, body, user):
+            b = body or {}
+            name = str(b.get("name", "") or "").strip()
+            if not name:
+                return self._json(400, {"error": "empty_name"})
+            owned = self._owned_agent_ids(user)
+            ids = [a for a in (b.get("agent_ids") or []) if a in owned]   # only your agents
+            registry.group_create(root, user["user_id"], name, ids)
+            return self._json(200, {"groups": self._groups_with_members(user)})
+
+        def _update_group(self, group_id, body, user):
+            g = registry.group_get(root, group_id)
+            if not g or g.get("owner_user_id") != user["user_id"]:
+                return self._json(404, {"error": "not_found"})
+            b = body or {}
+            name = b.get("name")
+            ids = None
+            if b.get("agent_ids") is not None:
+                owned = self._owned_agent_ids(user)
+                ids = [a for a in b.get("agent_ids") if a in owned]
+            registry.group_update(root, group_id,
+                                  name=(str(name).strip() if name is not None else None),
+                                  agent_ids=ids)
+            return self._json(200, {"groups": self._groups_with_members(user)})
+
+        def _delete_group(self, group_id, user):
+            g = registry.group_get(root, group_id)
+            if not g or g.get("owner_user_id") != user["user_id"]:
+                return self._json(404, {"error": "not_found"})
+            registry.group_delete(root, group_id)
+            return self._json(200, {"groups": self._groups_with_members(user)})
+
+        def _group_broadcast(self, group_id, body, user):
+            """Read-only broadcast to a group: every member answers, grounded in its own run
+            data, in its color. Owner-scoped; synchronous (bounded model calls)."""
+            g = registry.group_get(root, group_id)
+            if not g or g.get("owner_user_id") != user["user_id"]:
+                return self._json(404, {"error": "not_found"})
+            text = str((body or {}).get("text", "") or "").strip()
+            if not text:
+                return self._json(400, {"error": "empty_message"})
+            if not state.msg_rate_ok(user["user_id"]):           # credit guard
+                return self._json(429, {"error": "rate_limited",
+                                        "message": "Too many messages — give it a moment."})
+            return self._json(200, {"replies": state.group_broadcast(g, text, user["user_id"])})
+
+        def _group_message(self, group_id, body, user):
+            """Unified group send: @mention → the mentioned agents' actionable direct replies
+            (real session, staging respected); otherwise a read-only broadcast to all."""
+            g = registry.group_get(root, group_id)
+            if not g or g.get("owner_user_id") != user["user_id"]:
+                return self._json(404, {"error": "not_found"})
+            text = str((body or {}).get("text", "") or "").strip()
+            if not text:
+                return self._json(400, {"error": "empty_message"})
+            if not state.msg_rate_ok(user["user_id"]):           # credit guard
+                return self._json(429, {"error": "rate_limited",
+                                        "message": "Too many messages — give it a moment."})
+            members = next((gg["members"] for gg in self._groups_with_members(user)
+                            if gg["id"] == str(group_id)), [])
+            mentioned = state.parse_mentions(text, members)[:MAX_MENTIONS_PER_MESSAGE]  # bound fan-out
+            if mentioned:
+                by_id = {a.get("agent_id"): a
+                         for a in registry.agents_for_user(root, user["user_id"])}
+                replies = [state.group_direct(by_id[aid], text, user["user_id"])
+                           for aid in mentioned if aid in by_id]
+                return self._json(200, {"mode": "direct", "replies": replies})
+            return self._json(200, {"mode": "broadcast",
+                                    "replies": state.group_broadcast(g, text, user["user_id"])})
+
+        def _set_agent_color(self, agent_id, body, user):
+            if agent_id not in self._owned_agent_ids(user):
+                return self._json(404, {"error": "not_found"})
+            color = str((body or {}).get("color", "") or "").strip()
+            if not color:
+                return self._json(400, {"error": "empty_color"})
+            registry.agent_set_color(root, agent_id, color)
+            return self._json(200, {"agent_id": agent_id, "color": color})
+
         def _delete_capture_data(self, agent_id, user):
             """Delete one workflow's capture data (the origin session). Resolves the
             agent owner-scoped, then removes its capture session; the agent stays live."""
@@ -1759,6 +2247,10 @@ def make_handler(state):
             if rest == "/pending":                           # Spec 8: staged actions awaiting review
                 items = registry.pending_for_user(root, user["user_id"])
                 return self._json(200, {"pending": items, "pending_count": len(items)})
+            if rest == "/consent":                           # Phase B: account-wide lesson sharing
+                return self._json(200, registry.user_consent_get(root, user["user_id"]))
+            if rest == "/groups":                            # group chat: list groups + members
+                return self._json(200, {"groups": self._groups_with_members(user)})
             mdm = re.match(r"^/agents/([^/]+)/messages$", rest)
             if mdm:                                          # one DM thread, oldest-first
                 agent = next((a for a in registry.agents_for_user(root, user["user_id"])
@@ -1778,7 +2270,13 @@ def make_handler(state):
                     return self._json(404, {"error": "not_found"})
                 return self._json(200, {"agent": {"agent_id": agent.get("agent_id"),
                                                   "name": agent.get("name") or agent.get("bundle_id"),
-                                                  "staged_apps": agent.get("staged_apps") or []},
+                                                  "staged_apps": agent.get("staged_apps") or [],
+                                                  "available_apps": state.agent_available_apps(agent),
+                                                  "consent": {
+                                                      "effective": registry.agent_lesson_scopes(root, agent),
+                                                      "override": {
+                                                          "contribute_scope": agent.get("lesson_contribute_scope"),
+                                                          "consume_scope": agent.get("lesson_consume_scope")}}},
                                         "activity": state.agent_activity(agent)})
             m = re.match(r"^/sessions/([^/]+)(/.*)?$", rest)
             if m:
@@ -1826,6 +2324,9 @@ def make_handler(state):
                     return self._json(400, {"error": "empty_message"})
                 if (state.chat_jobs.get(aid) or {}).get("state") == "running":
                     return self._json(409, {"error": "already_replying"})
+                if not state.msg_rate_ok(user["user_id"]):   # credit guard (a DM = a full session)
+                    return self._json(429, {"error": "rate_limited",
+                                            "message": "Too many messages — give it a moment."})
                 state.send_agent_message(agent, text)
                 return self._json(202, {"state": "running"})
             mp = re.match(r"^/pending/([^/]+)/(approve|reject)$", rest)
@@ -1843,6 +2344,39 @@ def make_handler(state):
                 ids = (body or {}).get("pending_ids") or []
                 threading.Thread(target=lambda: state.approve_actions(agent, ids), daemon=True).start()
                 return self._json(202, {"state": "running"})
+            mst = re.match(r"^/agents/([^/]+)/staging$", rest)
+            if mst:                                      # Spec 8: edit which apps are staged (no redeploy)
+                return self._set_staging(mst.group(1), body, user)
+            man = re.match(r"^/decisions/([^/]+)/answer$", rest)
+            if man:                                      # Gap #3: answer a paused question, auto-resume
+                return self._answer_decision(man.group(1), body, user)
+            if rest == "/lessons/confirm":               # Phase B: confirm/dismiss a shared lesson
+                return self._confirm_lesson(body, user)
+            if rest == "/consent":                       # Phase B: set account-wide sharing default
+                registry.user_consent_set(root, user["user_id"],
+                    contribute_scope=(body or {}).get("contribute_scope"),
+                    consume_scope=(body or {}).get("consume_scope"))
+                return self._json(200, registry.user_consent_get(root, user["user_id"]))
+            mac = re.match(r"^/agents/([^/]+)/consent$", rest)
+            if mac:                                      # Phase B: per-agent sharing override
+                return self._set_agent_consent(mac.group(1), body, user)
+            if rest == "/groups":                        # group chat: create a group
+                return self._create_group(body, user)
+            mgd = re.match(r"^/groups/([^/]+)/delete$", rest)
+            if mgd:
+                return self._delete_group(mgd.group(1), user)
+            mgb = re.match(r"^/groups/([^/]+)/broadcast$", rest)
+            if mgb:                                      # read-only group Q&A: every member replies
+                return self._group_broadcast(mgb.group(1), body, user)
+            mgm = re.match(r"^/groups/([^/]+)/message$", rest)
+            if mgm:                                      # unified: @mention → direct, else broadcast
+                return self._group_message(mgm.group(1), body, user)
+            mg = re.match(r"^/groups/([^/]+)$", rest)
+            if mg:                                       # rename / set members
+                return self._update_group(mg.group(1), body, user)
+            mcol = re.match(r"^/agents/([^/]+)/color$", rest)
+            if mcol:                                     # set an agent's bubble color
+                return self._set_agent_color(mcol.group(1), body, user)
             if rest == "/load-fixture":
                 return self._load_fixture(body, owner=uid)
             if rest == "/describe-workflow":                 # skip-recording path

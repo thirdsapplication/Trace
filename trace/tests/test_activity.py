@@ -25,6 +25,20 @@ def _staged_session():
     ]
 
 
+_NEEDS_INPUT = ('```needs_input\n'
+                '[{"question": "Which sheet gets ORD-029 — Open or Archive?", '
+                '"context": "Two matching sheets exist; the order maps to neither cleanly."}]\n```')
+
+
+def _needs_input_session():
+    return [
+        {"type": "user.message", "text": "on a new matching task"},
+        {"type": "agent.message", "text": "I found an order but can't place it."},
+        {"type": "agent.message", "text": _NEEDS_INPUT},
+        {"type": "session.thread_status_idle", "stop_reason": {"type": "end_turn"}},
+    ]
+
+
 def _executed_session():
     return [
         {"type": "user.message", "text": "on a new matching task"},
@@ -52,6 +66,13 @@ class ActivityEngineTest(unittest.TestCase):
             [{"type": "agent.message", "text": "working"}]), "running")  # no terminal yet
         self.assertEqual(activity.session_status(
             [{"type": "session.status_failed"}]), "failed")
+
+    def test_extract_questions_and_needs_input_status(self):
+        qs = activity.extract_questions(_needs_input_session())
+        self.assertEqual(len(qs), 1)
+        self.assertIn("Open or Archive", qs[0]["question"])
+        self.assertEqual(activity.session_status(_needs_input_session()), "needs_input")
+        self.assertEqual(activity.extract_questions(_executed_session()), [])
 
     def test_summarize_builds_compact_prompt_and_returns_text(self):
         seen = {}

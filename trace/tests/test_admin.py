@@ -106,7 +106,7 @@ class AdminEndpointsTest(AdminHTTPBase):
     def setUp(self):
         super().setUp()
         os.environ["TRACE_ADMIN_TOKEN"] = TOKEN
-        self.u = users.create_user("worker@acme.com", "longenough1")
+        self.u, _ = users.create_user("worker@acme.com", "longenough1")   # (user, token) tuple
         sid = sessions.create_session(self.root, label="capture-1")
         sessions.update_meta(self.root, sid, owner_user_id=self.u["user_id"])
         self.sid = sid

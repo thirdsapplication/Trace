@@ -71,6 +71,12 @@ def extract_proposals(events):
     return [p for p in proposals if isinstance(p, dict)]
 
 
+def extract_questions(events):
+    """The agent's ``needs_input`` questions from the session's final message (Gap #3),
+    parsed into ``[{question, context, options?}]``; ``[]`` when none/unparseable."""
+    return runner._parse_needs_input(runner._final_text(events))
+
+
 def is_terminal(events):
     return any(any(k in (e.get("type") or "").lower()
                    for k in ("idle", "completed", "ended", "failed"))
@@ -78,13 +84,16 @@ def is_terminal(events):
 
 
 def session_status(events):
-    """``running`` | ``failed`` | ``staged`` | ``completed`` derived from the events."""
+    """``running`` | ``failed`` | ``needs_input`` | ``staged`` | ``completed`` derived
+    from the events. A pause for input outranks staging — the human must answer first."""
     types = [(e.get("type") or "").lower() for e in events]
     if any(("status_failed" in t or t.endswith(".failed") or "session.failed" in t)
            for t in types):
         return "failed"
     if not is_terminal(events):
         return "running"
+    if extract_questions(events):
+        return "needs_input"
     if extract_proposals(events):
         return "staged"
     return "completed"

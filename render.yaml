@@ -50,3 +50,7 @@ services:
         sync: false
       - key: SUPABASE_SERVICE_ROLE_KEY
         sync: false
+      # Voyage embeddings for decision-memory RAG (Gap #3). Optional: without it the
+      # uncertainty loop still works; only fleet lesson retrieval is disabled.
+      - key: VOYAGE_API_KEY
+        sync: false

@@ -365,7 +365,12 @@ class DeploymentAgentActionsTest(AgentsEndpointTest):
             time.sleep(0.02)
         self.assertEqual(ma.manual_runs, ["dep_live"])
         self.assertEqual(ma.sessions, [])                     # no legacy session composed
-        runs = registry.runs_for_agent(self.root, "agent-d")
+        runs = []
+        for _ in range(100):     # the run record is written just AFTER manual_runs, same thread
+            runs = registry.runs_for_agent(self.root, "agent-d")
+            if runs:
+                break
+            time.sleep(0.02)
         self.assertEqual(runs[0]["status"], "ran")
 
     def test_legacy_agent_run_now_unchanged(self):

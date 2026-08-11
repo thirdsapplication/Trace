@@ -32,12 +32,13 @@ class UsersModuleTest(unittest.TestCase):
         self._tmp.cleanup()
 
     def test_create_verify_and_hashing(self):
-        u = users.create_user("Worker@Acme.com", "hunter2hunter")
+        u, token = users.create_user("Worker@Acme.com", "hunter2hunter")   # (user, token) tuple
         self.assertEqual(u["email"], "worker@acme.com")          # normalized
+        self.assertTrue(token)                                   # cookie token issued
         self.assertNotIn("password", u)                          # never returned
         self.assertNotIn("password_hash", u)
-        self.assertTrue(users.verify("worker@acme.com", "hunter2hunter"))
-        self.assertIsNone(users.verify("worker@acme.com", "wrong-password"))
+        self.assertIsNotNone(users.verify("worker@acme.com", "hunter2hunter")[0])
+        self.assertIsNone(users.verify("worker@acme.com", "wrong-password")[0])
         # password is hashed+salted on disk, never plaintext
         with open(users._PATH) as f:
             raw = f.read()
@@ -63,7 +64,7 @@ class UsersModuleTest(unittest.TestCase):
             self.assertNotIn("password_hash", u)               # never password material
 
     def test_login_session_lifecycle_and_key(self):
-        u = users.create_user("x@y.com", "longenough1")
+        u, _ = users.create_user("x@y.com", "longenough1")       # (user, token) tuple
         token = users.start_session(u["user_id"])
         self.assertEqual(users.session_user(token), u["user_id"])
         self.assertEqual(users.external_user_id(u["user_id"]), f"trace-user-{u['user_id']}")

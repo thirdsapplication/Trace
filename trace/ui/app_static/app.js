@@ -228,47 +228,239 @@ function ago(iso) {
 // one proposed action (checkbox to include in an approve batch; processed = status pill)
 function proposalRow(p) {
   const pl = p.payload || {};
+  // Long values and nested objects render pre-wrapped (multi-line) so email bodies and
+  // row payloads stay readable instead of collapsing to a one-line JSON blob.
   const rows = Object.keys(pl).map(k => {
     const v = pl[k];
-    const val = (v && typeof v === "object") ? JSON.stringify(v) : String(v);
-    return `<div class="sub" style="margin-top:2px;"><b>${esc(k)}:</b> ${esc(val)}</div>`;
+    const val = (v && typeof v === "object") ? JSON.stringify(v, null, 2) : String(v);
+    const multi = val.length > 60 || val.includes("\n");
+    return `<div class="sub" style="margin-top:3px;"><b>${esc(k)}:</b> `
+      + (multi ? `<span style="display:block;white-space:pre-wrap;margin-top:1px;">${esc(val)}</span>`
+               : esc(val))
+      + `</div>`;
   }).join("");
   const done = p.status && p.status !== "pending";
+  const why = (p.rationale || "").trim();
   return `<div class="card" style="margin-top:8px;">
     <div class="row" style="gap:8px;align-items:flex-start;">
       ${done ? `<span class="pill ${p.status === "executed" ? "pill-on" : "pill-off"}">${esc(p.status)}</span>`
              : `<input type="checkbox" class="prop" data-id="${esc(p.id)}" checked style="margin-top:4px;">`}
       <div style="flex:1;">
         <div class="title" style="font-size:14px;">${p.app ? `<span class="muted">${esc(p.app)} · </span>` : ""}${esc(p.summary || p.kind || "Action")}</div>
+        ${why ? `<div class="sub" style="margin-top:4px;"><span class="muted">Why:</span> ${esc(why)}</div>` : ""}
         <div style="margin-top:4px;">${rows || `<div class="sub muted">No details captured.</div>`}</div>
+        ${(!done && p.app) ? `<button class="btn-link prop-autoapprove" data-app="${esc(p.app)}" style="margin-top:6px;font-size:12px;">Auto-approve ${esc(p.app)} from now on</button>` : ""}
       </div>
       ${done ? "" : `<button class="btn-link prop-no" data-id="${esc(p.id)}" style="color:var(--danger,#b3261e);">Reject</button>`}
     </div>
   </div>`;
 }
 
+// Per-proposal quick action: stop staging one app (future actions in it run automatically).
+// Server computes current-minus-app, so it's race-free. Returns true if the user confirmed.
+async function autoApproveApp(agentId, app) {
+  if (!confirm(`Stop asking approval for ${app}? Future ${app} actions will run automatically.`)) return false;
+  await api("POST", `/api/u/agents/${agentId}/staging`, { unstage: app });
+  return true;
+}
+
+// Gap #3: a card for a question the agent paused on — context, quick-pick options, and a
+// free-text answer. Answering auto-immediately resumes the run.
+function decisionCard(d) {
+  const opts = (d.options || []).map(o =>
+    `<button class="btn-secondary btn-sm dec-opt" data-id="${esc(d.id)}" data-val="${esc(o)}">${esc(o)}</button>`).join(" ");
+  return `<div class="card dec-card" style="margin-top:8px;border-left:3px solid var(--accent,#5b8def);">
+    <div class="row" style="gap:8px;"><span class="pill pill-warn">needs you</span>
+      <div class="title" style="font-size:14px;flex:1;">${esc(d.question || "Needs your input")}</div></div>
+    ${d.context ? `<div class="sub" style="margin-top:4px;"><span class="muted">Context:</span> ${esc(d.context)}</div>` : ""}
+    ${opts ? `<div class="row" style="gap:6px;margin-top:8px;flex-wrap:wrap;">${opts}</div>` : ""}
+    <div class="row" style="gap:6px;margin-top:8px;">
+      <input type="text" class="dec-answer" data-id="${esc(d.id)}" placeholder="Type your answer…" style="flex:1;">
+      <button class="btn-accent btn-sm dec-submit" data-id="${esc(d.id)}">Answer &amp; continue</button>
+    </div>
+  </div>`;
+}
+
+// POST an answer; the server records it and auto-resumes the agent. Returns true on send.
+async function answerDecision(id, answer) {
+  if (!answer || !answer.trim()) return false;
+  await api("POST", `/api/u/decisions/${id}/answer`, { answer: answer.trim() });
+  return true;
+}
+
+// Phase B: a "confirm this shared lesson?" card — a lesson a SIMILAR agent (possibly
+// another user's) learned. Confirming lets it guide this agent autonomously from now on;
+// dismissing means it never resurfaces here. This is the one-time human touch per lesson.
+function lessonConfirmCard(agentId, c) {
+  return `<div class="card lesson-card" style="margin-top:8px;border-left:3px solid var(--accent,#5b8def);">
+    <div class="sub muted" style="margin-bottom:4px;">A similar agent learned this — apply it here?</div>
+    <div class="title" style="font-size:14px;">${esc(c.lesson || "")}</div>
+    <div class="row" style="gap:8px;margin-top:10px;">
+      <button class="btn-accent btn-sm lesson-yes" data-agent="${esc(agentId)}" data-id="${esc(c.decision_id)}">Use it</button>
+      <button class="btn-link lesson-no" data-agent="${esc(agentId)}" data-id="${esc(c.decision_id)}" style="color:var(--muted,#888);">Dismiss</button>
+    </div>
+  </div>`;
+}
+
 async function loadHome() {
   const { data } = await api("GET", "/api/u/home");
-  S.igHome = data || { agents: [], unread_total: 0 };
+  S.igHome = data || { agents: [], unread_total: 0, needs_you_total: 0 };
   return S.igHome;
 }
 
-function agentsTopbar(unread, backFn) {
+function agentsTopbar(unread, backFn, needsYou) {
+  const ct = (n) => n > 9 ? "9+" : n;
   return {
     html: `<div class="topbar">
       <div class="row">${backFn ? `<button id="agBack" class="btn-link">← back</button>` : ""}
         <div class="brand">● Trace</div></div>
       <div class="row">
-        <button id="agMsgs" class="btn-link">Messages${unread ? ` <span class="ct-badge">${unread > 9 ? "9+" : unread}</span>` : ""}</button>
+        ${needsYou ? `<button id="agNeeds" class="btn-link" style="color:var(--danger,#b3261e);font-weight:600;">Needs you <span class="ct-badge" style="background:var(--danger,#b3261e);">${ct(needsYou)}</span></button>` : ""}
+        <button id="agGroups" class="btn-link">Groups</button>
+        <button id="agMsgs" class="btn-link">Messages${unread ? ` <span class="ct-badge">${ct(unread)}</span>` : ""}</button>
+        <button id="agShare" class="btn-link">Sharing</button>
         <span class="muted" style="font-size:13px;">${esc(S.user.email)}</span>
         <button id="logout" class="btn-link">Sign out</button></div></div>`,
     wire() {
       $("#logout").onclick = async () => { await api("POST", "/api/auth/logout", {}); S.user = null; clearTimers(); renderAuth(); };
       $("#agMsgs").onclick = renderMessages;
+      $("#agGroups").onclick = renderGroups;
+      $("#agShare").onclick = renderSettings;
+      const n = $("#agNeeds");
+      if (n) n.onclick = () => { S.igHome = null; renderHome(); };
       const b = $("#agBack");
       if (b) b.onclick = backFn;
     },
   };
+}
+
+/* ---------------- Phase B: lesson-sharing consent ---------------- */
+const SCOPE_LABELS = {
+  contribute: { owner: "Keep to myself", team: "Share with my team", global: "Share with everyone (anonymized)" },
+  consume: { owner: "Only my own", team: "My team's", global: "Everyone's (anonymized)" },
+};
+function scopeSelect(cls, current, kind, includeInherit) {
+  const labels = SCOPE_LABELS[kind];
+  const opts = (includeInherit ? [["", "Inherit account default"]] : [])
+    .concat(["owner", "team", "global"].map(s => [s, labels[s]]));
+  return `<select class="${cls}">${opts.map(([v, l]) =>
+    `<option value="${v}" ${String(current || "") === v ? "selected" : ""}>${esc(l)}</option>`).join("")}</select>`;
+}
+
+async function renderSettings() {
+  clearTimers();
+  const home = S.igHome || await loadHome();
+  const { data } = await api("GET", "/api/u/consent");
+  const c = data || { contribute_scope: "global", consume_scope: "global" };
+  const tb = agentsTopbar(home.unread_total, renderHome, home.needs_you_total);
+  root.innerHTML = `${tb.html}
+    <div class="panel">
+      <h2>Lesson sharing</h2>
+      <p class="lead">When your agents learn from your decisions, those anonymized lessons can help other similar agents — and theirs can help yours. Choose how much to share and use. This is your account default; each agent can override it on its own page.</p>
+      <div class="row" style="gap:10px;margin-top:14px;align-items:center;">
+        <span class="label" style="min-width:180px;">Contribute my lessons</span>${scopeSelect("set-contrib", c.contribute_scope, "contribute", false)}</div>
+      <div class="row" style="gap:10px;margin-top:8px;align-items:center;">
+        <span class="label" style="min-width:180px;">Use others' lessons</span>${scopeSelect("set-consume", c.consume_scope, "consume", false)}</div>
+      <button class="btn-accent btn-sm" id="saveConsent" style="margin-top:16px;">Save</button>
+      <p class="sub muted" style="margin-top:12px;">"Anonymized" means names, emails, amounts and ids are stripped and a second privacy check runs before anything leaves your account. A shared lesson only ever guides someone else's agent after they confirm it once.</p>
+    </div>`;
+  tb.wire();
+  $("#saveConsent").onclick = async (e) => {
+    await api("POST", "/api/u/consent", {
+      contribute_scope: $(".set-contrib").value, consume_scope: $(".set-consume").value });
+    e.target.textContent = "Saved ✓";
+  };
+}
+
+/* ---------------- GROUP CHAT: agents as contacts in a group ---------------- */
+const colorDot = (c) => `<span style="display:inline-block;width:9px;height:9px;border-radius:50%;background:${esc(c)};margin-right:4px;vertical-align:middle;"></span>`;
+
+async function renderGroups() {
+  clearTimers();
+  const home = S.igHome || await loadHome();
+  const { data } = await api("GET", "/api/u/groups");
+  const groups = (data && data.groups) || [];
+  const tb = agentsTopbar(home.unread_total, renderHome, home.needs_you_total);
+  const groupRows = groups.map(g => `
+    <button class="ag-row grp-row" data-id="${esc(g.id)}">
+      <span class="ag-mid">
+        <span class="title" style="font-size:14.5px;">${esc(g.name)}</span>
+        <span class="sub muted">${g.members.map(m => colorDot(m.color) + esc(m.name)).join("  ")}</span>
+      </span></button>`).join("");
+  const agentOpts = (home.agents || []).map(a =>
+    `<label class="row" style="gap:8px;margin-top:4px;cursor:pointer;"><input type="checkbox" class="grp-mem" value="${esc(a.agent_id)}"> ${esc(a.name)}</label>`).join("");
+  root.innerHTML = `${tb.html}
+    <div class="panel">
+      <h2>Group chats</h2>
+      <p class="lead">Add your agents to a group and talk to them together. "What did y'all do today?" gets each one's answer; @mention one to give it a task.</p>
+      <div class="stack" style="margin-top:12px;">${groupRows || `<p class="muted">No groups yet — make one below.</p>`}</div>
+    </div>
+    <div class="panel">
+      <h2>New group</h2>
+      <input type="text" id="grpName" placeholder="Group name (e.g. Operations)" style="width:100%;margin-top:8px;padding:8px;">
+      <div style="margin-top:10px;">${agentOpts || `<p class="muted">No agents yet.</p>`}</div>
+      <button class="btn-accent btn-sm" id="grpCreate" style="margin-top:12px;">Create group</button>
+    </div>`;
+  tb.wire();
+  root.querySelectorAll(".grp-row").forEach(b => b.onclick = () =>
+    renderGroupChat(groups.find(x => x.id === b.dataset.id)));
+  $("#grpCreate").onclick = async () => {
+    const name = ($("#grpName").value || "").trim();
+    if (!name) { $("#grpName").focus(); return; }
+    const ids = Array.from(root.querySelectorAll(".grp-mem")).filter(c => c.checked).map(c => c.value);
+    await api("POST", "/api/u/groups", { name, agent_ids: ids });
+    renderGroups();
+  };
+}
+
+function renderGroupChat(group) {
+  clearTimers();
+  if (!group) { renderGroups(); return; }
+  const msgs = [];   // {who:'you'|'sys'|agentId, name, color, text, staged}
+  const bubble = (m) => m.who === "you"
+    ? `<div class="row" style="justify-content:flex-end;margin-top:10px;"><div class="card" style="background:#1A1A1A;color:#fff;max-width:78%;">${esc(m.text)}</div></div>`
+    : `<div style="margin-top:10px;">
+         <div class="sub" style="color:${esc(m.color)};font-weight:600;">${esc(m.name)}</div>
+         <div class="card" style="border-left:3px solid ${esc(m.color)};max-width:82%;">${esc(m.text)}
+           ${m.staged ? `<div class="sub muted" style="margin-top:4px;">📋 ${m.staged} action${m.staged > 1 ? "s" : ""} staged — approve on the agent's page.</div>` : ""}
+         </div></div>`;
+  const draw = () => {
+    const tb = agentsTopbar(0, renderGroups, 0);
+    root.innerHTML = `${tb.html}
+      <div class="panel">
+        <div class="row" style="gap:8px;align-items:baseline;"><h2 style="margin:0;">${esc(group.name)}</h2>
+          <span class="sub muted">${group.members.map(m => `<span style="color:${esc(m.color)};">${esc(m.name)}</span>`).join(", ") || "no members"}</span></div>
+        <div id="grpMsgs" style="margin-top:12px;min-height:140px;max-height:60vh;overflow:auto;">${
+          msgs.map(bubble).join("") || `<p class="muted">Try "what did y'all get up to today?" — or @${esc((group.members[0] || {}).name || "agent")} to direct one.</p>`}</div>
+        <div class="row" style="gap:6px;margin-top:12px;">
+          <input type="text" id="grpInput" placeholder="Message the group…  (@name to direct one)" style="flex:1;padding:8px;">
+          <button class="btn-accent btn-sm" id="grpSend">Send</button>
+        </div>
+      </div>`;
+    tb.wire();
+    const send = async () => {
+      const text = ($("#grpInput").value || "").trim();
+      if (!text) return;
+      msgs.push({ who: "you", text });
+      const btn = $("#grpSend"); if (btn) { btn.disabled = true; btn.textContent = "…"; }
+      draw();
+      const { status, data } = await api("POST", `/api/u/groups/${group.id}/message`, { text });
+      if (status === 429) {
+        msgs.push({ who: "sys", name: "Trace", color: "#b3261e",
+                    text: (data && data.message) || "Too many messages — give it a moment." });
+      } else {
+        for (const r of (data && data.replies) || [])
+          msgs.push({ who: r.agent_id, name: r.name, color: r.color, text: r.reply,
+                      staged: (r.staged || []).length });
+      }
+      draw();
+    };
+    $("#grpSend").onclick = send;
+    const inp = $("#grpInput");
+    if (inp) inp.onkeydown = (e) => { if (e.key === "Enter") send(); };
+    const box = $("#grpMsgs"); if (box) box.scrollTop = box.scrollHeight;
+  };
+  draw();
 }
 
 /* ---------------- HOME: stories to review + agents list ---------------- */
@@ -282,11 +474,32 @@ async function renderHome() {
       <span class="st-ring">${avatar(a.name, 52)}<span class="ct-badge st-ct">${a.unreviewed}</span></span>
       <span class="st-name">${esc(a.name.length > 14 ? a.name.slice(0, 13) + "…" : a.name)}</span>
     </button>`).join("");
+  // Gap #4: "Needs you" — agents with a blocking question or a pending approval, questions
+  // first (they block the agent), each deep-linking to the review flow where you resolve it.
+  const needsYou = agents.filter(a => a.needs_you > 0)
+    .sort((x, y) => (y.open_decisions - x.open_decisions) || (y.needs_you - x.needs_you));
+  const nConf = (a) => (a.lesson_confirmations || []).length;
+  const needBit = (a) => [
+    a.open_decisions ? `${a.open_decisions} question${a.open_decisions > 1 ? "s" : ""}` : "",
+    a.pending_approvals ? `${a.pending_approvals} to approve` : "",
+    nConf(a) ? `${nConf(a)} to confirm` : ""].filter(Boolean).join(" · ");
+  const needRows = needsYou.map(a => `
+    <button class="ag-row needs-row" data-agent="${esc(a.agent_id)}" style="border-left:3px solid var(--danger,#b3261e);">
+      ${avatar(a.name, 44)}
+      <span class="ag-mid">
+        <span class="title" style="font-size:14.5px;">${esc(a.name)}</span>
+        <span class="sub" style="color:var(--danger,#b3261e);font-weight:600;">${esc(needBit(a))}</span>
+      </span>
+      <span class="ct-badge" style="background:var(--danger,#b3261e);">${a.needs_you}</span>
+    </button>`).join("");
   const rows = agents.map(a => {
     const sched = a.schedule || null;
     const paused = sched && sched.paused;
     const bits = [];
-    if (a.unreviewed) bits.push(`${a.unreviewed} to review`);
+    if (a.open_decisions) bits.push(`${a.open_decisions} awaiting your answer`);
+    if (a.pending_approvals) bits.push(`${a.pending_approvals} to approve`);
+    if (nConf(a)) bits.push(`${nConf(a)} lesson${nConf(a) > 1 ? "s" : ""} to confirm`);
+    if (a.fyi_reviews) bits.push(`${a.fyi_reviews} to review`);
     if (a.unread) bits.push(`${a.unread} new message${a.unread > 1 ? "s" : ""}`);
     bits.push(sched ? (paused ? "schedule paused" : `runs ${cadenceToValue(sched.cadence) || "on its schedule"}`) : "runs when you say");
     return `<button class="ag-row" data-agent="${esc(a.agent_id)}">
@@ -297,15 +510,18 @@ async function renderHome() {
         <span class="ag-bio">${esc(a.description || ("Runs when: " + (a.trigger || "you say so")))}</span>
         <span class="sub muted">${esc(bits.join(" · "))}</span>
       </span>
-      ${a.unreviewed ? `<span class="ct-badge">${a.unreviewed}</span>` : ""}
+      ${a.needs_you ? `<span class="ct-badge" style="background:var(--danger,#b3261e);">${a.needs_you}</span>`
+        : (a.unreviewed ? `<span class="ct-badge">${a.unreviewed}</span>` : "")}
     </button>`;
   }).join("");
-  const tb = agentsTopbar(d.unread_total, null);
+  const tb = agentsTopbar(d.unread_total, null, d.needs_you_total);
   root.innerHTML = `${tb.html}
     <div class="panel">
       <div class="spread"><h2>Your agents</h2>
         <button id="recAnother" class="btn-primary btn-sm">Record another workflow</button></div>
       <p class="lead">Every workflow you've automated. Sessions wait under "To review" until you've seen them — then they move into the agent's history.</p>
+      ${needRows ? `<div class="label" style="margin-bottom:8px;color:var(--danger,#b3261e);">Needs you</div>
+        <div class="stack" style="margin-bottom:18px;">${needRows}</div>` : ""}
       ${withStories.length ? `<div class="label" style="margin-bottom:8px;">To review</div>
         <div class="st-row">${stories}</div>` : ""}
       <div class="stack" style="margin-top:${withStories.length ? "18" : "0"}px;">
@@ -318,6 +534,13 @@ async function renderHome() {
   $("#backFlow").onclick = () => loadAndRender();
   root.querySelectorAll(".st-btn").forEach(b => b.onclick = () => renderReview(b.dataset.agent));
   root.querySelectorAll(".ag-row").forEach(b => b.onclick = () => renderProfile(b.dataset.agent));
+  // "Needs you" rows jump to where the work is: the review flow for story questions/
+  // approvals, or the profile for lesson-confirmations (which live there).
+  root.querySelectorAll(".needs-row").forEach(b => {
+    const a = needsYou.find(x => x.agent_id === b.dataset.agent);
+    const toReview = a && (a.open_decisions || a.pending_approvals);
+    b.onclick = () => toReview ? renderReview(b.dataset.agent) : renderProfile(b.dataset.agent);
+  });
   S._timers.push(setTimeout(renderHome, 30000));            // gentle live refresh
 }
 const renderDashboard = renderHome;                          // legacy entry points
@@ -333,6 +556,8 @@ function renderReview(agentId, startAt) {
   const draw = () => {
     const st = a.stories[i];
     const pending = (st.proposals || []).filter(p => !p.status || p.status === "pending");
+    const decs = st.decisions || [];
+    const waiting = pending.length || decs.length;
     root.innerHTML = `
       <div class="rv-view">
         <div class="rv-inner">
@@ -347,6 +572,10 @@ function renderReview(agentId, startAt) {
           <div class="rv-card">
             <div class="label" style="margin-bottom:8px;">What happened</div>
             <p class="rv-note">${esc(st.note)}</p>
+            ${decs.length ? `
+              <div class="label" style="margin:16px 0 4px;">Needs your input — answer to continue</div>
+              ${decs.map(decisionCard).join("")}
+            ` : ""}
             ${st.proposals && st.proposals.length ? `
               <div class="label" style="margin:16px 0 4px;">Proposed actions — approve to run them</div>
               ${st.proposals.map(proposalRow).join("")}
@@ -356,7 +585,7 @@ function renderReview(agentId, startAt) {
           <div class="rv-nav">
             <button class="btn-secondary btn-sm" id="rvPrev" ${i === 0 ? "disabled" : ""}>‹ Previous</button>
             <span class="muted" style="font-size:12.5px;">${i + 1} of ${a.stories.length}</span>
-            <button class="btn-primary btn-sm" id="rvNext">${pending.length ? "Skip for now ›" : "Mark reviewed ›"}</button>
+            <button class="btn-primary btn-sm" id="rvNext">${waiting ? "Skip for now ›" : "Mark reviewed ›"}</button>
           </div>
         </div>
       </div>`;
@@ -384,6 +613,25 @@ function renderReview(agentId, startAt) {
       st.proposals = (st.proposals || []).filter(p => String(p.id) !== String(b.dataset.id));
       draw();
     });
+    root.querySelectorAll(".prop-autoapprove").forEach(b => b.onclick = async () => {
+      // loosen staging for this app; its still-pending proposals stay approvable as-is
+      if (await autoApproveApp(agentId, b.dataset.app)) draw();
+    });
+    const afterAnswer = () => S._timers.push(setTimeout(async () => {  // resume is async
+      await loadHome();
+      const fresh = (S.igHome.agents || []).find(x => x.agent_id === agentId);
+      if (fresh && fresh.stories.length) renderReview(agentId, Math.min(i, fresh.stories.length - 1));
+      else close();
+    }, 3500));
+    root.querySelectorAll(".dec-opt").forEach(b => b.onclick = async () => {
+      if (await answerDecision(b.dataset.id, b.dataset.val)) { await markReviewed(st); afterAnswer(); }
+    });
+    root.querySelectorAll(".dec-submit").forEach(b => b.onclick = async () => {
+      const inp = root.querySelector(`.dec-answer[data-id="${b.dataset.id}"]`);
+      if (!inp || !inp.value.trim()) { if (inp) inp.focus(); return; }
+      b.disabled = true; b.textContent = "Sending…";
+      if (await answerDecision(b.dataset.id, inp.value)) { await markReviewed(st); afterAnswer(); }
+    });
   };
   draw();
 }
@@ -392,7 +640,7 @@ function renderReview(agentId, startAt) {
 async function renderMessages() {
   clearTimers();
   const d = S.igHome || await loadHome();
-  const tb = agentsTopbar(d.unread_total, renderHome);
+  const tb = agentsTopbar(d.unread_total, renderHome, d.needs_you_total);
   root.innerHTML = `${tb.html}
     <div class="panel">
       <h2>Messages</h2>
@@ -487,7 +735,7 @@ async function renderProfile(agentId) {
   const cur = cadenceToValue(sched && sched.cadence);
   const paused = sched && sched.paused;
   const opts = CADENCES.map(c => `<option value="${c.v}" ${c.v === cur ? "selected" : ""}>${c.label}</option>`).join("");
-  const tb = agentsTopbar(home.unread_total, renderHome);
+  const tb = agentsTopbar(home.unread_total, renderHome, home.needs_you_total);
   root.innerHTML = `${tb.html}
     <div class="panel">
       <div class="row" style="gap:16px;align-items:flex-start;">
@@ -511,6 +759,34 @@ async function renderProfile(agentId) {
           ? `<button id="pDelCap" class="btn-link" style="color:var(--danger,#b3261e);">Delete capture data</button>`
           : `<span class="muted" style="font-size:12px;">Capture data deleted</span>`}
       </div>
+    </div>
+    ${(a.lesson_confirmations && a.lesson_confirmations.length) ? `
+    <div class="panel">
+      <h2>Shared lessons to confirm</h2>
+      <p class="sub muted" style="margin-top:2px;">Lessons a similar agent learned. Confirm one and this agent applies it on its own from then on; dismiss and it won't come back.</p>
+      <div style="margin-top:10px;">${a.lesson_confirmations.map(c => lessonConfirmCard(agentId, c)).join("")}</div>
+    </div>` : ""}
+    ${(a.active_lessons && a.active_lessons.length) ? `
+    <div class="panel">
+      <h2>Active shared lessons</h2>
+      <p class="sub muted" style="margin-top:2px;">Lessons this agent applies automatically. Retire one to stop it.</p>
+      <div style="margin-top:10px;">${a.active_lessons.map(c => `
+        <div class="card" style="margin-top:8px;">
+          <div class="row" style="gap:8px;align-items:flex-start;">
+            <div class="title" style="font-size:14px;flex:1;">${esc(c.lesson || "")}</div>
+            <button class="btn-link lesson-retire" data-agent="${esc(agentId)}" data-id="${esc(c.decision_id)}" style="color:var(--danger,#b3261e);">Retire</button>
+          </div>
+        </div>`).join("")}</div>
+    </div>` : ""}
+    <div class="panel" id="pApprovalsPanel" style="display:none;">
+      <h2>Approvals</h2>
+      <p class="sub muted" style="margin-top:2px;">Choose which apps need your approval before the agent acts. Others run automatically. Takes effect on the next run.</p>
+      <div id="pApprovals" style="margin-top:10px;"></div>
+    </div>
+    <div class="panel" id="pSharingPanel" style="display:none;">
+      <h2>Lesson sharing (this agent)</h2>
+      <p class="sub muted" style="margin-top:2px;">Override your account default for just this agent, or leave it to inherit.</p>
+      <div id="pSharing" style="margin-top:10px;"></div>
     </div>
     <div class="panel">
       <div class="spread"><h2>Session history</h2>
@@ -545,6 +821,49 @@ async function renderProfile(agentId) {
   // the log: real per-session activity (summaries + proposals), newest first
   const { data } = await api("GET", `/api/u/agents/${agentId}/activity`);
   const sessionsList = (data && data.activity) || [];
+  // Approvals: per-app staged/autonomous toggles (post-deploy, no redeploy). All
+  // interpolated values are escaped via esc() (the file's XSS-safe rendering idiom).
+  const availApps = (data && data.agent && data.agent.available_apps) || [];
+  const apPanel = $("#pApprovalsPanel");
+  if (apPanel && availApps.length) {
+    apPanel.style.display = "";
+    const apMarkup = availApps.map(ap => `
+      <label class="row" style="gap:8px;margin-top:6px;cursor:pointer;">
+        <input type="checkbox" class="stage-toggle" data-slug="${esc(ap.slug)}" ${ap.staged ? "checked" : ""}>
+        <span class="title" style="font-size:14px;">${esc(ap.label)}</span>
+        <span class="sub muted">${ap.staged ? "needs approval" : "runs automatically"}</span>
+      </label>`).join("")
+      + `<button class="btn-accent btn-sm" id="pStageSave" style="margin-top:12px;">Save approval settings</button>`;
+    $("#pApprovals").insertAdjacentHTML("beforeend", apMarkup);
+    $("#pStageSave").onclick = async (e) => {
+      const staged = Array.from(root.querySelectorAll(".stage-toggle"))
+        .filter(c => c.checked).map(c => c.dataset.slug);
+      if (!staged.length &&
+          !confirm("No apps will need approval — this agent will act automatically with no review. Continue?")) return;
+      e.target.disabled = true; e.target.textContent = "Saving…";
+      await api("POST", `/api/u/agents/${agentId}/staging`, { staged_apps: staged });
+      S.igHome = null; renderProfile(agentId);
+    };
+  }
+  // Per-agent lesson-sharing override (Phase B). Empty override = inherit account default.
+  const consent = data && data.agent && data.agent.consent;
+  const shPanel = $("#pSharingPanel");
+  if (shPanel && consent) {
+    shPanel.style.display = "";
+    const ov = consent.override || {};
+    $("#pSharing").insertAdjacentHTML("beforeend", `
+      <div class="row" style="gap:10px;align-items:center;">
+        <span class="label" style="min-width:170px;">Contribute my lessons</span>${scopeSelect("ag-contrib", ov.contribute_scope, "contribute", true)}</div>
+      <div class="row" style="gap:10px;margin-top:8px;align-items:center;">
+        <span class="label" style="min-width:170px;">Use others' lessons</span>${scopeSelect("ag-consume", ov.consume_scope, "consume", true)}</div>
+      <button class="btn-accent btn-sm" id="pShareSave" style="margin-top:12px;">Save</button>`);
+    $("#pShareSave").onclick = async (e) => {
+      await api("POST", `/api/u/agents/${agentId}/consent`, {
+        contribute_scope: $(".ag-contrib").value || "inherit",
+        consume_scope: $(".ag-consume").value || "inherit" });
+      e.target.textContent = "Saved ✓";
+    };
+  }
   const stats = $("#pStats");
   if (stats) {
     const staged = sessionsList.reduce((n, s) =>
@@ -554,6 +873,7 @@ async function renderProfile(agentId) {
   }
   const logRow = (s) => {
     const props = s.proposals || [];
+    const decs = s.decisions || [];
     const approvable = props.filter(p => !p.status || p.status === "pending");
     return `<div class="log-row" data-sess="${esc(s.run_session_id || "")}">
       <div class="row" style="gap:10px;">
@@ -561,6 +881,9 @@ async function renderProfile(agentId) {
         ${runBadge(s.status)}
       </div>
       <div class="log-note">${esc(s.summary || "No summary yet — the run may still be in progress.")}</div>
+      ${decs.length ? `<div style="margin-top:8px;"><div class="label">Needs your input</div>
+        ${decs.map(decisionCard).join("")}
+      </div>` : ""}
       ${props.length ? `<div style="margin-top:8px;"><div class="label">Proposed actions</div>
         ${props.map(proposalRow).join("")}
         ${approvable.length ? `<button class="btn-accent btn-sm approve-sel" style="margin-top:10px;">Approve &amp; run selected</button>` : ""}
@@ -582,6 +905,29 @@ async function renderProfile(agentId) {
   root.querySelectorAll(".prop-no").forEach(b => b.onclick = async () => {
     await api("POST", `/api/u/pending/${b.dataset.id}/reject`, {});
     S.igHome = null; renderProfile(agentId);
+  });
+  root.querySelectorAll(".prop-autoapprove").forEach(b => b.onclick = async () => {
+    if (await autoApproveApp(agentId, b.dataset.app)) { S.igHome = null; renderProfile(agentId); }
+  });
+  const refreshAfterAnswer = () =>
+    S._timers.push(setTimeout(() => { S.igHome = null; renderProfile(agentId); }, 4000));
+  root.querySelectorAll(".dec-opt").forEach(b => b.onclick = async () => {
+    if (await answerDecision(b.dataset.id, b.dataset.val)) refreshAfterAnswer();
+  });
+  root.querySelectorAll(".dec-submit").forEach(b => b.onclick = async () => {
+    const inp = root.querySelector(`.dec-answer[data-id="${b.dataset.id}"]`);
+    if (!inp || !inp.value.trim()) { if (inp) inp.focus(); return; }
+    b.disabled = true; b.textContent = "Sending…";
+    if (await answerDecision(b.dataset.id, inp.value)) refreshAfterAnswer();
+  });
+  const confirmLesson = async (agent, id, action) => {
+    await api("POST", "/api/u/lessons/confirm", { agent_id: agent, decision_id: id, action });
+    S.igHome = null; renderProfile(agentId);
+  };
+  root.querySelectorAll(".lesson-yes").forEach(b => b.onclick = () => confirmLesson(b.dataset.agent, b.dataset.id, "confirm"));
+  root.querySelectorAll(".lesson-no").forEach(b => b.onclick = () => confirmLesson(b.dataset.agent, b.dataset.id, "dismiss"));
+  root.querySelectorAll(".lesson-retire").forEach(b => b.onclick = () => {
+    if (confirm("Retire this lesson? This agent will stop applying it.")) confirmLesson(b.dataset.agent, b.dataset.id, "retire");
   });
 }
 const renderActivity = renderProfile;                        // legacy entry point

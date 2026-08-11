@@ -422,6 +422,8 @@ def list_sessions(root, owner_id=None):
         if not os.path.isdir(session_dir(root, sid)):
             continue
         meta = read_meta(root, sid)
+        if owner_id and meta.get("owner_user_id") != owner_id:
+            continue                    # per-user isolation — mirror the Supabase owner filter
         meta = {**meta, "artifacts": artifacts(root, sid)}
         out.append(meta)
     return out

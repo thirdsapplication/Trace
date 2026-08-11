@@ -126,16 +126,58 @@ STAGING_DIRECTIVE = (
     "sending an email, adding or editing a row, posting a record), DO NOT call the tool. "
     "Instead, gather the exact details and, as your FINAL message, output one fenced code "
     "block tagged `proposed_actions` containing a JSON array — one object per action you "
-    "would have taken, each: {\"app\": \"<app>\", \"action\": \"<short verb>\", "
-    "\"summary\": \"<one line a human can approve>\", \"details\": { ...the full, exact "
-    "fields needed to perform it, e.g. to/subject/body or the row values... }}. "
+    "would have taken. Each object MUST have these fields:\n"
+    "  - \"app\": the app the action runs in (one of the staged apps above).\n"
+    "  - \"action\": a short verb phrase for the action (e.g. \"send email\", \"add row\").\n"
+    "  - \"summary\": ONE self-contained line a human can approve at a glance. Name the "
+    "concrete entities and values — recipient, subject, record id, the actual amounts — "
+    "so it makes sense with NO other context. Do not write vague references like \"the "
+    "order\" or \"that customer\"; write \"PO-1234\", \"buyer@acme.com\".\n"
+    "  - \"rationale\": WHY you are proposing this, citing the specific evidence you read "
+    "that triggered it (e.g. \"inbound email from buyer@acme.com on Aug 9 asked to "
+    "confirm PO-1234\"). This is what lets the human approve confidently — be specific "
+    "about the source, not generic.\n"
+    "  - \"details\": an object with the FULL, exact fields needed to perform the action "
+    "verbatim (e.g. to/subject/body for an email, or every column value for a row). Put "
+    "ONLY real action parameters here — no commentary, no rationale, nothing the "
+    "executor would have to re-derive. Whoever approves will run it exactly as given.\n"
     "If there are no outbound actions to take, output an empty array. Take outbound "
     "actions normally in any app NOT listed above.\n\n"
     "Example final message:\n"
     "```proposed_actions\n"
     "[{\"app\": \"Gmail\", \"action\": \"send email\", \"summary\": \"Confirm PO-1234 to "
-    "buyer@acme.com\", \"details\": {\"to\": \"buyer@acme.com\", \"subject\": \"Order "
-    "PO-1234 confirmed\", \"body\": \"...\"}}]\n"
+    "buyer@acme.com ($4,200, ships Aug 15)\", \"rationale\": \"Inbound email from "
+    "buyer@acme.com on Aug 9 asked for written confirmation of order PO-1234; the order "
+    "is in Sheets marked 'ready to ship'\", \"details\": {\"to\": \"buyer@acme.com\", "
+    "\"subject\": \"Order PO-1234 confirmed\", \"body\": \"...\"}}]\n"
+    "```\n")
+
+
+# Gap #3 uncertainty handling: appended to EVERY run (staged or autonomous) so the agent
+# can pause on a genuinely blocking edge case instead of guessing or silently failing.
+# The question cap mirrors the initial setup interview (interview._MAX_QUESTIONS = 10);
+# the parser enforces it. `{max_questions}` is filled at runtime.
+UNCERTAINTY_DIRECTIVE = (
+    "WHEN YOU'RE STUCK — you may pause and ask the human, but ONLY for a genuinely "
+    "blocking, consequential ambiguity you cannot resolve by reading/looking things up: a "
+    "conflict in the data, a missing fact you can't find, or a judgment call outside your "
+    "mandate whose wrong guess would matter. Do NOT pause for anything you can reasonably "
+    "decide yourself, and do NOT pause for an outbound action you can simply stage for "
+    "approval — pausing is for questions, not actions.\n"
+    "If (and only if) you hit such a block, do the rest of the work you safely can, then as "
+    "part of your FINAL message output one fenced code block tagged `needs_input` "
+    "containing a JSON array of AT MOST {max_questions} objects — one per question — each: "
+    "{\"question\": \"<the specific decision you need>\", \"context\": \"<what you found "
+    "and why you're stuck, concretely>\", \"options\": [\"<option A>\", \"<option B>\"]}. "
+    "`options` is optional (omit or leave empty for an open question). Ask only what you "
+    "truly need; fewer, sharper questions are better. If nothing blocks you, do NOT output "
+    "this block at all.\n"
+    "Example:\n"
+    "```needs_input\n"
+    "[{\"question\": \"Order PO-1234 has no ship date — assume standard 5-day or ask the "
+    "buyer?\", \"context\": \"The inbound email requests confirmation but omits a ship "
+    "date; Sheets shows the item in stock. I can't confirm without a date.\", \"options\": "
+    "[\"Assume standard 5-day\", \"Reply asking the buyer for a date\"]}]\n"
     "```\n")
 
 
@@ -216,6 +258,30 @@ CHAT_DIRECTIVE = (
     "change anything unless their message explicitly asks you to do so right now.\n\n"
     "Recent conversation:\n{context}\n\n"
     "Their message: {text}")
+
+
+# Group-chat broadcast (read-only): one bounded model call per member — NO tools, NO
+# session, NO ability to act. The agent answers ONLY about its own recent work from the
+# activity it's given; if the answer isn't there it says so rather than guessing. This is
+# the structural "hard limit" — the model literally has no tools to act with.
+GROUP_QA_SYSTEM = (
+    "You are one automation agent in a group chat with the person you work for and their "
+    "other agents. Answer their message about YOUR OWN recent work, using ONLY the activity "
+    "you are given below — nothing else. Reply in first person, brief and plain (1–3 "
+    "sentences), no JSON or code. If the answer isn't in your activity, say you don't have "
+    "that on hand. This is a read-only status chat: never claim to send, create, or change "
+    "anything.")
+
+
+# Group-chat @mention (directed, actionable): the user @-mentioned ONE agent and is asking
+# it to do/answer something. Unlike the read-only broadcast, this runs a real session so the
+# agent CAN act — but staging still applies (via _staging_trigger), so outbound actions in
+# staged apps are PROPOSED for approval, not performed. `{text}` is the user's message.
+GROUP_DIRECT_DIRECTIVE = (
+    "DIRECT MESSAGE in a group chat — the person you work for @-mentioned you with: "
+    "\"{text}\". Handle it using your tools, then reply to them as your FINAL message in "
+    "plain language (concise, first person, no JSON or code fences). If you have nothing "
+    "to do, just answer their question.")
 
 
 # --- Platform (deployment) scheduling ---------------------------------------

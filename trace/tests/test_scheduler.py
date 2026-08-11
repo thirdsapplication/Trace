@@ -122,6 +122,12 @@ _PROPOSAL_BLOCK = ('```proposed_actions\n'
                    '"summary": "Confirm PO-1234 to bob@x.com", '
                    '"details": {"to": "bob@x.com", "subject": "Confirmed", "body": "Hi"}}]\n```')
 
+# Gap #3: a final message where the agent paused on a blocking edge case.
+_NEEDS_INPUT_BLOCK = ('```needs_input\n'
+                      '[{"question": "PO-1234 has no ship date — assume 5-day or ask buyer?", '
+                      '"context": "Inbound email omits a ship date; item is in stock.", '
+                      '"options": ["Assume 5-day", "Ask the buyer"]}]\n```')
+
 
 class RunnerTest(unittest.TestCase):
     def test_completed_run(self):
@@ -236,6 +242,58 @@ class RunnerTest(unittest.TestCase):
         ma = FakeMA()
         runner.run_once(ma, _agent())
         self.assertEqual(ma.sessions[0]["vault_ids"], ["vlt-1"])
+
+    # --- Gap #3: uncertainty handling (agent-initiated pause) ---------------
+    def test_uncertainty_directive_on_every_run(self):
+        # Even a plain, non-staged run carries the uncertainty directive so the agent
+        # can pause when genuinely stuck.
+        ma = FakeMA()
+        runner.run_once(ma, _agent())
+        self.assertIn("needs_input", ma.triggers[0])
+        self.assertIn(str(runner._uncertainty_max_questions()), ma.triggers[0])
+
+    def test_needs_input_run_gets_needs_input_status(self):
+        ma = FakeMA(events=[{"type": "agent.message", "text": _NEEDS_INPUT_BLOCK},
+                            {"type": "session.thread_status_idle",
+                             "stop_reason": {"type": "end_turn"}}])
+        rec = runner.run_once(ma, _agent())
+        self.assertEqual(rec["status"], "needs_input")
+        self.assertEqual(len(rec["questions"]), 1)
+        self.assertIn("ship date", rec["details"][0])
+        self.assertEqual(rec["questions"][0]["options"], ["Assume 5-day", "Ask the buyer"])
+
+    def test_parse_needs_input_requires_fence_and_caps(self):
+        # a bare array (no needs_input fence) is NOT read as questions
+        self.assertEqual(runner._parse_needs_input('[{"question": "x"}]'), [])
+        # a proposals block is not misread as questions
+        self.assertEqual(runner._parse_needs_input(_PROPOSAL_BLOCK), [])
+        # capped at the interview limit
+        cap = runner._uncertainty_max_questions()
+        many = ", ".join('{"question": "q%d"}' % i for i in range(cap + 5))
+        parsed = runner._parse_needs_input("```needs_input\n[" + many + "]\n```")
+        self.assertEqual(len(parsed), cap)
+
+    def test_needs_input_status_ranks_above_staged(self):
+        # a message with BOTH a question and a proposal reads as needs_input (answer first)
+        ma = FakeMA(events=[{"type": "agent.message",
+                             "text": _NEEDS_INPUT_BLOCK + "\n" + _PROPOSAL_BLOCK},
+                            {"type": "session.thread_status_idle",
+                             "stop_reason": {"type": "end_turn"}}])
+        rec = runner.run_once(ma, _agent())
+        self.assertEqual(rec["status"], "needs_input")
+
+    # --- Gap #3 B4: retrieved lessons injected into the run trigger ----------
+    def test_guidance_injected_into_trigger(self):
+        ma = FakeMA()
+        runner.run_once(ma, _agent(),
+                        guidance=["When an order lacks a ship date, ask the customer."])
+        self.assertIn("LESSONS FROM PAST HUMAN DECISIONS", ma.triggers[0])
+        self.assertIn("ask the customer", ma.triggers[0])
+
+    def test_no_guidance_means_no_lessons_block(self):
+        ma = FakeMA()
+        runner.run_once(ma, _agent())
+        self.assertNotIn("LESSONS FROM PAST HUMAN DECISIONS", ma.triggers[0])
 
 
 class ScheduleDueTest(unittest.TestCase):
