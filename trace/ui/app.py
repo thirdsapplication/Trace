@@ -15,6 +15,7 @@ network: ``AppState.reconstruct_fn`` and ``AppState.controller_factory``.
 import argparse
 import calendar
 import collections
+import concurrent.futures
 import hmac
 import json
 import os
@@ -1457,17 +1458,68 @@ class AppState:
         self._msg_rate[uid] = recent
         return True
 
-    def _agent_run_context(self, agent, limit=8):
-        """A compact text digest of an agent's recent runs (cached summaries + statuses) —
-        the grounding for a read-only Q&A. No platform calls; uses stored run records."""
+    def _agent_run_context(self, agent, limit=8, detail_lines=6):
+        """A compact text digest of an agent's recent runs — the grounding for a read-only
+        Q&A. No platform calls; uses stored run records.
+
+        Includes each run's ACTIONS and anything it staged, not just the one-line summary.
+        With summaries alone an agent could say "I ran two jobs today" but not what was in
+        them, so asking it anything concrete got "you'd need to open the Activity logs" —
+        the specifics were sitting in the run record, just never handed over.
+        """
         root = self.sessions_root
+        aid = agent.get("agent_id")
+        staged_by_session = {}
+        try:                                               # what it proposed, per run
+            for p in registry.pending_for_user(root, agent.get("owner_user_id")):
+                if p.get("agent_id") == aid and p.get("run_session_id"):
+                    staged_by_session.setdefault(p["run_session_id"], []).append(
+                        str(p.get("summary") or "")[:200])
+        except Exception:                                  # noqa: BLE001 — best-effort
+            staged_by_session = {}
         lines = []
-        for r in registry.runs_for_agent(root, agent.get("agent_id"), limit):
+        for r in registry.runs_for_agent(root, aid, limit):
             sid = r.get("run_session_id")
             summ = (registry.summary_get(root, sid) or {}).get("summary") if sid else None
             note = summ or r.get("summary") or ""
             lines.append(f"- [{r.get('ran_at', '')}] {r.get('status', '')}: {note}")
+            for d in (r.get("details") or [])[:detail_lines]:
+                text = d if isinstance(d, str) else (
+                    (d or {}).get("summary") or (d or {}).get("action") or "")
+                if str(text).strip():
+                    lines.append(f"    · did: {str(text).strip()[:200]}")
+            for s in staged_by_session.get(sid, [])[:detail_lines]:
+                if s.strip():
+                    lines.append(f"    · staged for approval: {s.strip()}")
         return "\n".join(lines) or "(no runs yet)"
+
+    @staticmethod
+    def _fanout(thunks, workers=None):
+        """Run independent, IO-bound calls concurrently and return results IN ORDER.
+
+        Every fan-out here is one network call per agent — model calls for a broadcast,
+        platform sessions for @mentions — so they were waiting on the sum of the parts
+        for no reason. A thunk that raises yields None rather than losing the whole set;
+        callers substitute their own fallback.
+        """
+        thunks = list(thunks or [])
+        if not thunks:
+            return []
+        if len(thunks) == 1:                               # no thread for a single call
+            try:
+                return [thunks[0]()]
+            except Exception:                              # noqa: BLE001
+                return [None]
+
+        def _safe(fn):
+            try:
+                return fn()
+            except Exception:                              # noqa: BLE001
+                return None
+
+        with concurrent.futures.ThreadPoolExecutor(
+                max_workers=workers or len(thunks)) as pool:
+            return list(pool.map(_safe, thunks))
 
     def _agent_qa(self, agent, question, model_fn):
         """One agent's read-only answer about its own recent work — a SINGLE bounded model
@@ -1485,22 +1537,30 @@ class AppState:
     def group_broadcast(self, group, text, owner):
         """Read-only group broadcast: every member agent answers the question grounded in
         its own recent run data. One bounded model call per member — NO tools, NO session,
-        so it structurally cannot act. Returns [{agent_id, name, color, reply}]."""
+        so it structurally cannot act. Returns [{agent_id, name, color, reply}].
+
+        Members answer CONCURRENTLY. Asking three agents used to cost three model calls
+        back to back, so the group waited on the sum; now it waits on the slowest one.
+        ``_agent_qa`` never raises (it returns a fallback string), so a slow or failing
+        member degrades to its own reply instead of taking the broadcast down.
+        """
         root = self.sessions_root
         try:
             model_fn = self._summarize_model_fn()
         except Exception:                                  # noqa: BLE001 — no key in dev
             model_fn = None
         by_id = {a.get("agent_id"): a for a in registry.agents_for_user(root, owner)}
-        out = []
-        for aid in group.get("member_agent_ids", [])[:MAX_BROADCAST_MEMBERS]:   # bound fan-out
-            agent = by_id.get(aid)
-            if not agent:
-                continue
-            out.append({"agent_id": aid, "name": agent.get("name") or aid,
-                        "color": registry.agent_color(agent),
-                        "reply": self._agent_qa(agent, text, model_fn)})
-        return out
+        members = [(aid, by_id[aid])
+                   for aid in group.get("member_agent_ids", [])[:MAX_BROADCAST_MEMBERS]
+                   if aid in by_id]                        # bound fan-out
+        if not members:
+            return []
+        replies = self._fanout([lambda a=a: self._agent_qa(a, text, model_fn)
+                                for _aid, a in members])
+        return [{"agent_id": aid, "name": a.get("name") or aid,
+                 "color": registry.agent_color(a),
+                 "reply": reply if reply is not None else "I couldn't answer just now."}
+                for (aid, a), reply in zip(members, replies)]
 
     @staticmethod
     def parse_mentions(text, members):
@@ -2262,8 +2322,12 @@ def make_handler(state):
             if mentioned:
                 by_id = {a.get("agent_id"): a
                          for a in registry.agents_for_user(root, user["user_id"])}
-                replies = [state.group_direct(by_id[aid], text, user["user_id"])
-                           for aid in mentioned if aid in by_id]
+                hits = [aid for aid in mentioned if aid in by_id]
+                # Concurrent: each of these is a full platform session, so three
+                # @mentions serially is three session round trips of waiting.
+                replies = [r for r in state._fanout(
+                    [lambda a=by_id[aid]: state.group_direct(a, text, user["user_id"])
+                     for aid in hits]) if r is not None]
                 return self._json(200, {"mode": "direct", "replies": replies})
             return self._json(200, {"mode": "broadcast",
                                     "replies": state.group_broadcast(g, text, user["user_id"])})
