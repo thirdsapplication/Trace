@@ -373,26 +373,52 @@ async function loadHome() {
   return S.igHome;
 }
 
-function agentsTopbar(unread, backFn, needsYou) {
+// The app shell (frame 14): a persistent left sidebar plus the content column. Screens
+// still write `${tb.html} …content…` into #root, and the content lands inside <main>
+// because the shell's opening tags are left open — innerHTML closes them at the end of
+// the fragment, which is defined behaviour, not a quirk. Keeps all six screens'
+// call sites unchanged while replacing the navigation wholesale.
+const NAV = [
+  { key: "home", label: "Home", go: () => { S.igHome = null; renderHome(); } },
+  { key: "messages", label: "Messages", go: () => renderMessages() },
+  { key: "groups", label: "Groups", go: () => renderGroups() },
+  { key: "sharing", label: "Sharing", go: () => renderSettings() },
+  { key: "settings", label: "Settings", go: () => renderSettings() },
+];
+
+function agentsTopbar(unread, backFn, needsYou, active) {
   const ct = (n) => n > 9 ? "9+" : n;
+  const initial = (S.user && S.user.email || "?").trim().charAt(0).toUpperCase();
+  const items = NAV.map(n => {
+    const on = n.key === (active || "home");
+    const badge = (n.key === "messages" && unread)
+      ? `<span class="ct-badge">${ct(unread)}</span>` : "";
+    return `<button class="nav-item${on ? " active" : ""}" data-nav="${n.key}">
+      <span class="nav-dot${on ? " on" : ""}"></span>${n.label}${badge}</button>`;
+  }).join("");
   return {
-    html: `<div class="topbar">
-      <div class="row">${backFn ? `<button id="agBack" class="btn-link">← back</button>` : ""}
-        ${brandLockup()}</div>
-      <div class="row">
-        ${needsYou ? `<button id="agNeeds" class="btn-link" style="color:var(--danger,#b3261e);font-weight:600;">Needs you <span class="ct-badge" style="background:var(--danger,#b3261e);">${ct(needsYou)}</span></button>` : ""}
-        <button id="agGroups" class="btn-link">Groups</button>
-        <button id="agMsgs" class="btn-link">Messages${unread ? ` <span class="ct-badge">${ct(unread)}</span>` : ""}</button>
-        <button id="agShare" class="btn-link">Sharing</button>
-        <span class="muted" style="font-size:13px;">${esc(S.user.email)}</span>
-        <button id="logout" class="btn-link">Sign out</button></div></div>`,
+    html: `<div class="shell"><aside class="sidebar">
+        ${brandLockup()}
+        ${items}
+        <div class="side-foot">
+          <button id="navNew" class="btn-primary full">+ New workflow</button>
+          <div class="user-chip"><span class="user-av">${esc(initial)}</span>
+            <span class="user-mail">${esc(S.user ? S.user.email : "")}</span>
+            <button id="logout" class="btn-link" title="Sign out">Sign out</button></div>
+        </div>
+      </aside><main class="main">
+      ${backFn ? `<button id="agBack" class="btn-link" style="margin-bottom:6px;">← back</button>` : ""}`,
     wire() {
-      $("#logout").onclick = async () => { await api("POST", "/api/auth/logout", {}); S.user = null; clearTimers(); renderAuth(); };
-      $("#agMsgs").onclick = renderMessages;
-      $("#agGroups").onclick = renderGroups;
-      $("#agShare").onclick = renderSettings;
-      const n = $("#agNeeds");
-      if (n) n.onclick = () => { S.igHome = null; renderHome(); };
+      root.className = "";                        // the shell owns layout, not .wrap
+      document.querySelectorAll(".nav-item").forEach(b => {
+        b.onclick = () => { const n = NAV.find(x => x.key === b.dataset.nav); if (n) n.go(); };
+      });
+      const nw = $("#navNew");
+      if (nw) nw.onclick = recordAnother;
+      $("#logout").onclick = async () => {
+        await api("POST", "/api/auth/logout", {});
+        S.user = null; clearTimers(); root.className = "wrap"; renderAuth();
+      };
       const b = $("#agBack");
       if (b) b.onclick = backFn;
     },
@@ -417,7 +443,7 @@ async function renderSettings() {
   const home = S.igHome || await loadHome();
   const { data } = await api("GET", "/api/u/consent");
   const c = data || { contribute_scope: "global", consume_scope: "global" };
-  const tb = agentsTopbar(home.unread_total, renderHome, home.needs_you_total);
+  const tb = agentsTopbar(home.unread_total, renderHome, home.needs_you_total, "sharing");
   root.innerHTML = `${tb.html}
     <div class="panel">
       <h2>Lesson sharing</h2>
@@ -449,7 +475,7 @@ async function renderGroups() {
   const home = S.igHome || await loadHome();
   const { data } = await api("GET", "/api/u/groups");
   const groups = (data && data.groups) || [];
-  const tb = agentsTopbar(home.unread_total, renderHome, home.needs_you_total);
+  const tb = agentsTopbar(home.unread_total, renderHome, home.needs_you_total, "groups");
   const groupRows = groups.map(g => `
     <button class="ag-row grp-row" data-id="${esc(g.id)}">
       <span class="ag-mid">
@@ -494,7 +520,7 @@ function renderGroupChat(group) {
            ${m.staged ? `<div class="sub muted" style="margin-top:4px;">📋 ${m.staged} action${m.staged > 1 ? "s" : ""} staged — approve on the agent's page.</div>` : ""}
          </div></div>`;
   const draw = () => {
-    const tb = agentsTopbar(0, renderGroups, 0);
+    const tb = agentsTopbar(0, renderGroups, 0, "groups");
     root.innerHTML = `${tb.html}
       <div class="panel">
         <div class="row" style="gap:8px;align-items:baseline;"><h2 style="margin:0;">${esc(group.name)}</h2>
@@ -583,7 +609,7 @@ async function renderHome() {
         : (a.unreviewed ? `<span class="ct-badge">${a.unreviewed}</span>` : "")}
     </button>`;
   }).join("");
-  const tb = agentsTopbar(d.unread_total, null, d.needs_you_total);
+  const tb = agentsTopbar(d.unread_total, null, d.needs_you_total, "home");
   root.innerHTML = `${tb.html}
     <div class="panel">
       <div class="spread"><h2>Your agents</h2>
@@ -709,7 +735,7 @@ function renderReview(agentId, startAt) {
 async function renderMessages() {
   clearTimers();
   const d = S.igHome || await loadHome();
-  const tb = agentsTopbar(d.unread_total, renderHome, d.needs_you_total);
+  const tb = agentsTopbar(d.unread_total, renderHome, d.needs_you_total, "messages");
   root.innerHTML = `${tb.html}
     <div class="panel">
       <h2>Messages</h2>
@@ -804,7 +830,7 @@ async function renderProfile(agentId) {
   const cur = cadenceToValue(sched && sched.cadence);
   const paused = sched && sched.paused;
   const opts = CADENCES.map(c => `<option value="${c.v}" ${c.v === cur ? "selected" : ""}>${c.label}</option>`).join("");
-  const tb = agentsTopbar(home.unread_total, renderHome, home.needs_you_total);
+  const tb = agentsTopbar(home.unread_total, renderHome, home.needs_you_total, "home");
   root.innerHTML = `${tb.html}
     <div class="panel">
       <div class="row" style="gap:16px;align-items:flex-start;">
