@@ -473,7 +473,21 @@ function ago(iso) {
 // Frame 22 stamps a thread with a clock time — "9:12", "Mon" — not "2h ago". In a list
 // you scan for the message you remember, and you remember it as this morning or Monday.
 // ago() stays for everywhere that describes a single event's recency.
-function stamp(iso) {
+// "ran today, 7:00 AM" (15). The story overlay was printing the raw ISO string.
+function ranWhen(iso) {
+  const t = Date.parse(iso || "");
+  if (isNaN(t)) return "";
+  const d = new Date(t), now = new Date();
+  const clock = d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+  if (d.toDateString() === now.toDateString()) return `ran today, ${clock}`;
+  if ((now - d) / 86400000 < 7)
+    return `ran ${d.toLocaleDateString(undefined, { weekday: "long" })}, ${clock}`;
+  return `ran ${d.toLocaleDateString(undefined, { month: "short", day: "numeric" })}, ${clock}`;
+}
+
+// (named threadStamp, not stamp: drawHome declares a local `const stamp` for its date
+// line, which would shadow this inside that function.)
+function threadStamp(iso) {
   const t = Date.parse(iso || "");
   if (isNaN(t)) return "";
   const d = new Date(t), now = new Date();
@@ -1119,8 +1133,8 @@ function renderReview(agentId, startAt) {
           <div class="rv-progress">${a.stories.map((_, k) =>
             `<span class="${k < i ? "done" : (k === i ? "cur" : "")}"></span>`).join("")}</div>
           <div class="rv-head">
-            ${avatar(a.name, 34)}
-            <span><b>${esc(a.name)}</b><span class="muted" style="margin-left:8px;font-size:12.5px;">${esc(st.ran_at || "")}</span></span>
+            ${avatar(a.name, 34, a)}
+            <span><b>${esc(a.name)}</b><span class="muted" style="margin-left:8px;font-size:12.5px;">${esc(ranWhen(st.ran_at))}</span></span>
             ${runBadge(st.status)}
             <button class="rv-x" id="rvX">✕</button>
           </div>
@@ -1240,7 +1254,7 @@ async function renderMessages() {
           ? esc(((last.sender === "user" ? "You: " : "") + (last.text || "")).slice(0, 72))
           : "No messages yet"}</span>
       </span>
-      <span class="sub muted">${last ? esc(stamp(last.created_at)) : ""}</span>
+      <span class="sub muted">${last ? esc(threadStamp(last.created_at)) : ""}</span>
       ${a.unread ? `<span class="flag-dot" title="${a.unread} unread"></span>` : ""}
     </button>`).join("");
   const el = $("#dmList");
@@ -1293,7 +1307,7 @@ async function renderThread(agentId) {
     const msgs = r.data.messages || [];
     name = (r.data.agent && r.data.agent.name) || "";
     const head = $("#thHead");
-    if (head) head.innerHTML = `${avatar(name, 26)}<b style="font-size:14px;">${esc(name)}</b>`;
+    if (head) head.innerHTML = `${avatar(name, 26, me)}<b style="font-size:14px;">${esc(name)}</b>`;
     const chat = $("#chat");
     if (chat) {
       chat.innerHTML = (msgs.map(m => `
@@ -1471,7 +1485,7 @@ async function renderProfile(agentId) {
   tb.paint(`
     <div class="panel">
       <div class="row" style="gap:16px;align-items:flex-start;">
-        ${avatar(name, 64)}
+        ${avatar(name, 64, a)}
         <div style="flex:1;">
           <div class="row" style="gap:10px;"><h2 id="pTitle" style="margin:0;">${esc(name)}</h2>
             <button id="pEdit" class="pencil" title="Rename or recolor">✎</button>
