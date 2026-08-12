@@ -461,7 +461,9 @@ input:focus, textarea:focus { outline: none; border-color: var(--accent); backgr
 .grp-mid { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 .grp-name { font-weight: 700; font-size: 13.5px; }
 .grp-sub { font-size: 12px; color: var(--ink-2); }
-.grp-flag { width: 8px; height: 8px; border-radius: 999px; background: var(--alert); flex: none; }
+/* one coral dot, everywhere something needs you: an unread thread (22), a group with a
+   blocked member (24). Same size, same meaning — it is never decorative. */
+.flag-dot { width: 8px; height: 8px; border-radius: 999px; background: var(--alert); flex: none; }
 
 /* the create card (24): raised rather than an overlay, so the list stays visible */
 .grp-new { background: var(--panel); border: 1px solid var(--line-2); border-radius: 16px;

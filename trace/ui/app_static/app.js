@@ -316,9 +316,12 @@ function shell(inner) {
   const reached = deriveStep();                 // furthest step the artifacts allow
   const chips = STEPS.map((st, i) => {
     const nav = i <= reached;                    // completed steps + the current one are navigable
-    const cls = [i === S.step ? "active" : (i < reached ? "done" : ""), nav ? "nav" : ""].join(" ").trim();
-    // "1 Record", not "01 Record" — frame 06 numbers the steps the way you'd say them.
-    return `<span class="step-chip ${cls}" ${nav ? `data-step="${i}"` : ""}><span class="n">${i + 1}</span>${st.label}</span>`;
+    const done = i !== S.step && i < reached;
+    const cls = [i === S.step ? "active" : (done ? "done" : ""), nav ? "nav" : ""].join(" ").trim();
+    // "✓ Record" once a step is behind you, "2 Find work" otherwise (07–13). The number
+    // is only useful while the step is still ahead — after that, what you want to know
+    // is that it's finished.
+    return `<span class="step-chip ${cls}" ${nav ? `data-step="${i}"` : ""}><span class="n">${done ? "✓" : i + 1}</span>${st.label}</span>`;
   }).join("");
   root.innerHTML = `
     <div class="topbar">
@@ -796,7 +799,7 @@ async function renderGroups() {
         <span class="grp-name">${esc(g.name)}</span>
         <span class="grp-sub">${n} agent${n === 1 ? "" : "s"} · ${esc(when)}</span>
       </span>
-      ${blocked ? `<span class="grp-flag" title="A member needs you"></span>` : ""}
+      ${blocked ? `<span class="flag-dot" title="A member needs you"></span>` : ""}
     </button>`;
   }).join("");
 
@@ -1177,7 +1180,7 @@ async function renderMessages() {
           : "No messages yet"}</span>
       </span>
       <span class="sub muted">${last ? esc(ago(last.created_at)) : ""}</span>
-      ${a.unread ? `<span class="ct-badge">${a.unread}</span>` : ""}
+      ${a.unread ? `<span class="flag-dot" title="${a.unread} unread"></span>` : ""}
     </button>`).join("");
   const el = $("#dmList");
   if (el) el.innerHTML = list || `<p class="muted">No agents yet.</p>`;
@@ -1418,7 +1421,7 @@ async function renderProfile(agentId) {
       </div>
       <div class="row" style="margin-top:16px;gap:8px;flex-wrap:wrap;">
         <button class="btn-secondary btn-sm" id="pMsg">Message</button>
-        <button class="btn-accent btn-sm" id="pRun">Run now</button>
+        <button class="btn-primary btn-sm" id="pRun">Run now</button>
         <span class="label" style="margin-left:6px;">Runs</span>
         <select class="sched" id="pSched">${opts}</select>
         ${sched ? `<button class="btn-secondary btn-sm" id="pPause">${paused ? "Resume" : "Pause"}</button>` : ""}
