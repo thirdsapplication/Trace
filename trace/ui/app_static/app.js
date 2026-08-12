@@ -1420,6 +1420,74 @@ const EXTENDED_SHADES = [
   "#A9BDFB", "#7B98F9", "#2447C4", "#1A3390",
 ];
 
+/* ---------------- go-live colour assignment (29) ---------------- */
+
+// The 25 shades, core five first so early agents get the strong colours — the same
+// order the popover offers them in.
+const ALL_SHADES = CORE_AGENT_COLORS.concat(EXTENDED_SHADES);
+
+// Hue in degrees, for measuring how far apart two shades read.
+function hexHue(hex) {
+  const s = String(hex).replace("#", "");
+  const r = parseInt(s.slice(0, 2), 16) / 255;
+  const g = parseInt(s.slice(2, 4), 16) / 255;
+  const b = parseInt(s.slice(4, 6), 16) / 255;
+  const max = Math.max(r, g, b), min = Math.min(r, g, b), d = max - min;
+  if (!d) return 0;
+  let h;
+  if (max === r) h = ((g - b) / d) % 6;
+  else if (max === g) h = (b - r) / d + 2;
+  else h = (r - g) / d + 4;
+  return (h * 60 + 360) % 360;
+}
+
+// Frame 29: the most distinct unused shade — the one whose nearest neighbour among the
+// colours already in use is furthest away. No shade repeats until all 25 are spoken for;
+// after that it cycles, and the popover already marks a taken shade with its owner.
+function pickShade(taken) {
+  const used = new Set((taken || []).filter(Boolean).map(c => String(c).toUpperCase()));
+  // The core five are spent FIRST — frame 29's whole premise is the sixth agent, the one
+  // that arrives after "all 5 core colours are taken". Picking on hue distance alone
+  // reaches into the extended tones from the second agent onward, which gets you a muted
+  // palette before you have five agents.
+  const freeCore = CORE_AGENT_COLORS.filter(c => !used.has(c.toUpperCase()));
+  const free = freeCore.length ? freeCore : ALL_SHADES.filter(c => !used.has(c.toUpperCase()));
+  if (!free.length) return ALL_SHADES[used.size % ALL_SHADES.length];
+  if (!used.size) return free[0];
+  const hues = Array.from(used).map(hexHue);
+  let best = free[0], bestGap = -1;
+  for (const c of free) {
+    const h = hexHue(c);
+    const gap = Math.min(...hues.map(t => {
+      const d = Math.abs(h - t) % 360;
+      return Math.min(d, 360 - d);
+    }));
+    if (gap > bestGap) { bestGap = gap; best = c; }
+  }
+  return best;
+}
+
+// Give every agent that just went live its own shade. Runs AFTER the deploy has already
+// succeeded and is entirely best-effort: the colour endpoint is the same one the popover
+// uses, and if any of it fails the agent simply keeps the derived default. Nothing here
+// may affect whether the deploy is considered to have worked.
+async function assignShadesTo(newIds) {
+  if (!newIds || !newIds.length) return;
+  try {
+    const home = await loadHome(true);
+    const agents = home.agents || [];
+    const fresh = new Set(newIds);
+    const taken = agents.filter(a => !fresh.has(a.agent_id)).map(a => a.color);
+    for (const id of newIds) {
+      const shade = pickShade(taken);
+      const r = await api("POST", `/api/u/agents/${id}/color`, { color: shade });
+      if (!r.ok) return;                       // endpoint unhappy — leave the rest alone
+      taken.push(shade);                       // so the next one picks against this too
+    }
+    S.igHome = null;                           // colours changed; next read must be fresh
+  } catch (e) { /* a colour is never worth failing a go-live over */ }
+}
+
 function openIdentityPopover(agent, agentId) {
   const taken = {};                                  // color -> another agent's initial
   ((S.igHome && S.igHome.agents) || []).forEach(x => {
@@ -2397,6 +2465,9 @@ async function renderGolive(sid) {
       <button id="liveGo" class="btn-primary full" style="margin-top:6px;">Go live</button>`;
     $("#liveGo").onclick = async () => {
       $("#liveGo").disabled = true; $("#liveGo").textContent = "Deploying…";
+      // Which agents existed BEFORE this deploy, so the ones that appear after it are
+      // exactly the ones that need a shade picked (29).
+      const before = new Set((((await loadHome()) || {}).agents || []).map(a => a.agent_id));
       const staged_apps = Array.from(document.querySelectorAll(".stage-app"))
         .filter(c => c.checked).map(c => c.dataset.slug);
       const r = await upost(sid, "/deploy", { trigger: "on a new matching task", staged_apps });
@@ -2415,6 +2486,10 @@ async function renderGolive(sid) {
         return;
       }
       try { await pollJob(sid, "deploy"); } catch (e) { $("#liveMsg").textContent = friendly(e.message); }
+      // Deploy is already done and recorded by here — this only paints the new agents.
+      const after = await loadHome(true);
+      await assignShadesTo(((after || {}).agents || [])
+        .map(a => a.agent_id).filter(id => !before.has(id)));
       await refreshSession(); render();
     };
     return;
