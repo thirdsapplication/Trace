@@ -32,6 +32,7 @@ class FakeDeployClient:
         self.last_vault_ids, self.start = None, None
         self.memory_stores = list(existing_stores or [])   # [{"id", "name"}]
         self.seeded = []                                   # (store_id, path)
+        self.environments = []                             # names passed to create_environment
         self.deployments = []                              # recorded create kwargs
         self.archived, self.paused, self.unpaused = [], [], []
         self.manual_runs = []
@@ -44,6 +45,7 @@ class FakeDeployClient:
         return {"id": "agent_live", "name": envelope["name"], "reused": False}
 
     def create_environment(self, defaults=None):
+        self.environments.append((defaults or {}).get("name"))
         return "env_0"
 
     def create_session(self, agent_id, environment_id, resources, title=None, vault_ids=None):
@@ -57,15 +59,21 @@ class FakeDeployClient:
         return "trig_0"
 
     # --- memory stores + deployments (the platform-native start) ---
-    def create_or_reuse_memory_store(self, name, description):
-        for s in self.memory_stores:
-            if s["name"] == name:
-                return {"id": s["id"], "reused": True}
-        store = {"id": f"mem_{len(self.memory_stores)}", "name": name}
-        self.memory_stores.append(store)
-        self.seeded.append((store["id"], "/current_workflow_status.md"))
-        self.seeded.append((store["id"], "/lessons_learned.md"))
-        return {"id": store["id"], "reused": False}
+    def create_or_reuse_memory_store(self, name, description, documents=None):
+        # mirrors the real client: the caller's documents are ensured on BOTH the
+        # fresh and the reused path (a shared store's "reused" only means another
+        # agent got there first); already-seeded paths are left untouched
+        documents = documents or [("/current_workflow_status.md", ""),
+                                  ("/lessons_learned.md", "")]
+        store = next((s for s in self.memory_stores if s["name"] == name), None)
+        reused = store is not None
+        if store is None:
+            store = {"id": f"mem_{len(self.memory_stores)}", "name": name}
+            self.memory_stores.append(store)
+        for path, _content in documents:
+            if (store["id"], path) not in self.seeded:
+                self.seeded.append((store["id"], path))
+        return {"id": store["id"], "reused": reused}
 
     def create_deployment(self, name, agent_id, environment_id, trigger_text,
                           schedule=None, resources=None, vault_ids=None, metadata=None):
@@ -188,10 +196,12 @@ class DeployTest(unittest.TestCase):
         bundle, live = _live_dict()
         client = FakeDeployClient()
         rec = deploy.deploy_live(bundle, live, CONNECTION, client, trigger="on a new inbound PO")
-        # one memory store, seeded with BOTH canonical documents
+        # one DEDICATED memory store for this agent, keyed on user + workflow name
+        # (NOT the platform agent id, which redeploys rotate), seeded with BOTH
+        # canonical documents
         self.assertEqual(len(client.memory_stores), 1)
         self.assertEqual(client.memory_stores[0]["name"],
-                         config.memory_store_name("agent_live", "trace-s1"))
+                         config.memory_store_name("trace-s1", live["name"]))
         self.assertEqual({p for _sid, p in client.seeded},
                          {config.MEMORY_STATUS_DOC, config.MEMORY_LESSONS_DOC})
         # one MANUAL deployment (no schedule at deploy; the dashboard attaches cron)
@@ -239,13 +249,48 @@ class DeployTest(unittest.TestCase):
         self.assertIn(config.MEMORY_UPDATE_DIRECTIVE, text)
 
     def test_memory_store_reused_on_redeploy_keeps_lessons(self):
+        # a redeploy rotates the platform agent id, but the store name keys on
+        # user + workflow, so the SAME dedicated store is found and reused
         bundle, live = _live_dict()
-        name = config.memory_store_name("agent_live", "trace-s1")
+        name = config.memory_store_name("trace-s1", live["name"])
         client = FakeDeployClient(existing_stores=[{"id": "mem_prior", "name": name}])
         rec = deploy.deploy_live(bundle, live, CONNECTION, client)
         self.assertEqual(rec["memory_store_id"], "mem_prior")
         self.assertTrue(rec["memory_store_reused"])
-        self.assertEqual(client.seeded, [])                 # reuse never re-seeds
+        # reuse never creates a second store, and existing documents stay untouched
+        # (the conflict-tolerant seed contract in test_agent_api_client)
+        self.assertEqual(len(client.memory_stores), 1)
+
+    def test_each_agent_gets_its_own_store(self):
+        # a user's SECOND workflow gets its OWN dedicated store — one store per
+        # agent, never shared — and both names still identify the user
+        b1, live1 = _live_dict("marcy")
+        b2, live2 = _live_dict("recruiter")
+        client = FakeDeployClient()
+        r1 = deploy.deploy_live(b1, live1, CONNECTION, client)
+        r2 = deploy.deploy_live(b2, live2, CONNECTION, client)
+        self.assertEqual(len(client.memory_stores), 2)
+        self.assertNotEqual(r1["memory_store_id"], r2["memory_store_id"])
+        self.assertFalse(r1["memory_store_reused"])
+        self.assertFalse(r2["memory_store_reused"])
+        for s in client.memory_stores:
+            self.assertIn("trace-s1", s["name"])            # whose it is, at a glance
+
+    def test_deployment_and_environment_named_for_the_user(self):
+        # the old names repeated per user ("trace-B1" for every first workflow); now
+        # deployment + environment carry the owner identity + the workflow name
+        bundle, live = _live_dict()
+        client = FakeDeployClient()
+        conn = dict(CONNECTION, owner_email="jane@acme.com")
+        deploy.deploy_live(bundle, live, conn, client, trigger="on a new inbound PO")
+        self.assertEqual(client.deployments[0]["name"],
+                         config.deployment_name("jane@acme.com", live["name"]))
+        self.assertIn("jane-acme-com", client.deployments[0]["name"])
+        self.assertIn("jane-acme-com", client.environments[0])
+        # without an email the stable external user id still identifies the user
+        client2 = FakeDeployClient()
+        deploy.deploy_live(bundle, live, CONNECTION, client2)
+        self.assertIn("trace-s1", client2.deployments[0]["name"])
 
     def test_deploy_fails_loud_when_deployment_create_raises(self):
         bundle, live = _live_dict()

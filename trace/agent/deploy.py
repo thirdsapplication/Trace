@@ -80,10 +80,13 @@ def build_deployment_trigger(base_trigger, staged_slugs, rejected=None):
 
 def deploy_live(bundle, live_envelope_dict, connection_record, client,
                 trigger=None, schedule=None, staged_apps=None, connect_client=None):
-    """Create the LIVE agent for one bundle over the bound connection, plus its
-    per-agent MEMORY STORE (created-or-reused by name so lessons survive redeploys)
+    """Create the LIVE agent for one bundle over the bound connection, plus its own
+    dedicated per-agent MEMORY STORE (created-or-reused by a name keyed on user +
+    workflow, so lessons survive redeploys even though the platform agent id rotates)
     and a platform DEPLOYMENT whose initial message set carries the task + the
     memory-update directive (+ the staging directive when apps are staged). The
+    deployment, environment, and store are NAMED for the owner + workflow so an
+    administrator can tell whose they are in the Console (runs inherit the name). The
     deployment is created MANUAL (no schedule) — the dashboard cadence attaches a
     cron schedule afterwards. Returns a ``live_record``. The customer's vault rides
     on the deployment (injected into every run session). Memory-store and deployment
@@ -136,13 +139,24 @@ def deploy_live(bundle, live_envelope_dict, connection_record, client,
                         + " — the agent would deploy green but reach Pipedream "
                           "unauthenticated. Reconnect the app(s) and redeploy.")
 
+    # WHO and WHAT, for every platform name: the account email when the app passed it
+    # through on the connection record, else the worker's confirmed identity, else the
+    # stable external user id — never anonymous.
+    owner = config.owner_label((connection_record or {}).get("owner_email"),
+                               (connection_record or {}).get("expected_identity"),
+                               external_user_id)
+    workflow = (live_envelope_dict.get("name") or bundle.get("name")
+                or bundle.get("id") or "agent")
+
     agent = client.create_or_reuse_agent(live_envelope_dict)
     agent_id = agent.get("id") if isinstance(agent, dict) else agent
-    environment_id = client.create_environment()
+    environment_id = client.create_environment(config.environment_defaults(owner, workflow))
 
+    # This agent's OWN store, keyed on (user, workflow name) — the workflow name is
+    # the reuse key that survives redeploys; the platform agent id does not.
     store = client.create_or_reuse_memory_store(
-        name=config.memory_store_name(agent_id, external_user_id),
-        description=config.MEMORY_STORE_DESCRIPTION)
+        name=config.memory_store_name(external_user_id, workflow),
+        description=config.memory_store_description(owner))
     memory_store_id = store.get("id") if isinstance(store, dict) else store
 
     base_trigger = trigger or (bundle.get("trigger") or "on a new matching event")
@@ -153,7 +167,7 @@ def deploy_live(bundle, live_envelope_dict, connection_record, client,
     cron = ({"expression": schedule, "timezone": config.TRACE_SCHEDULE_TZ}
             if schedule else None)
     deployment_id = client.create_deployment(
-        name=f"trace-{bundle.get('id')}",
+        name=config.deployment_name(owner, workflow),
         agent_id=agent_id, environment_id=environment_id,
         trigger_text=trigger_text,
         schedule=cron,
@@ -172,6 +186,7 @@ def deploy_live(bundle, live_envelope_dict, connection_record, client,
         "memory_store_reused": bool(isinstance(store, dict) and store.get("reused")),
         "vault_ref": vault_ref,
         "external_user_id": external_user_id,
+        "owner_email": (connection_record or {}).get("owner_email"),
         "start": start,
         "status": "live",
         "error": None,

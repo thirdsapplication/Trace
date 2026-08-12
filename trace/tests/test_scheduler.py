@@ -23,14 +23,16 @@ class FakeMA:
         self.sessions = []
         self.approved, self.rejected, self.triggers = [], [], []
 
-    def create_environment(self):
+    def create_environment(self, defaults=None):
+        self.environments = getattr(self, "environments", [])
+        self.environments.append((defaults or {}).get("name"))
         return "env-1"
 
     def create_session(self, agent_id, env, resources, title=None, vault_ids=None):
         if self.fail:
             raise RuntimeError("platform down")
         self.sessions.append({"agent_id": agent_id, "vault_ids": vault_ids,
-                              "resources": resources})
+                              "resources": resources, "title": title})
         return "run-sess-1"
 
     def send_trigger_and_collect(self, sid, trigger, timeout=None, max_events=None):
@@ -648,6 +650,20 @@ class RunnerMemoryTest(unittest.TestCase):
         self.assertEqual(rec["status"], "executed")
         self.assertEqual(ma.sessions[0]["resources"][0]["type"], "memory_store")
         self.assertIn(agent_config.MEMORY_UPDATE_DIRECTIVE, ma.triggers[0])
+
+    def test_run_names_identify_the_user(self):
+        # session titles + environment names carry owner identity + agent + purpose,
+        # so an administrator can tell whose run this is in the Console backend
+        ma = FakeMA()
+        agent = {**_agent(), "owner_email": "jane@acme.com", "name": "Order intake"}
+        runner.run_once(ma, agent)
+        self.assertEqual(ma.sessions[0]["title"],
+                         "Trace · jane@acme.com · Order intake · scheduled run")
+        self.assertEqual(ma.environments[-1], "trace-jane-acme-com-order-intake-env")
+        # rows deployed before owner_email existed fall back to the external id
+        ma2 = FakeMA()
+        runner.run_once(ma2, _agent())
+        self.assertEqual(ma2.sessions[0]["title"], "Trace · x · WF · scheduled run")
 
 
 class RegistryDeploymentFileModeTest(unittest.TestCase):

@@ -231,8 +231,11 @@ UNCERTAINTY_DIRECTIVE = (
 
 
 # --- Per-agent memory store (Managed Agents memory beta) ---------------------
-# Every deployed agent gets ONE memory store (created-or-REUSED by name, so redeploys
-# never wipe accumulated lessons) holding two documents the agent maintains itself.
+# Every deployed agent gets its OWN memory store (created-or-REUSED by name, so
+# redeploys never wipe accumulated lessons), holding two documents the agent
+# maintains itself. The name keys on (user, workflow name) — see
+# ``memory_store_name`` — so it identifies the owner in the Console AND stays
+# stable across redeploys, which rotate the platform agent id.
 # The store is attached at deployment/session creation via a memory_store resource
 # and mounts at /mnt/memory/<store-name>/ where the agent uses ordinary file tools.
 # Beta shape — confirm against current Managed Agents memory docs.
@@ -262,6 +265,14 @@ MEMORY_STORE_DESCRIPTION = (
     "Persistent workflow memory for this Trace agent: current_workflow_status.md "
     "(the workflow's live state) and lessons_learned.md (accumulated lessons). "
     "Read both before starting work.")
+
+
+def memory_store_description(owner=None):
+    """The store description, leading with the owner's identity so an administrator
+    can tell whose memory a store holds at a glance in the Console."""
+    owner = str(owner or "").strip()
+    return (f"Owner: {owner}. " if owner else "") + MEMORY_STORE_DESCRIPTION
+
 
 # Instruction appended to every deployment's initial message set (and to approval-
 # execution instructions), telling the agent to maintain its two memory documents.
@@ -296,24 +307,34 @@ MEMORY_UPDATE_DIRECTIVE = (
     "rewriting). NEVER write credentials, tokens, API keys, or any secret into memory.")
 
 
-def memory_store_name(agent_id, external_user_id):
-    """The per-agent memory store name: keyed on the platform AGENT ID, which is
-    immutable, unique, and stable across redeploys (``create_or_reuse_agent`` reuses by
-    name and returns the same agent), so memory follows the agent and a DIFFERENT
-    workflow can never inherit it. Keying on the agent's *name* would work until someone
-    renames the agent, which would silently orphan everything it had learned.
+def name_slug(text, fallback=""):
+    """Lowercase alnum-and-dash slug for platform object names (environments,
+    deployments, memory stores)."""
+    s = re.sub(r"[^a-z0-9]+", "-", str(text or "").lower()).strip("-")
+    return s or fallback
 
-    It used to key on the bundle id, which is unique only WITHIN a session: discovery
-    labels bundles B1, B2, B3 per recording, so ``trace-B1-<user>`` was the name for the
-    first workflow of EVERY recording that user ever made. A brand-new agent therefore
-    mounted an older, unrelated agent's notes and read them as fact about its own
-    workflow (observed in the wild as ``memory_store_reused: true`` on a first deploy).
 
-    ``external_user_id`` comes FIRST so the 100-char clamp can never truncate it away and
-    let two customers collide on one store.
+def memory_store_name(external_user_id, workflow_name):
+    """The per-agent memory store name: one DEDICATED store per (user, workflow),
+    e.g. ``trace-user-<id>-order-intake-memory`` — so every agent keeps its own
+    store while the name still tells an administrator whose it is.
+
+    The workflow-name half is the platform agent name ``create_or_reuse_agent``
+    reuses by, which is what makes it the right key: it survives redeploys — the
+    platform agent ID does NOT (redeploys delete+recreate the agent under a new
+    id, so the previous id-keyed name minted a fresh store on every redeploy and
+    orphaned what the agent had learned) — and a display rename
+    (``registry.agent_set_name``) never touches it. An earlier scheme keyed on the
+    bundle id, which is unique only within a recording (B1, B2 …), so a brand-new
+    workflow inherited an older, unrelated agent's notes.
+
+    ``external_user_id`` comes FIRST so the 100-char clamp can never truncate it
+    away and let two customers collide on one store.
     """
-    slug = re.sub(r"[^a-z0-9]+", "-", (str(agent_id) or "agent").lower()).strip("-")
-    return f"trace-{external_user_id}-{slug or 'agent'}"[:100]
+    uid = name_slug(external_user_id, "user")
+    if not uid.startswith("trace-"):
+        uid = f"trace-{uid}"
+    return f"{uid}-{name_slug(workflow_name, 'agent')}"[:93] + "-memory"
 
 
 def memory_resource(memory_store_id):
@@ -470,6 +491,70 @@ ENVIRONMENT_DEFAULTS = {
     "name": "trace-test-env",
     "config": {"type": "cloud", "networking": {"type": "unrestricted"}},
 }
+
+
+# --- Human-legible platform naming ------------------------------------------
+# Everything Trace creates on Managed Agents is named so an administrator scanning
+# the Console can tell WHOSE it is and WHAT it is at a glance. Sessions, deployments,
+# and environments used to repeat identically across users ("trace-B1", "Trace group
+# message", "trace-test-env"), which made the backend unnavigable once several users
+# were live. Deployment runs inherit the deployment's name, so the owner baked in
+# here is what platform-fired sessions surface too.
+
+def owner_label(*candidates):
+    """The most human-recognizable owner identity available: the first non-empty
+    candidate (typically the account email, then the connection's expected identity,
+    then the stable external user id)."""
+    for c in candidates:
+        c = str(c or "").strip()
+        if c:
+            return c
+    return "unknown-user"
+
+
+def agent_owner(agent):
+    """Owner identity from a registry agent row: the persisted account email when the
+    row carries one (deploys since the naming change), else the stable external user
+    id (``trace-user-<id>``), else the raw owner id — never empty."""
+    a = agent or {}
+    return owner_label(a.get("owner_email"), a.get("external_user_id"),
+                       a.get("owner_user_id"))
+
+
+def _owner_slug(owner):
+    """The owner identity as a name segment. External user ids already start with
+    ``trace-``; drop that so names read ``trace-user-<id>-…``, not ``trace-trace-…``."""
+    s = name_slug(owner)
+    return s[len("trace-"):] if s.startswith("trace-") else s
+
+
+def session_title(purpose, agent_name=None, owner=None):
+    """A run-session title: ``Trace · <owner> · <agent> · <purpose>`` — every part
+    optional but the order fixed, so the Console sorts and scans consistently."""
+    parts = ["Trace", str(owner or "").strip(), str(agent_name or "").strip(),
+             str(purpose or "").strip()]
+    return " · ".join(p for p in parts if p)[:150]
+
+
+def environment_defaults(owner=None, agent_name=None):
+    """Environment create params named for the owner (+ workflow), e.g.
+    ``trace-jane-acme-com-order-intake-env``, so environments stop all being
+    ``trace-test-env``. Falls back to the anonymous default when nothing is known
+    (the founder Test UI path)."""
+    name = "-".join(p for p in ("trace", _owner_slug(owner), name_slug(agent_name),
+                                "env") if p)
+    if name == "trace-env":
+        name = ENVIRONMENT_DEFAULTS["name"]
+    return {"name": name[:100], "config": ENVIRONMENT_DEFAULTS["config"]}
+
+
+def deployment_name(owner, workflow):
+    """A deployment name carrying owner + workflow
+    (``trace-jane-acme-com-order-intake``) instead of the old bundle-id-only
+    ``trace-B1``, which repeated for every user's first workflow and titled every
+    platform-fired run session identically."""
+    return "-".join(p for p in ("trace", _owner_slug(owner),
+                                name_slug(workflow, "agent")) if p)[:100]
 
 # --- P4 — observed application identity -> MCP server entry -----------------
 # Keys are lowercased application-identity substrings matched against the app/window

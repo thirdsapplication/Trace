@@ -769,6 +769,7 @@ class AppState:
                 items.append(it)
         if not items:
             return {"status": "failed", "summary": "Nothing to approve."}
+        agent = self._with_owner(agent)
         self._refresh_agent_binding(agent)
         try:
             client = self._live_client()
@@ -989,6 +990,19 @@ class AppState:
         agent_ids = list(dict.fromkeys(agent_ids))
         deployment_ids = list(dict.fromkeys(deployment_ids))
         memory_store_ids = list(dict.fromkeys(memory_store_ids))
+        # A memory store is reused across redeploys of its workflow (keyed on user +
+        # workflow name), so a re-recorded workflow's NEW agent can mount the store
+        # this session's deploy created: never delete a store that a registered agent
+        # from ANOTHER capture session still uses.
+        if memory_store_ids:
+            try:
+                keep = {a.get("memory_store_id")
+                        for a in registry.agents_all(self.sessions_root)
+                        if a.get("memory_store_id") and a.get("session_id") != sid}
+            except Exception:                              # noqa: BLE001 — deletion is the risky path,
+                keep = None                                # so an unknown registry state skips it
+            memory_store_ids = ([m for m in memory_store_ids if m not in keep]
+                                if keep is not None else [])
         kw = {}
         if deployment_ids:
             kw["deployment_ids"] = deployment_ids
@@ -1191,6 +1205,17 @@ class AppState:
             try:
                 eligible, _, conn = self._deploy_eligible(sid)
                 conn, bind_errors = self._refresh_stale_bindings(sid, conn)  # WS5 + URL migration
+                # The deploy names everything it creates (deployment, environment,
+                # memory store) for the OWNER — hand it the account email when the
+                # session has one. Transient enrichment; the record on disk keeps its
+                # shape for sessions without an owner (the founder Test UI).
+                owner_uid = (sessions.read_meta(root, sid) or {}).get("owner_user_id")
+                if owner_uid and not (conn or {}).get("owner_email"):
+                    try:
+                        conn = {**(conn or {}),
+                                "owner_email": (users.get_user(owner_uid) or {}).get("email")}
+                    except Exception:                      # noqa: BLE001 — naming must never block a deploy
+                        pass
                 if bind_errors:
                     # visible on the deploy job — a rebind failure usually means the
                     # per-bundle deploys below will fail their binding check too
@@ -1210,7 +1235,7 @@ class AppState:
                         # so a re-run adds to the user's agent set without clobbering
                         # prior agents, and schedules/activity have something to key on.
                         if rec.get("status") == "live" and rec.get("agent_id"):
-                            owner = (sessions.read_meta(root, sid) or {}).get("owner_user_id")
+                            owner = owner_uid
                             if owner:
                                 # A redeploy deleted+recreated the agent, stranding any
                                 # prior deployment — archive it so the Console stays clean.
@@ -1236,6 +1261,9 @@ class AppState:
                                     "staged_apps": rec.get("staged_apps") or [],
                                     "deployment_id": rec.get("deployment_id"),
                                     "memory_store_id": rec.get("memory_store_id"),
+                                    # the owner identity every later session/
+                                    # environment/deployment is named with
+                                    "owner_email": rec.get("owner_email"),
                                     # the worker's review-step correction is the truer bio
                                     "description": b.get("user_description")
                                                    or b.get("description") or ""})
@@ -1426,6 +1454,21 @@ class AppState:
             self._agent_dm(agent, f"My last run hit a problem: {rec['summary']}")
         return rec
 
+    def _with_owner(self, agent):
+        """The agent row + a resolved ``owner_email``, so every session, environment,
+        and deployment created for it is named for the user. Rows deployed since the
+        naming change persist the email; older rows get a best-effort users lookup,
+        and when neither works the naming helpers fall back to the stable
+        external_user_id — never anonymous."""
+        if agent and not agent.get("owner_email"):
+            try:
+                email = (users.get_user(agent.get("owner_user_id") or "") or {}).get("email")
+            except Exception:                              # noqa: BLE001 — naming must never block a run
+                email = None
+            if email:
+                agent = {**agent, "owner_email": email}
+        return agent
+
     # --- Instagram-style "My agents": DMs + home feed ---------------------
     def _agent_dm(self, agent, text):
         """Record a proactive message FROM the agent to its owner (failed runs,
@@ -1462,10 +1505,13 @@ class AppState:
                     for m in history[:-1][-8:]) or "(no prior messages)"
                 instruction = (agent_config.CHAT_DIRECTIVE
                                .replace("{context}", context).replace("{text}", text))
-                env = client.create_environment()
+                named = self._with_owner(agent)
+                who, agent_name = agent_config.agent_owner(named), named.get("name") or aid
+                env = client.create_environment(
+                    agent_config.environment_defaults(who, agent_name))
                 sid = client.create_session(
                     aid, env, resources=agent_runner._memory_resources(agent),
-                    title="Trace direct message",
+                    title=agent_config.session_title("direct message", agent_name, who),
                     vault_ids=[agent["vault_ref"]] if agent.get("vault_ref") else None)
                 events = client.send_trigger_and_collect(sid, instruction)
                 reply = (agent_runner._final_text(events) or "").strip()
@@ -1627,10 +1673,13 @@ class AppState:
         trigger = agent_runner._staging_trigger(directive, staged_apps) if staged_apps else directive
         try:
             client = self._live_client()
-            env = client.create_environment()
+            named = self._with_owner(agent)
+            who, agent_name = agent_config.agent_owner(named), named.get("name") or aid
+            env = client.create_environment(
+                agent_config.environment_defaults(who, agent_name))
             sid = client.create_session(
                 aid, env, resources=agent_runner._memory_resources(agent),
-                title="Trace group message",
+                title=agent_config.session_title("group message", agent_name, who),
                 vault_ids=[agent["vault_ref"]] if agent.get("vault_ref") else None)
             events = client.send_trigger_and_collect(sid, trigger)
         except Exception:                                  # noqa: BLE001
@@ -1758,10 +1807,14 @@ class AppState:
                 agent.get("trigger"), [s for s in (agent.get("staged_apps") or []) if s],
                 rejected=self._rejected_for(agent))
             store_id = agent.get("memory_store_id")
+            named = self._with_owner(agent)
+            who = agent_config.agent_owner(named)
+            workflow = named.get("name") or named.get("bundle_id") or aid
             new_id = client.create_deployment(       # create BEFORE archive
-                name=f"trace-{agent.get('bundle_id') or aid}",
+                name=agent_config.deployment_name(who, workflow),
                 agent_id=aid,
-                environment_id=client.create_environment(),
+                environment_id=client.create_environment(
+                    agent_config.environment_defaults(who, workflow)),
                 trigger_text=trigger_text,
                 schedule=agent_config.cadence_to_cron(cadence) if cadence else None,
                 resources=[agent_config.memory_resource(store_id)] if store_id else None,
@@ -1830,6 +1883,7 @@ class AppState:
         advance its last_run. Reuses the Deployer's run path via agent_runner; a
         missing key / platform error is recorded as a failed run, never raised.
         ``resume`` (Gap #3) seeds the run with a prior paused question + human answer."""
+        agent = self._with_owner(agent)      # run sessions/environments named for the user
         self._refresh_agent_binding(agent)   # WS5: fresh Pipedream token before the run
         guidance = self._retrieve_guidance(agent)   # Gap #3 B4: lessons from past decisions
         rejected = self._rejected_for(agent)        # don't re-propose what was turned down
@@ -1898,6 +1952,7 @@ class AppState:
         if not agent:
             registry.pending_set_status(self.sessions_root, item.get("id"), "failed")
             return {"status": "failed", "summary": "The agent is no longer available."}
+        agent = self._with_owner(agent)
         self._refresh_agent_binding(agent)
         try:
             client = self._live_client()

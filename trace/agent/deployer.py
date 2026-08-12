@@ -90,7 +90,8 @@ def run_test(bundle, spec_md, env_record, event_log, test_envelope_dict, client,
     sessions_out, records = [], []
     for t in triggers:
         sid = client.create_session(agent_id, environment_id, resources,
-                                    title=f"Trace run — {bundle.get('id')}")
+                                    title=config.session_title(
+                                        f"test run {bundle.get('id')}", agent_name))
 
         try:
             events = client.send_trigger_and_collect(sid, t["message"])  # only the trigger
