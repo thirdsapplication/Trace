@@ -2157,6 +2157,15 @@ function renderInterview(sid, data) {
   // and no way to tell whose questions you were answering.
   const allIds = data.approved_ids || Object.keys(interviews);
   const ids = allIds.filter(bid => ((interviews[bid] || {}).questions || []).length);
+  // Rules already set on a previous pass, so coming back doesn't silently reset them.
+  const priorRules = (() => {
+    for (const bid of allIds) {
+      const hit = ((interviews[bid] || {}).answers || [])
+        .find(a => a.q === SAFETY_RULES_ID && String(a.answer || "").trim());
+      if (hit) return hit.answer;
+    }
+    return "";
+  })();
   const nameOf = (bid) => (data.names && data.names[bid]) || bid;
   let page = 0;
   const blocks = ids.map(bid => {
@@ -2273,17 +2282,131 @@ function renderInterview(sid, data) {
         throw new Error((r.data && r.data.error) || "answers didn't save — try again");
       }
     }
+    return byB;                 // the safety net re-posts these alongside its rules
   };
   $("#ivGo").onclick = async () => {
     if (page < ids.length - 1) { page += 1; showPage(); return; }   // next workflow
     $("#ivGo").disabled = true; $("#ivGo").textContent = "Saving…";
     try {
-      await saveAll();                        // every page's answers, in one pass
+      const saved = await saveAll();          // every page's answers, in one pass
       await refreshSession();                 // pick up interview_complete_at
-      goStep(4);
+      // Step 4½ (10) sits between the questions and the build.
+      renderSafetyNet(sid, allIds, saved, priorRules);
     } catch (e) {
       const m = $("#ivMsg"); m.className = "msg err"; m.textContent = friendly(e.message);
       $("#ivGo").textContent = "Save & continue"; updateGo();
+    }
+  };
+}
+
+/* ---------------- 04½ SAFETY NET (10) ---------------- */
+
+// The rules that make an agent stop mid-run and come get you. Frame 16 is the other end
+// of this screen: when one fires, the run halts and the card names the rule that stopped
+// it — "STOPPED — YOUR RULE: NUMBERS THAT LOOK WRONG".
+//
+// Outbound is first and has no switch on purpose. It is the promise the whole product
+// rests on, and a toggle would imply it is negotiable.
+// Mirrors SAFETY_RULES_ID in app.py — the reserved answer key the rules ride in on.
+const SAFETY_RULES_ID = "safety_rules";
+
+const SAFETY_RULES = [
+  { id: "outbound", locked: true, title: "Anything outbound — always",
+    sub: "Emails, sheet edits, uploads are staged for your approval. Can't be turned off." },
+  { id: "new_party", on: true, title: "Someone new",
+    sub: "A contact, portal, or file it hasn't touched before" },
+  { id: "odd_numbers", on: true, title: "Numbers that look wrong",
+    sub: "Off by more than <b>20%</b> from the usual pattern" },
+  { id: "low_confidence", on: true, title: "Low confidence",
+    sub: "Not at least 90% sure what you'd do — asks instead of guessing" },
+];
+
+// Rules are stored per bundle as one reserved interview answer, so they travel to the
+// agent config on the path answers already use. Rendered back as a sentence because that
+// is what the config consumes — a list of conditions in the worker's own terms.
+function safetyRulesText(on, own) {
+  const lines = SAFETY_RULES.filter(r => r.locked || on[r.id])
+    .map(r => "- " + r.title.replace(" — always", "") + ": "
+              + r.sub.replace(/<[^>]+>/g, "").replace(/\.$/, ""));
+  if (own.trim()) lines.push("- " + own.trim());
+  return "Stop and ask me when any of these is true:\n" + lines.join("\n");
+}
+
+// `saved` is the answers map the interview just posted, keyed by bundle. It has to be
+// re-sent with the rules: save_interview REBUILDS a bundle's answer list from whatever it
+// is given, so posting the rules alone would drop every question answer and drop the
+// bundle back out of "complete", which is the gate the build step stands on.
+function renderSafetyNet(sid, ids, saved, prior) {
+  clearTimers();
+  const on = {};
+  SAFETY_RULES.forEach(r => { if (!r.locked) on[r.id] = r.on !== false; });
+  let own = "";
+  // Coming back to this screen keeps what you set: the stored sentence lists each rule it
+  // kept, so a rule missing from it was one you switched off.
+  if (prior) {
+    SAFETY_RULES.forEach(r => {
+      if (!r.locked) on[r.id] = prior.includes(r.title.replace(" — always", ""));
+    });
+  }
+
+  const row = (r) => r.locked
+    ? `<div class="sn-row">
+         <div class="sn-mid"><div class="sn-title">${r.title}</div><div class="sn-sub">${r.sub}</div></div>
+         <span class="sn-built">BUILT IN</span>
+       </div>`
+    : `<button class="sn-row sn-toggle" data-rule="${r.id}" aria-pressed="${on[r.id]}">
+         <div class="sn-mid"><div class="sn-title">${r.title}</div><div class="sn-sub">${r.sub}</div></div>
+         <span class="tgl${on[r.id] ? " on" : ""}"><i></i></span>
+       </button>`;
+
+  shell(`
+    <div class="sn-stage">
+      <div class="eyebrow">Last one — the safety net</div>
+      <h1 class="sn-head">When should your agents stop and come get you?</h1>
+      <p class="sn-lead">Applies to every agent. Tighten or loosen per agent later, from its profile.</p>
+      <div class="sn-list">
+        ${SAFETY_RULES.map(row).join("")}
+        <button class="sn-add" id="snAdd">+ Add your own — <span>"stop for anything about pricing"</span></button>
+        <div class="sn-own" id="snOwnWrap" hidden>
+          <textarea id="snOwn" rows="2" placeholder="In your words: stop for anything about pricing"></textarea>
+        </div>
+      </div>
+      <p id="snMsg" class="msg err"></p>
+      <div class="sn-acts">
+        <button id="snGo" class="btn-primary">Save &amp; build my agents</button>
+      </div>
+    </div>`);
+
+  root.querySelectorAll(".sn-toggle").forEach(b => b.onclick = () => {
+    const id = b.dataset.rule;
+    on[id] = !on[id];
+    b.setAttribute("aria-pressed", String(on[id]));
+    b.querySelector(".tgl").classList.toggle("on", on[id]);
+  });
+  const wrap = $("#snOwnWrap");
+  $("#snAdd").onclick = () => {
+    wrap.hidden = false;
+    $("#snAdd").hidden = true;
+    $("#snOwn").focus();
+  };
+  $("#snGo").onclick = async () => {
+    const btn = $("#snGo");
+    btn.disabled = true; btn.textContent = "Saving…";
+    own = ($("#snOwn") && $("#snOwn").value) || "";
+    try {
+      // One save per workflow: the rules are per-agent from here on, so each agent's
+      // config carries its own copy and can be loosened later without touching the rest.
+      const text = safetyRulesText(on, own);
+      for (const bid of ids) {
+        const answers = Object.assign({}, (saved || {})[bid], { [SAFETY_RULES_ID]: text });
+        const r = await upost(sid, `/interview/${bid}`, { answers });
+        if (!r.ok) throw new Error((r.data && r.data.error) || "couldn't save the rules");
+      }
+      await refreshSession();
+      goStep(4);
+    } catch (e) {
+      $("#snMsg").textContent = friendly(e.message);
+      btn.disabled = false; btn.textContent = "Save & build my agents";
     }
   };
 }

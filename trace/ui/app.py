@@ -82,6 +82,13 @@ def _write_text(path, text):
 EXTRA_NOTES_ID = "extra_notes"
 EXTRA_NOTES_LABEL = "Anything else we should know about this workflow?"
 
+# The safety net (frame 10): when an agent should stop mid-run and come get you. Rides the
+# SAME reserved-answer path as the note above, for the same reason — it reaches the agent
+# config through configgen._load_answers with no plumbing of its own, and no new table.
+# Set once for every approved workflow, then tightened per agent from its profile later.
+SAFETY_RULES_ID = "safety_rules"
+SAFETY_RULES_LABEL = "When should this agent stop and come get you?"
+
 
 def _interview_record(bid, questions, answers):
     """Assemble an interview record, computing unresolved + status server-side.
@@ -827,7 +834,7 @@ class AppState:
                     # the free-text note isn't tied to any question, so regenerating the
                     # questions must not throw it away
                     answers += [a for a in (prior.get("answers") or [])
-                                if a.get("q") == EXTRA_NOTES_ID
+                                if a.get("q") in (EXTRA_NOTES_ID, SAFETY_RULES_ID)
                                 and str(a.get("answer", "")).strip()]
                     rec = _interview_record(b["id"], questions, answers)
                     _write_json(sessions.path(root, sid, sessions.interview_filename(b["id"])), rec)
@@ -882,6 +889,10 @@ class AppState:
         if extra:                                      # free-text: optional, never gating
             answers.append({"q": EXTRA_NOTES_ID, "question": EXTRA_NOTES_LABEL,
                             "answer": extra})
+        rules = str((answers_map or {}).get(SAFETY_RULES_ID, "") or "").strip()
+        if rules:                                      # frame 10: same shape, same rules
+            answers.append({"q": SAFETY_RULES_ID, "question": SAFETY_RULES_LABEL,
+                            "answer": rules})
         rec = _interview_record(bid, questions, answers)
         _write_json(sessions.path(self.sessions_root, sid, sessions.interview_filename(bid)), rec)
         self._sync_interview_complete(sid)

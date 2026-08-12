@@ -294,6 +294,34 @@ input:focus, textarea:focus { outline: none; border-color: var(--accent); backgr
 .pw-show { position: absolute; right: 12px; background: none; border: none; padding: 0;
   font-size: 12px; font-weight: 600; color: var(--accent); cursor: pointer; }
 
+/* safety net (10): the rules that stop a run and come get you. Outbound sits first and
+   carries a BUILT IN pill instead of a switch — it is the promise the product rests on,
+   and a toggle would imply it were negotiable. */
+.sn-stage { display: flex; flex-direction: column; gap: 14px; min-height: 560px; }
+.sn-head { font-family: var(--display); font-weight: 800; font-size: 23px;
+  letter-spacing: -0.02em; line-height: 1.2; margin: 0; }
+.sn-lead { font-size: 13px; color: var(--ink-2); line-height: 1.55; margin: 0; }
+.sn-list { display: flex; flex-direction: column; gap: 9px; padding-top: 2px; }
+.sn-row { width: 100%; background: var(--panel); border: 1px solid var(--line-2);
+  border-radius: 13px; padding: 13px 16px; display: flex; align-items: center; gap: 13px;
+  text-align: left; }
+button.sn-row { cursor: pointer; }
+button.sn-row:hover { border-color: var(--line); }
+.sn-mid { flex: 1; min-width: 0; }
+.sn-title { font-weight: 700; font-size: 13.5px; }
+.sn-sub { font-size: 12px; color: var(--ink-3); }
+.sn-sub b { color: var(--ink); }
+.sn-built { font-size: 10.5px; font-weight: 700; letter-spacing: .08em; color: var(--accent);
+  background: var(--accent-pill); border-radius: 999px; padding: 4px 10px; flex: none; }
+.sn-add { width: 100%; border: 1.5px dashed #C9D0E2; border-radius: 13px; padding: 13px 16px;
+  font-size: 13px; color: var(--ink-3); background: none; cursor: pointer; text-align: left; }
+.sn-add span { color: var(--ink-2); }
+.sn-add:hover { border-color: var(--accent); color: var(--accent); }
+.sn-own[hidden] { display: none; }
+.sn-own textarea { width: 100%; }
+.sn-acts { margin-top: auto; display: flex; justify-content: flex-end; }
+.sn-acts .btn-primary { font-size: 13.5px; border-radius: 11px; padding: 12px 26px; }
+
 /* interview (09): one pill per agent, so the whole interview is visible rather than just
    the page you're on. Not interactive — Continue is gated per page. */
 .iv-head { display: flex; flex-direction: column; gap: 9px; margin-bottom: 18px; }

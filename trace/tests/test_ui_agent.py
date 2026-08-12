@@ -233,6 +233,33 @@ class UIChainTest(unittest.TestCase):
         code, body = self.req("POST", f"/api/sessions/{self.sid}/build", {})
         self.assertEqual((code, body["error"]), (400, "interview_incomplete"))
 
+    def test_safety_rules_ride_the_reserved_answer_and_survive_regeneration(self):
+        """Frame 10's rules store as a reserved interview answer, like extra_notes.
+
+        Two things have to hold. They must not count as a question — a bundle stays
+        'complete' with them and gates nothing. And regenerating the questions must not
+        throw them away: the worker set them once for every agent, and re-reviewing a
+        workflow is not a reason to silently drop the conditions under which that agent
+        stops and asks. The same guarantee extra_notes already has.
+        """
+        rules = "Stop and ask me when any of these is true:\n- Someone new: a contact it hasn't touched"
+        code, body = self._interview_and_answer(
+            {"q1": "a", "q2": "b", "safety_rules": rules})
+        self.assertEqual(code, 200)
+        self.assertEqual(body["status"], "complete")          # never gates
+        saved = {a["q"]: a["answer"] for a in body["answers"]}
+        self.assertEqual(saved.get("safety_rules"), rules)
+        self.assertNotIn("safety_rules", body["unresolved"])
+
+        # regenerate the questions; the rules must still be there afterwards
+        code, _ = self.req("POST", f"/api/sessions/{self.sid}/interview", {})
+        self.assertEqual(code, 202)
+        self.assertEqual(self._await("interview")["state"], "done")
+        rec = sessions.read_json_artifact(
+            self.root, self.sid, sessions.interview_filename("B1"))
+        kept = {a["q"]: a["answer"] for a in rec["answers"]}
+        self.assertEqual(kept.get("safety_rules"), rules)
+
     def test_interview_vacuously_complete_with_zero_approved(self):
         reviewed = json.loads(json.dumps(REVIEWED))
         reviewed["bundles"][0]["disposition"] = "reject"
