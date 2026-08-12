@@ -56,6 +56,21 @@ a:hover { color: #2447C4; }
   50%,86% { opacity: 1; transform: translateY(0); } 96%,100% { opacity: 0; } }
 
 
+/* --- stopped run (16) --- */
+.stop-card { background: var(--panel); border: 1.5px solid var(--alert); border-radius: 14px;
+  padding: 16px 18px; display: flex; flex-direction: column; gap: 10px; margin-top: 8px; }
+.stop-label { font-size: 11px; font-weight: 700; letter-spacing: .1em; color: var(--danger); }
+.stop-q { font-weight: 700; font-size: 14.5px; line-height: 1.4; }
+.stop-ctx { font-size: 12.5px; color: var(--ink-2); line-height: 1.55; }
+.stop-note { font-size: 12px; color: var(--ink-3); }
+.chip-row { display: flex; gap: 8px; flex-wrap: wrap; }
+.chip { border: 1.5px solid var(--accent); color: var(--accent); background: #fff;
+  font-weight: 600; font-size: 12.5px; border-radius: 999px; padding: 7px 14px;
+  cursor: pointer; }
+.chip:hover { background: var(--accent-bg); }
+.chip-quiet { border-color: var(--line); color: var(--ink-2); }
+.chip-quiet:hover { background: var(--inset); }
+
 /* --- profile: tabs, pencil, identity popover (19, 21) --- */
 .pencil { width: 26px; height: 26px; border-radius: 8px; background: var(--accent-pill);
   color: var(--accent); border: none; cursor: pointer; font-size: 13px; padding: 0;

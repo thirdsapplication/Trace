@@ -398,18 +398,33 @@ async function autoApproveApp(agentId, app) {
 // Gap #3: a card for a question the agent paused on — context, quick-pick options, and a
 // free-text answer. Answering auto-immediately resumes the run.
 function decisionCard(d) {
+  // The stopped-run card (16): the agent paused mid-run against one of your rules. Coral
+  // border and rule label so it reads as "stopped", the question in full weight, answers
+  // as chips, and the promise that answering resumes it — this is the moment the
+  // human-in-the-loop loop is actually visible, so it should not look like a form field.
   const opts = (d.options || []).map(o =>
-    `<button class="btn-secondary btn-sm dec-opt" data-id="${esc(d.id)}" data-val="${esc(o)}">${esc(o)}</button>`).join(" ");
-  return `<div class="card dec-card" style="margin-top:8px;border-left:3px solid var(--accent,#5b8def);">
-    <div class="row" style="gap:8px;"><span class="pill pill-warn">needs you</span>
-      <div class="title" style="font-size:14px;flex:1;">${esc(d.question || "Needs your input")}</div></div>
-    ${d.context ? `<div class="sub" style="margin-top:4px;"><span class="muted">Context:</span> ${esc(d.context)}</div>` : ""}
-    ${opts ? `<div class="row" style="gap:6px;margin-top:8px;flex-wrap:wrap;">${opts}</div>` : ""}
-    <div class="row" style="gap:6px;margin-top:8px;">
+    `<button class="chip dec-opt" data-id="${esc(d.id)}" data-val="${esc(o)}">${esc(o)}</button>`).join("");
+  const rule = (d.rule || "").trim();
+  return `<div class="stop-card">
+    <div class="stop-label">STOPPED${rule ? ` — YOUR RULE: "${esc(rule.toUpperCase())}"` : ""}</div>
+    <div class="stop-q">${esc(d.question || "Needs your input")}</div>
+    ${d.context ? `<div class="stop-ctx">${esc(d.context)}</div>` : ""}
+    ${opts ? `<div class="chip-row">${opts}<button class="chip chip-quiet dec-explain" data-id="${esc(d.id)}">Let me explain…</button></div>` : ""}
+    <div class="row dec-free" data-id="${esc(d.id)}"${opts ? ' hidden' : ''} style="gap:6px;">
       <input type="text" class="dec-answer" data-id="${esc(d.id)}" placeholder="Type your answer…" style="flex:1;">
-      <button class="btn-accent btn-sm dec-submit" data-id="${esc(d.id)}">Answer &amp; continue</button>
+      <button class="btn-accent btn-sm dec-submit" data-id="${esc(d.id)}">Answer</button>
     </div>
+    <div class="stop-note">Answering resumes the run instantly · your answer becomes a lesson it remembers</div>
   </div>`;
+}
+
+// "Let me explain…" reveals the free-text row rather than replacing the chips, so a
+// considered answer and a one-tap answer are the same interaction.
+function wireDecisionCards(scope) {
+  (scope || document).querySelectorAll(".dec-explain").forEach(b => b.onclick = () => {
+    const row = (scope || document).querySelector(`.dec-free[data-id="${b.dataset.id}"]`);
+    if (row) { row.hidden = false; const i = row.querySelector("input"); if (i) i.focus(); }
+  });
 }
 
 // POST an answer; the server records it and auto-resumes the agent. Returns true on send.
@@ -838,7 +853,9 @@ function renderReview(agentId, startAt) {
       if (fresh && fresh.stories.length) renderReview(agentId, Math.min(i, fresh.stories.length - 1));
       else close();
     }, 3500));
-    root.querySelectorAll(".dec-opt").forEach(b => b.onclick = async () => {
+    wireDecisionCards(root);
+    wireDecisionCards(root);
+  root.querySelectorAll(".dec-opt").forEach(b => b.onclick = async () => {
       if (await answerDecision(b.dataset.id, b.dataset.val)) { await markReviewed(st); afterAnswer(); }
     });
     root.querySelectorAll(".dec-submit").forEach(b => b.onclick = async () => {
@@ -1230,6 +1247,7 @@ async function renderProfile(agentId) {
   });
   const refreshAfterAnswer = () =>
     S._timers.push(setTimeout(() => { S.igHome = null; renderProfile(agentId); }, 4000));
+  wireDecisionCards(root);
   root.querySelectorAll(".dec-opt").forEach(b => b.onclick = async () => {
     if (await answerDecision(b.dataset.id, b.dataset.val)) refreshAfterAnswer();
   });
