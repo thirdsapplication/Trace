@@ -941,6 +941,82 @@ async function renderThread(agentId) {
 }
 
 /* ---------------- AGENT PROFILE: bio + controls + session-history log ------ */
+
+/* ---------------- identity popover (19) ---------------- */
+// Five core shades, then 20 extended (4 per family) behind "More shades" — same five
+// families, so a crowded team never drifts into a rainbow. A shade already in use shows
+// its owner's initial, making a twin a choice rather than an accident (§4).
+const EXTENDED_SHADES = [
+  "#FFB3A6", "#FF8A73", "#E04A38", "#B33A2B",
+  "#FFE49A", "#FFD966", "#E0A818", "#A87F12",
+  "#A8E0BC", "#7BD097", "#2E8F50", "#1F6B3A",
+  "#D9CCF6", "#C3AFF0", "#8465CC", "#64489F",
+  "#A9BDFB", "#7B98F9", "#2447C4", "#1A3390",
+];
+
+function openIdentityPopover(agent, agentId) {
+  const taken = {};                                  // color -> another agent's initial
+  ((S.igHome && S.igHome.agents) || []).forEach(x => {
+    if (x.agent_id !== agentId && x.color) taken[String(x.color).toUpperCase()] = (x.name || "?").charAt(0).toUpperCase();
+  });
+  const chosen = { color: agentColor(agent) };
+  const swatch = (c) => {
+    const who = taken[c.toUpperCase()];
+    const on = c.toUpperCase() === String(chosen.color).toUpperCase();
+    return `<button class="sw${on ? " on" : ""}" data-color="${esc(c)}"
+      style="background:${esc(c)};${who ? "opacity:.35;" : ""}">${
+        who ? `<span class="sw-who">${esc(who)}</span>` : ""}</button>`;
+  };
+  const el = document.createElement("div");
+  el.className = "pop-back";
+  el.innerHTML = `<div class="pop">
+      <div class="row" style="gap:12px;">
+        ${avatar(agent.name, 52)}
+        <div class="pop-title">Edit agent</div>
+        <button class="pop-x" title="Close">✕</button>
+      </div>
+      <div class="field"><span class="label">Name</span>
+        <input id="popName" type="text" maxlength="80" value="${esc(agent.name || "")}"></div>
+      <div class="field"><span class="label">Color</span>
+        <div class="sw-row">${CORE_AGENT_COLORS.map(swatch).join("")}</div>
+        <button class="btn-link" id="popMore" style="padding-left:0;">More shades ▾</button>
+        <div class="sw-row" id="popExt" hidden>${EXTENDED_SHADES.map(swatch).join("")}</div>
+      </div>
+      <div class="row" style="gap:9px;">
+        <button class="btn-accent" id="popSave" style="flex:1;">Save</button>
+        <button class="btn-secondary" id="popCancel">Cancel</button>
+      </div>
+      <p class="pop-note">Changing the color recolors this agent everywhere — avatar, chat
+        bubbles, badges. A shade showing an initial is already another agent's.</p>
+    </div>`;
+  document.body.appendChild(el);
+  const close = () => el.remove();
+  el.onclick = (e) => { if (e.target === el) close(); };
+  el.querySelector(".pop-x").onclick = close;
+  el.querySelector("#popCancel").onclick = close;
+  el.querySelector("#popMore").onclick = () => {
+    const ext = el.querySelector("#popExt");
+    ext.hidden = !ext.hidden;
+    el.querySelector("#popMore").textContent = ext.hidden ? "More shades ▾" : "Fewer shades ▴";
+  };
+  el.querySelectorAll(".sw").forEach(b => b.onclick = () => {
+    chosen.color = b.dataset.color;
+    el.querySelectorAll(".sw").forEach(o => o.classList.toggle("on", o === b));
+  });
+  el.querySelector("#popSave").onclick = async () => {
+    const save = el.querySelector("#popSave");
+    save.disabled = true; save.textContent = "Saving…";
+    const name = (el.querySelector("#popName").value || "").trim();
+    try {
+      if (name && name !== agent.name) await api("POST", `/api/u/agents/${agentId}/name`, { name });
+      if (chosen.color !== agent.color) await api("POST", `/api/u/agents/${agentId}/color`, { color: chosen.color });
+      S.igHome = null;
+      close();
+      renderProfile(agentId);                        // recolor applies everywhere at once
+    } catch (e) { save.disabled = false; save.textContent = "Couldn't save"; }
+  };
+}
+
 async function renderProfile(agentId) {
   clearTimers();
   const home = S.igHome || await loadHome();
@@ -957,6 +1033,7 @@ async function renderProfile(agentId) {
         ${avatar(name, 64)}
         <div style="flex:1;">
           <div class="row" style="gap:10px;"><h2 id="pTitle" style="margin:0;">${esc(name)}</h2>
+            <button id="pEdit" class="pencil" title="Rename or recolor">✎</button>
             <span class="pill ${paused ? "pill-warn" : "pill-on"}">${paused ? "PAUSED" : "LIVE"}</span></div>
           <p class="ag-bio wrap" style="margin:6px 0 0;">${esc(a.description || ("Runs when: " + (a.trigger || "you say so")))}</p>
           <p class="sub muted" style="margin-top:4px;"><span id="pStats">…</span>${a.deployed_at ? ` · live since ${esc(ago(a.deployed_at))}` : ""}</p>
@@ -969,20 +1046,9 @@ async function renderProfile(agentId) {
         <select class="sched" id="pSched">${opts}</select>
         ${sched ? `<button class="btn-secondary btn-sm" id="pPause">${paused ? "Resume" : "Pause"}</button>` : ""}
       </div>
-      <div class="row" style="margin-top:14px;gap:8px;align-items:center;flex-wrap:wrap;">
-        <span class="label">Name</span>
-        <input id="pName" type="text" value="${esc(a.name || "")}" maxlength="80"
-               style="flex:1;min-width:180px;" />
-        <button class="btn-secondary btn-sm" id="pNameSave">Save</button>
-      </div>
-      <div class="row" style="margin-top:10px;gap:8px;align-items:center;flex-wrap:wrap;">
-        <span class="label">Color</span>
-        ${AGENT_COLORS.map(c => `
-          <button class="ag-swatch" data-color="${esc(c)}" title="${esc(c)}"
-                  style="width:20px;height:20px;border-radius:50%;background:${esc(c)};
-                         border:${c.toLowerCase() === String(a.color || "").toLowerCase()
-                                   ? "2px solid var(--fg,#111)" : "1px solid rgba(0,0,0,.15)"};
-                         cursor:pointer;padding:0;"></button>`).join("")}
+      <div class="tabs" id="pTabs">
+        ${["Overview", "Rules", "Lessons", "History"].map((t, n) =>
+          `<button class="tab${n === 0 ? " on" : ""}" data-pane="${t.toLowerCase()}">${t}</button>`).join("")}
       </div>
       <div class="row" style="margin-top:12px;">
         ${a.capture_present
@@ -991,13 +1057,13 @@ async function renderProfile(agentId) {
       </div>
     </div>
     ${(a.lesson_confirmations && a.lesson_confirmations.length) ? `
-    <div class="panel">
+    <div class="panel" data-pane="lessons">
       <h2>Shared lessons to confirm</h2>
       <p class="sub muted" style="margin-top:2px;">Lessons a similar agent learned. Confirm one and this agent applies it on its own from then on; dismiss and it won't come back.</p>
       <div style="margin-top:10px;">${a.lesson_confirmations.map(c => lessonConfirmCard(agentId, c)).join("")}</div>
     </div>` : ""}
     ${(a.active_lessons && a.active_lessons.length) ? `
-    <div class="panel">
+    <div class="panel" data-pane="lessons">
       <h2>Active shared lessons</h2>
       <p class="sub muted" style="margin-top:2px;">Lessons this agent applies automatically. Retire one to stop it.</p>
       <div style="margin-top:10px;">${a.active_lessons.map(c => `
@@ -1041,40 +1107,29 @@ async function renderProfile(agentId) {
     await api("POST", `/api/u/agents/${agentId}/schedule/pause`, { paused: !paused });
     S.igHome = null; renderProfile(agentId);
   };
-  // Both of these update the page IN PLACE. Re-rendering the profile would refetch the
-  // activity log (session summaries), which is far too slow for picking a colour.
-  // S.igHome is dropped so the home list shows the new value next time it loads.
-  const nameSave = $("#pNameSave");
-  if (nameSave) nameSave.onclick = async () => {
-    const newName = ($("#pName").value || "").trim();
-    if (!newName) return;
-    nameSave.disabled = true; nameSave.textContent = "Saving…";
-    try {
-      await api("POST", `/api/u/agents/${agentId}/name`, { name: newName });
-      const title = $("#pTitle");
-      if (title) title.textContent = newName;
-      S.igHome = null;
-      nameSave.textContent = "Saved";
-    } catch (e) {
-      nameSave.textContent = "Couldn't save";
-    }
-    setTimeout(() => { nameSave.disabled = false; nameSave.textContent = "Save"; }, 1200);
+  // Identity lives in one popover now (frame 19), reached from the pencil in the header —
+  // §4 retires the inline name/color rows. Applying a change updates the page in place:
+  // re-rendering the profile would refetch the activity log, which is far too slow for
+  // picking a color.
+  const pe = $("#pEdit");
+  if (pe) pe.onclick = () => openIdentityPopover(a, agentId);
+
+  // Tabs (21). Panels are assigned to a pane; anything untagged belongs to Overview, so
+  // a panel added later shows up rather than vanishing.
+  const panes = () => Array.from(root.querySelectorAll(".panel[data-pane], .panel"));
+  const showPane = (want) => {
+    root.querySelectorAll(".panel").forEach((el, idx) => {
+      if (idx === 0) return;                        // the header panel is always visible
+      const pane = el.dataset.pane || "overview";
+      el.style.display = (pane === want) ? "" : "none";
+    });
+    root.querySelectorAll("#pTabs .tab").forEach(t =>
+      t.classList.toggle("on", t.dataset.pane === want));
   };
-  const swatches = Array.from(document.querySelectorAll(".ag-swatch"));
-  swatches.forEach(sw => {
-    sw.onclick = async () => {
-      const chosen = sw.dataset.color;
-      swatches.forEach(o => {                       // optimistic: show the pick at once
-        o.style.border = (o === sw) ? "2px solid var(--fg,#111)" : "1px solid rgba(0,0,0,.15)";
-      });
-      try {
-        await api("POST", `/api/u/agents/${agentId}/color`, { color: chosen });
-        S.igHome = null;
-      } catch (e) {
-        swatches.forEach(o => { o.style.border = "1px solid rgba(0,0,0,.15)"; });
-      }
-    };
-  });
+  root.querySelectorAll("#pTabs .tab").forEach(t =>
+    t.onclick = () => showPane(t.dataset.pane));
+  showPane("overview");
+
   const dc = $("#pDelCap");
   if (dc) dc.onclick = async () => {
     if (!confirm("Delete all recorded data for this workflow from your device and the cloud? Your agent keeps running. This can't be undone.")) return;
