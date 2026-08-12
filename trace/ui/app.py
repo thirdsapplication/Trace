@@ -1748,7 +1748,8 @@ class AppState:
                 if a.get("agent_id") == aid), agent)
             old_id = current.get("deployment_id") or old_id
             trigger_text = agent_deploy.build_deployment_trigger(
-                agent.get("trigger"), [s for s in (agent.get("staged_apps") or []) if s])
+                agent.get("trigger"), [s for s in (agent.get("staged_apps") or []) if s],
+                rejected=self._rejected_for(agent))
             store_id = agent.get("memory_store_id")
             new_id = client.create_deployment(       # create BEFORE archive
                 name=f"trace-{agent.get('bundle_id') or aid}",
@@ -1763,6 +1764,27 @@ class AppState:
             if old_id and old_id != new_id:
                 client.archive_deployment(old_id)    # then retire the old one (tolerant)
             return new_id
+
+    def refresh_deployment_trigger(self, agent_id, owner_user_id):
+        """Recreate a deployment so its baked-in trigger picks up what has changed since
+        deploy — today, the human's rejections.
+
+        Deployments are immutable and platform-fired, so a deployment agent keeps running
+        the exact text it was created with. Without this, rejecting a proposal changed
+        nothing for the agent that proposed it and the same action came back next run.
+        Reuses apply_platform_schedule's create-then-archive ordering, keeping the current
+        cadence. Best-effort: a failure leaves the existing deployment live and working.
+        """
+        try:
+            agent = next((a for a in registry.agents_for_user(self.sessions_root, owner_user_id)
+                          if a.get("agent_id") == agent_id), None)
+            if not agent or not agent.get("deployment_id"):
+                return None                                # nothing deployed to refresh
+            sched = registry.schedule_get(self.sessions_root, agent_id) or {}
+            return self.apply_platform_schedule(agent, sched.get("cadence"))
+        except Exception:                                  # noqa: BLE001 — never surfaced
+            traceback.print_exc()
+            return None
 
     def _rejected_for(self, agent, limit=20):
         """Recently rejected proposals for this agent, newest first, so the next run can
@@ -2190,6 +2212,12 @@ def make_handler(state):
                 return self._json(409, {"error": "already_processed"})
             if action == "reject":
                 registry.pending_set_status(root, pending_id, "rejected")
+                # A deployment-backed agent runs against text baked in at deploy time, so
+                # the rejection only reaches it by recreating the deployment. Async and
+                # best-effort: the rejection itself is already saved, and a platform
+                # hiccup must not turn a click into an error.
+                threading.Thread(target=lambda: state.refresh_deployment_trigger(
+                    item.get("agent_id"), user["user_id"]), daemon=True).start()
                 return self._json(200, {"id": pending_id, "status": "rejected"})
             threading.Thread(target=lambda: state.approve_pending(item), daemon=True).start()
             return self._json(202, {"id": pending_id, "state": "running"})

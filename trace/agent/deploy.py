@@ -51,16 +51,30 @@ def finalize_live_envelope(live_envelope_dict, connection_record, staged_apps=No
     return env
 
 
-def build_deployment_trigger(base_trigger, staged_slugs):
-    """The deployment's initial user.message: the (optionally staging-prefixed) task
-    plus the memory-maintenance directive. One composition point, reused whenever the
-    deployment is recreated (schedule changes)."""
+def build_deployment_trigger(base_trigger, staged_slugs, rejected=None):
+    """The deployment's initial user.message: the (optionally staging-prefixed) task, the
+    uncertainty directive, anything the human has rejected, and the memory-maintenance
+    directive. One composition point, reused whenever the deployment is recreated.
+
+    The uncertainty directive belongs HERE, not only in ``run_once``. Deployment-backed
+    agents are fired by the platform against this text, so while it was applied only on
+    the run_once path they were never told they could pause and ask — the entire
+    human-in-the-loop pause was inert for every real deployed agent. It showed up as
+    agents staging "here's the problem, please handle it manually" emails: escalating by
+    the only route they knew they had.
+
+    ``rejected`` is what the human has turned down, so a recreated deployment stops
+    proposing it. Deployments are immutable, so this only takes effect on recreation.
+    """
     from . import runner                                   # local import: runner imports deploy helpers' siblings
     base = base_trigger or "on a new matching event"
     if staged_slugs:
         text = runner._staging_trigger(base, staged_slugs)
     else:
         text = f"Task: {base}"
+    text = runner._uncertainty_trigger(text)
+    if rejected:
+        text = runner._rejected_preamble(rejected) + text
     return text + "\n\n" + config.MEMORY_UPDATE_DIRECTIVE
 
 
