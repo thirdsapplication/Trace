@@ -23,13 +23,24 @@ const STEPS = [
 ];
 
 /* ---------------- API ---------------- */
+// No request may hang a promise forever: the desktop node's cloud proxy times out
+// at 60s, so abort just above that — the server's error gets first claim, and a
+// dead network can't leave the splash (or any spinner) up indefinitely.
+const API_TIMEOUT_MS = 65000;
 async function api(method, path, body) {
   const opt = { method, headers: { "Content-Type": "application/json" }, credentials: "same-origin" };
   if (body !== undefined) opt.body = JSON.stringify(body);
-  const r = await fetch(path, opt);
-  let data = null;
-  try { data = await r.json(); } catch (e) { /* empty */ }
-  return { ok: r.ok, status: r.status, data: data || {} };
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), API_TIMEOUT_MS);
+  opt.signal = ctl.signal;
+  try {
+    const r = await fetch(path, opt);
+    let data = null;
+    try { data = await r.json(); } catch (e) { /* empty */ }
+    return { ok: r.ok, status: r.status, data: data || {} };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 const uget = (sid, sub) => api("GET", `/api/u/sessions/${sid}${sub || ""}`);
 const upost = (sid, sub, body) => api("POST", `/api/u/sessions/${sid}${sub}`, body || {});
@@ -118,13 +129,45 @@ function hideSplash() {
   setTimeout(() => { el.classList.add("splash-out"); setTimeout(() => el.remove(), 320); }, wait);
 }
 
+// The splash must come down no matter how boot ends: hideSplash() lives in the
+// finally, and a failure lands on a visible retry card instead of a dead splash.
+// A slow start (the cloud service waking up) gets a status line after 8s so it
+// reads as progress, not a hang.
 async function boot() {
-  const { data } = await api("GET", "/api/auth/me");
-  S.signupAllowed = data.signup_enabled !== false;
-  S.user = data.user;
-  if (!S.user) { renderAuth(); return hideSplash(); }
-  await routeSignedIn();
-  hideSplash();
+  const still = setTimeout(() => {
+    const sp = $("#splash");
+    if (!sp || $("#splashStatus")) return;
+    const note = document.createElement("div");
+    note.id = "splashStatus";
+    note.style.cssText = "margin-top:16px;color:#888;font-size:14px;";
+    note.textContent = "Still connecting — the service may be waking up…";
+    sp.appendChild(note);
+  }, 8000);
+  try {
+    const { data } = await api("GET", "/api/auth/me");
+    S.signupAllowed = data.signup_enabled !== false;
+    S.user = data.user;
+    if (!S.user) return renderAuth();
+    await routeSignedIn();
+  } catch (e) {
+    renderBootError(e);
+  } finally {
+    clearTimeout(still);
+    hideSplash();
+  }
+}
+
+function renderBootError(err) {
+  const msg = String(err && err.name === "AbortError"
+    ? "the service is taking too long to respond" : friendly(err && err.message));
+  root.innerHTML = `
+    <div class="card" style="max-width:420px;margin:120px auto;text-align:center;">
+      <div class="title">Couldn't reach Trace</div>
+      <p class="muted" style="margin-top:8px;">We couldn't load the app — ${esc(msg)}.
+        Check your connection and try again.</p>
+      <button id="bootRetry" class="btn-primary" style="margin-top:14px;">Try again</button>
+    </div>`;
+  $("#bootRetry").onclick = () => { root.innerHTML = ""; boot(); };
 }
 
 // Where a signed-in account belongs: a brand-new one is walked through Welcome (04) →

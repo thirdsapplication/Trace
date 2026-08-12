@@ -220,7 +220,17 @@ class AppState:
         # Load any stored Pipedream Connect settings into the agent config so every
         # consumer (ConnectClient defaults, config.pipedream_mcp_url at deploy, preflight)
         # sees them without env vars.
-        _apply_pipedream_settings(self.keystore)
+        #
+        # On the desktop node this must NOT run before the HTTP port binds: keyring
+        # reads hit the macOS Keychain, and an unsigned build can pop a modal prompt
+        # that blocks until answered — the shell would sit on "Starting…" the whole
+        # time. Every consumer of PIPEDREAM_* is proxied to the cloud in desktop
+        # mode, so nothing local races the background load.
+        if self.cloud_backend:
+            threading.Thread(target=_apply_pipedream_settings,
+                             args=(self.keystore,), daemon=True).start()
+        else:
+            _apply_pipedream_settings(self.keystore)
         self.recon_jobs = {}         # sid -> {state, current, total, error, flags, errors}
         self.discover_jobs = {}      # sid -> {state, error, bundles, anti_bundles}
         self.describe_jobs = {}      # sid -> {state, error, bundles, anti_bundles}
@@ -1981,8 +1991,17 @@ def make_handler(state):
         def _is_local_desktop_path(self, p):
             """Paths the desktop node MUST serve itself (never proxy): capture control
             (capture watches THIS machine) and the local-machine probes. Everything
-            else — UI assets, auth, all pipeline actions — is proxied to the cloud."""
+            else — auth, all pipeline actions — is proxied to the cloud."""
             if p == "/health" or p in ("/api/status", "/api/permissions"):
+                return True
+            # The end-user UI shell is bundled into the desktop node, so serve it
+            # locally: first paint stops depending on a cloud round-trip (60s
+            # timeout per request, cold starts included). The page is public and
+            # every data call it makes is still proxied/authed as before.
+            # TRACE_DESKTOP_LOCAL_UI=0 restores proxying, e.g. to pick up a cloud
+            # UI deploy without shipping a new app build.
+            if ((p == "/app" or p.startswith("/app/"))
+                    and os.environ.get("TRACE_DESKTOP_LOCAL_UI", "1") != "0"):
                 return True
             return p.startswith("/api/u/capture/") or p.startswith("/api/capture/")
 
@@ -3583,13 +3602,25 @@ def main():
                                 collector_port=args.collector_port,
                                 cloud_backend=args.cloud_backend)
     state.start_scheduler()   # Spec 4 (no-op on the desktop node; see start_scheduler)
-    url = f"http://{args.host}:{args.port}/"
-    print(f"Trace test UI: {url}")
-    print(f"  sessions  -> {os.path.abspath(args.sessions_root)}")
-    print(f"  collector -> 127.0.0.1:{args.collector_port} (browser extension target)")
+    # The OS assigns the real port when PORT=0 (the desktop shell passes 0 so the
+    # bind can never race another process) — report the bound port, not the request.
+    port = httpd.server_address[1]
+    url = f"http://{args.host}:{port}/"
+    # Desktop handoff: the shell can't parse stdout (it's redirected to a log file),
+    # so when it asks for a portfile, publish the bound port there. Written atomically
+    # (tmp + replace) so the shell never reads a torn file.
+    portfile = os.environ.get("TRACE_PORTFILE")
+    if portfile:
+        tmp = portfile + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(str(port))
+        os.replace(tmp, portfile)
+    print(f"Trace test UI: {url}", flush=True)
+    print(f"  sessions  -> {os.path.abspath(args.sessions_root)}", flush=True)
+    print(f"  collector -> 127.0.0.1:{args.collector_port} (browser extension target)", flush=True)
     if args.cloud_backend:
-        print(f"  desktop mode -> proxying auth + pipeline to {args.cloud_backend}")
-    print("Ctrl-C to stop.")
+        print(f"  desktop mode -> proxying auth + pipeline to {args.cloud_backend}", flush=True)
+    print("Ctrl-C to stop.", flush=True)
     # Only pop a browser for a genuine local bind; in the cloud (0.0.0.0 / a
     # non-loopback host) there is no display and the URL isn't reachable here.
     if not args.no_open and args.host in ("127.0.0.1", "localhost"):
