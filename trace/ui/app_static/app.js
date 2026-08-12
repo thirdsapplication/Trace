@@ -345,38 +345,46 @@ function ago(iso) {
 // one proposed action (checkbox to include in an approve batch; processed = status pill)
 function proposalRow(p) {
   const pl = p.payload || {};
-  // Long values and nested objects render pre-wrapped (multi-line) so email bodies and
-  // row payloads stay readable instead of collapsing to a one-line JSON blob.
-  // Short values sit inline; anything long (an email body, a row payload) folds into a
-  // disclosure. Dumping a full body inline turned an approve card into a wall of text —
-  // you couldn't see WHAT you were approving without scrolling past the message itself.
-  const rows = Object.keys(pl).map(k => {
-    const v = pl[k];
-    const val = (v && typeof v === "object") ? JSON.stringify(v, null, 2) : String(v);
-    if (val.length <= 90 && !val.includes("\n")) {
-      return `<div class="sub" style="margin-top:3px;"><b>${esc(k)}:</b> ${esc(val)}</div>`;
-    }
-    const firstLine = val.split("\n")[0].slice(0, 70);
-    return `<details style="margin-top:3px;">
-      <summary class="sub" style="cursor:pointer;"><b>${esc(k)}:</b> ${esc(firstLine)}… <span class="muted">(show)</span></summary>
-      <span class="sub" style="display:block;white-space:pre-wrap;margin-top:4px;">${esc(val)}</span>
-    </details>`;
-  }).join("");
   const done = p.status && p.status !== "pending";
   const why = (p.rationale || "").trim();
-  return `<div class="card" style="margin-top:8px;">
-    <div class="row" style="gap:8px;align-items:flex-start;">
-      ${done ? `<span class="pill ${p.status === "executed" ? "pill-on" : "pill-off"}">${esc(p.status)}</span>`
-             : `<input type="checkbox" class="prop" data-id="${esc(p.id)}" checked style="margin-top:4px;">`}
-      <div style="flex:1;">
-        <div class="title" style="font-size:14px;">${p.app ? `<span class="muted">${esc(p.app)} · </span>` : ""}${esc(p.summary || p.kind || "Action")}</div>
-        ${why ? `<div class="sub" style="margin-top:4px;"><span class="muted">Why:</span> ${esc(why)}</div>` : ""}
-        <div style="margin-top:4px;">${rows || `<div class="sub muted">No details captured.</div>`}</div>
-        ${(!done && p.app) ? `<button class="btn-link prop-autoapprove" data-app="${esc(p.app)}" style="margin-top:6px;font-size:12px;">Auto-approve ${esc(p.app)} from now on</button>` : ""}
-      </div>
-      ${done ? "" : `<button class="btn-link prop-no" data-id="${esc(p.id)}" style="color:var(--danger,#b3261e);">Reject</button>`}
+  // Frame 27: a titled action with the payload folded behind a disclosure, so what you
+  // are approving reads in one line and the full email is one click away — rather than
+  // the card dumping every field inline and burying the decision.
+  const title = esc(p.summary || p.kind || "Action");
+  const fields = Object.keys(pl).map(k => {
+    const v = pl[k];
+    const val = (v && typeof v === "object") ? JSON.stringify(v, null, 2) : String(v);
+    const long = val.length > 90 || val.includes("\n");
+    return `<div class="pp-field${long ? " pp-body" : ""}"><b>${esc(k)}:</b> ${esc(val)}</div>`;
+  }).join("");
+  return `<div class="pp-card">
+    <div class="row" style="gap:9px;align-items:center;">
+      <span class="pp-dot"></span>
+      <span class="pp-title">${title}</span>
+      ${done ? `<span class="pill ${p.status === "executed" ? "pill-on" : "pill-off"}" style="margin-left:auto;">${esc(p.status)}</span>`
+             : `<button class="btn-link pp-toggle" data-id="${esc(p.id)}" style="margin-left:auto;">View full ▾</button>`}
     </div>
+    ${why ? `<div class="pp-why">${esc(why)}</div>` : ""}
+    <div class="pp-payload" data-for="${esc(p.id)}" hidden>${fields || `<div class="pp-field muted">No details captured.</div>`}</div>
+    ${done ? "" : `<div class="row" style="gap:9px;">
+      <button class="btn-accent prop-yes" data-id="${esc(p.id)}" style="flex:1;">Approve &amp; send</button>
+      <button class="btn-secondary prop-edit" data-id="${esc(p.id)}">Edit first</button>
+      <button class="btn-link prop-no" data-id="${esc(p.id)}" style="color:var(--ink-2);">Reject</button>
+    </div>
+    <div class="pp-note">Edits become lessons. Reject asks one line: why?</div>`}
   </div>`;
+}
+
+// Disclosure + per-card actions. Delegated so it survives re-renders of the list.
+function wireProposalCards(root_) {
+  (root_ || document).querySelectorAll(".pp-toggle").forEach(b => {
+    b.onclick = () => {
+      const box = (root_ || document).querySelector(`.pp-payload[data-for="${b.dataset.id}"]`);
+      if (!box) return;
+      box.hidden = !box.hidden;
+      b.textContent = box.hidden ? "View full ▾" : "Hide full ▴";
+    };
+  });
 }
 
 // Per-proposal quick action: stop staging one app (future actions in it run automatically).
@@ -617,84 +625,119 @@ function renderGroupChat(group) {
 }
 
 /* ---------------- HOME: stories to review + agents list ---------------- */
-async function renderHome() {
-  clearTimers();
-  const d = await loadHome();
-  const agents = d.agents || [];
-  const withStories = agents.filter(a => a.unreviewed > 0);
-  const stories = withStories.map(a => `
-    <button class="st-btn" data-agent="${esc(a.agent_id)}">
-      <span class="st-ring">${avatar(a.name, 52)}<span class="ct-badge st-ct">${a.unreviewed}</span></span>
-      <span class="st-name">${esc(a.name.length > 14 ? a.name.slice(0, 13) + "…" : a.name)}</span>
-    </button>`).join("");
-  // Gap #4: "Needs you" — agents with a blocking question or a pending approval, questions
-  // first (they block the agent), each deep-linking to the review flow where you resolve it.
-  const needsYou = agents.filter(a => a.needs_you > 0)
-    .sort((x, y) => (y.open_decisions - x.open_decisions) || (y.needs_you - x.needs_you));
-  const nConf = (a) => (a.lesson_confirmations || []).length;
-  const needBit = (a) => [
-    a.open_decisions ? `${a.open_decisions} question${a.open_decisions > 1 ? "s" : ""}` : "",
-    a.pending_approvals ? `${a.pending_approvals} to approve` : "",
-    nConf(a) ? `${nConf(a)} to confirm` : ""].filter(Boolean).join(" · ");
-  const needRows = needsYou.map(a => `
-    <button class="ag-row needs-row" data-agent="${esc(a.agent_id)}" style="border-left:3px solid var(--danger,#b3261e);">
-      ${avatar(a.name, 44)}
-      <span class="ag-mid">
-        <span class="title" style="font-size:14.5px;">${esc(a.name)}</span>
-        <span class="sub" style="color:var(--danger,#b3261e);font-weight:600;">${esc(needBit(a))}</span>
-      </span>
-      <span class="ct-badge" style="background:var(--danger,#b3261e);">${a.needs_you}</span>
-    </button>`).join("");
+
+// An agent's color: its stored choice, else a deterministic pick from the core five so
+// the same agent is always the same color (mirrors registry.agent_color server-side).
+const CORE_AGENT_COLORS = ["#FF6655", "#FFC83D", "#45B86B", "#A58AE8", "#315EF6"];
+function agentColor(a) {
+  if (a && a.color) return a.color;
+  const id = String((a && (a.agent_id || a.id)) || "");
+  let sum = 0;
+  for (let i = 0; i < id.length; i++) sum += id.charCodeAt(i);
+  return CORE_AGENT_COLORS[sum % CORE_AGENT_COLORS.length];
+}
+
+// The full agent list, reached from the brief's "See all runs" — the detail behind the
+// headline, rather than the landing screen it used to be.
+async function renderAllRuns() {
+  const home = await loadHome();
+  const agents = home.agents || [];
+  const tb = agentsTopbar(home.unread_total, renderHome, home.needs_you_total, "home");
   const rows = agents.map(a => {
     const sched = a.schedule || null;
-    const paused = sched && sched.paused;
     const bits = [];
     if (a.open_decisions) bits.push(`${a.open_decisions} awaiting your answer`);
     if (a.pending_approvals) bits.push(`${a.pending_approvals} to approve`);
-    if (nConf(a)) bits.push(`${nConf(a)} lesson${nConf(a) > 1 ? "s" : ""} to confirm`);
     if (a.fyi_reviews) bits.push(`${a.fyi_reviews} to review`);
     if (a.unread) bits.push(`${a.unread} new message${a.unread > 1 ? "s" : ""}`);
-    bits.push(sched ? (paused ? "schedule paused" : `runs ${cadenceToValue(sched.cadence) || "on its schedule"}`) : "runs when you say");
+    bits.push(sched ? (sched.paused ? "schedule paused" : `runs ${cadenceToValue(sched.cadence) || "on its schedule"}`)
+                    : "runs when you say");
     return `<button class="ag-row" data-agent="${esc(a.agent_id)}">
       ${avatar(a.name, 44)}
       <span class="ag-mid">
-        <span class="row" style="gap:8px;"><span class="title" style="font-size:14.5px;">${esc(a.name)}</span>
-          <span class="pill ${paused ? "pill-warn" : "pill-on"}">${paused ? "PAUSED" : "LIVE"}</span></span>
-        <span class="ag-bio">${esc(a.description || ("Runs when: " + (a.trigger || "you say so")))}</span>
-        <span class="sub muted">${esc(bits.join(" · "))}</span>
+        <span class="title">${esc(a.name)}</span>
+        <span class="ag-bio">${esc(bits.join(" · "))}</span>
       </span>
-      ${a.needs_you ? `<span class="ct-badge" style="background:var(--danger,#b3261e);">${a.needs_you}</span>`
-        : (a.unreviewed ? `<span class="ct-badge">${a.unreviewed}</span>` : "")}
+      <span class="pill ${sched && sched.paused ? "pill-off" : "pill-on"}">${sched && sched.paused ? "PAUSED" : "LIVE"}</span>
     </button>`;
   }).join("");
-  const tb = agentsTopbar(d.unread_total, null, d.needs_you_total, "home");
   root.innerHTML = `${tb.html}
     <div class="panel">
       <div class="spread"><h2>Your agents</h2>
-        <button id="recAnother" class="btn-primary btn-sm">Record another workflow</button></div>
-      <p class="lead">Every workflow you've automated. Sessions wait under "To review" until you've seen them — then they move into the agent's history.</p>
-      ${needRows ? `<div class="label" style="margin-bottom:8px;color:var(--danger,#b3261e);">Needs you</div>
-        <div class="stack" style="margin-bottom:18px;">${needRows}</div>` : ""}
-      ${withStories.length ? `<div class="label" style="margin-bottom:8px;">To review</div>
-        <div class="st-row">${stories}</div>` : ""}
-      <div class="stack" style="margin-top:${withStories.length ? "18" : "0"}px;">
-        ${rows || `<p class="muted">No agents yet. Record a workflow to build your first.</p>`}
-      </div>
-      <button id="backFlow" class="btn-link" style="margin-top:16px;">← back to setup</button>
+        <button id="recAnother" class="btn-secondary btn-sm">Record another workflow</button></div>
+      <p class="lead">Every workflow you've automated. Open one to see its runs, rules and lessons.</p>
+      <div class="stack" style="margin-top:14px;">${rows || `<p class="muted">No agents yet.</p>`}</div>
     </div>`;
   tb.wire();
-  $("#recAnother").onclick = recordAnother;
-  $("#backFlow").onclick = () => loadAndRender();
-  root.querySelectorAll(".st-btn").forEach(b => b.onclick = () => renderReview(b.dataset.agent));
+  const ra = $("#recAnother"); if (ra) ra.onclick = recordAnother;
   root.querySelectorAll(".ag-row").forEach(b => b.onclick = () => renderProfile(b.dataset.agent));
-  // "Needs you" rows jump to where the work is: the review flow for story questions/
-  // approvals, or the profile for lesson-confirmations (which live there).
-  root.querySelectorAll(".needs-row").forEach(b => {
-    const a = needsYou.find(x => x.agent_id === b.dataset.agent);
-    const toReview = a && (a.open_decisions || a.pending_approvals);
-    b.onclick = () => toReview ? renderReview(b.dataset.agent) : renderProfile(b.dataset.agent);
-  });
-  S._timers.push(setTimeout(renderHome, 30000));            // gentle live refresh
+}
+
+async function renderHome() {
+  const home = await loadHome();
+  const agents = home.agents || [];
+  const tb = agentsTopbar(home.unread_total, null, home.needs_you_total, "home");
+  const need = agents.filter(a => a.needs_you > 0)
+    .sort((x, y) => (y.open_decisions - x.open_decisions) || (y.needs_you - x.needs_you));
+  const clean = agents.filter(a => !a.needs_you);
+  const total = home.needs_you_total || 0;
+
+  // The morning brief (14): headline states the situation, the sentence below names the
+  // agents involved in their own colors, and the Overnight strip is the per-agent detail.
+  const now = new Date();
+  const stamp = now.toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" })
+    + " · " + now.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+  const headline = total
+    ? `${total === 1 ? "One thing needs" : total + " things need"} you.<br>Everything else ran clean.`
+    : "Everything ran clean.<br>Nothing needs you.";
+  const tint = (a) => `<span style="color:${esc(agentColor(a))};font-weight:600;">${esc(a.name)}</span>`;
+  const phrase = (a) => {
+    if (a.open_decisions) return `${tint(a)} hit ${a.open_decisions === 1 ? "a question" : a.open_decisions + " questions"} it can't settle`;
+    if (a.pending_approvals) return `${tint(a)} staged ${a.pending_approvals} ${a.pending_approvals === 1 ? "action" : "actions"} for your sign-off`;
+    return `${tint(a)} has a lesson to confirm`;
+  };
+  const lead = need.length
+    ? need.slice(0, 2).map(phrase).join(", and ") + "."
+      + (clean.length ? ` ${clean.slice(0, 3).map(a => esc(a.name)).join(", ")} finished with nothing to show you.` : "")
+    : "Your agents ran and handled everything themselves.";
+
+  const card = (a) => {
+    const bits = [];
+    if (a.open_decisions) bits.push(`${a.open_decisions} question${a.open_decisions > 1 ? "s" : ""}`);
+    if (a.pending_approvals) bits.push(`${a.pending_approvals} staged`);
+    if (!bits.length) bits.push(a.fyi_reviews ? `${a.fyi_reviews} run${a.fyi_reviews > 1 ? "s" : ""}, clean` : "nothing new");
+    const last = (a.stories || []).slice(-1)[0];
+    return `<button class="ov-card" data-agent="${esc(a.agent_id)}"${a.needs_you ? "" : ' style="opacity:.6;"'}>
+      <span class="row" style="gap:8px;">
+        <span class="ov-dot" style="background:${esc(agentColor(a))};"></span>
+        <span class="ov-name">${esc(a.name)}</span>
+        ${a.needs_you ? `<span class="ov-flag"></span>` : ""}
+      </span>
+      <span class="ov-sub">${esc(bits.join(" · "))}${last && last.ran_at ? " · " + esc(ago(last.ran_at)) : ""}</span>
+    </button>`;
+  };
+
+  root.innerHTML = `${tb.html}
+    <div class="brief">
+      <div class="brief-stamp">${esc(stamp)}</div>
+      <h1 class="brief-head">${headline}</h1>
+      <p class="brief-lead">${lead}</p>
+      <div class="row" style="gap:10px;">
+        ${total ? `<button id="hmReview" class="btn-accent" style="padding:13px 26px;">Start review · ${total}</button>` : ""}
+        <button id="hmAll" class="btn-secondary" style="padding:13px 22px;">See all runs</button>
+      </div>
+      ${agents.length ? `<div class="ov-wrap">
+        <div class="label">Overnight</div>
+        <div class="ov-row">${need.concat(clean).map(card).join("")}</div>
+      </div>` : `<p class="muted">No agents yet — record a workflow to build your first.</p>`}
+    </div>`;
+  tb.wire();
+  const first = need[0] || agents[0];
+  const rv = $("#hmReview");
+  if (rv && first) rv.onclick = () => renderReview(first.agent_id, 0);
+  $("#hmAll").onclick = renderAllRuns;
+  root.querySelectorAll(".ov-card").forEach(b =>
+    b.onclick = () => renderProfile(b.dataset.agent));
 }
 const renderDashboard = renderHome;                          // legacy entry points
 
@@ -748,6 +791,25 @@ function renderReview(agentId, startAt) {
       await markReviewed(st);                     // stays a story server-side while pending remain
       if (i < a.stories.length - 1) { i++; draw(); } else { close(); }
     };
+    wireProposalCards(root);                      // frame 27 payload disclosure
+    // Each card approves itself now — the checkbox-and-bulk-button flow made you decide
+    // about several actions at once, which is the opposite of reading one and approving it.
+    root.querySelectorAll(".prop-yes").forEach(b => b.onclick = async () => {
+      b.disabled = true; b.textContent = "Sending…";
+      await api("POST", `/api/u/agents/${agentId}/approve-actions`, { pending_ids: [b.dataset.id] });
+      await markReviewed(st);
+      S._timers.push(setTimeout(async () => {
+        await loadHome();
+        const fresh = (S.igHome.agents || []).find(x => x.agent_id === agentId);
+        if (fresh && fresh.stories.length) renderReview(agentId, Math.min(i, fresh.stories.length - 1));
+        else close();
+      }, 3500));
+    });
+    root.querySelectorAll(".prop-edit").forEach(b => b.onclick = () => {
+      // Editing opens the payload; saving an edit as a lesson is step 6's job.
+      const box = root.querySelector(`.pp-payload[data-for="${b.dataset.id}"]`);
+      if (box) box.hidden = false;
+    });
     root.querySelectorAll(".approve-sel").forEach(b => b.onclick = async () => {
       const ids = Array.from(root.querySelectorAll(".prop")).filter(c => c.checked).map(c => c.dataset.id);
       if (!ids.length) { b.textContent = "Select at least one"; return; }
