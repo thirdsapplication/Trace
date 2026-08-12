@@ -1711,6 +1711,10 @@ class AppState:
             fyi_reviews = sum(1 for s in stories if not s["decisions"] and not s["proposals"])
             agents_out.append({
                 "agent_id": aid, "name": a.get("name") or aid,
+                # Without this the home + messages screens fall back to a derived color
+                # and the agent's CHOSEN color only appears where the server resolves it
+                # (group replies) — the same omission _agent_to_caller had.
+                "color": registry.agent_color(a),
                 "bundle_id": a.get("bundle_id"),
                 "description": a.get("description") or "",
                 "trigger": a.get("trigger") or "",

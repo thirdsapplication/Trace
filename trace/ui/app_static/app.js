@@ -254,6 +254,10 @@ function renderAuth(mode) {
 
 /* ---------------- shell ---------------- */
 function shell(inner) {
+  // The app shell clears root's .wrap class because the sidebar owns layout. The wizard
+  // is full-screen and OUTSIDE the shell, so it has to put the centered column back —
+  // without this its panels stretch edge to edge.
+  root.className = "wrap";
   const reached = deriveStep();                 // furthest step the artifacts allow
   const chips = STEPS.map((st, i) => {
     const nav = i <= reached;                    // completed steps + the current one are navigable
@@ -576,7 +580,7 @@ async function renderSettings() {
   const home = S.igHome || await loadHome();
   const { data } = await api("GET", "/api/u/consent");
   const c = data || { contribute_scope: "global", consume_scope: "global" };
-  const tb = agentsTopbar(home.unread_total, renderHome, home.needs_you_total, "sharing");
+  const tb = agentsTopbar(home.unread_total, null, home.needs_you_total, "sharing");
   root.innerHTML = `${tb.html}
     <div class="panel">
       <h2>Lesson sharing</h2>
@@ -607,12 +611,7 @@ async function renderSettings() {
     await api("POST", "/api/u/consent", {
       contribute_scope: picked.contribute, consume_scope: picked.consume });
   });
-  const sc = $("#saveConsent");
-  if (sc) sc.onclick = async (e) => {
-    await api("POST", "/api/u/consent", {
-      contribute_scope: picked.contribute, consume_scope: picked.consume });
-    e.target.textContent = "Saved ✓";
-  };
+
 }
 
 /* ---------------- GROUP CHAT: agents as contacts in a group ---------------- */
@@ -627,7 +626,7 @@ async function renderGroups() {
   const home = S.igHome || await loadHome();
   const { data } = await api("GET", "/api/u/groups");
   const groups = (data && data.groups) || [];
-  const tb = agentsTopbar(home.unread_total, renderHome, home.needs_you_total, "groups");
+  const tb = agentsTopbar(home.unread_total, null, home.needs_you_total, "groups");
   const groupRows = groups.map(g => `
     <button class="ag-row grp-row" data-id="${esc(g.id)}">
       <span class="ag-mid">
@@ -728,7 +727,7 @@ function agentColor(a) {
 async function renderAllRuns() {
   const home = await loadHome();
   const agents = home.agents || [];
-  const tb = agentsTopbar(home.unread_total, renderHome, home.needs_you_total, "home");
+  const tb = agentsTopbar(home.unread_total, null, home.needs_you_total, "home");
   const rows = agents.map(a => {
     const sched = a.schedule || null;
     const bits = [];
@@ -943,7 +942,7 @@ function renderReview(agentId, startAt) {
 async function renderMessages() {
   clearTimers();
   const d = S.igHome || await loadHome();
-  const tb = agentsTopbar(d.unread_total, renderHome, d.needs_you_total, "messages");
+  const tb = agentsTopbar(d.unread_total, null, d.needs_you_total, "messages");
   root.innerHTML = `${tb.html}
     <div class="panel">
       <h2>Messages</h2>
@@ -1144,7 +1143,7 @@ async function renderProfile(agentId) {
   const cur = cadenceToValue(sched && sched.cadence);
   const paused = sched && sched.paused;
   const opts = CADENCES.map(c => `<option value="${c.v}" ${c.v === cur ? "selected" : ""}>${c.label}</option>`).join("");
-  const tb = agentsTopbar(home.unread_total, renderHome, home.needs_you_total, "home");
+  const tb = agentsTopbar(home.unread_total, null, home.needs_you_total, "home");
   root.innerHTML = `${tb.html}
     <div class="panel">
       <div class="row" style="gap:16px;align-items:flex-start;">
