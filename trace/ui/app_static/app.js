@@ -1206,6 +1206,53 @@ async function renderThread(agentId) {
 
 /* ---------------- AGENT PROFILE: bio + controls + session-history log ------ */
 
+/* ---------------- destructive confirm (28) ---------------- */
+
+// Frame 28. Replaces window.confirm() for anything that destroys data: a native dialog
+// can be dismissed with a stray Enter, and it can't say what is about to be lost. This
+// one keeps "Delete forever" disabled until the word is typed exactly, so agreeing has
+// to be deliberate. Resolves true only on confirm — Escape, Cancel and a scrim click
+// all resolve false, so a caller can simply `if (!await confirmDestructive(…)) return`.
+// Reuses .pop-back/.pop so every modal in the app is the same object.
+function confirmDestructive({ title, body, verb = "Delete forever", word = "delete" }) {
+  return new Promise(resolve => {
+    const back = document.createElement("div");
+    back.className = "pop-back";
+    back.innerHTML = `<div class="pop pop-confirm" role="alertdialog" aria-modal="true"
+                           aria-labelledby="cfTitle">
+      <div class="pop-title" id="cfTitle">${esc(title)}</div>
+      <p class="cf-body">${esc(body)}</p>
+      <input type="text" id="cfWord" class="cf-input" autocomplete="off"
+             aria-label="Type ${esc(word)} to confirm" placeholder="Type ${esc(word)} to confirm">
+      <div class="cf-acts">
+        <button class="btn-secondary" id="cfNo">Cancel</button>
+        <button class="btn-destroy" id="cfYes" disabled>${esc(verb)}</button>
+      </div>
+    </div>`;
+    document.body.appendChild(back);
+
+    const input = back.querySelector("#cfWord");
+    const yes = back.querySelector("#cfYes");
+    const done = (v) => {
+      document.removeEventListener("keydown", onKey);
+      back.remove();
+      resolve(v);
+    };
+    const onKey = (e) => {
+      if (e.key === "Escape") done(false);
+      if (e.key === "Enter" && !yes.disabled) done(true);
+    };
+    input.oninput = () => {
+      yes.disabled = input.value.trim().toLowerCase() !== word;
+    };
+    back.querySelector("#cfNo").onclick = () => done(false);
+    yes.onclick = () => done(true);
+    back.onclick = (e) => { if (e.target === back) done(false); };   // scrim, not the card
+    document.addEventListener("keydown", onKey);
+    input.focus();
+  });
+}
+
 /* ---------------- identity popover (19) ---------------- */
 // Five core shades, then 20 extended (4 per family) behind "More shades" — same five
 // families, so a crowded team never drifts into a rainbow. A shade already in use shows
@@ -1406,7 +1453,11 @@ async function renderProfile(agentId) {
 
   const dc = $("#pDelCap");
   if (dc) dc.onclick = async () => {
-    if (!confirm("Delete all recorded data for this workflow from your device and the cloud? Your agent keeps running. This can't be undone.")) return;
+    const okd = await confirmDestructive({
+      title: `Delete ${a.name || "this agent"}'s capture data?`,
+      body: "Removes its recordings from your device and the cloud, permanently. The agent keeps working — it just can't be retrained from this data. This can't be undone.",
+    });
+    if (!okd) return;
     dc.disabled = true; dc.textContent = "Deleting…";
     await api("POST", `/api/u/agents/${agentId}/delete-capture-data`, {});
     S.igHome = null; renderProfile(agentId);

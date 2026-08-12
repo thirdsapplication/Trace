@@ -404,6 +404,19 @@ input:focus, textarea:focus { outline: none; border-color: var(--accent); backgr
 
 .main { flex: 1; min-width: 0; padding: 38px 46px; max-width: 880px; }
 
+/* destructive confirm (28): tighter than the generic .pop, and the confirm button is
+   SOLID danger — the outline .btn-danger is the trigger on the card, this is the commit. */
+.pop-confirm { border-radius: 16px; padding: 24px 26px; gap: 12px; }
+.cf-body { font-size: 13px; color: var(--ink-2); line-height: 1.6; margin: 0; }
+.cf-input { border: 1.5px solid var(--line); border-radius: 10px; padding: 10px 13px;
+  font: inherit; font-size: 13px; width: 100%; }
+.cf-input:focus { outline: none; border-color: var(--accent); background: var(--accent-bg); }
+.cf-acts { display: flex; gap: 9px; justify-content: flex-end; }
+.cf-acts button { font-size: 13px; font-weight: 700; border-radius: 10px; padding: 10px 18px; }
+.btn-destroy { background: var(--danger); color: #fff; border: 1px solid var(--danger); }
+.btn-destroy:disabled { opacity: .45; cursor: not-allowed; }
+.btn-destroy:hover:not(:disabled) { background: #B33A2B; border-color: #B33A2B; }
+
 /* groups (24): stacked member tiles read the group as one object; the coral dot is the
    only decoration on the row and means a member needs you, nothing else. */
 .grp-head { display: flex; justify-content: space-between; align-items: center; }
