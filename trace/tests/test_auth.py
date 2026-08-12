@@ -190,7 +190,7 @@ class IsolationTest(_AuthHTTPBase):
 
 
 class EndUserUITest(_AuthHTTPBase):
-    """WS2 — the end-user UI is served separately at /app, carries the Direction H
+    """WS2 — the end-user UI is served separately at /app, carries the Palza
     tokens, leaks no platform credentials/IDs/paths, and uses the scoped API."""
 
     def asset(self, path):
@@ -198,15 +198,16 @@ class EndUserUITest(_AuthHTTPBase):
         r = urllib.request.urlopen(url)
         return r.status, r.read().decode("utf-8")
 
-    def test_served_separately_with_direction_h(self):
+    def test_served_separately_with_palza_brand(self):
         code, html = self.asset("/app")
         self.assertEqual(code, 200)
         self.assertIn('id="root"', html)
         self.assertIn("/app/app.js", html)
         code, css = self.asset("/app/app.css")
-        self.assertIn("#F26A1B", css)               # accent token
-        self.assertIn("Hanken Grotesk", css)         # heading font
-        self.assertIn("#1A1A1A", css)                # primary CTA ink
+        self.assertIn("#315EF6", css)                # Core Blue — action token
+        self.assertIn("#FF6655", css)                # Action Coral — "needs you" only
+        self.assertIn("Manrope", css)                # headline font
+        self.assertIn("#121A2F", css)                # ink
         # the founder Test UI is still at / and unchanged
         code, root_html = self.asset("/")
         self.assertEqual(code, 200)

@@ -1,5 +1,5 @@
 /* ============================================================
-   Trace — end-user UI. Direction H aesthetic, wired to the real
+   Palza — end-user UI, wired to the real
    pipeline via /api/auth/* and /api/u/* (scoped to the logged-in
    user). No platform credentials, internal IDs, or file paths are
    ever shown. Stages: record -> find workflows -> review ->
@@ -115,17 +115,17 @@ function renderAuth(mode) {
   mode = mode || "login";
   const isSignup = mode === "signup" && S.signupAllowed;
   root.innerHTML = `
-    <div class="topbar"><div class="brand">● Trace</div></div>
+    <div class="topbar"><div class="brand">palza</div></div>
     <div class="panel" style="max-width:420px;margin:8vh auto 0;">
       <div class="eyebrow">${isSignup ? "Create account" : "Welcome back"}</div>
-      <h2>${isSignup ? "Set up your Trace" : "Sign in"}</h2>
+      <h2>${isSignup ? "Set up your palza" : "Sign in"}</h2>
       <p class="lead">${isSignup ? "Your work stays yours — only you can see your agents and connections." : "Pick up where you left off."}</p>
       <div class="field"><span class="label">Email</span><input id="email" type="email" autocomplete="username" placeholder="you@work.com"></div>
       <div class="field"><span class="label">Password</span><input id="pw" type="password" autocomplete="current-password" placeholder="${isSignup ? "at least 8 characters" : "••••••••"}"></div>
       <p id="authMsg" class="msg err"></p>
       <button id="authGo" class="btn-primary full">${isSignup ? "Create account" : "Sign in"}</button>
       ${S.signupAllowed ? `<p class="notice" style="margin-top:14px;text-align:center;">
-        ${isSignup ? "Already have an account?" : "New to Trace?"}
+        ${isSignup ? "Already have an account?" : "New to palza?"}
         <button id="authSwap" class="btn-link">${isSignup ? "Sign in" : "Create one"}</button></p>` : ""}
     </div>`;
   const go = async () => {
@@ -151,7 +151,7 @@ function shell(inner) {
   }).join("");
   root.innerHTML = `
     <div class="topbar">
-      <div class="brand">● Trace</div>
+      <div class="brand">palza</div>
       <div class="row"><button id="navAgents" class="btn-link">My agents</button>
         <span class="muted" style="font-size:13px;">${esc(S.user.email)}</span>
         <button id="logout" class="btn-link">Sign out</button></div>
@@ -179,7 +179,7 @@ function recordAnother() { S.session = null; S.step = 0; render(); }
    Structure: stories = sessions you haven't reviewed yet (approve staged actions
    where applicable; reviewing moves the session into the agent's history log);
    each agent has a profile (bio + controls + session-history log) and a DM thread.
-   Trace's own look — normal width, no borrowed chrome. */
+   Palza's own look — normal width, no borrowed chrome. */
 const CADENCES = [
   { v: "", label: "manually" },
   { v: "daily", label: "daily · 9am" },
@@ -319,7 +319,7 @@ function agentsTopbar(unread, backFn, needsYou) {
   return {
     html: `<div class="topbar">
       <div class="row">${backFn ? `<button id="agBack" class="btn-link">← back</button>` : ""}
-        <div class="brand">● Trace</div></div>
+        <div class="brand">palza</div></div>
       <div class="row">
         ${needsYou ? `<button id="agNeeds" class="btn-link" style="color:var(--danger,#b3261e);font-weight:600;">Needs you <span class="ct-badge" style="background:var(--danger,#b3261e);">${ct(needsYou)}</span></button>` : ""}
         <button id="agGroups" class="btn-link">Groups</button>
@@ -456,7 +456,7 @@ function renderGroupChat(group) {
       draw();
       const { status, data } = await api("POST", `/api/u/groups/${group.id}/message`, { text });
       if (status === 429) {
-        msgs.push({ who: "sys", name: "Trace", color: "#b3261e",
+        msgs.push({ who: "sys", name: "palza", color: "#FF6655",
                     text: (data && data.message) || "Too many messages — give it a moment." });
       } else {
         for (const r of (data && data.replies) || [])
@@ -997,7 +997,7 @@ function stepRecord() {
     <div class="panel">
       <div class="eyebrow">Step one</div>
       <h2>Record your day</h2>
-      <p class="lead">Trace watches how you work for a while and learns your routines. On your Mac · no screenshots · sensitive text removed before saving.</p>
+      <p class="lead">Palza watches how you work for a while and learns your routines. On your Mac · no screenshots · sensitive text removed before saving.</p>
       <div id="recBody"></div>
     </div>`);
   renderRecBody("idle");
@@ -1035,7 +1035,7 @@ function renderRecBody(mode, started) {
         <span class="label">Describe your workflow</span>
         <textarea id="descText" rows="7" placeholder="In a few sentences: what kicks this work off, the steps you take, the apps you use — name them (e.g. Gmail, Google Sheets) — and what the finished result looks like."></textarea>
       </div>
-      <p class="notice">The more concretely you name your apps and steps, the better your agent will be. You'll review and correct what Trace understood next.</p>
+      <p class="notice">The more concretely you name your apps and steps, the better your agent will be. You'll review and correct what palza understood next.</p>
       <p id="recMsg" class="msg err"></p>
       <div class="row" style="gap:10px;">
         <button id="descBack" class="btn-secondary">← Back</button>
@@ -1096,7 +1096,7 @@ function stepWorkflows() {
     <div class="panel">
       <div class="eyebrow">Step two</div>
       <h2>Finding your routines</h2>
-      <p class="lead">Trace reads back your day and groups the repeating work it can take off your plate.</p>
+      <p class="lead">Palza reads back your day and groups the repeating work it can take off your plate.</p>
       <div class="progress"><i id="wfBar" style="width:0%"></i></div>
       <p id="wfMsg" class="msg">${a.event_log ? "Looking for repeatable workflows…" : "Reading your day…"}</p>
       <div id="wfErr" class="msg err"></div>
@@ -1147,7 +1147,7 @@ async function stepReview() {
   const resolved = (id) => und[id] === "confirmed" || (und[id] === "corrected" && corr[id].trim());
   // the one-line reason the engine gave (fall back to the internal "why" fields)
   const reasonOf = (it) => it.rationale || it.why_automatable || it.why_judgment || "";
-  // plain-language summary of what Trace thinks this workflow is (anti_bundles
+  // plain-language summary of what palza thinks this workflow is (anti_bundles
   // have no trigger/steps; they carry why_judgment instead)
   const summary = (it) => {
     const rows = [];
@@ -1414,7 +1414,7 @@ function wireBuiltContinue() { $("#buildGo").onclick = () => goStep(5); }
 async function stepConnect() {
   const sid = S.session.id;
   shell(`<div class="panel"><div class="eyebrow">Step six</div><h2>Connect your apps</h2>
-    <p class="lead">Sign in with each service. Trace never sees your password, and only uses accounts that match your work email.</p>
+    <p class="lead">Sign in with each service. Palza never sees your password, and only uses accounts that match your work email.</p>
     <div id="connBody"><p class="muted">Loading…</p></div></div>`);
   await renderConnect(sid);
 }
