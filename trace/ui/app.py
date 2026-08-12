@@ -1655,6 +1655,22 @@ class AppState:
                 client.archive_deployment(old_id)    # then retire the old one (tolerant)
             return new_id
 
+    def _rejected_for(self, agent, limit=20):
+        """Recently rejected proposals for this agent, newest first, so the next run can
+        be told not to propose them again. Best-effort — never blocks a run.
+
+        Rejecting used to set the row's status and stop there, which the agent never saw,
+        so the identical action came back next run and the rejection taught nothing.
+        """
+        try:
+            rows = registry.pending_for_user(self.sessions_root,
+                                             agent.get("owner_user_id"), status="rejected")
+        except Exception:                              # noqa: BLE001 — best-effort
+            return []
+        aid = agent.get("agent_id")
+        return [{"summary": r.get("summary"), "app": r.get("app")}
+                for r in rows if r.get("agent_id") == aid][:limit]
+
     def _refresh_agent_binding(self, agent):
         """Re-mint + rotate the Pipedream token in the agent's vault before a
         scheduled/Run-now run, so a run long after deploy still authenticates (the
@@ -1678,9 +1694,11 @@ class AppState:
         ``resume`` (Gap #3) seeds the run with a prior paused question + human answer."""
         self._refresh_agent_binding(agent)   # WS5: fresh Pipedream token before the run
         guidance = self._retrieve_guidance(agent)   # Gap #3 B4: lessons from past decisions
+        rejected = self._rejected_for(agent)        # don't re-propose what was turned down
         try:
             client = self._live_client()
-            rec = agent_runner.run_once(client, agent, resume=resume, guidance=guidance)
+            rec = agent_runner.run_once(client, agent, resume=resume, guidance=guidance,
+                                        rejected=rejected)
         except Exception:
             rec = {"agent_id": agent.get("agent_id"), "status": "failed",
                    "summary": "Couldn't start the run.", "details": [], "run_session_id": None}

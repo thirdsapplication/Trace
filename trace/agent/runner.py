@@ -311,7 +311,31 @@ def _guidance_preamble(lessons):
             "have to ask again:\n" + body + "\n\n") if body else ""
 
 
-def run_once(client, agent, resume=None, guidance=None):
+def _rejected_preamble(rejected):
+    """Lead the trigger with actions the human REJECTED, so they aren't proposed again.
+
+    Rejecting only set the row's status, which the agent never sees — so the next run
+    re-proposed the identical action and rejecting taught the system nothing. A rejection
+    is a signal ("don't do this"), and it has to reach the agent to act like one.
+    ``rejected`` is a list of ``{summary, app}`` from recently rejected proposals.
+    """
+    lines = []
+    for r in rejected or []:
+        summary = str((r or {}).get("summary") or "").strip()
+        if not summary:
+            continue
+        app = str((r or {}).get("app") or "").strip()
+        lines.append(f"- {summary}" + (f"  [{app}]" if app else ""))
+    if not lines:
+        return ""
+    return ("ALREADY REJECTED BY THE HUMAN — do NOT propose these again, and do not "
+            "propose a lightly reworded version of them. If you believe one is now "
+            "genuinely warranted because the situation changed, say why in its "
+            "rationale rather than re-proposing it silently:\n"
+            + "\n".join(lines[:20]) + "\n\n")
+
+
+def run_once(client, agent, resume=None, guidance=None, rejected=None):
     """Run one agent once. ``agent`` is a registry row carrying ``agent_id``,
     ``vault_ref``, and ``trigger``. Returns a run record dict
     ``{agent_id, status, summary, details, run_session_id}`` where ``status`` is
@@ -319,7 +343,8 @@ def run_once(client, agent, resume=None, guidance=None):
     the in-Trace list of actions. Never raises (a platform failure becomes ``failed``).
     ``resume`` (Gap #3) seeds the trigger with a prior paused question + human answer so
     the agent continues where it stopped. ``guidance`` (Gap #3 B4) is a list of retrieved
-    reusable lessons injected as leading context."""
+    reusable lessons injected as leading context. ``rejected`` is a list of
+    ``{summary, app}`` the human turned down, so the same action isn't proposed again."""
     agent_id = agent.get("agent_id")
     base_trigger = agent.get("trigger") or "on a new matching task"
     if resume:
@@ -330,6 +355,8 @@ def run_once(client, agent, resume=None, guidance=None):
     trigger = _uncertainty_trigger(trigger)            # Gap #3: agent may pause when stuck
     if agent.get("memory_store_id"):
         trigger = trigger + "\n\n" + config.MEMORY_UPDATE_DIRECTIVE
+    if rejected:                                       # don't re-propose what was refused
+        trigger = _rejected_preamble(rejected) + trigger
     if guidance:                                       # Gap #3 B4: retrieved lessons up top
         trigger = _guidance_preamble(guidance) + trigger
     try:
