@@ -266,7 +266,7 @@ function renderWelcome() {
         an agent for each. Nothing leaves without your approval.</p>
       <div class="row" style="gap:8px;">${CORE_DOTS.map(c =>
         `<span class="fr-dot" style="background:${c};"></span>`).join("")}</div>
-      <button id="frGo" class="btn-accent" style="padding:13px 34px;margin-top:6px;">Get started</button>
+      <button id="frGo" class="btn-primary" style="padding:13px 34px;margin-top:6px;">Get started</button>
     </div>`;
   $("#frGo").onclick = renderTerms;
 }
@@ -294,7 +294,7 @@ function renderTerms() {
         <input type="checkbox" id="frAgree">
         <span style="font-size:12.5px;color:var(--ink-2);">I agree to the terms of service and privacy policy</span>
       </label>
-      <button id="frAccept" class="btn-accent full" disabled>Agree &amp; continue</button>
+      <button id="frAccept" class="btn-primary full" disabled>Agree &amp; continue</button>
     </div>`;
   $("#frAgree").onchange = (e) => { $("#frAccept").disabled = !e.target.checked; };
   $("#frAccept").onclick = async () => {
@@ -531,7 +531,7 @@ function proposalRow(p) {
     ${why ? `<div class="pp-why">${esc(why)}</div>` : ""}
     <div class="pp-payload" data-for="${esc(p.id)}" hidden>${fields || `<div class="pp-field muted">No details captured.</div>`}</div>
     ${done ? "" : `<div class="row" style="gap:9px;">
-      <button class="btn-accent prop-yes" data-id="${esc(p.id)}" style="flex:1;">Approve &amp; send</button>
+      <button class="btn-primary prop-yes" data-id="${esc(p.id)}" style="flex:1;">Approve &amp; send</button>
       <button class="btn-secondary prop-edit" data-id="${esc(p.id)}">Edit first</button>
       <button class="btn-link prop-no" data-id="${esc(p.id)}" style="color:var(--ink-2);">Reject</button>
     </div>
@@ -576,7 +576,7 @@ function decisionCard(d) {
     ${opts ? `<div class="chip-row">${opts}<button class="chip chip-quiet dec-explain" data-id="${esc(d.id)}">Let me explain…</button></div>` : ""}
     <div class="row dec-free" data-id="${esc(d.id)}"${opts ? ' hidden' : ''} style="gap:6px;">
       <input type="text" class="dec-answer" data-id="${esc(d.id)}" placeholder="Type your answer…" style="flex:1;">
-      <button class="btn-accent btn-sm dec-submit" data-id="${esc(d.id)}">Answer</button>
+      <button class="btn-primary btn-sm dec-submit" data-id="${esc(d.id)}">Answer</button>
     </div>
     <div class="stop-note">Answering resumes the run instantly · your answer becomes a lesson it remembers</div>
   </div>`;
@@ -606,7 +606,7 @@ function lessonConfirmCard(agentId, c) {
     <div class="sub muted" style="margin-bottom:4px;">A similar agent learned this — apply it here?</div>
     <div class="title" style="font-size:14px;">${esc(c.lesson || "")}</div>
     <div class="row" style="gap:8px;margin-top:10px;">
-      <button class="btn-accent btn-sm lesson-yes" data-agent="${esc(agentId)}" data-id="${esc(c.decision_id)}">Use it</button>
+      <button class="btn-primary btn-sm lesson-yes" data-agent="${esc(agentId)}" data-id="${esc(c.decision_id)}">Use it</button>
       <button class="btn-link lesson-no" data-agent="${esc(agentId)}" data-id="${esc(c.decision_id)}" style="color:var(--muted,#888);">Dismiss</button>
     </div>
   </div>`;
@@ -709,7 +709,7 @@ function agentsTopbar(unread, backFn, needsYou, active) {
         ${brandLockup()}
         ${items}
         <div class="side-foot">
-          <button id="navNew" class="btn-primary full">+ New workflow</button>
+          <button id="navNew" class="btn-accent full">+ New workflow</button>
           <div class="user-chip"><span class="user-av">${esc(initial)}</span>
             <span class="user-mail">${esc(S.user ? S.user.email : "")}</span>
             <button id="logout" class="btn-link" title="Sign out">Sign out</button></div>
@@ -802,7 +802,7 @@ async function renderSettings() {
           <div class="dial-note">"Ask me first" surfaces a lesson to confirm on the agent's page.</div>
         </div>
       </div>
-      <button class="btn-accent btn-sm" id="saveConsent" style="margin-top:16px;">Save</button>
+      <button class="btn-primary btn-sm" id="saveConsent" style="margin-top:16px;">Save</button>
       <p class="sub muted" style="margin-top:12px;">"Anonymized" means names, emails, amounts and ids are stripped and a second privacy check runs before anything leaves your account. A shared lesson only ever guides someone else's agent after they confirm it once.</p>
     </div>`);
   tb.wire();
@@ -959,7 +959,7 @@ function renderGroupChat(group) {
           msgs.map(bubble).join("") || `<p class="muted">Try "what did y'all get up to today?" — or @${esc((group.members[0] || {}).name || "agent")} to direct one.</p>`}</div>
         <div class="row" style="gap:6px;margin-top:12px;">
           <input type="text" id="grpInput" placeholder="Message the group…  (@name to direct one)" style="flex:1;padding:8px;">
-          <button class="btn-accent btn-sm" id="grpSend">Send</button>
+          <button class="btn-primary btn-sm" id="grpSend">Send</button>
         </div>
       </div>`);
     tb.wire();
@@ -1105,7 +1105,7 @@ function drawHome(home) {
       <h1 class="brief-head">${headline}</h1>
       <p class="brief-lead">${lead}</p>
       <div class="row" style="gap:10px;">
-        ${total ? `<button id="hmReview" class="btn-accent" style="padding:13px 26px;">Start review · ${total}</button>` : ""}
+        ${total ? `<button id="hmReview" class="btn-primary" style="padding:13px 26px;">Start review · ${total}</button>` : ""}
         <button id="hmAll" class="btn-secondary" style="padding:13px 22px;">See all runs</button>
       </div>
       ${agents.length ? `<div class="ov-wrap">
@@ -1157,7 +1157,7 @@ function renderReview(agentId, startAt) {
             ${st.proposals && st.proposals.length ? `
               <div class="label" style="margin:16px 0 4px;">Proposed actions — approve to run them</div>
               ${st.proposals.map(proposalRow).join("")}
-              ${pending.length ? `<button class="btn-accent approve-sel" style="margin-top:12px;">Approve &amp; run selected</button>` : ""}
+              ${pending.length ? `<button class="btn-primary approve-sel" style="margin-top:12px;">Approve &amp; run selected</button>` : ""}
             ` : ""}
           </div>
           <div class="rv-nav">
@@ -1437,7 +1437,7 @@ function openIdentityPopover(agent, agentId) {
         <div class="sw-row" id="popExt" hidden>${EXTENDED_SHADES.map(swatch).join("")}</div>
       </div>
       <div class="row" style="gap:9px;">
-        <button class="btn-accent" id="popSave" style="flex:1;">Save</button>
+        <button class="btn-primary" id="popSave" style="flex:1;">Save</button>
         <button class="btn-secondary" id="popCancel">Cancel</button>
       </div>
       <p class="pop-note">Changing the color recolors this agent everywhere — avatar, chat
@@ -1620,7 +1620,7 @@ async function renderProfile(agentId) {
         <span class="title" style="font-size:14px;">${esc(ap.label)}</span>
         <span class="sub muted">${ap.staged ? "needs approval" : "runs automatically"}</span>
       </label>`).join("")
-      + `<button class="btn-accent btn-sm" id="pStageSave" style="margin-top:12px;">Save approval settings</button>`;
+      + `<button class="btn-primary btn-sm" id="pStageSave" style="margin-top:12px;">Save approval settings</button>`;
     $("#pApprovals").insertAdjacentHTML("beforeend", apMarkup);
     $("#pStageSave").onclick = async (e) => {
       const staged = Array.from(root.querySelectorAll(".stage-toggle"))
@@ -1643,7 +1643,7 @@ async function renderProfile(agentId) {
         <span class="label" style="min-width:170px;">Contribute my lessons</span>${scopeSelect("ag-contrib", ov.contribute_scope, "contribute", true)}</div>
       <div class="row" style="gap:10px;margin-top:8px;align-items:center;">
         <span class="label" style="min-width:170px;">Use others' lessons</span>${scopeSelect("ag-consume", ov.consume_scope, "consume", true)}</div>
-      <button class="btn-accent btn-sm" id="pShareSave" style="margin-top:12px;">Save</button>`);
+      <button class="btn-primary btn-sm" id="pShareSave" style="margin-top:12px;">Save</button>`);
     $("#pShareSave").onclick = async (e) => {
       await api("POST", `/api/u/agents/${agentId}/consent`, {
         contribute_scope: $(".ag-contrib").value || "inherit",
@@ -1673,7 +1673,7 @@ async function renderProfile(agentId) {
       </div>` : ""}
       ${props.length ? `<div style="margin-top:8px;"><div class="label">Proposed actions</div>
         ${props.map(proposalRow).join("")}
-        ${approvable.length ? `<button class="btn-accent btn-sm approve-sel" style="margin-top:10px;">Approve &amp; run selected</button>` : ""}
+        ${approvable.length ? `<button class="btn-primary btn-sm approve-sel" style="margin-top:10px;">Approve &amp; run selected</button>` : ""}
       </div>` : ""}
     </div>`;
   };
@@ -1811,7 +1811,7 @@ function renderRecBody(mode, started) {
       </div>
       <div class="rec-acts">
         <button id="descBack" class="btn-secondary">← Back</button>
-        <button id="descGo" class="btn-accent">Continue</button>
+        <button id="descGo" class="btn-primary">Continue</button>
       </div>`;
     $("#descBack").onclick = () => renderRecBody("idle");
     $("#descGo").onclick = async () => {
@@ -2331,7 +2331,7 @@ async function connectApp(sid, slug) {
     $("#connMsg").textContent = `Could not start sign-in for ${slug}. Please try again.`;
   }
   $("#connBody").insertAdjacentHTML("beforeend",
-    `<button id="connVerify" class="btn-accent full" style="margin-top:10px;">I've approved — verify</button>`);
+    `<button id="connVerify" class="btn-primary full" style="margin-top:10px;">I've approved — verify</button>`);
   $("#connVerify").onclick = async () => {
     $("#connVerify").disabled = true; $("#connVerify").textContent = "Verifying…";
     await upost(sid, `/connect/${slug}/callback`, {});
@@ -2404,7 +2404,7 @@ async function renderGolive(sid) {
   const held = (b) => (b.held_actions || []).map(a => {
     if (a.status !== "held") return `<div class="sub" style="margin-top:6px;">${esc(a.summary)} — ${esc(a.status)}</div>`;
     return `<div class="row" style="margin-top:8px;gap:8px;"><span class="title" style="font-size:13.5px;flex:1;">${esc(a.summary)}</span>
-      <button class="btn-accent btn-sm dep-ok" data-b="${esc(b.id)}" data-a="${esc(a.action_id)}">Approve</button>
+      <button class="btn-primary btn-sm dep-ok" data-b="${esc(b.id)}" data-a="${esc(a.action_id)}">Approve</button>
       <button class="btn-secondary btn-sm dep-no" data-b="${esc(b.id)}" data-a="${esc(a.action_id)}">Decline</button></div>`;
   }).join("");
   // a bundle with no deploy record (creation failed) must NOT show as LIVE
