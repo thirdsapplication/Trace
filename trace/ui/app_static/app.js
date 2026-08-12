@@ -105,35 +105,29 @@ function splashMark() {
 // Shown once per launch, then cross-fades to whatever comes next. Resolves after the
 // animation's meaningful beats (draw ~1.3s, pop ~1.9s, wordmark ~2.1s) rather than the
 // full 4.2s loop, which would idle on a blank hold before repeating.
-const SPLASH_MS = 2600;
-function splashOnce() {
-  if (sessionStorage.getItem("palzaSplashShown")) return Promise.resolve();
-  sessionStorage.setItem("palzaSplashShown", "1");
-  const reduced = window.matchMedia
-    && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-  const el = document.createElement("div");
-  el.className = "splash";
-  el.innerHTML = reduced
-    ? `${logoMark(120, 98)}<div class="brand splash-word">palza</div>`
-    : `${splashMark()}<div class="brand splash-word" style="animation:palzaRise 4.2s ease-in-out infinite">palza</div>`;
-  document.body.appendChild(el);
-  return new Promise(resolve => setTimeout(() => {
-    el.classList.add("splash-out");                 // cross-fade, then remove
-    setTimeout(() => { el.remove(); resolve(); }, 320);
-  }, reduced ? 700 : SPLASH_MS));
+// The splash is already on screen (it ships in index.html so it paints on the first
+// frame). It stays up until the first screen is ready rather than for a fixed duration —
+// a timer either cuts off a slow load or stalls a fast one. A short floor stops it
+// flashing when everything is warm.
+const SPLASH_FLOOR_MS = 500;
+const _splashAt = Date.now();
+function hideSplash() {
+  const el = document.getElementById("splash");
+  if (!el) return;
+  const wait = Math.max(0, SPLASH_FLOOR_MS - (Date.now() - _splashAt));
+  setTimeout(() => { el.classList.add("splash-out"); setTimeout(() => el.remove(), 320); }, wait);
 }
 
 async function boot() {
-  const splash = splashOnce();                      // runs while the first call is in flight
   const { data } = await api("GET", "/api/auth/me");
-  await splash;
   S.signupAllowed = data.signup_enabled !== false;
   S.user = data.user;
-  if (!S.user) return renderAuth();
+  if (!S.user) { renderAuth(); return hideSplash(); }
   const fr = await api("GET", "/api/u/first-run");
-  if (!(fr.data && fr.data.terms_accepted_at)) return renderWelcome();
-  if (fr.data.first_run_completed_at) { S.igHome = null; return renderHome(); }
+  if (!(fr.data && fr.data.terms_accepted_at)) { renderWelcome(); return hideSplash(); }
+  if (fr.data.first_run_completed_at) { S.igHome = null; await renderHome(); return hideSplash(); }
   await loadAndRender();
+  hideSplash();
 }
 
 async function refreshSession() {
@@ -326,11 +320,39 @@ function runBadge(status) {
 const AV_GRADS = [["#f582ae", "#b8235a"], ["#8bd3dd", "#1f6f8b"], ["#ffd803", "#e16162"],
                   ["#a786df", "#5f2da5"], ["#7ec4a2", "#2e6f4e"], ["#f3a712", "#c1440e"]];
 function avHash(s) { let h = 0; for (const c of String(s)) h = (h * 31 + c.charCodeAt(0)) >>> 0; return h; }
-function avatar(name, size) {
-  const g = AV_GRADS[avHash(name || "?") % AV_GRADS.length];
+
+// §4: an agent carries a color, a background tint, and a text tone. Elements read them as
+// custom properties, so recoloring one agent restyles its avatar, dots, rings and bubbles
+// together instead of each place picking its own shade of the same hue.
+const AGENT_TINTS = {
+  "#FF6655": ["#FFEDEA", "#D4442E"], "#FFC83D": ["#FFF6DE", "#C89011"],
+  "#45B86B": ["#E8F6EC", "#2E8F50"], "#A58AE8": ["#F1EBFC", "#8465CC"],
+  "#315EF6": ["#EEF2FF", "#315EF6"],
+  "#FFB3A6": ["#FFEDEA", "#D4442E"], "#FF8A73": ["#FFEDEA", "#D4442E"],
+  "#E04A38": ["#FFEDEA", "#B33A2B"], "#B33A2B": ["#FFEDEA", "#B33A2B"],
+  "#FFE49A": ["#FFF6DE", "#A87F12"], "#FFD966": ["#FFF6DE", "#C89011"],
+  "#E0A818": ["#FFF6DE", "#A87F12"], "#A87F12": ["#FFF6DE", "#A87F12"],
+  "#A8E0BC": ["#E8F6EC", "#2E8F50"], "#7BD097": ["#E8F6EC", "#2E8F50"],
+  "#2E8F50": ["#E8F6EC", "#1F6B3A"], "#1F6B3A": ["#E8F6EC", "#1F6B3A"],
+  "#D9CCF6": ["#F1EBFC", "#8465CC"], "#C3AFF0": ["#F1EBFC", "#8465CC"],
+  "#8465CC": ["#F1EBFC", "#64489F"], "#64489F": ["#F1EBFC", "#64489F"],
+  "#A9BDFB": ["#EEF2FF", "#2447C4"], "#7B98F9": ["#EEF2FF", "#2447C4"],
+  "#2447C4": ["#EEF2FF", "#1A3390"], "#1A3390": ["#EEF2FF", "#1A3390"],
+};
+function agentVars(a) {
+  const c = agentColor(a);
+  const [bg, fg] = AGENT_TINTS[String(c).toUpperCase()] || ["#EEF2FF", c];
+  return `--ag:${c};--ag-bg:${bg};--ag-fg:${fg}`;
+}
+
+function avatar(name, size, agent) {
   const initial = (String(name || "?").trim()[0] || "?").toUpperCase();
-  return `<span class="ag-av" style="width:${size}px;height:${size}px;font-size:${Math.round(size * .42)}px;
-    background:linear-gradient(135deg,${g[0]},${g[1]});">${esc(initial)}</span>`;
+  // An agent avatar is its own color: tinted fill, colored ring, colored initial (21).
+  // Falls back to a name-derived hue when no agent is in hand (e.g. a bare name).
+  const vars = agentVars(agent || { agent_id: name, color: (agent || {}).color });
+  return `<span class="ag-av" style="${vars};width:${size}px;height:${size}px;
+    font-size:${Math.round(size * .40)}px;background:var(--ag-bg);color:var(--ag-fg);
+    border:${size >= 44 ? 3 : 2}px solid var(--ag);">${esc(initial)}</span>`;
 }
 function ago(iso) {
   const t = Date.parse(iso || "");
@@ -717,7 +739,7 @@ async function renderAllRuns() {
     bits.push(sched ? (sched.paused ? "schedule paused" : `runs ${cadenceToValue(sched.cadence) || "on its schedule"}`)
                     : "runs when you say");
     return `<button class="ag-row" data-agent="${esc(a.agent_id)}">
-      ${avatar(a.name, 44)}
+      ${avatar(a.name, 44, a)}
       <span class="ag-mid">
         <span class="title">${esc(a.name)}</span>
         <span class="ag-bio">${esc(bits.join(" · "))}</span>
@@ -937,7 +959,7 @@ async function renderMessages() {
   }));
   const list = threads.map(({ a, last }) => `
     <button class="ag-row" data-agent="${esc(a.agent_id)}">
-      ${avatar(a.name, 44)}
+      ${avatar(a.name, 44, a)}
       <span class="ag-mid">
         <span class="title" style="font-size:14.5px;">${esc(a.name)}</span>
         <span class="ag-bio ${a.unread ? "unread" : ""}">${last
@@ -955,17 +977,38 @@ async function renderMessages() {
 async function renderThread(agentId) {
   clearTimers();
   await api("POST", `/api/u/agents/${agentId}/messages/read`, {});
-  root.innerHTML = `
-    <div class="topbar"><div class="row"><button id="agBack" class="btn-link">← messages</button>
-      <span id="thHead" class="row" style="gap:8px;"></span></div>
-      <button id="logout" class="btn-link">Sign out</button></div>
+  const home = await loadHome();
+  const me = (home.agents || []).find(x => x.agent_id === agentId) || { name: "Agent" };
+  const tb = agentsTopbar(home.unread_total, renderMessages, home.needs_you_total, "messages");
+  // Frame 23: the thread says what it can actually do — answers come from its run
+  // history, not from a fresh session — and offers openers, so the box isn't a blank
+  // prompt you have to invent a question for.
+  const SUGGESTIONS = ["What did you do today?", "Anything you're stuck on?",
+                       "What did you skip and why?"];
+  root.innerHTML = `${tb.html}
     <div class="panel dm-panel">
+      <div class="dm-head">
+        ${avatar(me.name, 44, me)}
+        <div style="flex:1;">
+          <div class="title">${esc(me.name)}</div>
+          <div class="dm-live"><span class="dm-live-dot"></span>live · answers from its run history</div>
+        </div>
+        <button id="thProfile" class="btn-secondary btn-sm">View profile</button>
+      </div>
       <div class="dm-chat" id="chat"><p class="muted">Loading…</p></div>
+      <div class="chip-row" id="dmSuggest">${SUGGESTIONS.map(t =>
+        `<button class="chip chip-quiet dm-sug">${esc(t)}</button>`).join("")}</div>
       <div class="dm-bar">
         <input id="dmText" type="text" placeholder="Message…" autocomplete="off">
-        <button id="dmSend" class="btn-primary btn-sm">Send</button>
+        <button id="dmSend" class="dm-send" title="Send">↑</button>
       </div>
     </div>`;
+  tb.wire();
+  const pf = $("#thProfile");
+  if (pf) pf.onclick = () => renderProfile(agentId);
+  root.querySelectorAll(".dm-sug").forEach(b => b.onclick = () => {
+    const i = $("#dmText"); if (i) { i.value = b.textContent; i.focus(); }
+  });
   $("#agBack").onclick = renderMessages;
   $("#logout").onclick = async () => { await api("POST", "/api/auth/logout", {}); S.user = null; clearTimers(); renderAuth(); };
   let name = "";
@@ -1037,7 +1080,7 @@ function openIdentityPopover(agent, agentId) {
   el.className = "pop-back";
   el.innerHTML = `<div class="pop">
       <div class="row" style="gap:12px;">
-        ${avatar(agent.name, 52)}
+        ${avatar(agent.name, 52, agent)}
         <div class="pop-title">Edit agent</div>
         <button class="pop-x" title="Close">✕</button>
       </div>

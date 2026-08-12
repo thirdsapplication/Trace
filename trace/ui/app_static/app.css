@@ -56,6 +56,18 @@ a:hover { color: #2447C4; }
   50%,86% { opacity: 1; transform: translateY(0); } 96%,100% { opacity: 0; } }
 
 
+/* --- DM thread (23) --- */
+.dm-head { display: flex; align-items: center; gap: 12px; padding-bottom: 12px;
+  border-bottom: 1px solid var(--line-2); margin-bottom: 10px; }
+.dm-live { font-size: 12px; color: var(--ok); display: flex; align-items: center; gap: 6px; }
+.dm-live-dot { width: 7px; height: 7px; border-radius: 999px; background: var(--ok); }
+.dm-send { width: 38px; height: 38px; border-radius: 999px; background: var(--accent);
+  color: #fff; border: none; cursor: pointer; font-size: 16px; font-weight: 700;
+  flex: none; padding: 0; }
+.dm-send:hover { filter: brightness(1.05); }
+.dm-bar input { border-radius: 999px; }
+#dmSuggest { margin-bottom: 8px; }
+
 /* --- sharing dials (25) --- */
 .dial-row { display: flex; gap: 12px; margin-top: 14px; flex-wrap: wrap; }
 .dial-card { flex: 1 1 260px; background: var(--panel); border: 1px solid var(--line-2);

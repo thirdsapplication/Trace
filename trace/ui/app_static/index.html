@@ -10,9 +10,21 @@
 <link rel="stylesheet" href="/app/app.css">
 </head>
 <body>
-  <div class="wrap" id="root">
-    <div class="panel"><p class="muted">Loading…</p></div>
+  <!-- The splash lives in the HTML so it paints on the FIRST frame, before any script
+       runs. It used to be a "Loading…" card that appeared first and was then replaced,
+       which read as a stray panel flashing up before the app. app.js removes this as
+       soon as the first screen is ready. -->
+  <div class="splash" id="splash">
+    <svg width="220" height="150" viewBox="0 0 220 150" fill="none" aria-hidden="true">
+      <path d="M20 15 C104 15 104 75 164 75" stroke="#FF6655" stroke-width="12" stroke-linecap="round" stroke-dasharray="170" style="animation:palzaDraw 4.2s ease-in-out infinite"/>
+      <path d="M20 45 C96 45 96 75 164 75" stroke="#FFC83D" stroke-width="12" stroke-linecap="round" stroke-dasharray="170" style="animation:palzaDraw 4.2s ease-in-out .12s infinite"/>
+      <path d="M20 105 C96 105 96 75 164 75" stroke="#45B86B" stroke-width="12" stroke-linecap="round" stroke-dasharray="170" style="animation:palzaDraw 4.2s ease-in-out .24s infinite"/>
+      <path d="M20 135 C104 135 104 75 164 75" stroke="#A58AE8" stroke-width="12" stroke-linecap="round" stroke-dasharray="170" style="animation:palzaDraw 4.2s ease-in-out .36s infinite"/>
+      <circle cx="178" cy="75" r="19" fill="#315EF6" style="transform-box:fill-box;transform-origin:center;animation:palzaPop 4.2s ease-in-out infinite"/>
+    </svg>
+    <div class="brand splash-word" style="animation:palzaRise 4.2s ease-in-out infinite">palza</div>
   </div>
+  <div class="wrap" id="root"></div>
   <script src="/app/app.js"></script>
 </body>
 </html>
