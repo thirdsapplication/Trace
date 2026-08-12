@@ -554,7 +554,12 @@ function wireProposalCards(root_) {
 // Per-proposal quick action: stop staging one app (future actions in it run automatically).
 // Server computes current-minus-app, so it's race-free. Returns true if the user confirmed.
 async function autoApproveApp(agentId, app) {
-  if (!confirm(`Stop asking approval for ${app}? Future ${app} actions will run automatically.`)) return false;
+  const ok = await confirmDestructive({
+    title: `Stop asking approval for ${app}?`,
+    body: `Future ${app} actions run automatically, without showing you first. You can turn approval back on from this agent's page.`,
+    verb: "Stop asking", word: null, tone: "primary",
+  });
+  if (!ok) return false;
   await api("POST", `/api/u/agents/${agentId}/staging`, { unstage: app });
   return true;
 }
@@ -1357,7 +1362,11 @@ async function renderThread(agentId) {
 // to be deliberate. Resolves true only on confirm — Escape, Cancel and a scrim click
 // all resolve false, so a caller can simply `if (!await confirmDestructive(…)) return`.
 // Reuses .pop-back/.pop so every modal in the app is the same object.
-function confirmDestructive({ title, body, verb = "Delete forever", word = "delete" }) {
+// `word: null` drops the typed confirmation — for choices that are consequential but not
+// destructive (turning off every approval gate, retiring a lesson). Those were still
+// window.confirm(), which in a redesigned app looks like the browser interrupting it.
+function confirmDestructive({ title, body, verb = "Delete forever", word = "delete",
+                              tone = "danger" }) {
   return new Promise(resolve => {
     const back = document.createElement("div");
     back.className = "pop-back";
@@ -1365,11 +1374,12 @@ function confirmDestructive({ title, body, verb = "Delete forever", word = "dele
                            aria-labelledby="cfTitle">
       <div class="pop-title" id="cfTitle">${esc(title)}</div>
       <p class="cf-body">${esc(body)}</p>
-      <input type="text" id="cfWord" class="cf-input" autocomplete="off"
-             aria-label="Type ${esc(word)} to confirm" placeholder="Type ${esc(word)} to confirm">
+      ${word ? `<input type="text" id="cfWord" class="cf-input" autocomplete="off"
+             aria-label="Type ${esc(word)} to confirm" placeholder="Type ${esc(word)} to confirm">` : ""}
       <div class="cf-acts">
         <button class="btn-secondary" id="cfNo">Cancel</button>
-        <button class="btn-destroy" id="cfYes" disabled>${esc(verb)}</button>
+        <button class="${tone === "danger" ? "btn-destroy" : "btn-primary"}" id="cfYes"
+                ${word ? "disabled" : ""}>${esc(verb)}</button>
       </div>
     </div>`;
     document.body.appendChild(back);
@@ -1385,14 +1395,16 @@ function confirmDestructive({ title, body, verb = "Delete forever", word = "dele
       if (e.key === "Escape") done(false);
       if (e.key === "Enter" && !yes.disabled) done(true);
     };
-    input.oninput = () => {
-      yes.disabled = input.value.trim().toLowerCase() !== word;
-    };
+    if (input) {
+      input.oninput = () => {
+        yes.disabled = input.value.trim().toLowerCase() !== word;
+      };
+    }
     back.querySelector("#cfNo").onclick = () => done(false);
     yes.onclick = () => done(true);
     back.onclick = (e) => { if (e.target === back) done(false); };   // scrim, not the card
     document.addEventListener("keydown", onKey);
-    input.focus();
+    (input || yes).focus();
   });
 }
 
@@ -1625,8 +1637,11 @@ async function renderProfile(agentId) {
     $("#pStageSave").onclick = async (e) => {
       const staged = Array.from(root.querySelectorAll(".stage-toggle"))
         .filter(c => c.checked).map(c => c.dataset.slug);
-      if (!staged.length &&
-          !confirm("No apps will need approval — this agent will act automatically with no review. Continue?")) return;
+      if (!staged.length && !await confirmDestructive({
+        title: "Let this agent act without review?",
+        body: "No app will need your approval — everything it does, including anything outbound, happens without showing you first.",
+        verb: "Turn off approvals", word: null, tone: "primary",
+      })) return;
       e.target.disabled = true; e.target.textContent = "Saving…";
       await api("POST", `/api/u/agents/${agentId}/staging`, { staged_apps: staged });
       S.igHome = null; renderProfile(agentId);
@@ -1714,8 +1729,13 @@ async function renderProfile(agentId) {
   };
   root.querySelectorAll(".lesson-yes").forEach(b => b.onclick = () => confirmLesson(b.dataset.agent, b.dataset.id, "confirm"));
   root.querySelectorAll(".lesson-no").forEach(b => b.onclick = () => confirmLesson(b.dataset.agent, b.dataset.id, "dismiss"));
-  root.querySelectorAll(".lesson-retire").forEach(b => b.onclick = () => {
-    if (confirm("Retire this lesson? This agent will stop applying it.")) confirmLesson(b.dataset.agent, b.dataset.id, "retire");
+  root.querySelectorAll(".lesson-retire").forEach(b => b.onclick = async () => {
+    const ok = await confirmDestructive({
+      title: "Retire this lesson?",
+      body: "The agent stops applying it from its next run. What it already did stays as it is.",
+      verb: "Retire it", word: null, tone: "primary",
+    });
+    if (ok) confirmLesson(b.dataset.agent, b.dataset.id, "retire");
   });
 }
 const renderActivity = renderProfile;                        // legacy entry point
