@@ -76,6 +76,14 @@ def _write_text(path, text):
         f.write(text)
 
 
+# The worker's free-text note rides in the same answers list as a reserved entry, so it
+# reaches the agent config through the existing path (configgen._load_answers) with no
+# plumbing of its own. It is deliberately NOT a question: it never counts as unresolved
+# and never gates the step.
+EXTRA_NOTES_ID = "extra_notes"
+EXTRA_NOTES_LABEL = "Anything else we should know about this workflow?"
+
+
 def _interview_record(bid, questions, answers):
     """Assemble an interview record, computing unresolved + status server-side.
     A question is unresolved iff it has no non-empty answer; zero questions is a
@@ -824,6 +832,11 @@ class AppState:
                     answers = [a for a in (prior.get("answers") or [])
                                if a.get("q") in qtext and str(a.get("answer", "")).strip()
                                and a.get("question", "") == qtext[a.get("q")]]
+                    # the free-text note isn't tied to any question, so regenerating the
+                    # questions must not throw it away
+                    answers += [a for a in (prior.get("answers") or [])
+                                if a.get("q") == EXTRA_NOTES_ID
+                                and str(a.get("answer", "")).strip()]
                     rec = _interview_record(b["id"], questions, answers)
                     _write_json(sessions.path(root, sid, sessions.interview_filename(b["id"])), rec)
                     return b["id"]
@@ -873,6 +886,10 @@ class AppState:
             text = str((answers_map or {}).get(q["id"], "") or "").strip()
             if text:
                 answers.append({"q": q["id"], "question": q.get("question", ""), "answer": text})
+        extra = str((answers_map or {}).get(EXTRA_NOTES_ID, "") or "").strip()
+        if extra:                                      # free-text: optional, never gating
+            answers.append({"q": EXTRA_NOTES_ID, "question": EXTRA_NOTES_LABEL,
+                            "answer": extra})
         rec = _interview_record(bid, questions, answers)
         _write_json(sessions.path(self.sessions_root, sid, sessions.interview_filename(bid)), rec)
         self._sync_interview_complete(sid)

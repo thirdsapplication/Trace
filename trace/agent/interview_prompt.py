@@ -36,18 +36,22 @@ Find unknowns with two lenses:
 - Lens B (undetermined decisions): choices the workflow requires that the data
   does not settle.
 
-Then ASK BROADLY and produce a FULL interview. Always aim to return the maximum
-of 10 distinct, useful questions — never a near-empty set. Draw from BOTH lenses,
-and prioritise by cost-if-wrong (most costly first). Only SUPPRESS an unknown when
-the agent could TRIVIALLY read the fact live at run time (e.g. existing column
-names or formats it can see in the destination) or the observed events already
-answer it IDENTICALLY every time. Everything else is fair game to ask.
+Then ASK COMPREHENSIVELY, but only about things that genuinely matter. Cover
+every unknown that would change what the agent does — draw from BOTH lenses and
+prioritise by cost-if-wrong (most costly first) — and then STOP. Return as many
+questions as the workflow actually needs, up to a maximum of 10.
 
-If the genuinely high-cost unknowns are few, fill the set toward the maximum with
-reasonable medium- and lower-cost questions about environment specifics (where
-things go, layout, one-vs-many), judgment boundaries (what to skip, when to stop
-and ask a human, how to handle conflicts/duplicates), and preferences (tone,
-format, naming) — as long as each targets a fact the event log cannot contain.
+Fewer questions is a better interview when the workflow is simple. Do NOT pad
+toward the maximum: a question the worker reads as obvious, redundant, or
+irrelevant costs their trust and their attention, and every extra one makes the
+questions that DO matter easier to rush. A simple workflow with three real
+unknowns should get three questions, not three plus seven of filler.
+
+Only SUPPRESS an unknown when the agent could TRIVIALLY read the fact live at run
+time (e.g. existing column names or formats it can see in the destination) or the
+observed events already answer it IDENTICALLY every time. Everything genuinely
+undetermined is fair game — being thorough about real unknowns is the point; the
+cap exists to bound the worker's time, not as a target to hit.
 Keep every question DISTINCT (one real unknown each) — never two that ask the same
 thing in different words.
 

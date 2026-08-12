@@ -245,3 +245,47 @@ class UserDescriptionToInterviewTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExtraNotesTest(unittest.TestCase):
+    """The optional free-text note: reaches the agent config, never gates the step."""
+
+    def setUp(self):
+        import tempfile
+        from trace.ui import app as ui_app
+        self.app = ui_app
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = self._tmp.name
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _rec(self, answers):
+        return self.app._interview_record("B1", [{"id": "q1", "question": "Which tab?"}], answers)
+
+    def test_note_does_not_count_as_an_unanswered_question(self):
+        rec = self._rec([{"q": self.app.EXTRA_NOTES_ID, "question": self.app.EXTRA_NOTES_LABEL,
+                          "answer": "skip anything from a personal address"}])
+        self.assertEqual(rec["unresolved"], ["q1"])      # the real question is still open
+        self.assertEqual(rec["status"], "incomplete")
+
+    def test_note_alongside_answers_completes(self):
+        rec = self._rec([{"q": "q1", "question": "Which tab?", "answer": "Open_Orders"},
+                         {"q": self.app.EXTRA_NOTES_ID, "question": self.app.EXTRA_NOTES_LABEL,
+                          "answer": "never touch the archive tab"}])
+        self.assertEqual(rec["unresolved"], [])
+        self.assertEqual(rec["status"], "complete")
+
+    def test_note_reaches_the_agent_config(self):
+        """configgen reads the record's `answers` list, so the note must live there —
+        otherwise the field is decorative."""
+        import json, os
+        from trace.agent import configgen
+        os.makedirs(os.path.join(self.root, "specs"), exist_ok=True)
+        rec = self._rec([{"q": "q1", "question": "Which tab?", "answer": "Open_Orders"},
+                         {"q": self.app.EXTRA_NOTES_ID, "question": self.app.EXTRA_NOTES_LABEL,
+                          "answer": "never touch the archive tab"}])
+        with open(os.path.join(self.root, "interview_B1.json"), "w", encoding="utf-8") as f:
+            json.dump(rec, f)
+        loaded = configgen._load_answers(self.root, "B1")
+        self.assertIn("never touch the archive tab", json.dumps(loaded))

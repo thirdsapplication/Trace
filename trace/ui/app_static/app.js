@@ -1289,9 +1289,17 @@ function renderInterview(sid, data) {
         ${(q.suggested_answers || []).length ? `<div class="chips" style="margin-top:8px;">${
           q.suggested_answers.map(s => `<button class="suggest" data-q="${esc(q.id)}" data-bid="${esc(bid)}">${esc(s)}</button>`).join("")}</div>` : ""}
       </div>`).join("");
+    // Optional free-text: instructions the generated questions never thought to ask.
+    // Never gates the step — it is not a question and never counts as unresolved.
+    const extra = prior["extra_notes"] || "";
     return `<div class="iv-page" data-bid="${esc(bid)}" style="display:none;">
       <div class="card" style="padding:16px;">
         <div class="label" style="margin-bottom:10px;">${esc(nameOf(bid))}</div>${qs}
+        <div class="field" style="margin-top:14px;">
+          <div class="title" style="margin-bottom:6px;">Anything else we should know? <span class="muted" style="font-weight:400;">(optional)</span></div>
+          <textarea class="iv-extra" data-bid="${esc(bid)}" rows="3" style="min-height:72px;"
+            placeholder="Anything the questions above didn't cover — exceptions, preferences, things to avoid">${esc(extra)}</textarea>
+        </div>
       </div></div>`;
   }).join("");
   $("#ivBody").innerHTML = `
@@ -1341,6 +1349,10 @@ function renderInterview(sid, data) {
     root.querySelectorAll(".iv-a").forEach(inp => {
       const v = inp.value.trim(); if (!v) return;
       (byB[inp.dataset.bid] = byB[inp.dataset.bid] || {})[inp.dataset.q] = v;
+    });
+    root.querySelectorAll(".iv-extra").forEach(t => {
+      const v = (t.value || "").trim(); if (!v) return;
+      (byB[t.dataset.bid] = byB[t.dataset.bid] || {}).extra_notes = v;
     });
     for (const bid of Object.keys(byB)) {
       const r = await upost(sid, `/interview/${bid}`, { answers: byB[bid] });
