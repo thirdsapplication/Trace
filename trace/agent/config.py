@@ -230,12 +230,12 @@ UNCERTAINTY_DIRECTIVE = (
     "```\n")
 
 
-# --- Per-user memory store (Managed Agents memory beta) ----------------------
-# Every USER gets ONE memory store (created-or-REUSED by name, so redeploys never
-# wipe accumulated lessons), SHARED by all of that user's agents. Each agent keeps
-# its own two documents inside the store under ``agents/<workflow-slug>/`` (see
-# ``agent_memory_dir``), so agents never clobber each other's status/lessons while
-# the Console shows a single store per user instead of one per agent per user.
+# --- Per-agent memory store (Managed Agents memory beta) ---------------------
+# Every deployed agent gets its OWN memory store (created-or-REUSED by name, so
+# redeploys never wipe accumulated lessons), holding two documents the agent
+# maintains itself. The name keys on (user, workflow name) — see
+# ``memory_store_name`` — so it identifies the owner in the Console AND stays
+# stable across redeploys, which rotate the platform agent id.
 # The store is attached at deployment/session creation via a memory_store resource
 # and mounts at /mnt/memory/<store-name>/ where the agent uses ordinary file tools.
 # Beta shape — confirm against current Managed Agents memory docs.
@@ -262,10 +262,9 @@ MEMORY_LESSONS_SEED = (
     "approaches, and edge cases; never routine run logs.\n")
 
 MEMORY_STORE_DESCRIPTION = (
-    "Persistent workflow memory for this user's Trace agents. Each agent keeps its "
-    "own directory under agents/<workflow>/ holding current_workflow_status.md (the "
-    "workflow's live state) and lessons_learned.md (accumulated lessons). An agent "
-    "reads its own two documents before starting work.")
+    "Persistent workflow memory for this Trace agent: current_workflow_status.md "
+    "(the workflow's live state) and lessons_learned.md (accumulated lessons). "
+    "Read both before starting work.")
 
 
 def memory_store_description(owner=None):
@@ -278,22 +277,9 @@ def memory_store_description(owner=None):
 # Instruction appended to every deployment's initial message set (and to approval-
 # execution instructions), telling the agent to maintain its two memory documents.
 # NEVER asks for secrets in memory — the platform forbids credentials in memory stores.
-# The intro varies by store layout: agents deployed since stores became per-USER get
-# their own directory inside the shared store (``memory_update_directive(memory_dir)``);
-# agents from before that keep the legacy root-level documents (the bare constant).
-_MEMORY_DIRECTIVE_INTRO_LEGACY = (
+MEMORY_UPDATE_DIRECTIVE = (
     "MEMORY — you have a persistent memory directory mounted under /mnt/memory/ "
-    "containing current_workflow_status.md and lessons_learned.md.\n")
-
-_MEMORY_DIRECTIVE_INTRO_SHARED = (
-    "MEMORY — your persistent memory is the directory {memory_dir}/ inside the "
-    "memory store mounted under /mnt/memory/. YOUR two files are "
-    "{memory_dir}/current_workflow_status.md and {memory_dir}/lessons_learned.md "
-    "(create the directory if it is missing). The store is shared with the same "
-    "person's other agents: work ONLY inside your own directory, and never read or "
-    "modify any other agent's directory.\n")
-
-_MEMORY_DIRECTIVE_BODY = (
+    "containing current_workflow_status.md and lessons_learned.md.\n"
     "At the START of this session: read both files and factor them into how you work "
     "(the status file tells you where the workflow stands; the lessons file tells you "
     "what has already been learned the hard way).\n"
@@ -320,64 +306,35 @@ _MEMORY_DIRECTIVE_BODY = (
     "Keep each file concise and well under 100KB (prune superseded content when "
     "rewriting). NEVER write credentials, tokens, API keys, or any secret into memory.")
 
-MEMORY_UPDATE_DIRECTIVE = _MEMORY_DIRECTIVE_INTRO_LEGACY + _MEMORY_DIRECTIVE_BODY
-
-
-def memory_update_directive(memory_dir=None):
-    """The per-run memory instruction. ``memory_dir`` is the agent's own directory
-    inside its owner's shared store (persisted on the live record / agent row by
-    deploys since stores became per-user); None keeps the legacy root-document
-    wording for agents deployed before that, whose store holds root-level docs."""
-    if not memory_dir:
-        return MEMORY_UPDATE_DIRECTIVE
-    return (_MEMORY_DIRECTIVE_INTRO_SHARED.replace("{memory_dir}",
-                                                   str(memory_dir).strip("/"))
-            + _MEMORY_DIRECTIVE_BODY)
-
 
 def name_slug(text, fallback=""):
     """Lowercase alnum-and-dash slug for platform object names (environments,
-    deployments, memory stores, memory directories)."""
+    deployments, memory stores)."""
     s = re.sub(r"[^a-z0-9]+", "-", str(text or "").lower()).strip("-")
     return s or fallback
 
 
-def memory_store_name(external_user_id):
-    """The per-USER memory store name: ONE store per customer, keyed on the stable
-    ``external_user_id`` and shared by every agent that user deploys. Each agent
-    keeps its own documents inside the store (``agent_memory_dir``), so nothing
-    collides while the Console shows one store per user.
+def memory_store_name(external_user_id, workflow_name):
+    """The per-agent memory store name: one DEDICATED store per (user, workflow),
+    e.g. ``trace-user-<id>-order-intake-memory`` — so every agent keeps its own
+    store while the name still tells an administrator whose it is.
 
-    It used to key on ``(agent_id, external_user_id)`` — one store per agent per
-    user — which littered the backend with a dedicated store for every agent, and,
-    because redeploys DELETE and RECREATE the platform agent under a new id
-    (``create_or_reuse_agent``), silently minted a fresh store on every redeploy,
-    orphaning what the agent had learned. Keying on the user alone keeps the name
-    stable across deploys, redeploys, and renames.
+    The workflow-name half is the platform agent name ``create_or_reuse_agent``
+    reuses by, which is what makes it the right key: it survives redeploys — the
+    platform agent ID does NOT (redeploys delete+recreate the agent under a new
+    id, so the previous id-keyed name minted a fresh store on every redeploy and
+    orphaned what the agent had learned) — and a display rename
+    (``registry.agent_set_name``) never touches it. An earlier scheme keyed on the
+    bundle id, which is unique only within a recording (B1, B2 …), so a brand-new
+    workflow inherited an older, unrelated agent's notes.
+
+    ``external_user_id`` comes FIRST so the 100-char clamp can never truncate it
+    away and let two customers collide on one store.
     """
     uid = name_slug(external_user_id, "user")
     if not uid.startswith("trace-"):
         uid = f"trace-{uid}"
-    return f"{uid}-memory"[:100]
-
-
-def agent_memory_dir(workflow_name):
-    """One agent's directory INSIDE its owner's shared memory store. Keyed on the
-    platform agent NAME (the workflow name ``create_or_reuse_agent`` reuses by),
-    which survives redeploys — unlike the platform agent id, which delete+recreate
-    rotates — and is untouched by display renames (``registry.agent_set_name``), so
-    neither event orphans what the agent has learned. Persisted on the live record /
-    agent row as ``memory_dir`` and read back at every session create."""
-    return f"agents/{name_slug(workflow_name, 'agent')}"
-
-
-def agent_memory_documents(memory_dir):
-    """The ``(path, seed)`` pairs for one agent's two documents inside the shared
-    store. Seeded at every deploy; already-existing documents are left untouched
-    (``seed_memory`` tolerates the conflict), so a redeploy never wipes memory."""
-    base = "/" + str(memory_dir or "").strip("/")
-    return [(f"{base}{MEMORY_STATUS_DOC}", MEMORY_STATUS_SEED),
-            (f"{base}{MEMORY_LESSONS_DOC}", MEMORY_LESSONS_SEED)]
+    return f"{uid}-{name_slug(workflow_name, 'agent')}"[:93] + "-memory"
 
 
 def memory_resource(memory_store_id):

@@ -651,14 +651,6 @@ class RunnerMemoryTest(unittest.TestCase):
         self.assertEqual(ma.sessions[0]["resources"][0]["type"], "memory_store")
         self.assertIn(agent_config.MEMORY_UPDATE_DIRECTIVE, ma.triggers[0])
 
-    def test_agent_with_memory_dir_gets_shared_store_directive(self):
-        # deploys since stores became per-user persist the agent's own directory;
-        # the run directive must point THERE, not at the legacy root documents
-        ma = FakeMA()
-        runner.run_once(ma, {**_dep_agent(), "memory_dir": "agents/order-intake"})
-        self.assertIn("agents/order-intake/current_workflow_status.md", ma.triggers[0])
-        self.assertNotIn(agent_config.MEMORY_UPDATE_DIRECTIVE, ma.triggers[0])
-
     def test_run_names_identify_the_user(self):
         # session titles + environment names carry owner identity + agent + purpose,
         # so an administrator can tell whose run this is in the Console backend

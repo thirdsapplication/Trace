@@ -191,19 +191,19 @@ class DeployTest(unittest.TestCase):
         # the held list drains as actions are resolved
         self.assertEqual(deploy.list_held(client, sid), [])
 
-    # --- platform deployments + per-USER shared memory ---------------------
+    # --- platform deployments + per-agent memory ---------------------------
     def test_deploy_creates_memory_store_and_manual_deployment(self):
         bundle, live = _live_dict()
         client = FakeDeployClient()
         rec = deploy.deploy_live(bundle, live, CONNECTION, client, trigger="on a new inbound PO")
-        # one PER-USER memory store (keyed on the customer, not the agent), with this
-        # agent's two documents seeded inside its own directory
+        # one DEDICATED memory store for this agent, keyed on user + workflow name
+        # (NOT the platform agent id, which redeploys rotate), seeded with BOTH
+        # canonical documents
         self.assertEqual(len(client.memory_stores), 1)
         self.assertEqual(client.memory_stores[0]["name"],
-                         config.memory_store_name("trace-s1"))
-        self.assertEqual(rec["memory_dir"], config.agent_memory_dir(live["name"]))
+                         config.memory_store_name("trace-s1", live["name"]))
         self.assertEqual({p for _sid, p in client.seeded},
-                         {p for p, _c in config.agent_memory_documents(rec["memory_dir"])})
+                         {config.MEMORY_STATUS_DOC, config.MEMORY_LESSONS_DOC})
         # one MANUAL deployment (no schedule at deploy; the dashboard attaches cron)
         dep = client.deployments[0]
         self.assertIsNone(dep["schedule"])
@@ -230,12 +230,10 @@ class DeployTest(unittest.TestCase):
     def test_deployment_initial_message_has_task_and_memory_directive(self):
         bundle, live = _live_dict()
         client = FakeDeployClient()
-        rec = deploy.deploy_live(bundle, live, CONNECTION, client, trigger="on a new inbound PO")
+        deploy.deploy_live(bundle, live, CONNECTION, client, trigger="on a new inbound PO")
         text = client.deployments[0]["trigger_text"]
         self.assertIn("Task: on a new inbound PO", text)
-        # the directive points at the agent's OWN directory inside the shared store
-        self.assertIn(config.memory_update_directive(rec["memory_dir"]), text)
-        self.assertIn(f"{rec['memory_dir']}/current_workflow_status.md", text)
+        self.assertIn(config.MEMORY_UPDATE_DIRECTIVE, text)
         self.assertNotIn("STAGING MODE", text)              # nothing staged here
 
     def test_staged_deploy_message_contains_staging_directive(self):
@@ -243,42 +241,40 @@ class DeployTest(unittest.TestCase):
         conn = {"external_user_id": "trace-s1", "vault_ref": "vlt-s1",
                 "apps": {"gmail": {"usable": True}}}
         client = FakeDeployClient()
-        rec = deploy.deploy_live(bundle, live, conn, client,
-                                 trigger="on a new task", staged_apps=["gmail"])
+        deploy.deploy_live(bundle, live, conn, client,
+                           trigger="on a new task", staged_apps=["gmail"])
         text = client.deployments[0]["trigger_text"]
         self.assertIn("STAGING MODE", text)
         self.assertIn("Gmail", text)                        # staged app named
-        self.assertIn(config.memory_update_directive(rec["memory_dir"]), text)
+        self.assertIn(config.MEMORY_UPDATE_DIRECTIVE, text)
 
     def test_memory_store_reused_on_redeploy_keeps_lessons(self):
+        # a redeploy rotates the platform agent id, but the store name keys on
+        # user + workflow, so the SAME dedicated store is found and reused
         bundle, live = _live_dict()
-        name = config.memory_store_name("trace-s1")
+        name = config.memory_store_name("trace-s1", live["name"])
         client = FakeDeployClient(existing_stores=[{"id": "mem_prior", "name": name}])
         rec = deploy.deploy_live(bundle, live, CONNECTION, client)
         self.assertEqual(rec["memory_store_id"], "mem_prior")
         self.assertTrue(rec["memory_store_reused"])
-        # reuse never creates a second store; it only ENSURES this agent's own
-        # documents exist inside the shared one (existing content is untouched —
-        # see the conflict-tolerant seed contract in test_agent_api_client)
+        # reuse never creates a second store, and existing documents stay untouched
+        # (the conflict-tolerant seed contract in test_agent_api_client)
         self.assertEqual(len(client.memory_stores), 1)
-        self.assertEqual({p for _sid, p in client.seeded},
-                         {p for p, _c in config.agent_memory_documents(rec["memory_dir"])})
 
-    def test_one_store_per_user_shared_across_their_agents(self):
-        # a user's SECOND workflow joins the store the first one created — one store
-        # per user in the backend, each agent writing inside its own directory
+    def test_each_agent_gets_its_own_store(self):
+        # a user's SECOND workflow gets its OWN dedicated store — one store per
+        # agent, never shared — and both names still identify the user
         b1, live1 = _live_dict("marcy")
         b2, live2 = _live_dict("recruiter")
         client = FakeDeployClient()
         r1 = deploy.deploy_live(b1, live1, CONNECTION, client)
         r2 = deploy.deploy_live(b2, live2, CONNECTION, client)
-        self.assertEqual(len(client.memory_stores), 1)
-        self.assertEqual(r1["memory_store_id"], r2["memory_store_id"])
-        self.assertTrue(r2["memory_store_reused"])
-        self.assertNotEqual(r1["memory_dir"], r2["memory_dir"])   # no clobbering
-        self.assertEqual({p for _sid, p in client.seeded},
-                         {p for d in (r1, r2)
-                          for p, _c in config.agent_memory_documents(d["memory_dir"])})
+        self.assertEqual(len(client.memory_stores), 2)
+        self.assertNotEqual(r1["memory_store_id"], r2["memory_store_id"])
+        self.assertFalse(r1["memory_store_reused"])
+        self.assertFalse(r2["memory_store_reused"])
+        for s in client.memory_stores:
+            self.assertIn("trace-s1", s["name"])            # whose it is, at a glance
 
     def test_deployment_and_environment_named_for_the_user(self):
         # the old names repeated per user ("trace-B1" for every first workflow); now

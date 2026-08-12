@@ -360,17 +360,15 @@ class ManagedAgentsClient:
     # created once, attached at session/deployment create via a memory_store resource,
     # and mount at /mnt/memory/<store-name>/ inside the container.
     def create_or_reuse_memory_store(self, name, description, documents=None):
-        """One memory store per USER, keyed by its Trace-deterministic name. REUSED
+        """One memory store per agent, keyed by its Trace-deterministic name. REUSED
         when it already exists (unlike agents, which are recreated on redeploy) so
-        accumulated lessons survive redeploys — and so a user's second agent joins
-        the store their first agent created. ``documents`` is the ``(path, content)``
-        seed list for the calling agent (defaults to the legacy root-level pair);
-        seeds run on BOTH the fresh and the reused path, because on a shared store
-        "reused" only means another agent got there first — this agent's own
-        documents may not exist yet. ``seed_memory`` tolerates already-existing
-        paths (a reused document keeps its content); any other seed failure raises
-        (fail loud — a half-initialized store is worse than a failed deploy).
-        Returns ``{id, reused}``."""
+        accumulated lessons survive redeploys. ``documents`` is the ``(path,
+        content)`` seed list (defaults to the two canonical documents); seeds run on
+        BOTH the fresh and the reused path so a half-initialized store gets
+        completed, with ``seed_memory`` tolerating already-existing paths (a reused
+        document keeps its content — a redeploy never wipes memory); any other seed
+        failure raises (fail loud — a half-initialized store is worse than a failed
+        deploy). Returns ``{id, reused}``."""
         documents = documents or [(config.MEMORY_STATUS_DOC, config.MEMORY_STATUS_SEED),
                                   (config.MEMORY_LESSONS_DOC, config.MEMORY_LESSONS_SEED)]
         stores = self._agents_ns("memory_stores")

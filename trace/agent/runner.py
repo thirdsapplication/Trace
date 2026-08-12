@@ -354,7 +354,7 @@ def run_once(client, agent, resume=None, guidance=None, rejected=None):
     trigger = _staging_trigger(base_trigger, staged) if staged else base_trigger
     trigger = _uncertainty_trigger(trigger)            # Gap #3: agent may pause when stuck
     if agent.get("memory_store_id"):
-        trigger = trigger + "\n\n" + config.memory_update_directive(agent.get("memory_dir"))
+        trigger = trigger + "\n\n" + config.MEMORY_UPDATE_DIRECTIVE
     if rejected:                                       # don't re-propose what was refused
         trigger = _rejected_preamble(rejected) + trigger
     if guidance:                                       # Gap #3 B4: retrieved lessons up top
@@ -433,7 +433,7 @@ def execute_pending(client, agent, pending):
         "propose, or describe it — actually carry it out using your tools, then stop. "
         f"Action: {summary}. Details: {json.dumps(payload, ensure_ascii=False, default=str)}")
     if agent.get("memory_store_id"):
-        instruction = instruction + "\n\n" + config.memory_update_directive(agent.get("memory_dir"))
+        instruction = instruction + "\n\n" + config.MEMORY_UPDATE_DIRECTIVE
     owner, agent_name = config.agent_owner(agent), agent.get("name") or agent_id
     try:
         environment_id = client.create_environment(
@@ -471,7 +471,7 @@ def execute_actions(client, agent, items):
         "or describe them — actually carry each one out using your tools, then stop:\n"
         + "\n".join(lines))
     if agent.get("memory_store_id"):
-        instruction = instruction + "\n\n" + config.memory_update_directive(agent.get("memory_dir"))
+        instruction = instruction + "\n\n" + config.MEMORY_UPDATE_DIRECTIVE
     owner, agent_name = config.agent_owner(agent), agent.get("name") or agent_id
     try:
         environment_id = client.create_environment(

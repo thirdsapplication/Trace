@@ -990,9 +990,10 @@ class AppState:
         agent_ids = list(dict.fromkeys(agent_ids))
         deployment_ids = list(dict.fromkeys(deployment_ids))
         memory_store_ids = list(dict.fromkeys(memory_store_ids))
-        # Memory stores are shared per USER (all of a user's agents mount one store):
-        # never delete a store that a registered agent from ANOTHER capture session
-        # still uses — cleaning this session must not wipe what those agents learned.
+        # A memory store is reused across redeploys of its workflow (keyed on user +
+        # workflow name), so a re-recorded workflow's NEW agent can mount the store
+        # this session's deploy created: never delete a store that a registered agent
+        # from ANOTHER capture session still uses.
         if memory_store_ids:
             try:
                 keep = {a.get("memory_store_id")
@@ -1260,10 +1261,8 @@ class AppState:
                                     "staged_apps": rec.get("staged_apps") or [],
                                     "deployment_id": rec.get("deployment_id"),
                                     "memory_store_id": rec.get("memory_store_id"),
-                                    # the agent's directory inside the user's SHARED
-                                    # store + the owner identity every later session/
-                                    # deployment is named with
-                                    "memory_dir": rec.get("memory_dir"),
+                                    # the owner identity every later session/
+                                    # environment/deployment is named with
                                     "owner_email": rec.get("owner_email"),
                                     # the worker's review-step correction is the truer bio
                                     "description": b.get("user_description")
@@ -1806,7 +1805,7 @@ class AppState:
             old_id = current.get("deployment_id") or old_id
             trigger_text = agent_deploy.build_deployment_trigger(
                 agent.get("trigger"), [s for s in (agent.get("staged_apps") or []) if s],
-                rejected=self._rejected_for(agent), memory_dir=agent.get("memory_dir"))
+                rejected=self._rejected_for(agent))
             store_id = agent.get("memory_store_id")
             named = self._with_owner(agent)
             who = agent_config.agent_owner(named)

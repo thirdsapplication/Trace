@@ -234,17 +234,18 @@ class MemoryStoreClientTest(unittest.TestCase):
         self.assertEqual(out, {"id": "mem_prior", "reused": True})
         self.assertEqual(stores.memories.created, [])          # nothing overwritten
 
-    def test_reused_store_seeds_a_new_agents_own_documents(self):
-        # per-USER stores: "reused" can mean another agent created the store first —
-        # THIS agent's documents must still be seeded into it
+    def test_reused_store_gets_missing_documents_completed(self):
+        # seeds run on the reused path too: a store left half-initialized (e.g. a
+        # deploy interrupted between create and seed) gets its missing documents
+        # on the next deploy instead of staying broken forever
+        from trace.agent import config
         stores = _FakeMemoryStores(existing=[{"id": "mem_prior", "name": "trace-u1-memory"}])
         c = _NSClient.build({"memory_stores": stores})
-        docs = [("/agents/order-intake/current_workflow_status.md", "seed-a"),
-                ("/agents/order-intake/lessons_learned.md", "seed-b")]
-        out = c.create_or_reuse_memory_store("trace-u1-memory", "desc", documents=docs)
+        out = c.create_or_reuse_memory_store("trace-u1-memory", "desc")
         self.assertEqual(out, {"id": "mem_prior", "reused": True})
         self.assertEqual([(s, p) for s, p, _c in stores.memories.created],
-                         [("mem_prior", p) for p, _c in docs])
+                         [("mem_prior", config.MEMORY_STATUS_DOC),
+                          ("mem_prior", config.MEMORY_LESSONS_DOC)])
 
     def test_seed_tolerates_path_conflict_but_raises_otherwise(self):
         from trace.agent import config

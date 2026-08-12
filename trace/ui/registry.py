@@ -39,7 +39,6 @@ def _agent_to_caller(row):
         "staged_apps": row.get("staged_apps") or [],
         "deployment_id": row.get("deployment_id"),
         "memory_store_id": row.get("memory_store_id"),
-        "memory_dir": row.get("memory_dir"),
         "owner_email": row.get("owner_email"),
         "description": row.get("description"),
         "deployed_at": row.get("deployed_at") or row.get("created_at"),
@@ -60,8 +59,8 @@ def _agent_to_sb(agent):
     if "owner_user_id" in agent:
         sb["owner_id"] = agent["owner_user_id"]
     for key in ("external_user_id", "bundle_id", "name", "vault_ref", "trigger",
-                "session_id", "deployment_id", "memory_store_id", "memory_dir",
-                "owner_email", "description"):
+                "session_id", "deployment_id", "memory_store_id", "owner_email",
+                "description"):
         if key in agent:
             sb[key] = agent[key]
     if "staged_apps" in agent:
@@ -995,9 +994,9 @@ def agent_set_color(root, agent_id, color):
 
 
 def agent_set_name(root, agent_id, name):
-    """Rename an agent. Display only: the memory store is keyed on the user
-    (config.memory_store_name) and the agent's directory inside it is the persisted
-    ``memory_dir`` row field, so a rename never orphans what the agent has learned."""
+    """Rename an agent. Display only: the memory store is keyed on the user + the
+    PLATFORM workflow name (config.memory_store_name), which this rename never
+    touches, so a rename never orphans what the agent has learned."""
     if supa.is_configured():
         supa.get_admin().table("agents").update({"name": name}).eq("id", agent_id).execute()
         return
