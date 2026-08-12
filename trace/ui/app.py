@@ -809,7 +809,11 @@ class AppState:
                 if selected_ids is not None:
                     approved = [b for b in approved if b["id"] in set(selected_ids)]
                 model_fn = self._build_model_fn("interview", sid) if approved else None
-                for b in approved:
+
+                def _questions_for(b):
+                    """One workflow's questions. Runs CONCURRENTLY with the others: this
+                    is a model call each, and in series three workflows meant three waits
+                    on the slowest step of the wizard."""
                     questions = self.interview_fn(b, event_log, model_fn=model_fn)["questions"]
                     # preserve any prior answer whose question still maps — ids are
                     # positional (q1..qN), so the stored question text must match too
@@ -822,7 +826,15 @@ class AppState:
                                and a.get("question", "") == qtext[a.get("q")]]
                     rec = _interview_record(b["id"], questions, answers)
                     _write_json(sessions.path(root, sid, sessions.interview_filename(b["id"])), rec)
-                    job["generated"] += 1
+                    return b["id"]
+
+                done = self._fanout([lambda b=b: _questions_for(b) for b in approved])
+                job["generated"] = sum(1 for d in done if d)
+                failed = [b["id"] for b, d in zip(approved, done) if d is None]
+                if failed:
+                    # Surface which workflows failed instead of aborting the whole step —
+                    # the ones that succeeded keep their questions.
+                    raise RuntimeError("couldn't prepare questions for: " + ", ".join(failed))
                 sessions.update_meta(root, sid, interview_at=sessions._now())
                 self._sync_interview_complete(sid)   # zero-approved => vacuously complete
                 job.update(state="done")
@@ -902,7 +914,9 @@ class AppState:
                     approved = [b for b in approved if b["id"] in set(selected_ids)]
                 os.makedirs(specs_dir, exist_ok=True)
                 model_fn = self._build_model_fn("config", sid) if approved else None
-                for b in approved:
+                def _build_one(b):
+                    """One workflow's config. Concurrent for the same reason as the
+                    questions step; each bundle already records its own error."""
                     bid = b["id"]
                     try:
                         # (1) generate the configuration directly (Phase 1)
@@ -916,9 +930,13 @@ class AppState:
                                     compiled["live"]["yaml"])
                         _write_json(os.path.join(specs_dir, sessions.grounding_name(bid)),
                                     compiled["grounding"])
-                        job["generated"] += 1
+                        return bid
                     except Exception as e:
                         job["errors"][bid] = f"{type(e).__name__}: {e}"
+                        return None
+
+                built = self._fanout([lambda b=b: _build_one(b) for b in approved])
+                job["generated"] = sum(1 for x in built if x)
                 sessions.update_meta(root, sid, build_at=sessions._now())
                 job.update(state="done")
             except Exception as e:
