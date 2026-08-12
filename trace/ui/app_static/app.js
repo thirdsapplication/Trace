@@ -448,9 +448,15 @@ function lessonConfirmCard(agentId, c) {
   </div>`;
 }
 
-async function loadHome() {
+// Home data backs EVERY main screen, and each nav click was refetching it — the most
+// expensive endpoint in the app — so switching tabs waited on a full round trip every
+// time. Cached briefly; any mutation sets S.igHome = null, which still forces a refetch.
+const HOME_TTL_MS = 20000;
+async function loadHome(force) {
+  if (!force && S.igHome && (Date.now() - (S._homeAt || 0) < HOME_TTL_MS)) return S.igHome;
   const { data } = await api("GET", "/api/u/home");
   S.igHome = data || { agents: [], unread_total: 0, needs_you_total: 0 };
+  S._homeAt = Date.now();
   return S.igHome;
 }
 
@@ -492,7 +498,16 @@ function agentsTopbar(unread, backFn, needsYou, active) {
     wire() {
       root.className = "";                        // the shell owns layout, not .wrap
       document.querySelectorAll(".nav-item").forEach(b => {
-        b.onclick = () => { const n = NAV.find(x => x.key === b.dataset.nav); if (n) n.go(); };
+        b.onclick = () => {
+          // Move the highlight immediately; the screen follows. Waiting for the fetch
+          // before acknowledging the click is what made the sidebar feel sluggish.
+          document.querySelectorAll(".nav-item").forEach(o => {
+            o.classList.toggle("active", o === b);
+            const d = o.querySelector(".nav-dot"); if (d) d.classList.toggle("on", o === b);
+          });
+          const n = NAV.find(x => x.key === b.dataset.nav);
+          if (n) n.go();
+        };
       });
       const nw = $("#navNew");
       if (nw) nw.onclick = recordAnother;
@@ -511,6 +526,21 @@ const SCOPE_LABELS = {
   contribute: { owner: "Keep to myself", team: "Share with my team", global: "Share with everyone (anonymized)" },
   consume: { owner: "Only my own", team: "My team's", global: "Everyone's (anonymized)" },
 };
+
+// Frame 25: the two dials. Segmented controls rather than dropdowns, because this is a
+// consequential privacy choice and a <select> hides the alternatives behind a click.
+// The three positions map onto the existing owner|team|global scopes, so the stored
+// values and the API are unchanged — only how the choice is presented.
+const DIAL = {
+  contribute: [["owner", "Nothing"], ["team", "Lessons"], ["global", "+ patterns"]],
+  consume: [["owner", "Nothing"], ["team", "Ask me first"], ["global", "Auto-adopt"]],
+};
+function dial(kind, current, cls) {
+  return `<div class="seg" data-kind="${kind}">${DIAL[kind].map(([v, label]) =>
+    `<button class="seg-opt${String(current || "") === v ? " on" : ""} ${cls}" data-val="${v}">${esc(label)}</button>`
+  ).join("")}</div>`;
+}
+
 function scopeSelect(cls, current, kind, includeInherit) {
   const labels = SCOPE_LABELS[kind];
   const opts = (includeInherit ? [["", "Inherit account default"]] : [])
@@ -529,17 +559,36 @@ async function renderSettings() {
     <div class="panel">
       <h2>Lesson sharing</h2>
       <p class="lead">When your agents learn from your decisions, those anonymized lessons can help other similar agents — and theirs can help yours. Choose how much to share and use. This is your account default; each agent can override it on its own page.</p>
-      <div class="row" style="gap:10px;margin-top:14px;align-items:center;">
-        <span class="label" style="min-width:180px;">Contribute my lessons</span>${scopeSelect("set-contrib", c.contribute_scope, "contribute", false)}</div>
-      <div class="row" style="gap:10px;margin-top:8px;align-items:center;">
-        <span class="label" style="min-width:180px;">Use others' lessons</span>${scopeSelect("set-consume", c.consume_scope, "consume", false)}</div>
+      <div class="dial-row">
+        <div class="dial-card">
+          <div class="label">You contribute</div>
+          ${dial("contribute", c.contribute_scope, "set-contrib")}
+          <div class="dial-note">Teammates see the rule, never the example it came from.</div>
+        </div>
+        <div class="dial-card">
+          <div class="label">You consume</div>
+          ${dial("consume", c.consume_scope, "set-consume")}
+          <div class="dial-note">"Ask me first" surfaces a lesson to confirm on the agent's page.</div>
+        </div>
+      </div>
       <button class="btn-accent btn-sm" id="saveConsent" style="margin-top:16px;">Save</button>
       <p class="sub muted" style="margin-top:12px;">"Anonymized" means names, emails, amounts and ids are stripped and a second privacy check runs before anything leaves your account. A shared lesson only ever guides someone else's agent after they confirm it once.</p>
     </div>`;
   tb.wire();
-  $("#saveConsent").onclick = async (e) => {
+  // A dial saves on selection — a privacy choice shouldn't sit unsaved behind a button
+  // you might not press. The Save button stays for the per-agent overrides below.
+  const picked = { contribute: c.contribute_scope, consume: c.consume_scope };
+  root.querySelectorAll(".seg-opt").forEach(b => b.onclick = async () => {
+    const kind = b.closest(".seg").dataset.kind;
+    picked[kind] = b.dataset.val;
+    b.closest(".seg").querySelectorAll(".seg-opt").forEach(o => o.classList.toggle("on", o === b));
     await api("POST", "/api/u/consent", {
-      contribute_scope: $(".set-contrib").value, consume_scope: $(".set-consume").value });
+      contribute_scope: picked.contribute, consume_scope: picked.consume });
+  });
+  const sc = $("#saveConsent");
+  if (sc) sc.onclick = async (e) => {
+    await api("POST", "/api/u/consent", {
+      contribute_scope: picked.contribute, consume_scope: picked.consume });
     e.target.textContent = "Saved ✓";
   };
 }
@@ -1016,9 +1065,16 @@ function openIdentityPopover(agent, agentId) {
     ext.hidden = !ext.hidden;
     el.querySelector("#popMore").textContent = ext.hidden ? "More shades ▾" : "Fewer shades ▴";
   };
-  el.querySelectorAll(".sw").forEach(b => b.onclick = () => {
+  el.querySelectorAll(".sw").forEach(b => b.onclick = async () => {
     chosen.color = b.dataset.color;
     el.querySelectorAll(".sw").forEach(o => o.classList.toggle("on", o === b));
+    // Apply on click: picking a color IS the decision, and §4 says a recolor applies
+    // live everywhere. Save then only has the name left to commit.
+    try {
+      await api("POST", `/api/u/agents/${agentId}/color`, { color: chosen.color });
+      agent.color = chosen.color;
+      S.igHome = null;
+    } catch (e) { /* the Save button retries */ }
   });
   el.querySelector("#popSave").onclick = async () => {
     const save = el.querySelector("#popSave");
@@ -1026,7 +1082,9 @@ function openIdentityPopover(agent, agentId) {
     const name = (el.querySelector("#popName").value || "").trim();
     try {
       if (name && name !== agent.name) await api("POST", `/api/u/agents/${agentId}/name`, { name });
-      if (chosen.color !== agent.color) await api("POST", `/api/u/agents/${agentId}/color`, { color: chosen.color });
+      // Always send the color: agent.color is often absent (the UI was showing a
+      // derived default), so "unchanged" compared against nothing and skipped the save.
+      if (chosen.color) await api("POST", `/api/u/agents/${agentId}/color`, { color: chosen.color });
       S.igHome = null;
       close();
       renderProfile(agentId);                        // recolor applies everywhere at once

@@ -2457,7 +2457,21 @@ def make_handler(state):
                 items = registry.pending_for_user(root, user["user_id"])
                 return self._json(200, {"pending": items, "pending_count": len(items)})
             if rest == "/first-run":                         # §3: new vs returning account
-                return self._json(200, registry.user_flags_get(root, user["user_id"]))
+                flags = registry.user_flags_get(root, user["user_id"])
+                # An account that already has agents is NOT a first run, whatever the
+                # columns say. Without this, an unapplied migration 015 means the flags
+                # never persist and every sign-in replays Welcome and then resumes the
+                # wizard at the last session's step — landing you on a review of your
+                # most recent agent instead of Home.
+                if not flags.get("first_run_completed_at"):
+                    try:
+                        if registry.agents_for_user(root, user["user_id"]):
+                            flags = dict(flags, first_run_completed_at="derived",
+                                         terms_accepted_at=flags.get("terms_accepted_at")
+                                         or "derived")
+                    except Exception:                    # noqa: BLE001 — never block sign-in
+                        pass
+                return self._json(200, flags)
             if rest == "/consent":                           # Phase B: account-wide lesson sharing
                 return self._json(200, registry.user_consent_get(root, user["user_id"]))
             if rest == "/groups":                            # group chat: list groups + members
