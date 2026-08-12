@@ -62,7 +62,8 @@ from ..agent import runner as agent_runner
 from ..agent import activity as agent_activity
 from ..agent import embeddings as agent_embeddings
 from ..agent import generalize as agent_generalize
-from . import cloud, keystore, permissions, registry, sessions, supabase_client, users
+from . import (cloud, keystore, notify, permissions, registry, sessions,
+               supabase_client, users)
 
 
 def _write_json(path, obj):
@@ -1482,14 +1483,29 @@ class AppState:
 
     # --- Instagram-style "My agents": DMs + home feed ---------------------
     def _agent_dm(self, agent, text):
-        """Record a proactive message FROM the agent to its owner (failed runs,
-        staged approvals). Best-effort — a store error never breaks a run path."""
+        """Record a proactive message FROM the agent to its owner (failed runs, blocking
+        questions, staged approvals). Best-effort — a store error never breaks a run path.
+
+        This is also where the "ping me when an agent is blocked" email leaves from (18):
+        every needs-you moment already funnels through here, so one hook covers all of
+        them and none can be forgotten later. Both halves are independently best-effort —
+        a delivery problem must not cost the user the in-app message too.
+        """
         try:
             registry.message_add(self.sessions_root, {
                 "agent_id": agent.get("agent_id"),
                 "owner_user_id": agent.get("owner_user_id"),
                 "sender": "agent", "text": text})
         except Exception:                                  # noqa: BLE001
+            pass
+        try:
+            if notify.is_configured():                     # cheap; skips the lookups
+                uid = agent.get("owner_user_id")
+                who = users.get(uid) or {}
+                notify.agent_needs_you(
+                    registry.user_notify_prefs(self.sessions_root, uid),
+                    who.get("email"), agent.get("name"), text)
+        except Exception:                                  # noqa: BLE001 — never a failed run
             pass
 
     def send_agent_message(self, agent, text):
@@ -2542,6 +2558,12 @@ def make_handler(state):
                     except Exception:                    # noqa: BLE001 — never block sign-in
                         pass
                 return self._json(200, flags)
+            if rest == "/notifications":                     # frame 18's three toggles
+                prefs = registry.user_notify_prefs(root, user["user_id"])
+                # `email_configured` is the difference between "you turned this off" and
+                # "nothing can be sent at all" — the Settings pane should be able to say
+                # which, rather than showing switches that quietly do nothing.
+                return self._json(200, dict(prefs, email_configured=notify.is_configured()))
             if rest == "/consent":                           # Phase B: account-wide lesson sharing
                 return self._json(200, registry.user_consent_get(root, user["user_id"]))
             if rest == "/groups":                            # group chat: list groups + members
@@ -2655,6 +2677,10 @@ def make_handler(state):
                 registry.user_flags_set(root, user["user_id"],
                                         first_run_completed_at=sessions._now())
                 return self._json(200, registry.user_flags_get(root, user["user_id"]))
+            if rest == "/notifications":                 # frame 18: set the three toggles
+                prefs = registry.user_notify_set(root, user["user_id"], **{
+                    k: v for k, v in (body or {}).items() if isinstance(v, bool)})
+                return self._json(200, dict(prefs, email_configured=notify.is_configured()))
             if rest == "/consent":                       # Phase B: set account-wide sharing default
                 registry.user_consent_set(root, user["user_id"],
                     contribute_scope=(body or {}).get("contribute_scope"),

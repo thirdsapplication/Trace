@@ -792,6 +792,51 @@ def user_flags_set(root, uid, **fields):
         _save(root, "user_flags.json", d)
 
 
+_NOTIFY_DEFAULTS = {"notify_morning_brief": True, "notify_agent_blocked": True,
+                    "notify_weekly_digest": False}
+
+
+def user_notify_prefs(root, uid):
+    """Frame 18's three notification toggles for one account.
+
+    Read defensively, the same way user_flags_get is: migration 017 may not be applied,
+    in which case the columns don't exist and PostgREST errors. That must not break a
+    run path, so an unreadable preference falls back to the default — and the defaults
+    match the frame, where the two that help you act are on and the digest is off.
+    """
+    if supa.is_configured():
+        try:
+            cols = ", ".join(_NOTIFY_DEFAULTS)
+            r = supa.get_admin().table("profiles").select(cols) \
+                .eq("id", uid or "").maybe_single().execute() or supa.NO_ROW
+            d = r.data or {}
+        except Exception:                                  # noqa: BLE001 — pre-migration
+            d = {}
+    else:
+        d = (_load(root, "user_notify.json").get(str(uid)) or {})
+    return {k: (d.get(k) if isinstance(d.get(k), bool) else v)
+            for k, v in _NOTIFY_DEFAULTS.items()}
+
+
+def user_notify_set(root, uid, **fields):
+    """Set any of the three toggles. Unknown keys and non-booleans are ignored."""
+    allowed = {k: bool(v) for k, v in fields.items()
+               if k in _NOTIFY_DEFAULTS and isinstance(v, bool)}
+    if not allowed:
+        return user_notify_prefs(root, uid)
+    if supa.is_configured():
+        try:
+            supa.get_admin().table("profiles").update(allowed).eq("id", uid).execute()
+        except Exception:                                  # noqa: BLE001 — pre-migration
+            pass
+        return user_notify_prefs(root, uid)
+    with _LOCK:
+        d = _load(root, "user_notify.json")
+        d.setdefault(str(uid), {}).update(allowed)
+        _save(root, "user_notify.json", d)
+    return user_notify_prefs(root, uid)
+
+
 def user_consent_set(root, uid, contribute_scope=None, consume_scope=None):
     """Update a user's account-wide consent defaults (validated to owner|team|global)."""
     fields = {}

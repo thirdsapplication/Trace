@@ -38,6 +38,13 @@ services:
       # admin portal disabled (it fails closed).
       - key: TRACE_ADMIN_TOKEN
         sync: false
+      # Email notifications (frame 18) and team invites. Both must be set for anything
+      # to send; with either missing the app runs and notifications stay in-app only.
+      # EMAIL_FROM must use a domain verified in Resend or every send is refused.
+      - key: RESEND_API_KEY
+        sync: false
+      - key: EMAIL_FROM
+        sync: false
       # IANA timezone for scheduled deployments' cron (e.g. America/New_York —
       # the default when unset). "Daily · 9am" fires at 9am in this zone.
       - key: TRACE_SCHEDULE_TZ
