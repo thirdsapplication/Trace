@@ -486,31 +486,88 @@ async function loadHome(force) {
   return S.igHome;
 }
 
-// The app shell (frame 14): a persistent left sidebar plus the content column. Screens
-// still write `${tb.html} …content…` into #root, and the content lands inside <main>
-// because the shell's opening tags are left open — innerHTML closes them at the end of
-// the fragment, which is defined behaviour, not a quirk. Keeps all six screens'
-// call sites unchanged while replacing the navigation wholesale.
+// The app shell (frame 14): a persistent left sidebar plus the content column.
+//
+// The sidebar is built once and then STAYS. `tb.paint(content)` swaps only <main>, so
+// changing tabs re-parses one column instead of the whole page — the sidebar never
+// blanks and never re-lays-out, which is most of what made navigation read as a reload.
+// The first paint (or the first after the wizard/review overlays clear #root) has no
+// shell to reuse, so it writes the whole thing; the shell's opening tags are left open
+// and innerHTML closes them at the end of the fragment, which is defined behaviour.
 const NAV = [
-  { key: "home", label: "Home", go: () => { S.igHome = null; renderHome(); } },
+  // Home paints from cache and revalidates behind it, so this no longer drops the
+  // cache — doing that forced a blocking refetch on every visit to the landing screen.
+  { key: "home", label: "Home", go: () => renderHome() },
   { key: "messages", label: "Messages", go: () => renderMessages() },
   { key: "groups", label: "Groups", go: () => renderGroups() },
   { key: "sharing", label: "Sharing", go: () => renderSettings() },
   { key: "settings", label: "Settings", go: () => renderSettings() },
 ];
 
+// Bumped by every screen paint. A render that awaits data captures this first and
+// compares afterwards, so a slow response cannot paint over a screen you have since
+// navigated to.
+let SCREEN = 0;
+
+// The <main> of a shell that is already on screen, or null if there is nothing to reuse.
+function liveMain() {
+  const shell = root.firstElementChild;
+  return shell && shell.classList.contains("shell") ? shell.querySelector(".main") : null;
+}
+
+// Bring an already-rendered sidebar up to date: which item reads as current, and the
+// unread count beside Messages. Cheaper than rebuilding it, and it keeps the highlight
+// under the pointer from flickering off and back on during a tab change.
+function syncNav(activeKey, unread) {
+  document.querySelectorAll(".nav-item").forEach(o => {
+    const on = o.dataset.nav === activeKey;
+    o.classList.toggle("active", on);
+    const d = o.querySelector(".nav-dot");
+    if (d) d.classList.toggle("on", on);
+    if (o.dataset.nav === "messages" && typeof unread === "number") {
+      const b = o.querySelector(".ct-badge");
+      if (unread > 0) {
+        const txt = unread > 9 ? "9+" : String(unread);
+        if (b) b.textContent = txt;
+        else o.insertAdjacentHTML("beforeend", `<span class="ct-badge">${txt}</span>`);
+      } else if (b) b.remove();
+    }
+  });
+}
+
+// Painted the instant a nav item is clicked, before the screen's fetch resolves, so the
+// click has a visible consequence rather than leaving the previous screen sitting there
+// looking frozen. Panel-shaped, so real content lands in place instead of shifting it.
+function mainSkeleton() {
+  return `<div class="panel sk-panel" aria-busy="true">
+    <div class="sk sk-head"></div>
+    <div class="sk sk-line"></div><div class="sk sk-line short"></div>
+    <div class="sk-rows">${`<div class="sk sk-row"></div>`.repeat(3)}</div>
+  </div>`;
+}
+
+// Called as the first statement of a render that has to fetch before it can paint — it
+// runs before the first await, so the skeleton is on screen in the same tick as the
+// click. A render that can paint from cache skips this and never flashes one.
+function busy() {
+  const main = liveMain();
+  if (main) main.innerHTML = mainSkeleton();
+}
+
 function agentsTopbar(unread, backFn, needsYou, active) {
   const ct = (n) => n > 9 ? "9+" : n;
   const initial = (S.user && S.user.email || "?").trim().charAt(0).toUpperCase();
+  const navKey = active || "home";
   const items = NAV.map(n => {
-    const on = n.key === (active || "home");
+    const on = n.key === navKey;
     const badge = (n.key === "messages" && unread)
       ? `<span class="ct-badge">${ct(unread)}</span>` : "";
     return `<button class="nav-item${on ? " active" : ""}" data-nav="${n.key}">
       <span class="nav-dot${on ? " on" : ""}"></span>${n.label}${badge}</button>`;
   }).join("");
-  return {
-    html: `<div class="shell"><aside class="sidebar">
+  const back = backFn
+    ? `<button id="agBack" class="btn-link" style="margin-bottom:6px;">← back</button>` : "";
+  const shell = `<div class="shell"><aside class="sidebar">
         ${brandLockup()}
         ${items}
         <div class="side-foot">
@@ -520,17 +577,26 @@ function agentsTopbar(unread, backFn, needsYou, active) {
             <button id="logout" class="btn-link" title="Sign out">Sign out</button></div>
         </div>
       </aside><main class="main">
-      ${backFn ? `<button id="agBack" class="btn-link" style="margin-bottom:6px;">← back</button>` : ""}`,
+      ${back}`;
+  return {
+    html: shell,
+    // Write this screen's content into the shell, reusing the sidebar when one is up.
+    paint(content) {
+      SCREEN++;
+      const main = liveMain();
+      if (!main) { root.innerHTML = shell + content; return; }
+      syncNav(navKey, unread);
+      main.innerHTML = back + content;
+      main.scrollTop = 0;
+    },
     wire() {
       root.className = "";                        // the shell owns layout, not .wrap
       document.querySelectorAll(".nav-item").forEach(b => {
         b.onclick = () => {
-          // Move the highlight immediately; the screen follows. Waiting for the fetch
-          // before acknowledging the click is what made the sidebar feel sluggish.
-          document.querySelectorAll(".nav-item").forEach(o => {
-            o.classList.toggle("active", o === b);
-            const d = o.querySelector(".nav-dot"); if (d) d.classList.toggle("on", o === b);
-          });
+          // Acknowledge the click before the screen's data arrives: move the highlight,
+          // then drop a skeleton into <main>. Waiting for the fetch to come back before
+          // showing anything is what made the sidebar feel sluggish.
+          syncNav(b.dataset.nav, unread);
           const n = NAV.find(x => x.key === b.dataset.nav);
           if (n) n.go();
         };
@@ -577,11 +643,12 @@ function scopeSelect(cls, current, kind, includeInherit) {
 
 async function renderSettings() {
   clearTimers();
+  busy();
   const home = S.igHome || await loadHome();
   const { data } = await api("GET", "/api/u/consent");
   const c = data || { contribute_scope: "global", consume_scope: "global" };
   const tb = agentsTopbar(home.unread_total, null, home.needs_you_total, "sharing");
-  root.innerHTML = `${tb.html}
+  tb.paint(`
     <div class="panel">
       <h2>Lesson sharing</h2>
       <p class="lead">When your agents learn from your decisions, those anonymized lessons can help other similar agents — and theirs can help yours. Choose how much to share and use. This is your account default; each agent can override it on its own page.</p>
@@ -599,7 +666,7 @@ async function renderSettings() {
       </div>
       <button class="btn-accent btn-sm" id="saveConsent" style="margin-top:16px;">Save</button>
       <p class="sub muted" style="margin-top:12px;">"Anonymized" means names, emails, amounts and ids are stripped and a second privacy check runs before anything leaves your account. A shared lesson only ever guides someone else's agent after they confirm it once.</p>
-    </div>`;
+    </div>`);
   tb.wire();
   // A dial saves on selection — a privacy choice shouldn't sit unsaved behind a button
   // you might not press. The Save button stays for the per-agent overrides below.
@@ -623,6 +690,7 @@ const AGENT_COLORS = ["#F26A1B", "#2D7FF9", "#12B886", "#E8590C", "#7048E8",
 
 async function renderGroups() {
   clearTimers();
+  busy();
   const home = S.igHome || await loadHome();
   const { data } = await api("GET", "/api/u/groups");
   const groups = (data && data.groups) || [];
@@ -635,7 +703,7 @@ async function renderGroups() {
       </span></button>`).join("");
   const agentOpts = (home.agents || []).map(a =>
     `<label class="row" style="gap:8px;margin-top:4px;cursor:pointer;"><input type="checkbox" class="grp-mem" value="${esc(a.agent_id)}"> ${esc(a.name)}</label>`).join("");
-  root.innerHTML = `${tb.html}
+  tb.paint(`
     <div class="panel">
       <h2>Group chats</h2>
       <p class="lead">Add your agents to a group and talk to them together. "What did y'all do today?" gets each one's answer; @mention one to give it a task.</p>
@@ -646,7 +714,7 @@ async function renderGroups() {
       <input type="text" id="grpName" placeholder="Group name (e.g. Operations)" style="width:100%;margin-top:8px;padding:8px;">
       <div style="margin-top:10px;">${agentOpts || `<p class="muted">No agents yet.</p>`}</div>
       <button class="btn-accent btn-sm" id="grpCreate" style="margin-top:12px;">Create group</button>
-    </div>`;
+    </div>`);
   tb.wire();
   root.querySelectorAll(".grp-row").forEach(b => b.onclick = () =>
     renderGroupChat(groups.find(x => x.id === b.dataset.id)));
@@ -672,7 +740,7 @@ function renderGroupChat(group) {
          </div></div>`;
   const draw = () => {
     const tb = agentsTopbar(0, renderGroups, 0, "groups");
-    root.innerHTML = `${tb.html}
+    tb.paint(`
       <div class="panel">
         <div class="row" style="gap:8px;align-items:baseline;"><h2 style="margin:0;">${esc(group.name)}</h2>
           <span class="sub muted">${group.members.map(m => `<span style="color:${esc(m.color)};">${esc(m.name)}</span>`).join(", ") || "no members"}</span></div>
@@ -682,7 +750,7 @@ function renderGroupChat(group) {
           <input type="text" id="grpInput" placeholder="Message the group…  (@name to direct one)" style="flex:1;padding:8px;">
           <button class="btn-accent btn-sm" id="grpSend">Send</button>
         </div>
-      </div>`;
+      </div>`);
     tb.wire();
     const send = async () => {
       const text = ($("#grpInput").value || "").trim();
@@ -725,6 +793,7 @@ function agentColor(a) {
 // The full agent list, reached from the brief's "See all runs" — the detail behind the
 // headline, rather than the landing screen it used to be.
 async function renderAllRuns() {
+  busy();
   const home = await loadHome();
   const agents = home.agents || [];
   const tb = agentsTopbar(home.unread_total, null, home.needs_you_total, "home");
@@ -746,20 +815,37 @@ async function renderAllRuns() {
       <span class="pill ${sched && sched.paused ? "pill-off" : "pill-on"}">${sched && sched.paused ? "PAUSED" : "LIVE"}</span>
     </button>`;
   }).join("");
-  root.innerHTML = `${tb.html}
+  tb.paint(`
     <div class="panel">
       <div class="spread"><h2>Your agents</h2>
         <button id="recAnother" class="btn-secondary btn-sm">Record another workflow</button></div>
       <p class="lead">Every workflow you've automated. Open one to see its runs, rules and lessons.</p>
       <div class="stack" style="margin-top:14px;">${rows || `<p class="muted">No agents yet.</p>`}</div>
-    </div>`;
+    </div>`);
   tb.wire();
   const ra = $("#recAnother"); if (ra) ra.onclick = recordAnother;
   root.querySelectorAll(".ag-row").forEach(b => b.onclick = () => renderProfile(b.dataset.agent));
 }
 
+// Home is the tab you come back to most, so it paints from the cached brief immediately
+// and refreshes behind it. The refresh only repaints if the brief actually changed AND
+// you are still on the screen it was painted for — SCREEN is bumped by every paint, so a
+// slow response that lands after you've navigated away is dropped instead of clobbering
+// whatever you opened.
 async function renderHome() {
-  const home = await loadHome();
+  const cached = S.igHome;
+  if (!cached) {
+    busy();
+    drawHome(await loadHome());
+    return;
+  }
+  drawHome(cached);
+  const token = SCREEN;
+  const fresh = await loadHome(true);
+  if (SCREEN === token && JSON.stringify(fresh) !== JSON.stringify(cached)) drawHome(fresh);
+}
+
+function drawHome(home) {
   const agents = home.agents || [];
   const tb = agentsTopbar(home.unread_total, null, home.needs_you_total, "home");
   const need = agents.filter(a => a.needs_you > 0)
@@ -802,7 +888,7 @@ async function renderHome() {
     </button>`;
   };
 
-  root.innerHTML = `${tb.html}
+  tb.paint(`
     <div class="brief">
       <div class="brief-stamp">${esc(stamp)}</div>
       <h1 class="brief-head">${headline}</h1>
@@ -815,7 +901,7 @@ async function renderHome() {
         <div class="label">Overnight</div>
         <div class="ov-row">${need.concat(clean).map(card).join("")}</div>
       </div>` : `<p class="muted">No agents yet — record a workflow to build your first.</p>`}
-    </div>`;
+    </div>`);
   tb.wire();
   const first = need[0] || agents[0];
   const rv = $("#hmReview");
@@ -941,14 +1027,15 @@ function renderReview(agentId, startAt) {
 /* ---------------- MESSAGES: chat with your agents ---------------- */
 async function renderMessages() {
   clearTimers();
+  busy();
   const d = S.igHome || await loadHome();
   const tb = agentsTopbar(d.unread_total, null, d.needs_you_total, "messages");
-  root.innerHTML = `${tb.html}
+  tb.paint(`
     <div class="panel">
       <h2>Messages</h2>
       <p class="lead">A direct line to each of your agents — ask what it's been doing, or tell it something it should know.</p>
       <div class="stack" id="dmList"><p class="muted">Loading…</p></div>
-    </div>`;
+    </div>`);
   tb.wire();
   const agents = d.agents || [];
   const threads = await Promise.all(agents.map(async a => {
@@ -975,6 +1062,7 @@ async function renderMessages() {
 
 async function renderThread(agentId) {
   clearTimers();
+  busy();
   await api("POST", `/api/u/agents/${agentId}/messages/read`, {});
   const home = await loadHome();
   const me = (home.agents || []).find(x => x.agent_id === agentId) || { name: "Agent" };
@@ -984,7 +1072,7 @@ async function renderThread(agentId) {
   // prompt you have to invent a question for.
   const SUGGESTIONS = ["What did you do today?", "Anything you're stuck on?",
                        "What did you skip and why?"];
-  root.innerHTML = `${tb.html}
+  tb.paint(`
     <div class="panel dm-panel">
       <div class="dm-head">
         ${avatar(me.name, 44, me)}
@@ -1001,7 +1089,7 @@ async function renderThread(agentId) {
         <input id="dmText" type="text" placeholder="Message…" autocomplete="off">
         <button id="dmSend" class="dm-send" title="Send">↑</button>
       </div>
-    </div>`;
+    </div>`);
   tb.wire();
   const pf = $("#thProfile");
   if (pf) pf.onclick = () => renderProfile(agentId);
@@ -1136,6 +1224,7 @@ function openIdentityPopover(agent, agentId) {
 
 async function renderProfile(agentId) {
   clearTimers();
+  busy();
   const home = S.igHome || await loadHome();
   const a = (home.agents || []).find(x => x.agent_id === agentId) || {};
   const name = a.name || agentId;
@@ -1144,7 +1233,7 @@ async function renderProfile(agentId) {
   const paused = sched && sched.paused;
   const opts = CADENCES.map(c => `<option value="${c.v}" ${c.v === cur ? "selected" : ""}>${c.label}</option>`).join("");
   const tb = agentsTopbar(home.unread_total, null, home.needs_you_total, "home");
-  root.innerHTML = `${tb.html}
+  tb.paint(`
     <div class="panel">
       <div class="row" style="gap:16px;align-items:flex-start;">
         ${avatar(name, 64)}
@@ -1205,7 +1294,7 @@ async function renderProfile(agentId) {
       <div class="spread"><h2>Session history</h2>
         ${a.unreviewed ? `<button class="btn-secondary btn-sm" id="pReview">Review ${a.unreviewed} waiting →</button>` : ""}</div>
       <div id="pLog"><p class="muted">Loading…</p></div>
-    </div>`;
+    </div>`);
   tb.wire();
   $("#pMsg").onclick = () => renderThread(agentId);
   const pr = $("#pReview");

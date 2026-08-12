@@ -403,6 +403,23 @@ input:focus, textarea:focus { outline: none; border-color: var(--accent); backgr
 .main > .panel:first-of-type { margin-top: 0; }
 
 .main { flex: 1; min-width: 0; padding: 38px 46px; max-width: 880px; }
+
+/* loading skeleton: painted into <main> the moment a nav item is clicked, so a tab
+   change is acknowledged before its data arrives. Panel-shaped and roughly the height
+   of a real screen, so content lands in place rather than shoving the page around. */
+.sk { background: var(--inset); border-radius: 8px; }
+.sk-panel .sk { animation: skPulse 1.15s ease-in-out infinite; }
+.sk-head { height: 21px; width: 38%; border-radius: 7px; margin-bottom: 18px; }
+.sk-line { height: 11px; margin-bottom: 9px; }
+.sk-line.short { width: 61%; }
+.sk-rows { margin-top: 24px; display: flex; flex-direction: column; gap: 10px; }
+.sk-row { height: 62px; border-radius: 12px; }
+.sk-rows .sk-row:nth-child(2) { animation-delay: .12s; }
+.sk-rows .sk-row:nth-child(3) { animation-delay: .24s; }
+@keyframes skPulse { 0%, 100% { opacity: 1; } 50% { opacity: .42; } }
+@media (prefers-reduced-motion: reduce) {
+  .sk-panel .sk { animation: none; opacity: .7; }
+}
 /* needs-you card row (replaces red-left-border .needs-row) */
 .needs-row { display: flex; align-items: center; gap: 13px; background: var(--inset);
   border-radius: 12px; padding: 13px 15px; border: none; }
