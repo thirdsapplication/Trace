@@ -280,6 +280,17 @@ input:focus, textarea:focus { outline: none; border-color: var(--accent); backgr
 .rec-acts-col { flex-direction: column; gap: 12px; }
 .rec-acts .btn-secondary, .rec-acts .btn-accent { font-size: 13.5px; font-weight: 700;
   border-radius: 11px; padding: 12px 22px; }
+/* build (11): the phases describe what the build is doing. They only tick when the whole
+   build lands, because the job reports a count and never says which phase it is in. */
+.bd-phases { display: flex; flex-direction: column; gap: 10px; }
+.bd-phase { display: flex; align-items: center; gap: 11px; font-size: 13px; color: var(--ink-2); }
+.bd-phases.done .bd-phase { color: var(--ink); }
+.bd-dot { width: 18px; height: 18px; border-radius: 999px; flex: none;
+  border: 1.5px solid var(--line-2); display: inline-flex; align-items: center;
+  justify-content: center; font-size: 11px; color: #fff;
+  animation: skPulse 1.6s ease-in-out infinite; }
+.bd-dot.on { background: var(--ok); border-color: var(--ok); animation: none; }
+
 /* review (08): the cadence sits under the name, where it reads as part of the workflow's
    identity rather than one more labelled field in the body. */
 .rev-cadence { font-size: 12px; color: var(--ink-3); margin-top: 2px; }

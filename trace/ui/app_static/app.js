@@ -2114,19 +2114,37 @@ function renderInterview(sid, data) {
 }
 
 /* ---------------- 05 BUILD ---------------- */
+// Frame 11 ticks off four build phases per agent as they complete. The build job reports
+// {state, generated, errors} — a count, with no phase and no current bundle — so those
+// ticks would be invented. The phases are shown as what the build is doing, unticked,
+// which is the same information without claiming progress we cannot see.
+const BUILD_PHASES = [
+  "Learning the steps from your recorded day",
+  "Writing its judgment rules from your answers",
+  "Testing against what you actually did",
+  "Safety pass — staging everything outbound",
+];
+
 function stepBuild() {
   const sid = S.session.id;
-  shell(`<div class="panel"><div class="eyebrow">Step five</div><h2>Building your agents</h2>
-    <p class="lead">Turning your routines and answers into working agents.</p>
-    <div id="buildBody"></div></div>`);
+  shell(`<div class="rec-stage">
+    <div class="wf-head">
+      ${searchMark()}
+      <h1 class="rec-head" id="buildHead">Building your agents…</h1>
+      <div class="wf-sub">Usually under two minutes.</div>
+    </div>
+    <div class="wf-list" id="buildBody"></div>
+  </div>`);
   runBuild(sid);
 }
 async function runBuild(sid) {
   const b = $("#buildBody");
   // already built?
   if (S.session.build_at) { b.innerHTML = builtSummary(); wireBuiltContinue(); return; }
-  b.innerHTML = `<div class="card"><div class="row"><span class="spinner"></span>
-    <span class="title">Building…</span></div></div><div id="buildErr" class="msg err" style="margin-top:12px;"></div>`;
+  b.innerHTML = `
+    <div class="bd-phases">${BUILD_PHASES.map(p =>
+      `<div class="bd-phase"><span class="bd-dot"></span>${esc(p)}</div>`).join("")}</div>
+    <div id="buildErr" class="msg err"></div>`;
   try {
     const r = await upost(sid, "/build", {});
     if (!r.ok && r.status !== 409) {          // 409 = already running -> just poll
@@ -2138,21 +2156,26 @@ async function runBuild(sid) {
   } catch (e) { $("#buildErr").textContent = friendly(e.message); }
 }
 function builtSummary() {
+  const head = $("#buildHead");
+  if (head) head.textContent = "Your agents are built";
   return `
-    <div class="card center" style="padding:22px;">
-      <div class="big-check">✓</div>
-      <div class="title" style="font-size:17px;">Your agents are built</div>
-      <div class="notice">Next, connect the apps they'll work in.</div>
-    </div>
-    <button id="buildGo" class="btn-primary full" style="margin-top:14px;">Connect your apps</button>`;
+    <div class="bd-phases done">${BUILD_PHASES.map(p =>
+      `<div class="bd-phase"><span class="bd-dot on">✓</span>${esc(p)}</div>`).join("")}</div>
+    <button id="buildGo" class="btn-primary full">Connect your apps</button>`;
 }
 function wireBuiltContinue() { $("#buildGo").onclick = () => goStep(5); }
 
 /* ---------------- 06 CONNECT ---------------- */
 async function stepConnect() {
   const sid = S.session.id;
-  shell(`<div class="panel"><div class="eyebrow">Step six</div><h2>Connect your apps</h2>
-    <p class="lead">Sign in with each service. Palza never sees your password, and only uses accounts that match your work email.</p>
+  // Frame 12. The frame captions each app with the agents that need it ("Retail recap ·
+  // Inbox triage"); connect.py walks bundles to find apps but collapses the result into a
+  // flat by_slug list, dropping which bundle each came from — so that line has no data
+  // behind it and is left out rather than guessed.
+  shell(`<div class="panel">
+    <h1 class="rec-head" style="font-size:26px;">Give your agents their keys</h1>
+    <p class="lead">Each agent only gets the apps its workflow needs. Palza never sees your
+      password, only uses accounts matching your work email, and you can revoke any of it later.</p>
     <div id="connBody"><p class="muted">Loading…</p></div></div>`);
   await renderConnect(sid);
 }
@@ -2233,8 +2256,15 @@ async function connectApp(sid, slug) {
 /* ---------------- 07 GO LIVE ---------------- */
 async function stepGolive() {
   const sid = S.session.id;
-  shell(`<div class="panel"><div class="eyebrow">Step seven</div><h2>${S.session.deploy_at ? "Your agents are working" : "You're all set"}</h2>
-    <p class="lead">Your agents will handle this work on their own from now on, starting on the next matching task.</p>
+  // Frame 13. The staging controls and #liveGo / #liveMsg are untouched — only the frame
+  // around them changes. "Run a test now" is not built: /run-now exists for DEPLOYED
+  // agents only, and the frame offers a test run before you commit, which is a different
+  // thing than re-running something already live.
+  shell(`<div class="panel">
+    <h1 class="rec-head" style="font-size:26px;">${S.session.deploy_at
+      ? "Your agents are working" : "Meet your agents"}</h1>
+    <p class="lead">They'll handle this work on their own from here, starting on the next
+      matching task — and they'll show you everything before anything is sent.</p>
     <div id="liveBody"><p class="muted">Loading…</p></div></div>`);
   await renderGolive(sid);
 }
