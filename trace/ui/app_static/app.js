@@ -66,8 +66,67 @@ async function pollJob(sid, action, onTick) {
 }
 
 /* ---------------- bootstrap ---------------- */
+
+/* ---------------- brand ---------------- */
+// The "routes" mark (PALZA_REDESIGN §1): five colored routes converging on an ink dot
+// with a white center. Static — used in the lockup wherever the brand appears.
+function logoMark(w = 32, h = 26) {
+  return `<svg width="${w}" height="${h}" viewBox="0 0 110 90" fill="none" aria-hidden="true">
+    <path d="M6 9 C52 9 52 45 82 45"  stroke="#FF6655" stroke-width="10" stroke-linecap="round"/>
+    <path d="M6 27 C48 27 48 45 82 45" stroke="#FFC83D" stroke-width="10" stroke-linecap="round"/>
+    <path d="M6 45 H82"                stroke="#315EF6" stroke-width="10" stroke-linecap="round"/>
+    <path d="M6 63 C48 63 48 45 82 45" stroke="#45B86B" stroke-width="10" stroke-linecap="round"/>
+    <path d="M6 81 C52 81 52 45 82 45" stroke="#A58AE8" stroke-width="10" stroke-linecap="round"/>
+    <circle cx="90" cy="45" r="14" fill="#121A2F"/><circle cx="90" cy="45" r="5.5" fill="#FFFFFF"/>
+  </svg>`;
+}
+// Mark + wordmark, the lockup used in the topbar today and the sidebar from step 3.
+function brandLockup() {
+  return `<span class="brand">${logoMark(28, 23)}<span>palza</span></span>`;
+}
+// The animated splash (frame 02): FOUR curved routes drawing in toward a blue hub that
+// pops, then the wordmark rises. Deliberately not the five-route static mark — frame 02
+// is the source of truth for this screen. Keyframes live in app.css.
+function splashMark() {
+  const routes = [
+    ["M20 15 C104 15 104 75 164 75", "#FF6655", "0s"],
+    ["M20 45 C96 45 96 75 164 75", "#FFC83D", ".12s"],
+    ["M20 105 C96 105 96 75 164 75", "#45B86B", ".24s"],
+    ["M20 135 C104 135 104 75 164 75", "#A58AE8", ".36s"],
+  ];
+  return `<svg width="220" height="150" viewBox="0 0 220 150" fill="none" aria-hidden="true">
+    ${routes.map(([d, c, delay]) => `<path d="${d}" stroke="${c}" stroke-width="12"
+      stroke-linecap="round" stroke-dasharray="170"
+      style="animation:palzaDraw 4.2s ease-in-out ${delay} infinite"/>`).join("")}
+    <circle cx="178" cy="75" r="19" fill="#315EF6"
+      style="transform-box:fill-box;transform-origin:center;animation:palzaPop 4.2s ease-in-out infinite"/>
+  </svg>`;
+}
+// Shown once per launch, then cross-fades to whatever comes next. Resolves after the
+// animation's meaningful beats (draw ~1.3s, pop ~1.9s, wordmark ~2.1s) rather than the
+// full 4.2s loop, which would idle on a blank hold before repeating.
+const SPLASH_MS = 2600;
+function splashOnce() {
+  if (sessionStorage.getItem("palzaSplashShown")) return Promise.resolve();
+  sessionStorage.setItem("palzaSplashShown", "1");
+  const reduced = window.matchMedia
+    && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const el = document.createElement("div");
+  el.className = "splash";
+  el.innerHTML = reduced
+    ? `${logoMark(120, 98)}<div class="brand splash-word">palza</div>`
+    : `${splashMark()}<div class="brand splash-word" style="animation:palzaRise 4.2s ease-in-out infinite">palza</div>`;
+  document.body.appendChild(el);
+  return new Promise(resolve => setTimeout(() => {
+    el.classList.add("splash-out");                 // cross-fade, then remove
+    setTimeout(() => { el.remove(); resolve(); }, 320);
+  }, reduced ? 700 : SPLASH_MS));
+}
+
 async function boot() {
+  const splash = splashOnce();                      // runs while the first call is in flight
   const { data } = await api("GET", "/api/auth/me");
+  await splash;
   S.signupAllowed = data.signup_enabled !== false;
   S.user = data.user;
   if (!S.user) return renderAuth();
@@ -115,7 +174,7 @@ function renderAuth(mode) {
   mode = mode || "login";
   const isSignup = mode === "signup" && S.signupAllowed;
   root.innerHTML = `
-    <div class="topbar"><div class="brand">palza</div></div>
+    <div class="topbar">${brandLockup()}</div>
     <div class="panel" style="max-width:420px;margin:8vh auto 0;">
       <div class="eyebrow">${isSignup ? "Create account" : "Welcome back"}</div>
       <h2>${isSignup ? "Set up your palza" : "Sign in"}</h2>
@@ -151,7 +210,7 @@ function shell(inner) {
   }).join("");
   root.innerHTML = `
     <div class="topbar">
-      <div class="brand">palza</div>
+      ${brandLockup()}
       <div class="row"><button id="navAgents" class="btn-link">My agents</button>
         <span class="muted" style="font-size:13px;">${esc(S.user.email)}</span>
         <button id="logout" class="btn-link">Sign out</button></div>
@@ -319,7 +378,7 @@ function agentsTopbar(unread, backFn, needsYou) {
   return {
     html: `<div class="topbar">
       <div class="row">${backFn ? `<button id="agBack" class="btn-link">← back</button>` : ""}
-        <div class="brand">palza</div></div>
+        ${brandLockup()}</div>
       <div class="row">
         ${needsYou ? `<button id="agNeeds" class="btn-link" style="color:var(--danger,#b3261e);font-weight:600;">Needs you <span class="ct-badge" style="background:var(--danger,#b3261e);">${ct(needsYou)}</span></button>` : ""}
         <button id="agGroups" class="btn-link">Groups</button>

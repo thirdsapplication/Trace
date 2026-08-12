@@ -55,6 +55,20 @@ a:hover { color: #2447C4; }
 @keyframes palzaRise { 0%,34% { opacity: 0; transform: translateY(10px); }
   50%,86% { opacity: 1; transform: translateY(0); } 96%,100% { opacity: 0; } }
 
+
+/* --- opening splash (02) ------------------------------------------------
+   Full-bleed over the app on launch, then cross-fades out. The keyframes above
+   loop forever by design (they also drive the "Reading your day…" loader); the
+   splash simply removes itself after one pass. */
+.splash { position: fixed; inset: 0; z-index: 100; background: var(--canvas);
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 22px; transition: opacity .32s ease; }
+.splash-out { opacity: 0; pointer-events: none; }
+.splash-word { font-size: 44px; letter-spacing: -0.04em; }
+@media (prefers-reduced-motion: reduce) {
+  .splash svg [style*="animation"], .splash .splash-word { animation: none !important; }
+}
+
 .wrap { max-width: 760px; margin: 0 auto; padding: 40px 24px 96px; }
 
 /* --- type --- */
@@ -155,7 +169,8 @@ input:focus, textarea:focus { outline: none; border-color: var(--accent); backgr
 .hidden { display: none !important; }
 .topbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 28px; }
 .brand { font-family: var(--display); font-size: 19px; font-weight: 800;
-  letter-spacing: -0.03em; text-transform: none; }
+  letter-spacing: -0.03em; text-transform: none;
+  display: inline-flex; align-items: center; gap: 9px; }
 .chips { display: flex; flex-wrap: wrap; gap: 8px; }
 .suggest { font-size: 12px; font-weight: 600; color: var(--ink-2); background: #fff;
   border: 1.5px solid var(--line); border-radius: 999px; padding: 7px 14px; cursor: pointer; }
