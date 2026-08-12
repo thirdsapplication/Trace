@@ -2453,6 +2453,8 @@ def make_handler(state):
             if rest == "/pending":                           # Spec 8: staged actions awaiting review
                 items = registry.pending_for_user(root, user["user_id"])
                 return self._json(200, {"pending": items, "pending_count": len(items)})
+            if rest == "/first-run":                         # §3: new vs returning account
+                return self._json(200, registry.user_flags_get(root, user["user_id"]))
             if rest == "/consent":                           # Phase B: account-wide lesson sharing
                 return self._json(200, registry.user_consent_get(root, user["user_id"]))
             if rest == "/groups":                            # group chat: list groups + members
@@ -2558,6 +2560,14 @@ def make_handler(state):
                 return self._answer_decision(man.group(1), body, user)
             if rest == "/lessons/confirm":               # Phase B: confirm/dismiss a shared lesson
                 return self._confirm_lesson(body, user)
+            if rest == "/first-run/terms":                # §3: terms acceptance, timestamped
+                registry.user_flags_set(root, user["user_id"],
+                                        terms_accepted_at=sessions._now())
+                return self._json(200, registry.user_flags_get(root, user["user_id"]))
+            if rest == "/first-run/complete":             # §3: onboarding seen; land on Home next
+                registry.user_flags_set(root, user["user_id"],
+                                        first_run_completed_at=sessions._now())
+                return self._json(200, registry.user_flags_get(root, user["user_id"]))
             if rest == "/consent":                       # Phase B: set account-wide sharing default
                 registry.user_consent_set(root, user["user_id"],
                     contribute_scope=(body or {}).get("contribute_scope"),

@@ -56,6 +56,19 @@ a:hover { color: #2447C4; }
   50%,86% { opacity: 1; transform: translateY(0); } 96%,100% { opacity: 0; } }
 
 
+/* --- first run (04, 05) --- */
+.first-run { max-width: 560px; margin: 7vh auto 0; display: flex; flex-direction: column;
+  align-items: center; text-align: center; gap: 16px; padding: 44px 48px; }
+.fr-title { font-family: var(--display); font-weight: 800; font-size: 34px;
+  letter-spacing: -0.03em; line-height: 1.15; margin: 0; max-width: 400px; }
+.fr-lead { font-size: 15px; color: var(--ink-2); line-height: 1.6; max-width: 380px; margin: 0; }
+.fr-dot { width: 12px; height: 12px; border-radius: 4px; }
+.fr-point { background: var(--panel); border: 1px solid var(--line-2); border-radius: 13px;
+  padding: 15px 17px; display: flex; gap: 12px; width: 100%; }
+.fr-bullet { width: 9px; height: 9px; border-radius: 3px; flex: none; margin-top: 5px; }
+.fr-point-t { font-weight: 700; font-size: 13.5px; }
+.fr-point-d { font-size: 12.5px; color: var(--ink-2); line-height: 1.5; }
+
 /* --- opening splash (02) ------------------------------------------------
    Full-bleed over the app on launch, then cross-fades out. The keyframes above
    loop forever by design (they also drive the "Reading your day…" loader); the

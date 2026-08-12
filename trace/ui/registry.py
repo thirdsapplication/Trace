@@ -750,6 +750,46 @@ def user_consent_get(root, uid):
             "consume_scope": d.get("lesson_consume_scope") or d.get("consume_scope") or "global"}
 
 
+# --- first-run state (PALZA_REDESIGN §3) -------------------------------------
+def user_flags_get(root, uid):
+    """``{terms_accepted_at, first_run_completed_at}`` for one account.
+
+    Reads defensively: if migration 015 hasn't been applied the columns don't exist and
+    PostgREST errors, which must not break sign-in — an account then simply looks like a
+    first run, which is the safe direction.
+    """
+    if supa.is_configured():
+        try:
+            r = supa.get_admin().table("profiles") \
+                .select("terms_accepted_at, first_run_completed_at") \
+                .eq("id", uid).maybe_single().execute() or supa.NO_ROW
+            d = r.data or {}
+        except Exception:                                  # noqa: BLE001 — pre-migration
+            d = {}
+    else:
+        d = _load(root, "user_flags.json").get(str(uid)) or {}
+    return {"terms_accepted_at": d.get("terms_accepted_at"),
+            "first_run_completed_at": d.get("first_run_completed_at")}
+
+
+def user_flags_set(root, uid, **fields):
+    """Stamp first-run fields. Accepts terms_accepted_at / first_run_completed_at."""
+    allowed = {k: v for k, v in fields.items()
+               if k in ("terms_accepted_at", "first_run_completed_at")}
+    if not allowed:
+        return
+    if supa.is_configured():
+        try:
+            supa.get_admin().table("profiles").update(allowed).eq("id", uid).execute()
+        except Exception:                                  # noqa: BLE001 — pre-migration
+            pass
+        return
+    with _LOCK:
+        d = _load(root, "user_flags.json")
+        d.setdefault(str(uid), {}).update(allowed)
+        _save(root, "user_flags.json", d)
+
+
 def user_consent_set(root, uid, contribute_scope=None, consume_scope=None):
     """Update a user's account-wide consent defaults (validated to owner|team|global)."""
     fields = {}
