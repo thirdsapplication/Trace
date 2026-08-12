@@ -473,6 +473,15 @@ function ago(iso) {
 // Frame 22 stamps a thread with a clock time — "9:12", "Mon" — not "2h ago". In a list
 // you scan for the message you remember, and you remember it as this morning or Monday.
 // ago() stays for everywhere that describes a single event's recency.
+// "May 12" (21). "live since 3d ago" reads as a stumble — since is a point, not a span.
+function onDate(iso) {
+  const t = Date.parse(iso || "");
+  if (isNaN(t)) return "";
+  const d = new Date(t), opts = { month: "short", day: "numeric" };
+  if (d.getFullYear() !== new Date().getFullYear()) opts.year = "numeric";
+  return d.toLocaleDateString(undefined, opts);
+}
+
 // "ran today, 7:00 AM" (15). The story overlay was printing the raw ISO string.
 function ranWhen(iso) {
   const t = Date.parse(iso || "");
@@ -1086,7 +1095,7 @@ function drawHome(home) {
         <span class="ov-name">${esc(a.name)}</span>
         ${a.needs_you ? `<span class="ov-flag"></span>` : ""}
       </span>
-      <span class="ov-sub">${esc(bits.join(" · "))}${last && last.ran_at ? " · " + esc(ago(last.ran_at)) : ""}</span>
+      <span class="ov-sub">${esc(bits.join(" · "))}${last && last.ran_at ? " · " + esc(threadStamp(last.ran_at)) : ""}</span>
     </button>`;
   };
 
@@ -1491,7 +1500,7 @@ async function renderProfile(agentId) {
             <button id="pEdit" class="pencil" title="Rename or recolor">✎</button>
             <span class="pill ${paused ? "pill-warn" : "pill-on"}">${paused ? "PAUSED" : "LIVE"}</span></div>
           <p class="ag-bio wrap" style="margin:6px 0 0;">${esc(a.description || ("Runs when: " + (a.trigger || "you say so")))}</p>
-          <p class="sub muted" style="margin-top:4px;"><span id="pStats">…</span>${a.deployed_at ? ` · live since ${esc(ago(a.deployed_at))}` : ""}</p>
+          <p class="sub muted" style="margin-top:4px;"><span id="pStats">…</span>${a.deployed_at ? ` · live since ${esc(onDate(a.deployed_at))}` : ""}</p>
         </div>
       </div>
       <div class="row" style="margin-top:16px;gap:8px;flex-wrap:wrap;">
