@@ -123,11 +123,23 @@ async function boot() {
   S.signupAllowed = data.signup_enabled !== false;
   S.user = data.user;
   if (!S.user) { renderAuth(); return hideSplash(); }
-  const fr = await api("GET", "/api/u/first-run");
-  if (!(fr.data && fr.data.terms_accepted_at)) { renderWelcome(); return hideSplash(); }
-  if (fr.data.first_run_completed_at) { S.igHome = null; await renderHome(); return hideSplash(); }
-  await loadAndRender();
+  await routeSignedIn();
   hideSplash();
+}
+
+// Where a signed-in account belongs: a brand-new one is walked through Welcome (04) →
+// Privacy & terms (05), one that has finished onboarding lands on Home, one caught
+// mid-setup resumes the wizard.
+//
+// EVERY path that authenticates must come through here. Signing up used to call
+// loadAndRender() directly, which dropped straight into the wizard at Record — so a new
+// account never saw Welcome or the terms gate, and the only way to reach either was to
+// reload the page afterwards. The screens were built; nothing routed to them.
+async function routeSignedIn() {
+  const fr = await api("GET", "/api/u/first-run");
+  if (!(fr.data && fr.data.terms_accepted_at)) return renderWelcome();
+  if (fr.data.first_run_completed_at) { S.igHome = null; return renderHome(); }
+  return loadAndRender();
 }
 
 async function refreshSession() {
@@ -245,7 +257,7 @@ function renderAuth(mode) {
     const { ok, data } = await api("POST", isSignup ? "/api/auth/signup" : "/api/auth/login", { email, password });
     if (!ok) { $("#authMsg").textContent = data.error || "could not sign in"; return; }
     S.user = data.user;
-    await loadAndRender();
+    await routeSignedIn();
   };
   $("#authGo").onclick = go;
   $("#pw").onkeydown = (e) => { if (e.key === "Enter") go(); };

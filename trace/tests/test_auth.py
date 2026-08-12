@@ -213,6 +213,24 @@ class EndUserUITest(_AuthHTTPBase):
         self.assertEqual(code, 200)
         self.assertIn("Engine 1 Test Harness", root_html)
 
+    def test_signup_routes_through_the_first_run_check(self):
+        """A brand-new account must land on Welcome (04), not the wizard.
+
+        Welcome and the terms gate were built and unreachable: the sign-in form called
+        loadAndRender() directly, so the first-run check only ever ran on boot() — i.e.
+        you had to reload the page to see either screen. Nothing in this suite renders
+        app.js, so that whole class of bug (a screen that exists but nothing routes to)
+        is invisible unless asserted at the source level, which is what this does.
+        """
+        _, js = self.asset("/app/app.js")
+        self.assertIn("async function routeSignedIn()", js)
+        self.assertIn("renderWelcome()", js)            # the router can still reach 04
+        # the auth form hands off to the router rather than jumping into the wizard
+        go = js[js.index("const go = async () => {"):]
+        go = go[:go.index('$("#authGo").onclick')]
+        self.assertIn("routeSignedIn()", go)
+        self.assertNotIn("loadAndRender()", go)
+
     def test_spa_fallback_for_unknown_subpath(self):
         code, html = self.asset("/app/anything/here")
         self.assertEqual(code, 200)
