@@ -91,6 +91,35 @@ function logoMark(w = 32, h = 26) {
     <circle cx="90" cy="45" r="14" fill="#121A2F"/><circle cx="90" cy="45" r="5.5" fill="#FFFFFF"/>
   </svg>`;
 }
+// Frame 07's mark: the same five routes as logoMark, drawing themselves in on a stagger
+// while discovery runs. The routes converging on the hub is the thing being described —
+// scattered work becoming one workflow — so it says more than a spinner would.
+const MARK_ROUTES = [
+  ["M6 9 C52 9 52 45 82 45", "#FF6655"], ["M6 27 C48 27 48 45 82 45", "#FFC83D"],
+  ["M6 45 H82", "#315EF6"], ["M6 63 C48 63 48 45 82 45", "#45B86B"],
+  ["M6 81 C52 81 52 45 82 45", "#A58AE8"],
+];
+function searchMark() {
+  return `<svg width="110" height="90" viewBox="0 0 110 90" fill="none" aria-hidden="true">
+    ${MARK_ROUTES.map(([d, c], i) => `<path d="${d}" stroke="${c}" stroke-width="8"
+      stroke-linecap="round" stroke-dasharray="170"
+      style="animation:palzaDraw 3s ease-in-out ${(i * 0.15).toFixed(2)}s infinite"/>`).join("")}
+    <circle cx="90" cy="45" r="13" fill="#121A2F"/><circle cx="90" cy="45" r="5" fill="#FFFFFF"/>
+  </svg>`;
+}
+
+// "6h 12m captured · " when the session's own timestamps allow it, else "". Derived here
+// rather than added to the API: the sessions payload already carries created_at and
+// stopped_at, so the duration is a subtraction, not a new field.
+function capturedFor(session) {
+  const a = session && session.created_at, b = session && session.stopped_at;
+  const ms = (a && b) ? Date.parse(b) - Date.parse(a) : NaN;
+  if (!ms || ms < 0) return "";
+  const mins = Math.round(ms / 60000);
+  const h = Math.floor(mins / 60), m = mins % 60;
+  return (h ? `${h}h ${m}m` : `${m}m`) + " captured · ";
+}
+
 // Mark + wordmark, the lockup used in the topbar today and the sidebar from step 3.
 function brandLockup() {
   return `<span class="brand">${logoMark(28, 23)}<span>palza</span></span>`;
@@ -1784,14 +1813,26 @@ function renderRecBody(mode, started) {
 /* ---------------- 02 FIND WORKFLOWS (reconstruct + discover) ---------------- */
 function stepWorkflows() {
   const sid = S.session.id, a = S.session.artifacts || {};
+  // Frame 07. Every id runWorkflows touches (#wfBar, #wfMsg, #wfErr) is kept, so this is
+  // presentation only — the reconstruct/discover flow underneath is untouched.
+  //
+  // The frame streams workflow cards in as they're found. Discovery is atomic here: the
+  // job reports {state, current, total} and results exist only once it finishes, so there
+  // is nothing truthful to stream. The frame's own dashed "still looking…" card is
+  // exactly the right stand-in, and the progress bar stays — it carries real progress
+  // that a looping animation cannot.
   shell(`
-    <div class="panel">
-      <div class="eyebrow">Step two</div>
-      <h2>Finding your routines</h2>
-      <p class="lead">Palza reads back your day and groups the repeating work it can take off your plate.</p>
-      <div class="progress"><i id="wfBar" style="width:0%"></i></div>
-      <p id="wfMsg" class="msg">${a.event_log ? "Looking for repeatable workflows…" : "Reading your day…"}</p>
-      <div id="wfErr" class="msg err"></div>
+    <div class="rec-stage">
+      <div class="wf-head">
+        ${searchMark()}
+        <h1 class="rec-head" id="wfMsg">${a.event_log ? "Looking for repeatable workflows…" : "Reading your day…"}</h1>
+        <div class="wf-sub">${esc(capturedFor(S.session))}reading back the work that repeats</div>
+        <div class="progress wf-bar"><i id="wfBar" style="width:0%"></i></div>
+      </div>
+      <div class="wf-list">
+        <div class="wf-wait">still looking…</div>
+      </div>
+      <p id="wfErr" class="msg err"></p>
     </div>`);
   runWorkflows(sid, a);
 }
@@ -1818,8 +1859,10 @@ async function runWorkflows(sid, a) {
 /* ---------------- 03 REVIEW & APPROVE ---------------- */
 async function stepReview() {
   const sid = S.session.id;
-  shell(`<div class="panel"><div class="eyebrow">Step three</div><h2>Review what we found</h2>
-    <p class="lead">Here's what we think each workflow is. Check our description of each one — confirm it, or fix it in your own words. Your words win. What you mark <b>Automate</b> gets built; <b>Manual</b> stays yours to handle.</p>
+  // Frame 08's voice: it asks, rather than announcing what it produced.
+  shell(`<div class="panel"><h1 class="rec-head" style="font-size:26px;">Did I get these right?</h1>
+    <p class="lead">Correct anything — this is what your agents will be built from. What you
+      mark <b>Automate</b> gets built; <b>Manual</b> stays yours to handle.</p>
     <div id="revBody"><p class="muted">Loading…</p></div></div>`);
   const { ok, data } = await uget(sid, "/review-data");
   if (!ok) { $("#revBody").innerHTML = `<p class="msg err">${friendly(data.error)}</p>`; return; }
@@ -1844,7 +1887,7 @@ async function stepReview() {
   const summary = (it) => {
     const rows = [];
     if (it.description) rows.push(`<div class="sub">${esc(it.description)}</div>`);
-    if (it.trigger) rows.push(`<div class="sub"><b>Starts when:</b> ${esc(it.trigger)}</div>`);
+    // the trigger is the cadence line under the name now (08), so it isn't repeated here
     if ((it.steps || []).length)
       rows.push(`<ol class="sub" style="margin:6px 0 0 18px;">${it.steps.map(s => `<li>${esc(s)}</li>`).join("")}</ol>`);
     if (it.why_judgment) rows.push(`<div class="sub"><b>Why we'd leave it to you:</b> ${esc(it.why_judgment)}</div>`);
@@ -1857,7 +1900,10 @@ async function stepReview() {
     const reason = reasonOf(it);
     return `<div class="card" data-id="${esc(id)}" style="display:block;">
       <div class="spread">
-        <div class="title">${esc(it.name || id)}</div>
+        <div>
+          <div class="title">${esc(it.name || id)}</div>
+          ${it.trigger ? `<div class="rev-cadence">${esc(it.trigger)}</div>` : ""}
+        </div>
         <span class="pill ${auto ? "pill-on" : "pill-off"}">${auto ? "AUTOMATE" : "MANUAL"}</span>
       </div>
       <div class="sub" style="margin-top:6px;">${reason ? esc(reason) : `<span class="muted">no reason given</span>`}</div>
@@ -1883,7 +1929,7 @@ async function stepReview() {
     $("#revGo").disabled = !!left;
     $("#revGo").textContent = left
       ? `Confirm or fix ${left} more`
-      : (n ? `Continue with ${n} to automate` : "Continue");
+      : (n ? `Continue · ${n} confirmed` : "Continue");        // frame 08's wording
   };
 
   const paint = () => {

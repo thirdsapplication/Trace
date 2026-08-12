@@ -280,6 +280,30 @@ input:focus, textarea:focus { outline: none; border-color: var(--accent); backgr
 .rec-acts-col { flex-direction: column; gap: 12px; }
 .rec-acts .btn-secondary, .rec-acts .btn-accent { font-size: 13.5px; font-weight: 700;
   border-radius: 11px; padding: 12px 22px; }
+/* review (08): the cadence sits under the name, where it reads as part of the workflow's
+   identity rather than one more labelled field in the body. */
+.rev-cadence { font-size: 12px; color: var(--ink-3); margin-top: 2px; }
+
+/* find work (07): the mark draws itself while discovery runs, headline states the phase,
+   and the dashed card holds the space results will land in. */
+.wf-head { display: flex; flex-direction: column; align-items: center; gap: 6px;
+  padding-top: 10px; text-align: center; }
+.wf-head .rec-head { font-size: 24px; }
+.wf-sub { font-size: 13px; color: var(--ink-2); }
+.wf-bar { width: 240px; margin: 10px 0 0; }
+.wf-list { width: 100%; max-width: 520px; display: flex; flex-direction: column; gap: 9px; }
+.wf-wait { border: 1.5px dashed var(--line-2); border-radius: 13px; padding: 13px 17px;
+  font-size: 12.5px; color: var(--ink-3); text-align: center; }
+/* a found workflow, once discovery lands (also frame 08's row) */
+.wf-card { background: var(--panel); border: 1px solid var(--line-2); border-radius: 13px;
+  padding: 14px 17px; display: flex; align-items: center; gap: 12px; }
+.wf-chip { width: 10px; height: 10px; border-radius: 4px; flex: none; }
+.wf-name { font-weight: 700; font-size: 13.5px; }
+.wf-meta { font-size: 12px; color: var(--ink-3); }
+.wf-conf { font-size: 11px; font-weight: 700; border-radius: 999px; padding: 3px 9px; }
+.wf-conf.strong { color: var(--ok); background: var(--ok-bg); }
+.wf-conf.maybe { color: var(--warn); background: var(--warn-bg); }
+
 /* "RECORDING" is coral because it is a live state you are meant to notice, not decoration */
 .rec-live { display: flex; align-items: center; gap: 10px; font-size: 12px; font-weight: 700;
   letter-spacing: .14em; color: var(--alert); }
