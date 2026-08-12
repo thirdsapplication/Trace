@@ -230,10 +230,12 @@ input:focus, textarea:focus { outline: none; border-color: var(--accent); backgr
 .field > .label { display: block; margin-bottom: 6px; }
 
 /* --- step header / progress --- */
-.steps { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 24px; }
-.step-chip { display: inline-flex; align-items: center; gap: 7px; font-size: 11px;
-  font-weight: 600; color: var(--ink-3); background: var(--chip-2); border-radius: 999px; padding: 5px 12px; }
-.step-chip .n { color: var(--muted-2); }
+/* wizard step pills (06): centered, and the untaken steps carry a faint blue rather than
+   grey — they are the road ahead, not disabled controls. */
+.steps { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 24px; justify-content: center; }
+.step-chip { display: inline-flex; align-items: center; gap: 5px; font-size: 11px;
+  font-weight: 600; color: var(--ink-3); background: var(--accent-pill); border-radius: 999px; padding: 5px 12px; }
+.step-chip .n { color: inherit; }
 .step-chip.done { color: var(--ok); background: var(--ok-bg); font-weight: 700; }
 .step-chip.active { color: #fff; background: var(--accent); font-weight: 700; }
 .step-chip.active .n { color: #fff; }
@@ -250,8 +252,8 @@ input:focus, textarea:focus { outline: none; border-color: var(--accent); backgr
 .pill-off { color: var(--ink-2); background: var(--chip); }         /* PAUSED */
 .pill-warn { color: var(--warn); background: var(--warn-bg); }
 .dot { width: 9px; height: 9px; border-radius: 3px; background: var(--ag); flex: 0 0 auto; }
-.rec-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--alert);
-  animation: tracePulse 1.4s infinite; }
+.rec-dot { width: 12px; height: 12px; border-radius: 50%; background: var(--alert);
+  animation: tracePulse 1.4s infinite; flex: none; }
 .spinner { width: 14px; height: 14px; border: 2.5px solid var(--accent-track);
   border-top-color: var(--accent); border-radius: 50%; animation: traceSpin .9s linear infinite;
   flex: 0 0 auto; }
@@ -259,8 +261,30 @@ input:focus, textarea:focus { outline: none; border-color: var(--accent); backgr
   display: inline-flex; align-items: center; justify-content: center; font-size: 11px; flex: 0 0 auto; }
 .check-hollow { width: 18px; height: 18px; border-radius: 50%; border: 1.5px solid var(--line-3);
   flex: 0 0 auto; }
-.big-timer { font-family: var(--display); font-size: 52px; font-weight: 800;
+.big-timer { font-family: var(--display); font-size: 56px; font-weight: 800;
   letter-spacing: -0.02em; font-variant-numeric: tabular-nums; }
+
+/* record stage (06): the timer is the screen, so the step is one tall centered column —
+   pills above, actions pinned at the bottom, everything else floating in the middle. */
+.rec-stage { min-height: 600px; display: flex; flex-direction: column; align-items: center;
+  gap: 18px; }
+.rec-mid { flex: 1; display: flex; flex-direction: column; align-items: center;
+  justify-content: center; gap: 16px; text-align: center; }
+.rec-mid-form { justify-content: flex-start; align-self: stretch; padding-top: 8px; }
+.rec-mid-form textarea { width: 100%; }
+.rec-head { font-family: var(--display); font-weight: 800; font-size: 28px;
+  letter-spacing: -0.02em; margin: 0; }
+.rec-copy { font-size: 14px; color: var(--ink-2); line-height: 1.55; max-width: 380px; margin: 0; }
+.rec-mid-form .rec-copy { max-width: none; }
+.rec-acts { display: flex; gap: 10px; align-items: center; }
+.rec-acts-col { flex-direction: column; gap: 12px; }
+.rec-acts .btn-secondary, .rec-acts .btn-accent { font-size: 13.5px; font-weight: 700;
+  border-radius: 11px; padding: 12px 22px; }
+/* "RECORDING" is coral because it is a live state you are meant to notice, not decoration */
+.rec-live { display: flex; align-items: center; gap: 10px; font-size: 12px; font-weight: 700;
+  letter-spacing: .14em; color: var(--alert); }
+.rec-live.off { color: var(--ink-3); }
+.rec-live.off .rec-dot { background: var(--ink-3); animation: none; }
 .big-check { width: 56px; height: 56px; border-radius: 50%; background: var(--ok-bg);
   color: var(--ok); display: flex; align-items: center; justify-content: center; font-size: 28px; }
 
@@ -294,6 +318,9 @@ input:focus, textarea:focus { outline: none; border-color: var(--accent); backgr
 .waveform { display: flex; align-items: flex-end; gap: 4px; height: 40px; }
 .waveform > b { width: 5px; border-radius: 3px; display: block; background: var(--line-3); }
 .waveform > b:nth-child(2n) { background: var(--accent); }
+/* paused: the whole bank goes grey. Declared after the nth-child rule on purpose —
+   equal specificity, so source order is what makes it win. */
+.waveform.still > b, .waveform.still > b:nth-child(2n) { background: var(--line-3); }
 
 /* ============ MY AGENTS — stories · log · DMs ============ */
 .ag-av { border-radius: 12px; display: inline-flex; align-items: center; flex: none;

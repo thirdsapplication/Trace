@@ -262,7 +262,8 @@ function shell(inner) {
   const chips = STEPS.map((st, i) => {
     const nav = i <= reached;                    // completed steps + the current one are navigable
     const cls = [i === S.step ? "active" : (i < reached ? "done" : ""), nav ? "nav" : ""].join(" ").trim();
-    return `<span class="step-chip ${cls}" ${nav ? `data-step="${i}"` : ""}><span class="n">${String(i + 1).padStart(2, "0")}</span>${st.label}</span>`;
+    // "1 Record", not "01 Record" — frame 06 numbers the steps the way you'd say them.
+    return `<span class="step-chip ${cls}" ${nav ? `data-step="${i}"` : ""}><span class="n">${i + 1}</span>${st.label}</span>`;
   }).join("");
   root.innerHTML = `
     <div class="topbar">
@@ -1579,35 +1580,78 @@ const renderActivity = renderProfile;                        // legacy entry poi
 
 /* ---------------- 01 RECORD ---------------- */
 function stepRecord() {
-  shell(`
-    <div class="panel">
-      <div class="eyebrow">Step one</div>
-      <h2>Record your day</h2>
-      <p class="lead">Palza watches how you work for a while and learns your routines. On your Mac · no screenshots · sensitive text removed before saving.</p>
-      <div id="recBody"></div>
-    </div>`);
+  // Frame 06 is one tall centered stage, not a titled panel: while you are recording the
+  // timer IS the screen, and an eyebrow + heading above it just competes with the thing
+  // you are actually watching. The stage holds all three modes so the step doesn't change
+  // shape underneath you when you start.
+  shell(`<div class="rec-stage" id="recBody"></div>`);
   renderRecBody("idle");
 }
+
+// Frame 06's waveform: fixed heights rather than a formula, because the drawn rhythm is
+// deliberately irregular and `10 + (i % 4) * 8` reads as a sawtooth.
+const REC_BARS = [14, 26, 18, 34, 22, 38, 16, 28, 12];
+
 function renderRecBody(mode, started) {
   const b = $("#recBody");
   if (mode === "recording") {
     b.innerHTML = `
-      <div class="card center" style="padding:26px;">
-        <div class="row" style="gap:8px;"><span class="rec-dot"></span><span class="label" style="color:var(--accent);">● Recording</span></div>
-        <div class="big-timer" id="recTime">00:00:00</div>
-        <div class="waveform">${Array.from({length: 16}).map((_, i) =>
-          `<b style="height:${10 + (i % 4) * 8}px;background:${i % 2 ? "var(--accent)" : "var(--accent-track)"};"></b>`).join("")}</div>
+      <div class="rec-mid">
+        <div class="rec-live" id="recLive"><span class="rec-dot"></span>RECORDING</div>
+        <div class="big-timer" id="recTime">0:00:00</div>
+        <p class="rec-copy">Work like normal. Palza is quietly noting what repeats — you
+          review everything it thinks it found before anything is built.</p>
+        <div class="waveform" id="recWave">${REC_BARS.map(h =>
+          `<b style="height:${h}px;"></b>`).join("")}</div>
+        <p id="recMsg" class="msg err"></p>
       </div>
-      <button id="recStop" class="btn-secondary full" style="margin-top:14px;">Stop recording</button>`;
-    const t0 = started || Date.now();
+      <div class="rec-acts">
+        <button id="recPause" class="btn-secondary">Pause</button>
+        <button id="recStop" class="btn-accent">Finish recording</button>
+      </div>`;
+    // Elapsed is tracked as an origin that slides forward while paused, so the clock
+    // reports time actually recorded rather than wall-clock since you pressed start.
+    let t0 = started || Date.now();
+    let paused = false, pausedAt = 0;
     const tick = () => {
+      const el = $("#recTime");
+      if (!el) return;
       const s = Math.floor((Date.now() - t0) / 1000);
-      const hh = String(Math.floor(s / 3600)).padStart(2, "0");
       const mm = String(Math.floor((s % 3600) / 60)).padStart(2, "0");
       const ss = String(s % 60).padStart(2, "0");
-      if ($("#recTime")) { $("#recTime").textContent = `${hh}:${mm}:${ss}`; S._timers.push(setTimeout(tick, 1000)); }
+      el.textContent = `${Math.floor(s / 3600)}:${mm}:${ss}`;   // 2:14:36, per the frame
+      if (!paused) S._timers.push(setTimeout(tick, 1000));
     };
     tick();
+    $("#recPause").onclick = async () => {
+      const btn = $("#recPause");
+      btn.disabled = true;
+      const goingDown = !paused;
+      const { ok, data } = await api("POST", `/api/u/capture/${goingDown ? "pause" : "resume"}`, {});
+      btn.disabled = false;
+      if (!ok) {
+        // Usually "not_running" — the capture ended underneath us. Say so rather than
+        // letting the button look broken, and keep the clock where it was.
+        $("#recMsg").textContent = data.error === "not_running"
+          ? "the recording already stopped — finish up to save what you have"
+          : friendly(data.error);
+        return;
+      }
+      $("#recMsg").textContent = "";
+      paused = goingDown;
+      if (paused) {
+        pausedAt = Date.now();
+        clearTimers();
+      } else {
+        t0 += Date.now() - pausedAt;         // the gap never counts as recorded time
+        tick();
+      }
+      btn.textContent = paused ? "Resume" : "Pause";
+      const live = $("#recLive");
+      live.classList.toggle("off", paused);
+      live.lastChild.textContent = paused ? "PAUSED" : "RECORDING";
+      $("#recWave").classList.toggle("still", paused);
+    };
     $("#recStop").onclick = async () => {
       $("#recStop").disabled = true; $("#recStop").textContent = "Saving…";
       await api("POST", "/api/u/capture/stop", {});
@@ -1617,15 +1661,15 @@ function renderRecBody(mode, started) {
   }
   if (mode === "describe") {
     b.innerHTML = `
-      <div class="field">
-        <span class="label">Describe your workflow</span>
+      <div class="rec-mid rec-mid-form">
+        <h1 class="rec-head">Describe your workflow</h1>
         <textarea id="descText" rows="7" placeholder="In a few sentences: what kicks this work off, the steps you take, the apps you use — name them (e.g. Gmail, Google Sheets) — and what the finished result looks like."></textarea>
+        <p class="notice">The more concretely you name your apps and steps, the better your agent will be. You'll review and correct what palza understood next.</p>
+        <p id="recMsg" class="msg err"></p>
       </div>
-      <p class="notice">The more concretely you name your apps and steps, the better your agent will be. You'll review and correct what palza understood next.</p>
-      <p id="recMsg" class="msg err"></p>
-      <div class="row" style="gap:10px;">
+      <div class="rec-acts">
         <button id="descBack" class="btn-secondary">← Back</button>
-        <button id="descGo" class="btn-primary" style="flex:1;">Continue</button>
+        <button id="descGo" class="btn-accent">Continue</button>
       </div>`;
     $("#descBack").onclick = () => renderRecBody("idle");
     $("#descGo").onclick = async () => {
@@ -1649,15 +1693,19 @@ function renderRecBody(mode, started) {
     return;
   }
   b.innerHTML = `
-    <div class="row" style="gap:10px;">
-      <button id="recStart" class="btn-primary">Start recording</button>
-      <span class="muted" style="font-size:13px;">or</span>
-      <button id="recSample" class="btn-secondary">Use a sample day</button>
+    <div class="rec-mid">
+      <h1 class="rec-head">Record your day</h1>
+      <p class="rec-copy">Palza watches how you work for a while and learns your routines.
+        On your Mac · no screenshots · sensitive text removed before saving.</p>
+      <p id="recMsg" class="msg err"></p>
     </div>
-    <div class="row" style="margin-top:10px;">
+    <div class="rec-acts rec-acts-col">
+      <div class="rec-acts">
+        <button id="recSample" class="btn-secondary">Use a sample day</button>
+        <button id="recStart" class="btn-accent">Start recording</button>
+      </div>
       <button id="recDescribe" class="btn-link">Skip recording — describe it instead</button>
-    </div>
-    <p id="recMsg" class="msg err" style="margin-top:12px;"></p>`;
+    </div>`;
   $("#recStart").onclick = async () => {
     const { ok, data } = await api("POST", "/api/u/capture/start", {});
     if (!ok) { $("#recMsg").textContent = data.error === "already_running" ? "a recording is already in progress" : (data.detail || data.error || "could not start"); return; }
