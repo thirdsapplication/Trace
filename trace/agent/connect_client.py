@@ -88,6 +88,17 @@ def _with_app(url, app):
     return urllib.parse.urlunparse(parts._replace(query=urllib.parse.urlencode(q)))
 
 
+def _cred_url(cred):
+    """The MCP server URL a vault credential is keyed to. The URL may sit at the top
+    level or under ``auth`` on the returned credential object, so check both."""
+    url = _attr(cred, "mcp_server_url")
+    if url is None:
+        auth = _attr(cred, "auth") or {}
+        url = auth.get("mcp_server_url") if isinstance(auth, dict) \
+            else _attr(auth, "mcp_server_url")
+    return url
+
+
 def _account_email(acc):
     """Best-effort extraction of the connected account's email from a Pipedream account
     object. There is no standard ``email`` field — the email may sit under a profile/identity
@@ -263,21 +274,37 @@ class ConnectClient:
 
     def _find_credential(self, vault_ref, mcp_server_url):
         """The id of an existing credential in ``vault_ref`` keyed to ``mcp_server_url``,
-        or None. The server URL may sit at the top level or under ``auth`` on the returned
-        credential, so check both."""
+        or None."""
         try:
             res = _retry(lambda: self._vaults_ns().credentials.list(vault_ref))
         except Exception:
             return None
         for c in _data(res):
-            url = _attr(c, "mcp_server_url")
-            if url is None:
-                auth = _attr(c, "auth") or {}
-                url = auth.get("mcp_server_url") if isinstance(auth, dict) \
-                    else _attr(auth, "mcp_server_url")
-            if url == mcp_server_url:
+            if _cred_url(c) == mcp_server_url:
                 return _idof(c)
         return None
+
+    def _credentials_for_name(self, vault_ref, display_name):
+        """All credentials in ``vault_ref`` carrying ``display_name``, as
+        ``[(cred_id, mcp_server_url)]``. Used to locate old-URL-format credentials that
+        collide with a fresh bind by name."""
+        try:
+            res = _retry(lambda: self._vaults_ns().credentials.list(vault_ref))
+        except Exception:
+            return []
+        return [(_idof(c), _cred_url(c)) for c in _data(res)
+                if _attr(c, "display_name") == display_name]
+
+    def verify_bindings(self, vault_ref, expected_urls):
+        """For each expected MCP server URL: does the vault hold a credential keyed to
+        it? Returns ``{url: bool}`` from ONE credentials.list. This is the deploy-time
+        consistency check between the agent envelope's baked server URLs and the vault
+        MA will inject — the platform matches token→server by exact URL, so a URL with
+        no matching credential means an unauthenticated MCP server at run time.
+        Raises on a listing failure (callers decide whether that blocks)."""
+        res = _retry(lambda: self._vaults_ns().credentials.list(vault_ref))
+        have = {u for u in (_cred_url(c) for c in _data(res)) if u}
+        return {u: (u in have) for u in (expected_urls or [])}
 
     @staticmethod
     def _token_expiry_iso(tok):
@@ -291,8 +318,16 @@ class ConnectClient:
         Pipedream dev token (minted fresh here); ``external_user_id`` and ``app`` ride in
         the URL, NOT in the credential. Idempotent: a credential already keyed to that URL
         has its token rotated (``mcp_server_url`` is an immutable key, so it is sent only on
-        create, never on update). Returns ``{binding_ref, expires_at}`` (the token's TTL, so
-        the caller can refresh before a later run)."""
+        create, never on update).
+
+        MIGRATION: a duplicate rejection whose existing credential is keyed to a
+        DIFFERENT URL means the URL format changed since the app was connected (e.g.
+        the old ``/v3`` query-param surface -> per-user paths). The old credential is
+        replaced (delete + recreate — the URL is immutable on update), so the vault
+        always ends up with a credential MA can match to the freshly baked server URL.
+        Silent failure here is what once shipped agents that "looked connected" but had
+        no bearer at run time. Returns ``{binding_ref, expires_at}`` (the token's TTL,
+        so the caller can refresh before a later run)."""
         creds = self._vaults_ns().credentials
         tok = _retry(self.mint_access_token)
         expires_at = self._token_expiry_iso(tok)
@@ -305,15 +340,35 @@ class ConnectClient:
         try:
             c = _retry(lambda: creds.create(vault_ref, display_name=display_name,
                                             auth=create_auth))
-        except Exception as exc:                                # 409 duplicate -> rotate token
-            if "409" in str(exc) or "exist" in str(exc).lower():
-                cred_id = self._find_credential(vault_ref, mcp_server_url)
-                if not cred_id:
-                    raise
-                c = _retry(lambda: creds.update(cred_id, vault_id=vault_ref, auth=token_auth))
-            else:
+        except Exception as exc:                                # 409 duplicate
+            if not ("409" in str(exc) or "exist" in str(exc).lower()):
                 raise
+            cred_id = self._find_credential(vault_ref, mcp_server_url)
+            if cred_id:                                         # same URL -> rotate token
+                c = _retry(lambda: creds.update(cred_id, vault_id=vault_ref, auth=token_auth))
+            else:                                               # old-URL collision -> migrate
+                c = self._replace_stale_credential(creds, vault_ref, display_name, create_auth)
         return {"binding_ref": _idof(c) or f"{vault_ref}:{app}", "expires_at": expires_at}
+
+    def _replace_stale_credential(self, creds, vault_ref, display_name, create_auth):
+        """A create collided by display name with credential(s) keyed to an old URL
+        format: delete them and create fresh with the new URL. The vaults SDK surface
+        is BETA — when it has no credential delete, sidestep the name collision instead
+        by creating under a disambiguated name (the stale credential lingers, but the
+        new URL still gets its own credential, which is what run-time auth needs)."""
+        delete = getattr(creds, "delete", None)
+        stale = [cid for cid, _ in self._credentials_for_name(vault_ref, display_name) if cid]
+        if callable(delete) and stale:
+            for cid in stale:
+                try:
+                    _retry(lambda c=cid: delete(c, vault_id=vault_ref))
+                except Exception:
+                    pass                    # deletion is cleanup; the create below decides
+            return _retry(lambda: creds.create(vault_ref, display_name=display_name,
+                                               auth=create_auth))
+        return _retry(lambda: creds.create(vault_ref,
+                                           display_name=f"{display_name} (per-user)",
+                                           auth=create_auth))
 
     def refresh_binding(self, vault_ref, external_user_id, app):
         """Re-mint Trace's Pipedream token and ROTATE it into the existing vault credential

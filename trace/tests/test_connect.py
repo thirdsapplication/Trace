@@ -60,6 +60,10 @@ class StubConnectClient:
         return {"connected": True, "account_id": f"acc-{app}",
                 "identity_email": self.identity_email}
 
+    def verify_bindings(self, vault_ref, expected_urls):
+        self.calls.append(("verify", vault_ref, tuple(expected_urls)))
+        return {u: True for u in expected_urls}
+
 
 def _approved(domain):
     event_log, ak = _load(domain)
@@ -220,15 +224,30 @@ class BindAndVerifyTest(unittest.TestCase):
 
 
 class _FakeCreds:
-    def __init__(self, create_conflicts=False, create_error=None):
-        self.created, self.updated = [], []
+    """In-memory vault credentials namespace. ``existing`` seeds pre-existing
+    credentials; create 409s when ``create_conflicts`` is set OR when a seeded
+    credential shares the display name (MA-style per-vault name uniqueness — the
+    collision that triggers URL-format migration); delete removes a seeded one."""
+
+    def __init__(self, create_conflicts=False, create_error=None, existing=None):
+        self.created, self.updated, self.deleted = [], [], []
         self._conflict = create_conflicts          # raise 409 on create
         self._create_error = create_error           # raise this on every create
+        self._existing = existing                   # None -> default current-URL cred
+
+    def _seeded(self):
+        if self._existing is not None:
+            return self._existing
+        # one pre-existing credential keyed to the gmail server URL (for the 409 path)
+        from trace.agent import config
+        return [{"id": "cred-existing",
+                 "mcp_server_url": config.pipedream_mcp_url("trace-s1", "gmail")}]
 
     def create(self, vault_ref, display_name=None, auth=None):
         if self._create_error:
             raise self._create_error
-        if self._conflict:
+        if self._conflict or any(display_name and c.get("display_name") == display_name
+                                 for c in self._seeded()):
             raise RuntimeError("409 credential already exists")
         rec = {"vault_ref": vault_ref, "display_name": display_name, "auth": auth}
         self.created.append(rec)
@@ -239,11 +258,13 @@ class _FakeCreds:
                              "display_name": display_name})
         return {"id": cred_id}
 
+    def delete(self, cred_id, vault_id=None):
+        self.deleted.append({"cred_id": cred_id, "vault_id": vault_id})
+        if self._existing is not None:
+            self._existing = [c for c in self._existing if c.get("id") != cred_id]
+
     def list(self, vault_ref):
-        # one pre-existing credential keyed to the gmail server URL (for the 409 path)
-        from trace.agent import config
-        return [{"id": "cred-existing",
-                 "mcp_server_url": config.pipedream_mcp_url("trace-s1", "gmail")}]
+        return list(self._seeded())
 
 
 class _FakeVaults:
@@ -289,7 +310,9 @@ class RealBindCredentialTest(unittest.TestCase):
         self.assertNotIn("external_user_id", auth)
         self.assertNotIn("app", auth)
         self.assertEqual(auth["mcp_server_url"],
-                         f"{config.PIPEDREAM_MCP_BASE}/trace-s1/gmail")
+                         config.pipedream_mcp_url("trace-s1", "gmail"))
+        self.assertTrue(auth["mcp_server_url"].startswith(
+            f"{config.PIPEDREAM_MCP_BASE}/trace-s1/gmail?"))
 
     def test_409_update_rotates_token_without_immutable_url(self):
         c, vaults, _ = self._client(_FakeVaults(credentials=_FakeCreds(create_conflicts=True)))
@@ -307,6 +330,56 @@ class RealBindCredentialTest(unittest.TestCase):
             _FakeVaults(credentials=_FakeCreds(create_error=RuntimeError("500 server error"))))
         with self.assertRaises(Exception):
             c.bind_connection("vlt-s1", "trace-s1", "gmail")
+
+    # --- URL-format migration (the silent-failure fix) ----------------------
+    _OLD_URL = ("https://remote.mcp.pipedream.net/v3?projectId=proj_test"
+                "&environment=production&externalUserId=trace-s1&app=gmail")
+
+    def _old_format_cred(self):
+        return [{"id": "cred-old", "display_name": "Trace gmail",
+                 "mcp_server_url": self._OLD_URL}]
+
+    def test_url_migration_replaces_old_format_credential(self):
+        # A name-colliding credential keyed to a PREVIOUS URL format must be replaced,
+        # not left to shadow the bind: the old behavior raised (no new-URL credential
+        # matched) and the caller swallowed it -> agents deployed with no run-time bearer.
+        creds = _FakeCreds(existing=self._old_format_cred())
+        c, _, config = self._client(_FakeVaults(credentials=creds))
+        out = c.bind_connection("vlt-s1", "trace-s1", "gmail")
+        self.assertTrue(out["binding_ref"])
+        self.assertEqual(creds.deleted[-1]["cred_id"], "cred-old")   # stale cred removed
+        rec = creds.created[-1]
+        self.assertEqual(rec["display_name"], "Trace gmail")         # name survives migration
+        self.assertEqual(rec["auth"]["mcp_server_url"],
+                         config.pipedream_mcp_url("trace-s1", "gmail"))
+
+    def test_url_migration_without_sdk_delete_disambiguates_name(self):
+        # BETA SDK without credentials.delete: the new URL still gets its own credential,
+        # created under a disambiguated display name (run-time auth over vault tidiness).
+        creds = _FakeCreds(existing=self._old_format_cred())
+        creds.delete = None                                          # no delete on this SDK
+        c, _, config = self._client(_FakeVaults(credentials=creds))
+        out = c.bind_connection("vlt-s1", "trace-s1", "gmail")
+        self.assertTrue(out["binding_ref"])
+        rec = creds.created[-1]
+        self.assertEqual(rec["display_name"], "Trace gmail (per-user)")
+        self.assertEqual(rec["auth"]["mcp_server_url"],
+                         config.pipedream_mcp_url("trace-s1", "gmail"))
+
+    def test_verify_bindings_reports_match_and_miss(self):
+        creds = _FakeCreds(existing=self._old_format_cred())
+        c, _, config = self._client(_FakeVaults(credentials=creds))
+        new_url = config.pipedream_mcp_url("trace-s1", "gmail")
+        out = c.verify_bindings("vlt-s1", [new_url, self._OLD_URL])
+        self.assertEqual(out, {new_url: False, self._OLD_URL: True})
+
+    def test_verify_bindings_listing_failure_raises(self):
+        class _BoomCreds(_FakeCreds):
+            def list(self, vault_ref):
+                raise RuntimeError("400 bad request")
+        c, _, _ = self._client(_FakeVaults(credentials=_BoomCreds()))
+        with self.assertRaises(Exception):                       # caller decides blocking
+            c.verify_bindings("vlt-s1", ["u"])
 
     def test_bind_returns_token_expiry(self):
         c, _, _ = self._client()

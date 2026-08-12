@@ -161,16 +161,22 @@ reviewed/interview/build/deploy_at), `raw_events.jsonl`, `event_log.json`, `vali
 ## 6. Integration & safety model (what the worker actually touches)
 
 - A live agent reaches each app through a **per-app Pipedream MCP server URL**
-  (`remote.mcp.pipedream.net/{external_user_id}/{app}` — the documented per-user format),
+  (`remote.mcp.pipedream.net/{external_user_id}/{app}?projectId=…&environment=…&toolMode=tools-only`),
   authenticated by Trace's project-scoped token stored in the customer's **vault**,
-  **injected at session create**. The project and environment ride in the token, not the URL.
-  **Never pin an MCP version segment**: the old `/v3` query-param surface served a reduced,
-  stale tool subset — for Google Sheets, a read/append toolset with **no update tool**, which
-  stranded a live workflow in Aug 2026. The public per-app catalog (mcp.pipedream.com) is the
-  registry, *not* a promise of what a given server URL serves — deploy now runs a `tools/list`
-  preflight and records each app's served toolset on the deploy record, warning when a sheets
-  toolset can append but not update. Note the full catalog also includes destructive tools
-  (delete/clear); staging remains prompt-level.
+  **injected at session create**. **Every URL piece is load-bearing** (all verified live,
+  Aug 2026): the path routes to the customer; `projectId` + `environment` are what let the
+  server resolve their **connected account** — without them, tools still *list* but every
+  call answers "connect your account" while all dashboards look green; `toolMode=tools-only`
+  selects real structured tool schemas instead of the default one-string "instruction"
+  wrapper. **Never pin an MCP version segment**: the old `/v3` query-param surface served a
+  reduced, stale tool subset — for Google Sheets, a read/append toolset with **no update
+  tool**, which stranded a live workflow in Aug 2026. The public per-app catalog
+  (mcp.pipedream.com) is the registry, *not* a promise of what a given server URL serves —
+  deploy now runs a `tools/list` preflight and records each app's served toolset on the
+  deploy record, warning when a sheets toolset can append but not update, plus a **binding
+  check** that fails the deploy when a baked server URL has no matching vault credential.
+  Note the full catalog also includes destructive tools (delete/clear); staging remains
+  prompt-level.
 - **Every outbound write/send is held** (`always_ask`) — the agent goes idle awaiting a
   `tool_confirmation`; the held action's **kind + summary** is surfaced for one-tap **Approve/Reject**.
   **Reads proceed.** This is the single most important worker-facing safety surface.

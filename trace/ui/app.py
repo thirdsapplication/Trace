@@ -1125,31 +1125,35 @@ class AppState:
         falls back to a full bind when no credential matches the current URL — so a
         redeploy after a pipedream_mcp_url format change self-migrates the vault.
         Deploys are infrequent; the extra token mints are a few cheap calls.
-        Best-effort: a refresh failure never blocks deploy (a truly dead token would
-        surface as the run's own auth error)."""
+        Best-effort in that a refresh failure never blocks the deploy attempt — but
+        failures are RETURNED (``(conn, errors)``) so the deploy job can surface
+        them instead of reporting green: a swallowed rebind failure is how agents
+        once shipped "connected" with no run-time bearer. The hard gate is
+        deploy_live's binding check."""
+        errors = {}
         vault_ref = (conn or {}).get("vault_ref")
         if not vault_ref:
-            return conn
+            return conn, errors
         uid = conn.get("external_user_id")
         usable = [slug for slug, a in (conn.get("apps") or {}).items()
                   if a.get("usable")]
         if not usable:
-            return conn
+            return conn, errors
         try:
             client = self.connect_fn()
-        except Exception:
-            return conn
+        except Exception as exc:
+            return conn, {"_client": str(exc)}
         changed = False
         for slug in usable:
             try:
                 out = client.refresh_binding(vault_ref, uid, slug)
                 conn["apps"][slug]["token_expires_at"] = out.get("expires_at")
                 changed = True
-            except Exception:
-                pass
+            except Exception as exc:
+                errors[slug] = str(exc)
         if changed:
             self._save_connection(sid, conn)
-        return conn
+        return conn, errors
 
     def _deploy_eligible(self, sid):
         """Approved bundles that have a built config AND a usable connection."""
@@ -1186,7 +1190,11 @@ class AppState:
         def run():
             try:
                 eligible, _, conn = self._deploy_eligible(sid)
-                conn = self._refresh_stale_bindings(sid, conn)   # WS5: token fresh before run
+                conn, bind_errors = self._refresh_stale_bindings(sid, conn)  # WS5 + URL migration
+                if bind_errors:
+                    # visible on the deploy job — a rebind failure usually means the
+                    # per-bundle deploys below will fail their binding check too
+                    job["errors"]["_bindings"] = bind_errors
                 if selected_ids is not None:
                     eligible = [b for b in eligible if b["id"] in set(selected_ids)]
                 for b in eligible:
