@@ -15,6 +15,7 @@ The public user shape is always ``{user_id, email, created_at}``. The ``user_id`
 the Supabase UUID (string) in cloud mode, or ``usr_<hex>`` locally.
 """
 
+import concurrent.futures
 import datetime
 import hashlib
 import hmac
@@ -236,17 +237,51 @@ def start_session(user_id, token=None):
     return token
 
 
+# Supabase JWT validation is a network round trip, and it used to run — untimed —
+# on EVERY authenticated request, so it sat on the critical path of every app
+# launch and a hung Supabase hung the whole request. Two guards:
+#  - a short positive cache (token -> user_id), so repeat requests within the TTL
+#    skip the round trip entirely; logout evicts immediately, and the TTL bounds
+#    how long a remotely-revoked token can linger;
+#  - a hard timeout via a worker pool, so no request waits on Supabase for more
+#    than _JWT_TIMEOUT_S — a timeout fails closed (401), never hangs.
+_JWT_CACHE = {}                  # token -> (user_id, expires_epoch)
+_JWT_CACHE_TTL = 60
+_JWT_CACHE_MAX = 1024
+_JWT_TIMEOUT_S = 10
+_JWT_POOL = None                 # lazy; only ever built in Supabase mode
+
+
+def _get_user_bounded(client, token):
+    global _JWT_POOL
+    with _LOCK:
+        if _JWT_POOL is None:
+            _JWT_POOL = concurrent.futures.ThreadPoolExecutor(
+                max_workers=8, thread_name_prefix="supa-auth")
+    return _JWT_POOL.submit(client.auth.get_user, token).result(timeout=_JWT_TIMEOUT_S)
+
+
 def session_user(token):
     """The user_id for a live token, or None."""
     if supa.is_configured():
         if not token:
             return None
+        now = time.time()
+        hit = _JWT_CACHE.get(token)
+        if hit and hit[1] > now:
+            return hit[0]
         client = supa.get_client()
         try:
-            resp = client.auth.get_user(token)
-            return str(resp.user.id) if resp and resp.user else None
+            resp = _get_user_bounded(client, token)
+            uid = str(resp.user.id) if resp and resp.user else None
         except Exception:
             return None
+        if uid:
+            with _LOCK:
+                if len(_JWT_CACHE) >= _JWT_CACHE_MAX:
+                    _JWT_CACHE.clear()
+                _JWT_CACHE[token] = (uid, now + _JWT_CACHE_TTL)
+        return uid
     s = _SESSIONS.get(token or "")
     if not s:
         return None
@@ -259,6 +294,7 @@ def session_user(token):
 def end_session(token):
     """Invalidate a session token (logout)."""
     if supa.is_configured():
+        _JWT_CACHE.pop(token or "", None)   # logout is immediate, cache or not
         if token:
             try:
                 supa.get_admin().auth.admin.sign_out(token)

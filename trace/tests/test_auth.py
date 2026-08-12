@@ -10,6 +10,7 @@ import json
 import os
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -71,6 +72,55 @@ class UsersModuleTest(unittest.TestCase):
         users.end_session(token)
         self.assertIsNone(users.session_user(token))
         self.assertIsNone(users.session_user("bogus"))
+
+
+class SupabaseSessionUserTest(unittest.TestCase):
+    """Supabase-mode JWT validation: cached within the TTL (one round trip, not
+    one per request), evicted on logout, and bounded when the auth service hangs
+    (fails closed instead of hanging the request)."""
+
+    class _FakeAuth:
+        def __init__(self):
+            self.calls = 0
+            self.delay = 0.0
+
+        def get_user(self, token):
+            self.calls += 1
+            if self.delay:
+                time.sleep(self.delay)
+            user = type("U", (), {"id": "uid-1"})()
+            return type("R", (), {"user": user})()
+
+    def setUp(self):
+        self.auth = self._FakeAuth()
+        client = type("C", (), {"auth": self.auth})()
+        self._saved = (users.supa.is_configured, users.supa.get_client,
+                       users._JWT_TIMEOUT_S)
+        users.supa.is_configured = lambda: True
+        users.supa.get_client = lambda: client
+        users._JWT_CACHE.clear()
+
+    def tearDown(self):
+        users.supa.is_configured, users.supa.get_client, users._JWT_TIMEOUT_S = self._saved
+        users._JWT_CACHE.clear()
+
+    def test_validation_is_cached_within_ttl(self):
+        self.assertEqual(users.session_user("jwt-a"), "uid-1")
+        self.assertEqual(users.session_user("jwt-a"), "uid-1")
+        self.assertEqual(self.auth.calls, 1)                     # second hit served from cache
+
+    def test_logout_evicts_immediately(self):
+        users.session_user("jwt-b")
+        users.end_session("jwt-b")                               # get_admin raises; swallowed
+        users.session_user("jwt-b")
+        self.assertEqual(self.auth.calls, 2)                     # re-validated after logout
+
+    def test_hung_auth_service_fails_closed_quickly(self):
+        users._JWT_TIMEOUT_S = 0.1
+        self.auth.delay = 1.0
+        t0 = time.time()
+        self.assertIsNone(users.session_user("jwt-c"))
+        self.assertLess(time.time() - t0, 0.9)                   # bounded, not the full delay
 
 
 class _AuthHTTPBase(unittest.TestCase):
