@@ -316,7 +316,12 @@ function renderAuth(mode) {
       <h2>${isSignup ? "Set up your palza" : "Sign in"}</h2>
       <p class="lead">${isSignup ? "Your work stays yours — only you can see your agents and connections." : "Pick up where you left off."}</p>
       <div class="field"><span class="label">Email</span><input id="email" type="email" autocomplete="username" placeholder="you@work.com"></div>
-      <div class="field"><span class="label">Password</span><input id="pw" type="password" autocomplete="current-password" placeholder="${isSignup ? "at least 8 characters" : "••••••••"}"></div>
+      <div class="field"><span class="label">Password</span>
+        <div class="pw-wrap">
+          <input id="pw" type="password" autocomplete="current-password" placeholder="${isSignup ? "at least 8 characters" : "••••••••"}">
+          <button type="button" id="pwShow" class="pw-show" aria-pressed="false">show</button>
+        </div>
+      </div>
       <p id="authMsg" class="msg err"></p>
       <button id="authGo" class="btn-primary full">${isSignup ? "Create account" : "Sign in"}</button>
       ${S.signupAllowed ? `<p class="notice" style="margin-top:14px;text-align:center;">
@@ -333,6 +338,15 @@ function renderAuth(mode) {
   };
   $("#authGo").onclick = go;
   $("#pw").onkeydown = (e) => { if (e.key === "Enter") go(); };
+  // Frame 20's reveal. A password you cannot check is a password you mistype, and the
+  // remedy is on screen rather than a second confirm field.
+  $("#pwShow").onclick = () => {
+    const inp = $("#pw"), on = inp.type === "password";
+    inp.type = on ? "text" : "password";
+    $("#pwShow").textContent = on ? "hide" : "show";
+    $("#pwShow").setAttribute("aria-pressed", on ? "true" : "false");
+    inp.focus();
+  };
   if ($("#authSwap")) $("#authSwap").onclick = () => renderAuth(isSignup ? "login" : "signup");
 }
 
@@ -454,6 +468,19 @@ function ago(iso) {
   if (s < 3600) return `${Math.floor(s / 60)}m ago`;
   if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
   return `${Math.floor(s / 86400)}d ago`;
+}
+
+// Frame 22 stamps a thread with a clock time — "9:12", "Mon" — not "2h ago". In a list
+// you scan for the message you remember, and you remember it as this morning or Monday.
+// ago() stays for everywhere that describes a single event's recency.
+function stamp(iso) {
+  const t = Date.parse(iso || "");
+  if (isNaN(t)) return "";
+  const d = new Date(t), now = new Date();
+  const sameDay = d.toDateString() === now.toDateString();
+  if (sameDay) return d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+  if ((now - d) / 86400000 < 7) return d.toLocaleDateString(undefined, { weekday: "short" });
+  return d.toLocaleDateString(undefined, { month: "numeric", day: "numeric" });
 }
 
 // one proposed action (checkbox to include in an approve batch; processed = status pill)
@@ -887,11 +914,16 @@ function renderGroupChat(group) {
   clearTimers();
   if (!group) { renderGroups(); return; }
   const msgs = [];   // {who:'you'|'sys'|agentId, name, color, text, staged}
+  // Frame 17 renders @mentions in light blue inside the ink bubbles, so directing a
+  // question at one agent looks different from asking the room. Escaped FIRST, then the
+  // mention is wrapped — the pattern only ever matches text esc() has already made safe.
+  const mentions = (text) => esc(text).replace(/@([\w][\w .'-]{0,38}\w)/g,
+    (_, n) => `<span class="mention">@${n}</span>`);
   const bubble = (m) => m.who === "you"
-    ? `<div class="row" style="justify-content:flex-end;margin-top:10px;"><div class="card" style="background:#1A1A1A;color:#fff;max-width:78%;">${esc(m.text)}</div></div>`
+    ? `<div class="row" style="justify-content:flex-end;margin-top:10px;"><div class="card grp-you">${mentions(m.text)}</div></div>`
     : `<div style="margin-top:10px;">
-         <div class="sub" style="color:${esc(m.color)};font-weight:600;">${esc(m.name)}</div>
-         <div class="card" style="border-left:3px solid ${esc(m.color)};max-width:82%;">${esc(m.text)}
+         <div class="sub ag-name" style="color:${esc(m.color)};">${esc(m.name)}</div>
+         <div class="card" style="border-left:3px solid ${esc(m.color)};max-width:82%;">${mentions(m.text)}
            ${m.staged ? `<div class="sub muted" style="margin-top:4px;">📋 ${m.staged} action${m.staged > 1 ? "s" : ""} staged — approve on the agent's page.</div>` : ""}
          </div></div>`;
   const draw = () => {
@@ -1208,7 +1240,7 @@ async function renderMessages() {
           ? esc(((last.sender === "user" ? "You: " : "") + (last.text || "")).slice(0, 72))
           : "No messages yet"}</span>
       </span>
-      <span class="sub muted">${last ? esc(ago(last.created_at)) : ""}</span>
+      <span class="sub muted">${last ? esc(stamp(last.created_at)) : ""}</span>
       ${a.unread ? `<span class="flag-dot" title="${a.unread} unread"></span>` : ""}
     </button>`).join("");
   const el = $("#dmList");

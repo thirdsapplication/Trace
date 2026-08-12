@@ -280,6 +280,20 @@ input:focus, textarea:focus { outline: none; border-color: var(--accent); backgr
 .rec-acts-col { flex-direction: column; gap: 12px; }
 .rec-acts .btn-secondary, .rec-acts .btn-accent { font-size: 13.5px; font-weight: 700;
   border-radius: 11px; padding: 12px 22px; }
+/* group chat (17): your own bubble is ink, and an @mention inside it stays legible in
+   light blue — directing a question at one agent should look different from asking all. */
+.grp-you { background: var(--ink); color: #fff; max-width: 78%; }
+.mention { color: #8FB0FF; font-weight: 600; }
+.card:not(.grp-you) .mention { color: var(--accent); }
+.ag-name { font-weight: 600; }
+
+/* sign in (20): the reveal sits inside the field, so it reads as part of the input
+   rather than a control floating beside it. */
+.pw-wrap { position: relative; display: flex; align-items: center; }
+.pw-wrap input { width: 100%; padding-right: 58px; }
+.pw-show { position: absolute; right: 12px; background: none; border: none; padding: 0;
+  font-size: 12px; font-weight: 600; color: var(--accent); cursor: pointer; }
+
 /* interview (09): one pill per agent, so the whole interview is visible rather than just
    the page you're on. Not interactive — Continue is gated per page. */
 .iv-head { display: flex; flex-direction: column; gap: 9px; margin-bottom: 18px; }
