@@ -2040,7 +2040,37 @@ function renderInterview(sid, data) {
         </div>
       </div></div>`;
   }).join("");
+  // Frame 09's progress pills: one per agent, "2 of 4", so you can see the whole
+  // interview rather than just the page you're on. Display-only on purpose — the frame
+  // implies you can jump between agents, but Continue is gated per page, so a clickable
+  // pill would let you skip past questions that gate is there to collect.
+  //
+  // The "Everyone" tab is not built: interviews are strictly per-bundle and there is no
+  // shared-question concept to populate it with.
+  const answeredCount = (bid) => {
+    const iv = interviews[bid] || {};
+    const total = (iv.questions || []).length;
+    const live = root.querySelectorAll(`.iv-a[data-bid="${bid}"]`);
+    const done = live.length
+      ? Array.from(live).filter(i => i.value.trim()).length
+      : total - ((iv.unresolved || []).length);
+    return { done, total };
+  };
+  const pills = () => ids.map((bid, i) => {
+    const { done, total } = answeredCount(bid);
+    const state = done >= total ? "done" : (i === page ? "on" : "");
+    return `<span class="iv-pill ${state}">${esc(nameOf(bid))}
+      <b>${done >= total ? "✓" : `${done} of ${total}`}</b></span>`;
+  }).join("");
+
+  const qTotal = ids.reduce((n, bid) => n + ((interviews[bid] || {}).questions || []).length, 0);
+
   $("#ivBody").innerHTML = `
+    ${ids.length ? `<div class="iv-head">
+      <div class="iv-count">${qTotal} question${qTotal === 1 ? "" : "s"} for
+        ${ids.length} agent${ids.length === 1 ? "" : "s"}</div>
+      <div class="iv-pills" id="ivPills">${pills()}</div>
+    </div>` : ""}
     ${blocks || `<p class="muted">No questions needed — you're good to go.</p>`}
     <p id="ivProg" class="sub muted" style="margin-top:10px;"></p>
     <p id="ivMsg" class="msg ok" style="margin-top:6px;"></p>
@@ -2073,6 +2103,8 @@ function renderInterview(sid, data) {
   };
   const updateGo = () => {
     $("#ivGo").disabled = pageInputs().some(inp => !inp.value.trim());
+    const pl = $("#ivPills");
+    if (pl) pl.innerHTML = pills();          // counts follow what you've typed, not the save
   };
   root.querySelectorAll(".iv-a").forEach(inp => inp.oninput = updateGo);
   root.querySelectorAll(".suggest").forEach(btn => btn.onclick = () => {

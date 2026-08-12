@@ -280,6 +280,21 @@ input:focus, textarea:focus { outline: none; border-color: var(--accent); backgr
 .rec-acts-col { flex-direction: column; gap: 12px; }
 .rec-acts .btn-secondary, .rec-acts .btn-accent { font-size: 13.5px; font-weight: 700;
   border-radius: 11px; padding: 12px 22px; }
+/* interview (09): one pill per agent, so the whole interview is visible rather than just
+   the page you're on. Not interactive — Continue is gated per page. */
+.iv-head { display: flex; flex-direction: column; gap: 9px; margin-bottom: 18px; }
+.iv-count { font-family: var(--display); font-weight: 800; font-size: 18px;
+  letter-spacing: -0.02em; }
+.iv-pills { display: flex; flex-wrap: wrap; gap: 7px; }
+.iv-pill { display: inline-flex; align-items: baseline; gap: 6px; font-size: 12px;
+  font-weight: 600; color: var(--ink-2); background: var(--inset);
+  border-radius: 999px; padding: 5px 12px; }
+.iv-pill b { font-weight: 700; color: var(--ink-3); font-variant-numeric: tabular-nums; }
+.iv-pill.on { background: var(--accent-pill); color: var(--accent); }
+.iv-pill.on b { color: var(--accent); }
+.iv-pill.done { background: var(--ok-bg); color: var(--ok); }
+.iv-pill.done b { color: var(--ok); }
+
 /* build (11): the phases describe what the build is doing. They only tick when the whole
    build lands, because the job reports a count and never says which phase it is in. */
 .bd-phases { display: flex; flex-direction: column; gap: 10px; }
