@@ -1221,13 +1221,21 @@ class AppState:
                 # memory store) for the OWNER — hand it the account email when the
                 # session has one. Transient enrichment; the record on disk keeps its
                 # shape for sessions without an owner (the founder Test UI).
-                owner_uid = (sessions.read_meta(root, sid) or {}).get("owner_user_id")
+                owner_uid = sessions.owner_of(root, sid)
                 if owner_uid and not (conn or {}).get("owner_email"):
                     try:
                         conn = {**(conn or {}),
                                 "owner_email": (users.get(owner_uid) or {}).get("email")}
                     except Exception:                      # noqa: BLE001 — naming must never block a deploy
                         pass
+                # The isolation key, from the same owner, for the same reason. It was
+                # only ever read out of connection.json — a file on the container disk
+                # Render wipes — even though users.external_user_id is a pure function of
+                # the user id and cannot fail. When it went missing the memory store was
+                # named without an owner, and two accounts could land on one store.
+                if owner_uid and not (conn or {}).get("external_user_id"):
+                    conn = {**(conn or {}),
+                            "external_user_id": users.external_user_id(owner_uid)}
                 if bind_errors:
                     # visible on the deploy job — a rebind failure usually means the
                     # per-bundle deploys below will fail their binding check too

@@ -165,6 +165,32 @@ def read_meta(root, sid):
         return {"id": sid}
 
 
+def owner_of(root, sid):
+    """The account a session belongs to, or None.
+
+    read_meta only ever looks at meta.json on the container filesystem, and returns a
+    bare {"id": sid} when it isn't there — which is what happens after Render restarts,
+    since there is no persistent disk. The owner is not actually lost in that case: it
+    was written to the Supabase sessions row at creation. This asks the file first and
+    the database second, so a wiped disk costs a round trip rather than the answer.
+
+    Load-bearing: deploy names the per-agent memory store after the owner, and a store
+    named without one is a store two accounts can share.
+    """
+    uid = (read_meta(root, sid) or {}).get("owner_user_id")
+    if uid:
+        return uid
+    if supa.is_configured():
+        try:
+            r = supa.get_admin().table("sessions").select("owner_id") \
+                .eq("local_sid", sid).maybe_single().execute() or supa.NO_ROW
+            if r.data and r.data.get("owner_id"):
+                return str(r.data["owner_id"])
+        except Exception:                                  # noqa: BLE001 — best effort
+            pass
+    return None
+
+
 def write_meta(root, sid, meta):
     p = path(root, sid, META)
     tmp = p + ".tmp"
