@@ -26,3 +26,6 @@ src-tauri/binaries/
 # src-tauri/icons/ — tracked; required for Tauri build
 src-tauri/gen/
 node_modules/
+
+# macOS
+.DS_Store
