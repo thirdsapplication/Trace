@@ -1069,6 +1069,64 @@ def reviewed_keys(root, agent_id):
     return set((_load(root, "run_reviews.json").get(agent_id) or {}).keys())
 
 
+# --- batched reads -----------------------------------------------------------
+# home_data and the agents dashboard used to call reviewed_keys / runs_for_agent /
+# schedule_get once PER AGENT — three round trips each, so the home screen cost 3N
+# queries and got slower with every agent deployed. These fetch the same data for all
+# of an owner's agents in one query apiece. Same return shapes, keyed by agent_id.
+
+def reviewed_keys_many(root, agent_ids):
+    ids = [a for a in (agent_ids or []) if a]
+    if not ids:
+        return {}
+    if supa.is_configured():
+        r = supa.get_admin().table("run_reviews").select("agent_id, run_key") \
+            .in_("agent_id", ids).execute()
+        out = {a: set() for a in ids}
+        for row in (r.data or []):
+            out.setdefault(str(row.get("agent_id")), set()).add(row.get("run_key"))
+        return out
+    return {a: reviewed_keys(root, a) for a in ids}
+
+
+def runs_for_agents(root, agent_ids, limit=20):
+    ids = [a for a in (agent_ids or []) if a]
+    if not ids:
+        return {}
+    if supa.is_configured():
+        # One query for every agent's runs, newest first, then grouped and truncated in
+        # Python — PostgREST has no per-group limit. The ceiling keeps a chatty agent
+        # from starving the others out of the result set.
+        r = supa.get_admin().table("agent_runs").select("*") \
+            .in_("agent_id", ids) \
+            .order("started_at", desc=True) \
+            .limit(limit * len(ids)).execute()
+        out = {a: [] for a in ids}
+        for row in (r.data or []):
+            bucket = out.setdefault(str(row.get("agent_id")), [])
+            if len(bucket) < limit:
+                bucket.append(_run_to_caller(row))
+        return out
+    return {a: runs_for_agent(root, a, limit) for a in ids}
+
+
+def schedules_for_agents(root, agent_ids):
+    ids = [a for a in (agent_ids or []) if a]
+    if not ids:
+        return {}
+    if supa.is_configured():
+        r = supa.get_admin().table("schedules") \
+            .select("agent_id, cadence, paused, last_run_at") \
+            .in_("agent_id", ids).execute()
+        out = {a: None for a in ids}
+        for row in (r.data or []):
+            out[str(row.get("agent_id"))] = {"cadence": row.get("cadence"),
+                                             "paused": row.get("paused"),
+                                             "last_run_at": row.get("last_run_at")}
+        return out
+    return {a: schedule_get(root, a) for a in ids}
+
+
 # --- agent direct messages (Instagram-style "My agents") --------------------
 def message_add(root, rec):
     """rec: {agent_id, owner_user_id, sender ('user'|'agent'), text, read?}."""

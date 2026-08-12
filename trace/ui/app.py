@@ -1572,11 +1572,18 @@ class AppState:
             active_by_agent.setdefault(p.get("agent_id"), []).append(
                 {"decision_id": p.get("decision_id"), "lesson": p.get("lesson")})
         agents_out = []
-        for a in registry.agents_for_user(root, uid):
+        all_agents = registry.agents_for_user(root, uid)
+        # Batched: one query each instead of three per agent (the home screen used to
+        # cost 3N round trips and got slower with every agent deployed).
+        agent_ids = [a.get("agent_id") for a in all_agents]
+        reviewed_by_agent = registry.reviewed_keys_many(root, agent_ids)
+        runs_by_agent = registry.runs_for_agents(root, agent_ids, 20)
+        schedules_by_agent = registry.schedules_for_agents(root, agent_ids)
+        for a in all_agents:
             aid = a.get("agent_id")
-            reviewed = registry.reviewed_keys(root, aid)
+            reviewed = reviewed_by_agent.get(aid) or set()
             stories = []
-            for r in registry.runs_for_agent(root, aid, 20):
+            for r in runs_by_agent.get(aid) or []:
                 key = self.run_key(aid, r)
                 sid = r.get("run_session_id")
                 props = pending_by_session.get(sid, []) if sid else []
@@ -1604,7 +1611,7 @@ class AppState:
                 "trigger": a.get("trigger") or "",
                 "deployed_at": a.get("deployed_at"),
                 "deployment": bool(a.get("deployment_id")),
-                "schedule": registry.schedule_get(root, aid),
+                "schedule": schedules_by_agent.get(aid),
                 "capture_present": bool(a.get("session_id")) and
                 os.path.isdir(sessions.session_dir(root, a.get("session_id"))),
                 "stories": stories, "unreviewed": len(stories),
@@ -2006,11 +2013,15 @@ def make_handler(state):
             (Spec 2) and the activity view (Spec 3). Scoped by owner; never another
             user's agents."""
             out = []
-            for a in registry.agents_for_user(root, user["user_id"]):
+            agents = registry.agents_for_user(root, user["user_id"])
+            ids = [a.get("agent_id") for a in agents]
+            schedules = registry.schedules_for_agents(root, ids)     # batched: was 2 per agent
+            runs = registry.runs_for_agents(root, ids, 5)
+            for a in agents:
                 aid = a.get("agent_id")
                 out.append({**a,
-                            "schedule": registry.schedule_get(root, aid),
-                            "recent_runs": registry.runs_for_agent(root, aid, 5),
+                            "schedule": schedules.get(aid),
+                            "recent_runs": runs.get(aid) or [],
                             "capture_present": bool(a.get("session_id")) and
                             os.path.isdir(sessions.session_dir(root, a.get("session_id")))})
             return out
