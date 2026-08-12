@@ -41,8 +41,12 @@ def finalize_live_envelope(live_envelope_dict, connection_record, staged_apps=No
     directive (see runner). Returns a NEW dict (the template is not mutated)."""
     env = copy.deepcopy(live_envelope_dict)
     uid = (connection_record or {}).get("external_user_id")
+    # Namespace the platform agent name per customer BEFORE any early return:
+    # create-or-reuse and cleanup match by exact name account-wide, so a bare
+    # workflow name lets two customers' same-named workflows delete each other.
+    env["name"] = config.platform_agent_name(env.get("name"), uid)
     slugs = _usable_app_slugs(connection_record)
-    if not slugs:                                   # no usable app -> leave the template as-is
+    if not slugs:                                   # no usable app -> leave the rest as-is
         return env
     servers, toolsets = config.pipedream_mcp_servers(uid, slugs)
     env["mcp_servers"] = servers
@@ -79,17 +83,25 @@ def build_deployment_trigger(base_trigger, staged_slugs, rejected=None):
 
 
 def deploy_live(bundle, live_envelope_dict, connection_record, client,
-                trigger=None, schedule=None, staged_apps=None):
+                trigger=None, schedule=None, staged_apps=None,
+                capture_sid=None, prior_memory_store_id=None):
     """Create the LIVE agent for one bundle over the bound connection, plus its
-    per-agent MEMORY STORE (created-or-reused by name so lessons survive redeploys)
-    and a platform DEPLOYMENT whose initial message set carries the task + the
-    memory-update directive (+ the staging directive when apps are staged). The
-    deployment is created MANUAL (no schedule) — the dashboard cadence attaches a
-    cron schedule afterwards. Returns a ``live_record``. The customer's vault rides
-    on the deployment (injected into every run session). Memory-store and deployment
-    creation are NOT wrapped: a platform rejection propagates so the deploy job
-    surfaces the real API error instead of a phantom "live" (the always_ask lesson).
-    ``staged_apps`` (Spec 8) marks which app slugs are staged for approval."""
+    per-workflow MEMORY STORE and a platform DEPLOYMENT whose initial message set
+    carries the task + the memory-update directive (+ the staging directive when
+    apps are staged). The store is keyed on (customer, ``capture_sid``, bundle id) —
+    identity that survives redeploys, unlike the platform agent id, which churns
+    because the agent is deleted and recreated — and ``prior_memory_store_id`` (the
+    registry's store for this workflow, if any) is preferred when still valid, so
+    lessons genuinely accumulate. The deployment is created MANUAL (no schedule) —
+    the dashboard cadence attaches a cron schedule afterwards. Returns a
+    ``live_record``. The customer's vault rides on the deployment (injected into
+    every run session). Memory-store and deployment creation are NOT wrapped: a
+    platform rejection propagates so the deploy job surfaces the real API error
+    instead of a phantom "live" (the always_ask lesson). ``staged_apps`` (Spec 8)
+    marks which app slugs are staged for approval."""
+    if not capture_sid:
+        raise ValueError("capture_sid is required: the memory store is keyed on it, "
+                         "and a missing sid would collapse workflows onto one store")
     vault_ref = (connection_record or {}).get("vault_ref")
     external_user_id = (connection_record or {}).get("external_user_id")
 
@@ -99,8 +111,9 @@ def deploy_live(bundle, live_envelope_dict, connection_record, client,
     environment_id = client.create_environment()
 
     store = client.create_or_reuse_memory_store(
-        name=config.memory_store_name(agent_id, external_user_id),
-        description=config.MEMORY_STORE_DESCRIPTION)
+        name=config.memory_store_name(external_user_id, capture_sid, bundle.get("id")),
+        description=config.MEMORY_STORE_DESCRIPTION,
+        preferred_id=prior_memory_store_id)
     memory_store_id = store.get("id") if isinstance(store, dict) else store
 
     base_trigger = trigger or (bundle.get("trigger") or "on a new matching event")

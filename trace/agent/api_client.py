@@ -359,20 +359,39 @@ class ManagedAgentsClient:
     # Beta shape — confirm against current Managed Agents memory docs: stores are
     # created once, attached at session/deployment create via a memory_store resource,
     # and mount at /mnt/memory/<store-name>/ inside the container.
-    def create_or_reuse_memory_store(self, name, description):
-        """One memory store per agent, keyed by its Trace-deterministic name. REUSED
+    def create_or_reuse_memory_store(self, name, description, preferred_id=None):
+        """One memory store per workflow, keyed by its Trace-deterministic name. REUSED
         when it already exists (unlike agents, which are recreated on redeploy) so
         accumulated lessons survive redeploys. Fresh stores are seeded with the two
         canonical documents; a seed failure raises (fail loud — a half-initialized
-        store is worse than a failed deploy). Returns ``{id, reused}``."""
+        store is worse than a failed deploy). Returns ``{id, reused}``.
+
+        ``preferred_id`` is the store the registry already has on record for this
+        workflow. It is adopted only when the listing shows it still exists under THIS
+        customer's ``trace-<uid>-`` prefix — that keeps a workflow's store through the
+        naming-scheme change without ever re-adopting a legacy shared-era store
+        (``trace-B1-<uid>``, one per USER, which agents overwrote each other through;
+        those must be left behind so the redeploy lands on an isolated store). When the
+        listing itself fails, the registry id is trusted as-is: creating a duplicate
+        store on a transient list error loses the workflow's whole memory, while a
+        genuinely dead id fails loudly at deployment create."""
         stores = self._agents_ns("memory_stores")
+        listed, list_ok = [], False
         try:
-            res = _retry(lambda: stores.list())
-            for s in _data(res):
-                if _attr(s, "name") == name:
-                    return {"id": _idof(s), "reused": True}
+            listed = list(_data(_retry(lambda: stores.list())))
+            list_ok = True
         except Exception:                                  # noqa: BLE001 — list is best-effort
             pass
+        if preferred_id:
+            if not list_ok:
+                return {"id": preferred_id, "reused": True}
+            user_prefix = name.rsplit("-wf-", 1)[0] + "-"
+            for s in listed:
+                if _idof(s) == preferred_id and str(_attr(s, "name") or "").startswith(user_prefix):
+                    return {"id": preferred_id, "reused": True}
+        for s in listed:
+            if _attr(s, "name") == name:
+                return {"id": _idof(s), "reused": True}
         store = _retry(lambda: stores.create(name=name, description=description))
         store_id = _idof(store)
         self.seed_memory(store_id, config.MEMORY_STATUS_DOC, config.MEMORY_STATUS_SEED)

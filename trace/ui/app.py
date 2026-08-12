@@ -296,7 +296,9 @@ class AppState:
         client = ManagedAgentsClient(api_key=key)
         return agent_deploy.deploy_live(bundle, live_dict, connection_record, client,
                                         trigger=start.get("trigger"), schedule=start.get("schedule"),
-                                        staged_apps=start.get("staged_apps"))
+                                        staged_apps=start.get("staged_apps"),
+                                        capture_sid=start.get("capture_sid"),
+                                        prior_memory_store_id=start.get("prior_memory_store_id"))
 
     def _live_client(self):
         key = self.keystore.get_key()
@@ -972,8 +974,16 @@ class AppState:
         # the agent names Trace uses for this session's bundles (matches configgen's
         # _envelope: name -> bundle name/id), so the sweep can reach stale duplicates.
         approved, _ = self._approved_for_stage4(sid)
+        raw_names = [str(b.get("name") or b.get("id") or "Agent").strip() for b in approved]
+        # Sweep BOTH name forms: the bare workflow name (test agents, plus live agents
+        # from before names were customer-namespaced) and the namespaced live name.
+        try:
+            conn, _ = self._load_connection(sid)
+        except Exception:                              # noqa: BLE001 — sweep is best-effort
+            conn = None
+        ext_uid = (conn or {}).get("external_user_id")
         agent_names = list(dict.fromkeys(
-            str(b.get("name") or b.get("id") or "Agent").strip() for b in approved))
+            raw_names + [agent_config.platform_agent_name(n, ext_uid) for n in raw_names]))
         # live deploy records (Phase 6): the live sessions + agents + deployments + memory
         for d in sessions.list_deploy_records(self.sessions_root, sid):
             if d.get("session_id"):
@@ -1194,6 +1204,7 @@ class AppState:
                 conn = self._refresh_stale_bindings(sid, conn)   # WS5: token fresh before run
                 if selected_ids is not None:
                     eligible = [b for b in eligible if b["id"] in set(selected_ids)]
+                owner = (sessions.read_meta(root, sid) or {}).get("owner_user_id")
                 for b in eligible:
                     bid = b["id"]
                     rec = None                       # set once the platform agent exists
@@ -1201,28 +1212,39 @@ class AppState:
                         with open(os.path.join(specs_dir, sessions.agent_yaml_name(bid, "live")),
                                   encoding="utf-8") as f:
                             live_dict = yaml.safe_load(f.read())
-                        rec = self.deploy_fn(b, live_dict, conn, start)
+                        # This workflow's existing registry row: same owner, same
+                        # RECORDING, same bundle — bundle ids repeat across recordings
+                        # (every recording has a B1), so matching bundle alone could
+                        # grab an unrelated workflow. Its memory store rides into the
+                        # redeploy so lessons survive the agent's delete+recreate.
+                        prior = None
+                        if owner:
+                            try:
+                                prior = next(
+                                    (a for a in registry.agents_for_user(root, owner)
+                                     if a.get("session_id") == sid
+                                     and a.get("bundle_id") == bid), None)
+                            except Exception:          # noqa: BLE001 — best-effort
+                                pass
+                        rec = self.deploy_fn(b, live_dict, conn,
+                                             {**start, "capture_sid": sid,
+                                              "prior_memory_store_id":
+                                                  (prior or {}).get("memory_store_id")})
                         _write_json(os.path.join(specs_dir, sessions.deploy_record_name(bid)), rec)
                         # Spec 2/3/4: durable per-user agent index (survives restart),
                         # so a re-run adds to the user's agent set without clobbering
                         # prior agents, and schedules/activity have something to key on.
                         if rec.get("status") == "live" and rec.get("agent_id"):
-                            owner = (sessions.read_meta(root, sid) or {}).get("owner_user_id")
                             if owner:
-                                # A redeploy deleted+recreated the agent, stranding any
+                                # A redeploy deleted+recreated the agent, stranding the
                                 # prior deployment — archive it so the Console stays clean.
-                                try:
-                                    prior = next(
-                                        (a for a in registry.agents_for_user(root, owner)
-                                         if a.get("bundle_id") == bid
-                                         and a.get("deployment_id")
-                                         and a.get("deployment_id") != rec.get("deployment_id")),
-                                        None)
-                                    if prior:
+                                if (prior and prior.get("deployment_id")
+                                        and prior["deployment_id"] != rec.get("deployment_id")):
+                                    try:
                                         self._live_client().archive_deployment(
                                             prior["deployment_id"])
-                                except Exception:          # noqa: BLE001 — best-effort
-                                    pass
+                                    except Exception:      # noqa: BLE001 — best-effort
+                                        pass
                                 registry.agent_upsert(root, {
                                     "agent_id": rec["agent_id"], "owner_user_id": owner,
                                     "external_user_id": rec.get("external_user_id"),
@@ -1236,6 +1258,17 @@ class AppState:
                                     # the worker's review-step correction is the truer bio
                                     "description": b.get("user_description")
                                                    or b.get("description") or ""})
+                                # One row per workflow: move the old row's history
+                                # (chat, runs, reviews, schedule, …) onto the new agent
+                                # id and drop the old row, so "My agents" updates in
+                                # place instead of growing a dead duplicate.
+                                if (prior and prior.get("agent_id")
+                                        and prior["agent_id"] != rec["agent_id"]):
+                                    try:
+                                        registry.agent_supersede(
+                                            root, prior["agent_id"], rec["agent_id"])
+                                    except Exception:  # noqa: BLE001 — never fail a deploy
+                                        traceback.print_exc()
                                 try:                  # Phase B: agent-kind gate. Best-effort
                                     self._embed_agent_kind({   # — an embedding hiccup must
                                         "agent_id": rec["agent_id"],   # never fail a deploy

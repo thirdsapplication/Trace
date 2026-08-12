@@ -390,5 +390,58 @@ class DeploymentAgentActionsTest(AgentsEndpointTest):
         self.assertEqual(ma.manual_runs, [])
 
 
+class AgentSupersedeTest(unittest.TestCase):
+    """A redeploy replaces the platform agent id; agent_supersede must carry the whole
+    durable history to the new id and drop the old row (file-mode / dual-run path)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = self._tmp.name
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_agent_supersede_rekeys_history_and_drops_old_row(self):
+        uid = "u1"
+        for aid in ("agent_old", "agent_new"):
+            registry.agent_upsert(self.root, {
+                "agent_id": aid, "owner_user_id": uid, "external_user_id": "x",
+                "bundle_id": "B1", "name": "WF", "vault_ref": "v", "trigger": "t",
+                "session_id": "20260101-120000"})
+        registry.schedule_set(self.root, "agent_old", uid, {"preset": "daily"}, paused=False)
+        registry.message_add(self.root, {"agent_id": "agent_old", "owner_user_id": uid,
+                                         "sender": "user", "text": "hi"})
+        registry.run_add(self.root, {"agent_id": "agent_old", "owner_user_id": uid,
+                                     "status": "clean", "summary": "did X",
+                                     "run_session_id": "s1"})
+        registry.review_mark(self.root, "agent_old", uid, "run-1")
+        registry.pending_add(self.root, {"agent_id": "agent_old", "owner_user_id": uid,
+                                         "run_session_id": "rs", "app": "gmail",
+                                         "kind": "send", "summary": "s",
+                                         "content_hash": "h1"})
+        registry.agent_embedding_upsert(self.root, "agent_old", [0.1, 0.2])
+        group = registry.group_create(self.root, uid, "G", ["agent_old"])
+
+        registry.agent_supersede(self.root, "agent_old", "agent_new")
+
+        rows = registry.agents_for_user(self.root, uid)
+        self.assertEqual([r["agent_id"] for r in rows], ["agent_new"])   # old row gone
+        self.assertEqual(registry.schedule_get(self.root, "agent_new")["cadence"],
+                         {"preset": "daily"})
+        self.assertIsNone(registry.schedule_get(self.root, "agent_old"))
+        msgs = registry.messages_for_agent(self.root, uid, "agent_new")
+        self.assertEqual([m["text"] for m in msgs], ["hi"])              # chat thread moved
+        self.assertEqual([r["summary"] for r in
+                          registry.runs_for_agent(self.root, "agent_new")], ["did X"])
+        self.assertEqual(registry.runs_for_agent(self.root, "agent_old"), [])
+        self.assertEqual(registry.reviewed_keys(self.root, "agent_new"), {"run-1"})
+        self.assertEqual([p["agent_id"] for p in registry.pending_for_user(self.root, uid)],
+                         ["agent_new"])
+        # the old kind embedding is dropped (the deploy writes a fresh one)
+        self.assertIsNone(registry.agent_embedding_get(self.root, "agent_old"))
+        g = registry.group_get(self.root, group["id"])
+        self.assertEqual(g["member_agent_ids"], ["agent_new"])           # group follows
+
+
 if __name__ == "__main__":
     unittest.main()

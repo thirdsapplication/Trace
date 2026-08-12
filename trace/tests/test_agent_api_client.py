@@ -228,6 +228,44 @@ class MemoryStoreClientTest(unittest.TestCase):
         self.assertEqual(out, {"id": "mem_prior", "reused": True})
         self.assertEqual(stores.memories.created, [])          # lessons survive redeploys
 
+    def test_preferred_store_adopted_when_listed_under_user_prefix(self):
+        # The registry's store for this workflow (e.g. created under the short-lived
+        # agent-id keying) is kept when the listing shows it under this user's prefix.
+        stores = _FakeMemoryStores(existing=[{"id": "mem_prior",
+                                              "name": "trace-u1-agent-xyz"}])
+        c = _NSClient.build({"memory_stores": stores})
+        out = c.create_or_reuse_memory_store("trace-u1-wf-abcd1234", "desc",
+                                             preferred_id="mem_prior")
+        self.assertEqual(out, {"id": "mem_prior", "reused": True})
+        self.assertEqual(stores.created, [])
+        self.assertEqual(stores.memories.created, [])
+
+    def test_legacy_shared_store_never_adopted(self):
+        # A shared-era store (trace-B1-<uid>, one per USER) must be left behind even
+        # when the registry still points at it — otherwise the isolation fix would
+        # never reach existing agents. A fresh store is created instead.
+        stores = _FakeMemoryStores(existing=[{"id": "mem_shared",
+                                              "name": "trace-B1-u1"}])
+        c = _NSClient.build({"memory_stores": stores})
+        out = c.create_or_reuse_memory_store("trace-u1-wf-abcd1234", "desc",
+                                             preferred_id="mem_shared")
+        self.assertFalse(out["reused"])
+        self.assertNotEqual(out["id"], "mem_shared")
+        self.assertTrue(stores.created)                    # fresh isolated store, seeded
+        self.assertTrue(stores.memories.created)
+
+    def test_preferred_store_trusted_when_list_fails(self):
+        # On a transient listing failure, trusting the registry id beats creating a
+        # duplicate store (which silently abandons the workflow's whole memory).
+        stores = _FakeMemoryStores(existing=[{"id": "mem_prior",
+                                              "name": "trace-u1-agent-xyz"}])
+        stores.list = lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+        c = _NSClient.build({"memory_stores": stores})
+        out = c.create_or_reuse_memory_store("trace-u1-wf-abcd1234", "desc",
+                                             preferred_id="mem_prior")
+        self.assertEqual(out, {"id": "mem_prior", "reused": True})
+        self.assertEqual(stores.created, [])
+
     def test_seed_tolerates_path_conflict_but_raises_otherwise(self):
         from trace.agent import config
         stores = _FakeMemoryStores(conflict_paths={config.MEMORY_STATUS_DOC})

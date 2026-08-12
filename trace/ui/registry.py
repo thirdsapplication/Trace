@@ -185,6 +185,104 @@ def agent_set_deployment(root, agent_id, deployment_id):
             _save(root, "agents.json", d)
 
 
+def agent_supersede(root, old_agent_id, new_agent_id):
+    """A redeploy deletes+recreates the platform agent under a NEW id, and
+    ``agent_upsert`` (PK = agent id) has already inserted the new row. Move the old
+    row's durable history — chat thread, runs, review marks, pending actions,
+    decisions, schedule, group membership, lesson promotions/provenance — onto the
+    new id and drop the old row, so "My agents" updates in place instead of growing
+    a dead duplicate. Each step is best-effort (a partial move just leaves some
+    history under the old id, today's status quo); children move BEFORE the old
+    agents row is deleted so a cascading FK can never take the history with it.
+    The old agent_embeddings row is dropped, not moved — the deploy job writes a
+    fresh embedding for the new id."""
+    old_agent_id, new_agent_id = str(old_agent_id), str(new_agent_id)
+    if not old_agent_id or not new_agent_id or old_agent_id == new_agent_id:
+        return
+    if supa.is_configured():
+        admin = supa.get_admin()
+        for table in ("schedules", "agent_messages", "agent_runs", "run_reviews",
+                      "pending_actions", "agent_decisions", "chat_group_members",
+                      "lesson_promotions", "lesson_applications"):
+            try:
+                admin.table(table).update({"agent_id": new_agent_id}) \
+                    .eq("agent_id", old_agent_id).execute()
+            except Exception:                              # noqa: BLE001 — best-effort
+                pass
+        for op in (lambda: admin.table("agent_embeddings").delete()
+                   .eq("agent_id", old_agent_id).execute(),
+                   lambda: admin.table("agents").delete()
+                   .eq("id", old_agent_id).execute()):
+            try:
+                op()
+            except Exception:                              # noqa: BLE001 — best-effort
+                pass
+        return
+    with _LOCK:
+        # keyed BY agent id: move the key (never clobber data the new id already has)
+        for name in ("schedules.json", "run_reviews.json"):
+            d = _load(root, name)
+            if old_agent_id in d:
+                d.setdefault(new_agent_id, d.pop(old_agent_id))
+                _save(root, name, d)
+        # rows CARRYING an agent_id field: rewrite it
+        for name in ("messages.json", "pending.json", "decisions.json",
+                     "applications.json"):
+            d = _load(root, name)
+            changed = False
+            for it in d.values():
+                if it.get("agent_id") == old_agent_id:
+                    it["agent_id"] = new_agent_id
+                    changed = True
+            if changed:
+                _save(root, name, d)
+        # promotions are keyed "{agent_id}:{decision_id}" AND carry the field
+        d = _load(root, "promotions.json")
+        moved = {}
+        for key, rec in list(d.items()):
+            if rec.get("agent_id") == old_agent_id:
+                rec["agent_id"] = new_agent_id
+                del d[key]
+                moved[_promo_key(new_agent_id, rec.get("decision_id"))] = rec
+        if moved:
+            for key, rec in moved.items():
+                d.setdefault(key, rec)
+            _save(root, "promotions.json", d)
+        # per-agent run log file
+        old_p = os.path.join(_dir(root), f"runs_{_safe(old_agent_id)}.jsonl")
+        new_p = os.path.join(_dir(root), f"runs_{_safe(new_agent_id)}.jsonl")
+        if os.path.exists(old_p) and not os.path.exists(new_p):
+            try:
+                with open(old_p, encoding="utf-8") as f:
+                    rows = [json.loads(line) for line in f if line.strip()]
+                with open(new_p, "w", encoding="utf-8") as f:
+                    for r in rows:
+                        f.write(json.dumps({**r, "agent_id": new_agent_id}) + "\n")
+                os.remove(old_p)
+            except Exception:                              # noqa: BLE001 — best-effort
+                pass
+        # group membership: swap ids in member lists
+        d = _load(root, "groups.json")
+        changed = False
+        for g in d.values():
+            members = g.get("member_agent_ids") or []
+            if old_agent_id in members:
+                g["member_agent_ids"] = list(dict.fromkeys(
+                    new_agent_id if m == old_agent_id else m for m in members))
+                changed = True
+        if changed:
+            _save(root, "groups.json", d)
+        # drop the old kind embedding (redeploy writes a fresh one) and the old row
+        d = _load(root, "agent_embeddings.json")
+        if old_agent_id in d:
+            d.pop(old_agent_id, None)
+            _save(root, "agent_embeddings.json", d)
+        d = _load(root, "agents.json")
+        if old_agent_id in d:
+            d.pop(old_agent_id, None)
+            _save(root, "agents.json", d)
+
+
 def set_staged_apps(root, agent_id, staged_apps):
     """Update which apps are staged (held for approval) for one agent. Staging is
     prompt-level and read fresh each run (see runner.run_once), so this takes effect on
@@ -992,8 +1090,9 @@ def agent_set_color(root, agent_id, color):
 
 
 def agent_set_name(root, agent_id, name):
-    """Rename an agent. Display only: the memory store is keyed on the platform agent id
-    (config.memory_store_name), so a rename never orphans what the agent has learned."""
+    """Rename an agent. Display only: the memory store is keyed on the workflow's
+    stable identity — customer + recording session + bundle (config.memory_store_name)
+    — so a rename never orphans what the agent has learned."""
     if supa.is_configured():
         supa.get_admin().table("agents").update({"name": name}).eq("id", agent_id).execute()
         return

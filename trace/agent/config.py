@@ -5,6 +5,7 @@ Nothing here references a fixture, sender, tab, SKU, or bundle id; the app→MCP
 keys on application identity, not on any workflow's content.
 """
 
+import hashlib
 import os
 import re
 import urllib.parse
@@ -205,10 +206,12 @@ UNCERTAINTY_DIRECTIVE = (
     "```\n")
 
 
-# --- Per-agent memory store (Managed Agents memory beta) ---------------------
-# Every deployed agent gets ONE memory store (created-or-REUSED by name, so redeploys
-# never wipe accumulated lessons) holding two documents the agent maintains itself.
-# The store is attached at deployment/session creation via a memory_store resource
+# --- Per-workflow memory store (Managed Agents memory beta) ------------------
+# Every deployed workflow gets ONE memory store, keyed on identity that never
+# changes across redeploys (customer + recording session + bundle), so the
+# created-or-REUSED-by-name contract genuinely holds and redeploys never wipe
+# accumulated lessons. It holds two documents the agent maintains itself. The
+# store is attached at deployment/session creation via a memory_store resource
 # and mounts at /mnt/memory/<store-name>/ where the agent uses ordinary file tools.
 # Beta shape — confirm against current Managed Agents memory docs.
 MEMORY_STATUS_DOC = "/current_workflow_status.md"
@@ -271,24 +274,38 @@ MEMORY_UPDATE_DIRECTIVE = (
     "rewriting). NEVER write credentials, tokens, API keys, or any secret into memory.")
 
 
-def memory_store_name(agent_id, external_user_id):
-    """The per-agent memory store name: keyed on the platform AGENT ID, which is
-    immutable, unique, and stable across redeploys (``create_or_reuse_agent`` reuses by
-    name and returns the same agent), so memory follows the agent and a DIFFERENT
-    workflow can never inherit it. Keying on the agent's *name* would work until someone
-    renames the agent, which would silently orphan everything it had learned.
+def memory_store_name(external_user_id, capture_sid, bundle_id):
+    """The per-workflow memory store name, keyed on identity that NEVER changes across
+    redeploys: the customer (``external_user_id``), the recording session that produced
+    the workflow (``capture_sid``), and the bundle id within that recording. Same
+    workflow redeployed -> same name -> the store is REUSED and lessons survive.
 
-    It used to key on the bundle id, which is unique only WITHIN a session: discovery
-    labels bundles B1, B2, B3 per recording, so ``trace-B1-<user>`` was the name for the
-    first workflow of EVERY recording that user ever made. A brand-new agent therefore
-    mounted an older, unrelated agent's notes and read them as fact about its own
-    workflow (observed in the wild as ``memory_store_reused: true`` on a first deploy).
+    It must NOT key on the platform agent id: ``create_or_reuse_agent`` deletes and
+    recreates the agent on every redeploy, so the id churns and an id-keyed store came
+    back fresh (and empty) each redeploy. And it must not key on the bundle id alone,
+    which is unique only WITHIN a recording: discovery labels bundles B1, B2, B3 per
+    recording, so ``trace-B1-<user>`` was the name for the first workflow of EVERY
+    recording that user ever made, and agents mounted each other's notes.
 
-    ``external_user_id`` comes FIRST so the 100-char clamp can never truncate it away and
-    let two customers collide on one store.
+    The full untruncated identity lives in the digest, so the result is unique per
+    (customer, recording, bundle) even when the readable user prefix is clamped —
+    two customers (or two workflows) can never collide on one store. Length is
+    <= 6 + 74 + 4 + 16 = 100 by construction.
     """
-    slug = re.sub(r"[^a-z0-9]+", "-", (str(agent_id) or "agent").lower()).strip("-")
-    return f"trace-{external_user_id}-{slug or 'agent'}"[:100]
+    ident = f"{external_user_id}|{capture_sid}|{bundle_id}"
+    digest = hashlib.sha256(ident.encode("utf-8")).hexdigest()[:16]
+    uid = re.sub(r"[^a-z0-9-]+", "-", str(external_user_id or "user").lower()).strip("-")
+    return f"trace-{uid[:74]}-wf-{digest}"
+
+
+def platform_agent_name(workflow_name, external_user_id):
+    """The platform agent's name, namespaced per customer. Agent create-or-reuse and
+    cleanup both match by EXACT name against an account-wide listing, so a bare
+    workflow name lets two customers with an identically-named workflow delete each
+    other's live agents on deploy. The workflow part is clamped so the customer
+    suffix always survives."""
+    base = " ".join(str(workflow_name or "Agent").split())[:60]
+    return f"{base} [{external_user_id}]" if external_user_id else base
 
 
 def memory_resource(memory_store_id):
