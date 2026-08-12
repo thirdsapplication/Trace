@@ -409,6 +409,35 @@ def _fake_deploy_fn(bundle, live_dict, connection_record, start):
             "deployed_at": "now", "isolation": "per-customer"}
 
 
+class MemoryStoreIsolationTest(unittest.TestCase):
+    """A memory store is reused BY NAME, so the name is the isolation boundary.
+
+    name_slug falls back when given nothing, and memory_store_name used to pass "user"
+    as that fallback — producing "trace-user-<workflow>-memory", a name with no owner in
+    it. Two customers deploying a similarly-named workflow with a missing
+    external_user_id resolved to ONE store and could read each other's notes.
+
+    external_user_id comes from the connection record, which lives on the container
+    filesystem that Render wipes on deploy, so an empty value is a thing that happens.
+    """
+
+    def test_two_users_never_share_a_store_name(self):
+        a = config.memory_store_name("trace-user-aaa", "Shipping")
+        b = config.memory_store_name("trace-user-bbb", "Shipping")
+        self.assertNotEqual(a, b)
+        self.assertIn("aaa", a)
+        self.assertIn("bbb", b)
+
+    def test_missing_external_user_id_is_refused_not_defaulted(self):
+        for empty in ("", None, "   ", "!!!"):
+            with self.assertRaises(ValueError):
+                config.memory_store_name(empty, "Shipping")
+
+    def test_same_user_different_workflows_get_different_stores(self):
+        self.assertNotEqual(config.memory_store_name("trace-user-aaa", "Shipping"),
+                            config.memory_store_name("trace-user-aaa", "Remittance"))
+
+
 class UsersApiWiringTest(unittest.TestCase):
     """app.py's owner-email lookups are wrapped in `except Exception: pass` so naming
     can never block a deploy. That also makes an AttributeError from a misspelled module

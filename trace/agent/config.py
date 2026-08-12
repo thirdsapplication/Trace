@@ -331,7 +331,21 @@ def memory_store_name(external_user_id, workflow_name):
     ``external_user_id`` comes FIRST so the 100-char clamp can never truncate it
     away and let two customers collide on one store.
     """
-    uid = name_slug(external_user_id, "user")
+    # REFUSE to name a store without a real owner. name_slug falls back to "user" on an
+    # empty value, which produced "trace-user-<workflow>-memory" — a name carrying no
+    # user identity at all. Memory stores are reused BY NAME, so two different customers
+    # deploying a similarly-named workflow with a missing external_user_id resolved to
+    # ONE store and could read each other's notes.
+    #
+    # external_user_id comes from the connection record, and connection.json lives on
+    # the container filesystem, which Render wipes on every deploy — so "missing" is a
+    # thing that actually happens, not a theoretical guard. Failing the deploy loudly is
+    # strictly better than silently sharing memory across accounts.
+    uid = name_slug(external_user_id, "")
+    if not uid:
+        raise ValueError(
+            "refusing to build a memory store name without an external_user_id: the "
+            "store would carry no owner and could be shared with another account")
     if not uid.startswith("trace-"):
         uid = f"trace-{uid}"
     return f"{uid}-{name_slug(workflow_name, 'agent')}"[:93] + "-memory"
