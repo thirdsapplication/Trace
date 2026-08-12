@@ -95,8 +95,10 @@ class KeystorePipedreamTest(unittest.TestCase):
             self.assertEqual(config.PIPEDREAM_PROJECT, "proj_z")
             self.assertEqual(config.PIPEDREAM_CLIENT_SECRET, "secz")
             self.assertEqual(config.PIPEDREAM_ENVIRONMENT, "production")
-            # and the per-app MCP URL now carries the real project id
-            self.assertIn("projectId=proj_z", config.pipedream_mcp_url("trace-s1", "gmail"))
+            # the per-app MCP URL routes by path (uid + app); the project no longer
+            # rides in the URL — it rides in the project-scoped bearer token
+            self.assertEqual(config.pipedream_mcp_url("trace-s1", "gmail"),
+                             f"{config.PIPEDREAM_MCP_BASE}/trace-s1/gmail")
         finally:
             (config.PIPEDREAM_PROJECT, config.PIPEDREAM_CLIENT_ID,
              config.PIPEDREAM_CLIENT_SECRET, config.PIPEDREAM_ENVIRONMENT) = saved

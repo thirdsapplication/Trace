@@ -13,7 +13,6 @@ network: ``AppState.reconstruct_fn`` and ``AppState.controller_factory``.
 """
 
 import argparse
-import calendar
 import collections
 import concurrent.futures
 import hmac
@@ -131,19 +130,6 @@ def _signup_enabled():
     """Self-registration is on by default; an operator can disable it with
     TRACE_DISABLE_SIGNUP=1 to run provisioned-only."""
     return os.environ.get("TRACE_DISABLE_SIGNUP", "").strip().lower() not in ("1", "true", "yes")
-
-
-def _token_stale(expires_at_iso, margin=None):
-    """True if a stored Pipedream-token expiry is missing, unparseable, past, or within
-    the safety margin — i.e. the credential should be refreshed before a run (WS5)."""
-    margin = agent_config.TOKEN_REFRESH_MARGIN_SECONDS if margin is None else margin
-    if not expires_at_iso:
-        return True
-    try:
-        exp = calendar.timegm(time.strptime(expires_at_iso, "%Y-%m-%dT%H:%M:%SZ"))
-    except (ValueError, TypeError):
-        return True
-    return time.time() >= exp - margin
 
 
 def list_fixtures():
@@ -294,9 +280,14 @@ class AppState:
         os.environ["ANTHROPIC_API_KEY"] = key
         from ..agent.api_client import ManagedAgentsClient
         client = ManagedAgentsClient(api_key=key)
+        try:
+            connect_client = self.connect_fn()    # enables the tools/list preflight
+        except Exception:
+            connect_client = None                 # preflight is optional, deploy isn't
         return agent_deploy.deploy_live(bundle, live_dict, connection_record, client,
                                         trigger=start.get("trigger"), schedule=start.get("schedule"),
-                                        staged_apps=start.get("staged_apps"))
+                                        staged_apps=start.get("staged_apps"),
+                                        connect_client=connect_client)
 
     def _live_client(self):
         key = self.keystore.get_key()
@@ -1127,25 +1118,29 @@ class AppState:
 
     # --- Phase 6: live deployment ----------------------------------------
     def _refresh_stale_bindings(self, sid, conn):
-        """WS5: re-mint + rotate the Pipedream token for any usable app whose stored token
-        is stale, so a run long after Connect still authenticates — no manual re-verify.
+        """WS5: re-mint + rotate the Pipedream token for EVERY usable app at deploy, so
+        a run long after Connect still authenticates — no manual re-verify. Refreshing
+        all usable apps (not just stale ones) is load-bearing for URL migrations:
+        vault credentials are keyed to the exact MCP server URL, and refresh_binding
+        falls back to a full bind when no credential matches the current URL — so a
+        redeploy after a pipedream_mcp_url format change self-migrates the vault.
+        Deploys are infrequent; the extra token mints are a few cheap calls.
         Best-effort: a refresh failure never blocks deploy (a truly dead token would
-        surface as the run's own auth error). Reuses ConnectClient.refresh_binding, which
-        rotates only the token and never re-sends the immutable mcp_server_url."""
+        surface as the run's own auth error)."""
         vault_ref = (conn or {}).get("vault_ref")
         if not vault_ref:
             return conn
         uid = conn.get("external_user_id")
-        stale = [slug for slug, a in (conn.get("apps") or {}).items()
-                 if a.get("usable") and _token_stale(a.get("token_expires_at"))]
-        if not stale:
+        usable = [slug for slug, a in (conn.get("apps") or {}).items()
+                  if a.get("usable")]
+        if not usable:
             return conn
         try:
             client = self.connect_fn()
         except Exception:
             return conn
         changed = False
-        for slug in stale:
+        for slug in usable:
             try:
                 out = client.refresh_binding(vault_ref, uid, slug)
                 conn["apps"][slug]["token_expires_at"] = out.get("expires_at")
