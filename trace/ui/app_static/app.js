@@ -1271,7 +1271,13 @@ async function stepInterview() {
 }
 function renderInterview(sid, data) {
   const interviews = data.interviews || {};
-  const ids = data.approved_ids || Object.keys(interviews);
+  // ONE WORKFLOW PER PAGE. Every workflow's questions used to render on a single page —
+  // three workflows meant ~30 questions in one endless scroll, with no sense of progress
+  // and no way to tell whose questions you were answering.
+  const allIds = data.approved_ids || Object.keys(interviews);
+  const ids = allIds.filter(bid => ((interviews[bid] || {}).questions || []).length);
+  const nameOf = (bid) => (data.names && data.names[bid]) || bid;
+  let page = 0;
   const blocks = ids.map(bid => {
     const iv = interviews[bid] || { questions: [] };
     const prior = {}; (iv.answers || []).forEach(a => prior[a.q] = a.answer);
@@ -1283,26 +1289,53 @@ function renderInterview(sid, data) {
         ${(q.suggested_answers || []).length ? `<div class="chips" style="margin-top:8px;">${
           q.suggested_answers.map(s => `<button class="suggest" data-q="${esc(q.id)}" data-bid="${esc(bid)}">${esc(s)}</button>`).join("")}</div>` : ""}
       </div>`).join("");
-    if (!iv.questions || !iv.questions.length) return "";
-    return `<div class="card" style="padding:16px;"><div class="label" style="margin-bottom:10px;">${esc(data.names && data.names[bid] || bid)}</div>${qs}</div>`;
+    return `<div class="iv-page" data-bid="${esc(bid)}" style="display:none;">
+      <div class="card" style="padding:16px;">
+        <div class="label" style="margin-bottom:10px;">${esc(nameOf(bid))}</div>${qs}
+      </div></div>`;
   }).join("");
   $("#ivBody").innerHTML = `
     ${blocks || `<p class="muted">No questions needed — you're good to go.</p>`}
-    <p id="ivMsg" class="msg ok" style="margin-top:12px;"></p>
+    <p id="ivProg" class="sub muted" style="margin-top:10px;"></p>
+    <p id="ivMsg" class="msg ok" style="margin-top:6px;"></p>
     <div class="row" style="margin-top:6px;gap:10px;">
-      <button id="ivGo" class="btn-primary" style="flex:1;">Save & continue</button>
+      <button id="ivBack" class="btn-secondary" style="display:none;">Back</button>
+      <button id="ivGo" class="btn-primary" style="flex:1;">Save &amp; continue</button>
     </div>`;
-  // mandatory: continue only once EVERY question has a non-empty answer
+  // Only the current workflow's answers gate the button, so an unanswered question three
+  // workflows away can't silently block you with no clue why.
+  const pageInputs = () => {
+    const el = root.querySelectorAll(".iv-page")[page];
+    return el ? Array.from(el.querySelectorAll(".iv-a")) : [];
+  };
+  const showPage = () => {
+    root.querySelectorAll(".iv-page").forEach((el, i) => {
+      el.style.display = (i === page) ? "" : "none";
+    });
+    const last = page >= ids.length - 1;
+    const prog = $("#ivProg");
+    if (prog) {
+      prog.textContent = ids.length > 1
+        ? `Workflow ${page + 1} of ${ids.length} — ${nameOf(ids[page])}` : "";
+    }
+    const back = $("#ivBack");
+    if (back) back.style.display = (page > 0) ? "" : "none";
+    const go = $("#ivGo");
+    if (go) go.textContent = last ? "Save & continue" : "Next workflow";
+    updateGo();
+    if (typeof window.scrollTo === "function") window.scrollTo(0, 0);
+  };
   const updateGo = () => {
-    const inputs = Array.from(root.querySelectorAll(".iv-a"));
-    $("#ivGo").disabled = inputs.some(inp => !inp.value.trim());
+    $("#ivGo").disabled = pageInputs().some(inp => !inp.value.trim());
   };
   root.querySelectorAll(".iv-a").forEach(inp => inp.oninput = updateGo);
   root.querySelectorAll(".suggest").forEach(btn => btn.onclick = () => {
     const inp = root.querySelector(`.iv-a[data-bid="${btn.dataset.bid}"][data-q="${btn.dataset.q}"]`);
     if (inp) { inp.value = btn.textContent; updateGo(); }
   });
-  updateGo();
+  const back = $("#ivBack");
+  if (back) back.onclick = () => { if (page > 0) { page -= 1; showPage(); } };
+  showPage();
   const saveAll = async () => {
     const byB = {};
     root.querySelectorAll(".iv-a").forEach(inp => {
@@ -1317,9 +1350,10 @@ function renderInterview(sid, data) {
     }
   };
   $("#ivGo").onclick = async () => {
+    if (page < ids.length - 1) { page += 1; showPage(); return; }   // next workflow
     $("#ivGo").disabled = true; $("#ivGo").textContent = "Saving…";
     try {
-      await saveAll();
+      await saveAll();                        // every page's answers, in one pass
       await refreshSession();                 // pick up interview_complete_at
       goStep(4);
     } catch (e) {

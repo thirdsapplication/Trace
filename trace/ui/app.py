@@ -838,7 +838,14 @@ class AppState:
                                               sessions.interview_filename(b["id"]))
             out[b["id"]] = rec or {"bundle_id": b["id"], "questions": [], "answers": [],
                                    "unresolved": [], "status": "unstarted"}
-        return {"approved_ids": [b["id"] for b in approved], "interviews": out}
+        # Names, so the form can title each workflow the way the worker would recognize
+        # it. Without these the UI fell back to the bundle id and asked people about
+        # "B1" and "B2" — internal labels that mean nothing to them. The review-step
+        # correction wins where it exists, since that is the worker's own wording.
+        names = {b["id"]: (b.get("user_description") or b.get("name") or b["id"])
+                 for b in approved}
+        return {"approved_ids": [b["id"] for b in approved], "interviews": out,
+                "names": names}
 
     def save_interview(self, sid, bid, answers_map):
         """Persist the worker's answers for one bundle. ``answers_map`` is {qid: text};
