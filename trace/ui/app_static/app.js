@@ -682,11 +682,32 @@ async function renderSettings() {
 }
 
 /* ---------------- GROUP CHAT: agents as contacts in a group ---------------- */
-const colorDot = (c) => `<span style="display:inline-block;width:9px;height:9px;border-radius:50%;background:${esc(c)};margin-right:4px;vertical-align:middle;"></span>`;
 // Mirrors registry._AGENT_COLORS — the palette the server falls back to when an agent
 // has no explicit color, so the picker offers exactly the same choices.
 const AGENT_COLORS = ["#F26A1B", "#2D7FF9", "#12B886", "#E8590C", "#7048E8",
                       "#E64980", "#1098AD", "#F59F00", "#4263EB", "#0CA678"];
+
+// Frame 24's group row wants "n agents · active {t}" and a coral dot when a member is
+// blocked, but /api/u/groups returns only {id, name, members:[{agent_id,name,color}]} —
+// no timestamps, no status. Both are derivable from the home brief we already have, so
+// this cross-references it rather than growing the endpoint: "active" is the most recent
+// run among the members, and "blocked" is a member that needs you (a question it can't
+// settle, or an action waiting on your sign-off) — which is exactly what the dot means.
+function groupStatus(group, agents) {
+  const by = {};
+  (agents || []).forEach(a => { by[a.agent_id] = a; });
+  let last = null, lastMs = 0, blocked = false;
+  for (const m of group.members || []) {
+    const a = by[m.agent_id];
+    if (!a) continue;
+    if (a.needs_you > 0) blocked = true;
+    for (const s of a.stories || []) {
+      const ms = s.ran_at ? Date.parse(s.ran_at) : NaN;
+      if (ms && ms > lastMs) { lastMs = ms; last = s.ran_at; }
+    }
+  }
+  return { last, blocked };
+}
 
 async function renderGroups() {
   clearTimers();
@@ -694,37 +715,84 @@ async function renderGroups() {
   const home = S.igHome || await loadHome();
   const { data } = await api("GET", "/api/u/groups");
   const groups = (data && data.groups) || [];
+  const agents = home.agents || [];
   const tb = agentsTopbar(home.unread_total, null, home.needs_you_total, "groups");
-  const groupRows = groups.map(g => `
-    <button class="ag-row grp-row" data-id="${esc(g.id)}">
-      <span class="ag-mid">
-        <span class="title" style="font-size:14.5px;">${esc(g.name)}</span>
-        <span class="sub muted">${g.members.map(m => colorDot(m.color) + esc(m.name)).join("  ")}</span>
-      </span></button>`).join("");
-  const agentOpts = (home.agents || []).map(a =>
-    `<label class="row" style="gap:8px;margin-top:4px;cursor:pointer;"><input type="checkbox" class="grp-mem" value="${esc(a.agent_id)}"> ${esc(a.name)}</label>`).join("");
+
+  // Stacked color tiles (24): the group's members read as one object at a glance. Four
+  // is where the overlap stops being legible, so the rest become a "+n" tile.
+  const tiles = (members) => {
+    const shown = members.slice(0, 4);
+    const rest = members.length - shown.length;
+    return `<span class="grp-tiles">${shown.map(m =>
+      `<span class="grp-tile" style="background:${esc(m.color)};" title="${esc(m.name)}"></span>`
+    ).join("")}${rest ? `<span class="grp-tile grp-tile-more">+${rest}</span>` : ""}</span>`;
+  };
+
+  const groupRows = groups.map(g => {
+    const { last, blocked } = groupStatus(g, agents);
+    const n = (g.members || []).length;
+    const when = last
+      ? "active " + new Date(last).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })
+      : "no runs yet";
+    return `<button class="grp-card" data-id="${esc(g.id)}">
+      ${tiles(g.members || [])}
+      <span class="grp-mid">
+        <span class="grp-name">${esc(g.name)}</span>
+        <span class="grp-sub">${n} agent${n === 1 ? "" : "s"} · ${esc(when)}</span>
+      </span>
+      ${blocked ? `<span class="grp-flag" title="A member needs you"></span>` : ""}
+    </button>`;
+  }).join("");
+
+  const agentOpts = agents.map(a => `
+    <button class="grp-pick" data-id="${esc(a.agent_id)}" aria-pressed="false">
+      <span class="grp-box"></span>
+      <span class="grp-chip" style="background:${esc(agentColor(a))};"></span>
+      <span class="grp-pick-name">${esc(a.name)}</span>
+    </button>`).join("");
+
   tb.paint(`
-    <div class="panel">
-      <h2>Group chats</h2>
-      <p class="lead">Add your agents to a group and talk to them together. "What did y'all do today?" gets each one's answer; @mention one to give it a task.</p>
-      <div class="stack" style="margin-top:12px;">${groupRows || `<p class="muted">No groups yet — make one below.</p>`}</div>
+    <div class="grp-head">
+      <h1 class="grp-title">Groups</h1>
+      <button id="grpNew" class="btn-accent btn-sm">+ New group</button>
     </div>
-    <div class="panel">
-      <h2>New group</h2>
-      <input type="text" id="grpName" placeholder="Group name (e.g. Operations)" style="width:100%;margin-top:8px;padding:8px;">
-      <div style="margin-top:10px;">${agentOpts || `<p class="muted">No agents yet.</p>`}</div>
-      <button class="btn-accent btn-sm" id="grpCreate" style="margin-top:12px;">Create group</button>
+    <p class="lead">Talk to several agents at once. "What did y'all do today?" gets each one's answer; @mention one to give it a task.</p>
+    <div class="stack" style="margin-top:14px;">${groupRows
+      || `<p class="muted">No groups yet — "+ New group" puts a few agents in one conversation.</p>`}</div>
+    <div class="grp-new" id="grpForm" hidden>
+      <div class="grp-new-title">New group</div>
+      <input type="text" id="grpName" class="grp-input" placeholder="Group name (e.g. Operations)" autocomplete="off">
+      <div class="grp-picks">${agentOpts || `<p class="muted">No agents yet.</p>`}</div>
+      <button class="btn-primary full" id="grpCreate">Create group</button>
     </div>`);
   tb.wire();
-  root.querySelectorAll(".grp-row").forEach(b => b.onclick = () =>
+
+  root.querySelectorAll(".grp-card").forEach(b => b.onclick = () =>
     renderGroupChat(groups.find(x => x.id === b.dataset.id)));
-  $("#grpCreate").onclick = async () => {
+
+  const form = $("#grpForm");
+  $("#grpNew").onclick = () => {
+    form.hidden = !form.hidden;
+    if (!form.hidden) $("#grpName").focus();
+  };
+  // The checklist is buttons rather than <input type=checkbox> so the tick can carry
+  // frame 24's filled-square treatment; aria-pressed keeps it announced correctly.
+  root.querySelectorAll(".grp-pick").forEach(b => b.onclick = () => {
+    const on = b.getAttribute("aria-pressed") === "true";
+    b.setAttribute("aria-pressed", on ? "false" : "true");
+    b.classList.toggle("on", !on);
+  });
+  const create = async () => {
     const name = ($("#grpName").value || "").trim();
     if (!name) { $("#grpName").focus(); return; }
-    const ids = Array.from(root.querySelectorAll(".grp-mem")).filter(c => c.checked).map(c => c.value);
+    const ids = Array.from(root.querySelectorAll(".grp-pick.on")).map(b => b.dataset.id);
+    const btn = $("#grpCreate");
+    btn.disabled = true; btn.textContent = "Creating…";
     await api("POST", "/api/u/groups", { name, agent_ids: ids });
     renderGroups();
   };
+  $("#grpCreate").onclick = create;
+  $("#grpName").onkeydown = (e) => { if (e.key === "Enter") create(); };
 }
 
 function renderGroupChat(group) {
