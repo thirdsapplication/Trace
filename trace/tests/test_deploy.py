@@ -409,6 +409,28 @@ def _fake_deploy_fn(bundle, live_dict, connection_record, start):
             "deployed_at": "now", "isolation": "per-customer"}
 
 
+class UsersApiWiringTest(unittest.TestCase):
+    """app.py's owner-email lookups are wrapped in `except Exception: pass` so naming
+    can never block a deploy. That also makes an AttributeError from a misspelled module
+    function completely silent — and it shipped that way: users.py defines get(), app.py
+    called users.get_user(), so owner_email resolved to None on every path and the whole
+    owner-naming feature was inert. Nothing failed, so nothing caught it.
+
+    Asserting the call sites against the real module catches that class outright.
+    """
+
+    def test_app_only_calls_users_functions_that_exist(self):
+        import inspect
+        import re
+        from trace.ui import users
+        src = inspect.getsource(app)
+        called = set(re.findall(r"\busers\.([A-Za-z_][A-Za-z0-9_]*)\s*\(", src))
+        self.assertIn("get", called)                     # the lookup is still wired up
+        missing = sorted(n for n in called if not hasattr(users, n))
+        self.assertEqual(missing, [], "app.py calls users.%s, which do not exist"
+                         % ", users.".join(missing))
+
+
 class UIDeployTest(unittest.TestCase):
     def setUp(self):
         import tempfile

@@ -162,7 +162,7 @@ function renderBootError(err) {
     ? "the service is taking too long to respond" : friendly(err && err.message));
   root.innerHTML = `
     <div class="card" style="max-width:420px;margin:120px auto;text-align:center;">
-      <div class="title">Couldn't reach Trace</div>
+      <div class="title">Couldn't reach palza</div>
       <p class="muted" style="margin-top:8px;">We couldn't load the app — ${esc(msg)}.
         Check your connection and try again.</p>
       <button id="bootRetry" class="btn-primary" style="margin-top:14px;">Try again</button>

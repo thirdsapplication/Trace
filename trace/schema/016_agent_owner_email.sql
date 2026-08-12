@@ -1,4 +1,10 @@
--- 014: human-legible platform naming — agents.owner_email.
+-- 016: human-legible platform naming — agents.owner_email.
+--
+-- Numbered 016, not 014: this shipped as a SECOND 014 alongside
+-- 014_agent_runs_status.sql. With two files claiming the number, "is 014 applied?"
+-- had no answer — and it was in fact unapplied, so every deploy 400'd on the missing
+-- column AFTER the platform agent went live, leaving agents visible in Managed Agents
+-- and absent from the app.
 --
 -- Everything Trace creates on Managed Agents (session titles, environment names,
 -- deployment names, memory-store names/descriptions) now identifies the owner at a

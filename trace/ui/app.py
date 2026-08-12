@@ -1213,7 +1213,7 @@ class AppState:
                 if owner_uid and not (conn or {}).get("owner_email"):
                     try:
                         conn = {**(conn or {}),
-                                "owner_email": (users.get_user(owner_uid) or {}).get("email")}
+                                "owner_email": (users.get(owner_uid) or {}).get("email")}
                     except Exception:                      # noqa: BLE001 — naming must never block a deploy
                         pass
                 if bind_errors:
@@ -1462,7 +1462,7 @@ class AppState:
         external_user_id — never anonymous."""
         if agent and not agent.get("owner_email"):
             try:
-                email = (users.get_user(agent.get("owner_user_id") or "") or {}).get("email")
+                email = (users.get(agent.get("owner_user_id") or "") or {}).get("email")
             except Exception:                              # noqa: BLE001 — naming must never block a run
                 email = None
             if email:
