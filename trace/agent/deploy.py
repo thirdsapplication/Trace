@@ -77,13 +77,18 @@ def deploy_live(bundle, live_envelope_dict, connection_record, client,
     surfaces the real API error instead of a phantom "live" (the always_ask lesson).
     ``staged_apps`` (Spec 8) marks which app slugs are staged for approval.
 
-    ``connect_client`` (a ConnectClient, optional): when provided, each per-app MCP
-    server's served TOOLS are listed before the agent is created (see
-    ``mcp_preflight``) and recorded on the live record (``toolsets`` /
-    ``preflight_warnings`` / ``preflight_errors``) — the guard against a server
-    silently serving a toolset that can't perform the workflow (e.g. a sheets
-    toolset with no update tool). Best-effort: preflight problems are recorded,
-    never raised, and never block."""
+    ``connect_client`` (a ConnectClient, optional): when provided, two guards run
+    before the agent is created:
+      * TOOL PREFLIGHT — each per-app MCP server's served tools are listed (see
+        ``mcp_preflight``) and recorded on the live record (``toolsets`` /
+        ``preflight_warnings`` / ``preflight_errors``). Best-effort: recorded,
+        never raised, never blocks.
+      * BINDING CHECK — every baked ``mcp_servers`` URL must have a matching vault
+        credential (``verify_bindings``); MA matches token→server by exact URL, so
+        a miss means an agent that LOOKS deployed but reaches Pipedream with no
+        bearer at run time. A confirmed miss RAISES (the phantom-live philosophy:
+        surface the real error, never a green lie); a listing failure is recorded
+        as ``preflight_errors["binding_check"]`` and does not block."""
     vault_ref = (connection_record or {}).get("vault_ref")
     external_user_id = (connection_record or {}).get("external_user_id")
 
@@ -96,6 +101,27 @@ def deploy_live(bundle, live_envelope_dict, connection_record, client,
             pf = {"toolsets": {}, "warnings": [], "errors": {"*": str(exc)}}
 
     live_envelope_dict = finalize_live_envelope(live_envelope_dict, connection_record, staged_apps)
+
+    binding_check = {}
+    verify = getattr(connect_client, "verify_bindings", None) if connect_client else None
+    if callable(verify) and vault_ref:
+        # the template's nominal base-URL server (no app baked) is not a real binding
+        urls = [s.get("url") for s in live_envelope_dict.get("mcp_servers") or []
+                if s.get("url") and s.get("url") != config.PIPEDREAM_MCP_BASE]
+        if urls:
+            try:
+                binding_check = verify(vault_ref, urls)
+            except Exception as exc:            # listing failed: warn, don't block
+                pf["errors"]["binding_check"] = str(exc)
+            else:
+                missing = sorted(u for u, ok in binding_check.items() if not ok)
+                if missing:
+                    raise RuntimeError(
+                        "vault has no credential for baked MCP server URL(s): "
+                        + ", ".join(missing)
+                        + " — the agent would deploy green but reach Pipedream "
+                          "unauthenticated. Reconnect the app(s) and redeploy.")
+
     agent = client.create_or_reuse_agent(live_envelope_dict)
     agent_id = agent.get("id") if isinstance(agent, dict) else agent
     environment_id = client.create_environment()
@@ -140,6 +166,7 @@ def deploy_live(bundle, live_envelope_dict, connection_record, client,
         "toolsets": pf["toolsets"],
         "preflight_warnings": pf["warnings"],
         "preflight_errors": pf["errors"],
+        "binding_check": binding_check,
         "deployed_at": _now(),
         "isolation": "per-customer (vault scoped to external_user_id)",
     }

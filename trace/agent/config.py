@@ -62,9 +62,19 @@ APPROVAL_PERMISSION_POLICY = "always_ask"
 # NOTE: do NOT pin an MCP API version segment (the old "/v3" query-param surface).
 # That surface served a stale, curated tool subset — for google_sheets it exposed a
 # read/append-only toolset with NO update tool, which broke any workflow that edits
-# existing rows (verified live 2026-08-11: /v3 served 7 tools; the documented
-# per-user URL served the full 38-action catalog including google_sheets-update-row).
+# existing rows (verified live 2026-08-11: /v3 served 7 tools; the per-user URL
+# serves the full catalog including google_sheets-update-row).
+#
+# The per-user path is NOT sufficient on its own: the bearer token lists tools but
+# does NOT resolve the customer's connected account — every tool call answers
+# "connect your account" while all dashboards look green. ``projectId`` and
+# ``environment`` MUST ride as query params (the only channel MA can carry —
+# headers are not injectable). ``toolMode=tools-only`` selects direct structured
+# tool schemas (real props) instead of the default opaque one-string "instruction"
+# wrapper — deterministic args, which the staged-approval summaries depend on.
+# All three verified live 2026-08-12 against a fresh account.
 PIPEDREAM_MCP_BASE = "https://remote.mcp.pipedream.net"
+PIPEDREAM_MCP_TOOL_MODE = "tools-only"
 PIPEDREAM_MCP_NAME = "pipedream"        # the mcp_server_name the live toolset references
 # Nested object (NOT a bare string). Default: every live toolset (the agent toolset and
 # the per-app Pipedream MCP toolsets) runs WITHOUT an approval gate.
@@ -87,19 +97,25 @@ PIPEDREAM_CONNECT_BASE = PIPEDREAM_API_BASE           # paths are project-scoped
 
 
 def pipedream_mcp_url(external_user_id, app, project=None, environment=None):
-    """The per-customer, per-app Pipedream MCP server URL — the documented
-    ``/{external_user_id}/{app}`` format, one app per URL. MA injects only the bearer
-    token, matched to the server by URL; the token is project-scoped
-    (client_credentials), so the project and its environment ride in the token, not
-    the URL. ``project``/``environment`` are accepted and ignored for call-site
-    compatibility (same idiom as ``staged_slugs`` in ``pipedream_mcp_servers``).
+    """The per-customer, per-app Pipedream MCP server URL:
+    ``/{external_user_id}/{app}?projectId=…&environment=…&toolMode=tools-only``.
+    One app per URL; MA injects only the bearer token, matched to the server by URL.
 
-    ``external_user_id`` is load-bearing here (it routes to the customer's connected
-    account), so an empty value is an error, not an empty query param."""
+    Every piece is load-bearing (see the note on ``PIPEDREAM_MCP_BASE``):
+    the path routes to the customer, ``projectId``/``environment`` are what let the
+    server resolve their CONNECTED ACCOUNT (without them tools list but every call
+    answers "connect your account"), and ``toolMode=tools-only`` selects structured
+    tool schemas over the opaque instruction wrapper. An empty ``external_user_id``
+    is an error, not an empty segment."""
     if not external_user_id:
         raise ValueError("pipedream_mcp_url: external_user_id is required")
     uid = urllib.parse.quote(str(external_user_id), safe="")
-    return f"{PIPEDREAM_MCP_BASE}/{uid}/{app}"
+    q = urllib.parse.urlencode({
+        "projectId": project or PIPEDREAM_PROJECT,
+        "environment": environment or PIPEDREAM_ENVIRONMENT,
+        "toolMode": PIPEDREAM_MCP_TOOL_MODE,
+    })
+    return f"{PIPEDREAM_MCP_BASE}/{uid}/{app}?{q}"
 
 
 def pipedream_mcp_servers(external_user_id, app_slugs, staged_slugs=None):

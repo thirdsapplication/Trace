@@ -27,14 +27,22 @@ from trace.ui import app, sessions
 
 
 class PipedreamMcpUrlTest(unittest.TestCase):
-    def test_per_user_path_format(self):
-        self.assertEqual(config.pipedream_mcp_url("trace-s1", "google_sheets"),
-                         f"{config.PIPEDREAM_MCP_BASE}/trace-s1/google_sheets")
+    def test_per_user_path_with_context_params(self):
+        # every piece is load-bearing: path routes to the customer, projectId +
+        # environment resolve the CONNECTED ACCOUNT (bearer-only lists tools but
+        # every call answers "connect your account"), toolMode selects structured
+        # schemas over the opaque instruction wrapper
+        url = config.pipedream_mcp_url("trace-s1", "google_sheets")
+        path, _, query = url.partition("?")
+        self.assertEqual(path, f"{config.PIPEDREAM_MCP_BASE}/trace-s1/google_sheets")
+        self.assertIn("projectId=", query)
+        self.assertIn("environment=", query)
+        self.assertIn("toolMode=tools-only", query)
 
-    def test_no_query_params_and_no_version_pin(self):
+    def test_no_version_pin_and_uid_rides_the_path(self):
         url = config.pipedream_mcp_url("trace-s1", "gmail")
-        self.assertNotIn("?", url)
         self.assertNotIn("/v3", url)
+        self.assertNotIn("externalUserId=", url)    # the old query-param routing
 
     def test_external_user_id_is_percent_quoted(self):
         url = config.pipedream_mcp_url("user id/with junk", "gmail")
@@ -47,11 +55,10 @@ class PipedreamMcpUrlTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 config.pipedream_mcp_url(bad, "gmail")
 
-    def test_project_environment_kwargs_accepted_and_ignored(self):
-        # call-site compatibility: both now ride in the project-scoped bearer token
-        self.assertEqual(
-            config.pipedream_mcp_url("u", "gmail", project="p", environment="dev"),
-            config.pipedream_mcp_url("u", "gmail"))
+    def test_project_environment_overrides_apply(self):
+        url = config.pipedream_mcp_url("u", "gmail", project="proj_x", environment="development")
+        self.assertIn("projectId=proj_x", url)
+        self.assertIn("environment=development", url)
 
 
 class JsonRpcParsingTest(unittest.TestCase):
@@ -239,6 +246,73 @@ class DeployPreflightTest(unittest.TestCase):
         self.assertIn("*", rec["preflight_errors"])
 
 
+class _BindingConnect:
+    """verify_bindings-capable connect stub for deploy_live's binding check."""
+
+    def __init__(self, result=None, error=None):
+        self.calls = []
+        self._result, self._error = result, error
+
+    def mint_access_token(self):
+        return {"access_token": "t", "expires_in": 3600}
+
+    def verify_bindings(self, vault_ref, urls):
+        self.calls.append((vault_ref, list(urls)))
+        if self._error:
+            raise self._error
+        return self._result if self._result is not None else {u: True for u in urls}
+
+
+class DeployBindingCheckTest(unittest.TestCase):
+    """The hard gate against phantom-live: every baked MCP server URL must have a
+    matching vault credential, or the deploy fails with the real story."""
+
+    def _envelope(self):
+        return {"name": "wf", "model": "m", "system": "s",
+                "tools": [{"type": config.AGENT_TOOLSET_TYPE}], "mcp_servers": []}
+
+    def setUp(self):
+        self._orig = mcp_preflight.preflight_apps
+        mcp_preflight.preflight_apps = lambda c, uid, slugs: {
+            "toolsets": {}, "warnings": [], "errors": {}}
+        self.gmail_url = config.pipedream_mcp_url("trace-s1", "gmail")
+
+    def tearDown(self):
+        mcp_preflight.preflight_apps = self._orig
+
+    def test_all_bound_records_check_and_deploys(self):
+        connect = _BindingConnect()
+        rec = deploy.deploy_live({"id": "B1"}, self._envelope(), CONNECTION,
+                                 FakeDeployClient(), connect_client=connect)
+        self.assertEqual(rec["status"], "live")
+        self.assertEqual(rec["binding_check"], {self.gmail_url: True})
+        self.assertEqual(connect.calls, [("vlt-s1", [self.gmail_url])])
+
+    def test_missing_credential_fails_loudly_before_agent_creation(self):
+        client = FakeDeployClient()
+        connect = _BindingConnect(result={self.gmail_url: False})
+        with self.assertRaises(RuntimeError) as ctx:
+            deploy.deploy_live({"id": "B1"}, self._envelope(), CONNECTION,
+                               client, connect_client=connect)
+        self.assertIn(self.gmail_url, str(ctx.exception))
+        self.assertEqual(client.agents, [])          # nothing half-deployed
+        self.assertEqual(client.deployments, [])
+
+    def test_listing_failure_warns_but_deploys(self):
+        connect = _BindingConnect(error=RuntimeError("400 bad request"))
+        rec = deploy.deploy_live({"id": "B1"}, self._envelope(), CONNECTION,
+                                 FakeDeployClient(), connect_client=connect)
+        self.assertEqual(rec["status"], "live")
+        self.assertEqual(rec["binding_check"], {})
+        self.assertIn("binding_check", rec["preflight_errors"])
+
+    def test_connect_client_without_verify_bindings_skips_check(self):
+        rec = deploy.deploy_live({"id": "B1"}, self._envelope(), CONNECTION,
+                                 FakeDeployClient(), connect_client=object())
+        self.assertEqual(rec["status"], "live")
+        self.assertEqual(rec["binding_check"], {})
+
+
 class DeployRebindsAllUsableAppsTest(unittest.TestCase):
     """URL-migration property: the deploy path re-binds EVERY usable app, fresh
     token or not — refresh_binding's bind fallback is what moves vault credentials
@@ -256,7 +330,8 @@ class DeployRebindsAllUsableAppsTest(unittest.TestCase):
                          "google_sheets": {"usable": True,
                                            "token_expires_at": "2099-01-01T00:00:00Z"},
                          "slack": {"usable": False}}}
-        out = state._refresh_stale_bindings("s1", conn)
+        out, errors = state._refresh_stale_bindings("s1", conn)
+        self.assertEqual(errors, {})
         refreshed = sorted(c[3] for c in stub.calls if c[0] == "refresh")
         self.assertEqual(refreshed, ["gmail", "google_sheets"])   # usable only
         self.assertEqual(out["apps"]["gmail"]["token_expires_at"],
@@ -264,6 +339,25 @@ class DeployRebindsAllUsableAppsTest(unittest.TestCase):
         # and the record was persisted for later phases
         path = sessions.path(state.sessions_root, "s1", sessions.CONNECTION)
         self.assertTrue(os.path.exists(path))
+
+    def test_rebind_failures_are_surfaced_not_swallowed(self):
+        # the incident shape: refresh_binding raising per-app must come BACK to the
+        # deploy job as data, never vanish into a bare except
+        tmp = tempfile.mkdtemp()
+        stub = StubConnectClient()
+
+        def boom(vault_ref, uid, slug):
+            raise RuntimeError("409 credential already exists")
+
+        stub.refresh_binding = boom
+        state = app.AppState(tmp, key_store=FakeKeystore("sk-ant-x"),
+                             connect_fn=lambda: stub)
+        os.makedirs(os.path.join(state.sessions_root, "s1"), exist_ok=True)
+        conn = {"external_user_id": "trace-s1", "vault_ref": "vlt-s1",
+                "apps": {"gmail": {"usable": True}}}
+        out, errors = state._refresh_stale_bindings("s1", conn)
+        self.assertIn("gmail", errors)
+        self.assertIn("409", errors["gmail"])
 
 
 if __name__ == "__main__":
