@@ -359,25 +359,36 @@ class ManagedAgentsClient:
     # Beta shape — confirm against current Managed Agents memory docs: stores are
     # created once, attached at session/deployment create via a memory_store resource,
     # and mount at /mnt/memory/<store-name>/ inside the container.
-    def create_or_reuse_memory_store(self, name, description):
-        """One memory store per agent, keyed by its Trace-deterministic name. REUSED
+    def create_or_reuse_memory_store(self, name, description, documents=None):
+        """One memory store per USER, keyed by its Trace-deterministic name. REUSED
         when it already exists (unlike agents, which are recreated on redeploy) so
-        accumulated lessons survive redeploys. Fresh stores are seeded with the two
-        canonical documents; a seed failure raises (fail loud — a half-initialized
-        store is worse than a failed deploy). Returns ``{id, reused}``."""
+        accumulated lessons survive redeploys — and so a user's second agent joins
+        the store their first agent created. ``documents`` is the ``(path, content)``
+        seed list for the calling agent (defaults to the legacy root-level pair);
+        seeds run on BOTH the fresh and the reused path, because on a shared store
+        "reused" only means another agent got there first — this agent's own
+        documents may not exist yet. ``seed_memory`` tolerates already-existing
+        paths (a reused document keeps its content); any other seed failure raises
+        (fail loud — a half-initialized store is worse than a failed deploy).
+        Returns ``{id, reused}``."""
+        documents = documents or [(config.MEMORY_STATUS_DOC, config.MEMORY_STATUS_SEED),
+                                  (config.MEMORY_LESSONS_DOC, config.MEMORY_LESSONS_SEED)]
         stores = self._agents_ns("memory_stores")
+        store_id, reused = None, False
         try:
             res = _retry(lambda: stores.list())
             for s in _data(res):
                 if _attr(s, "name") == name:
-                    return {"id": _idof(s), "reused": True}
+                    store_id, reused = _idof(s), True
+                    break
         except Exception:                                  # noqa: BLE001 — list is best-effort
             pass
-        store = _retry(lambda: stores.create(name=name, description=description))
-        store_id = _idof(store)
-        self.seed_memory(store_id, config.MEMORY_STATUS_DOC, config.MEMORY_STATUS_SEED)
-        self.seed_memory(store_id, config.MEMORY_LESSONS_DOC, config.MEMORY_LESSONS_SEED)
-        return {"id": store_id, "reused": False}
+        if store_id is None:
+            store = _retry(lambda: stores.create(name=name, description=description))
+            store_id = _idof(store)
+        for path, content in documents:
+            self.seed_memory(store_id, path, content)
+        return {"id": store_id, "reused": reused}
 
     def seed_memory(self, store_id, path, content):
         """Create one memory document at ``path``. Tolerates the document already

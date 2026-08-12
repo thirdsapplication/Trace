@@ -51,10 +51,12 @@ def finalize_live_envelope(live_envelope_dict, connection_record, staged_apps=No
     return env
 
 
-def build_deployment_trigger(base_trigger, staged_slugs, rejected=None):
+def build_deployment_trigger(base_trigger, staged_slugs, rejected=None, memory_dir=None):
     """The deployment's initial user.message: the (optionally staging-prefixed) task, the
     uncertainty directive, anything the human has rejected, and the memory-maintenance
     directive. One composition point, reused whenever the deployment is recreated.
+    ``memory_dir`` is the agent's own directory inside its owner's SHARED memory store
+    (deploys since stores became per-user); None keeps the legacy root-document wording.
 
     The uncertainty directive belongs HERE, not only in ``run_once``. Deployment-backed
     agents are fired by the platform against this text, so while it was applied only on
@@ -75,15 +77,18 @@ def build_deployment_trigger(base_trigger, staged_slugs, rejected=None):
     text = runner._uncertainty_trigger(text)
     if rejected:
         text = runner._rejected_preamble(rejected) + text
-    return text + "\n\n" + config.MEMORY_UPDATE_DIRECTIVE
+    return text + "\n\n" + config.memory_update_directive(memory_dir)
 
 
 def deploy_live(bundle, live_envelope_dict, connection_record, client,
                 trigger=None, schedule=None, staged_apps=None, connect_client=None):
-    """Create the LIVE agent for one bundle over the bound connection, plus its
-    per-agent MEMORY STORE (created-or-reused by name so lessons survive redeploys)
-    and a platform DEPLOYMENT whose initial message set carries the task + the
+    """Create the LIVE agent for one bundle over the bound connection, attach the
+    customer's per-USER MEMORY STORE (one shared store per user, created-or-reused by
+    name so lessons survive redeploys; this agent gets its own ``memory_dir`` inside
+    it) and a platform DEPLOYMENT whose initial message set carries the task + the
     memory-update directive (+ the staging directive when apps are staged). The
+    deployment and environment are NAMED for the owner + workflow so an administrator
+    can tell whose they are in the Console (deployment runs inherit the name). The
     deployment is created MANUAL (no schedule) — the dashboard cadence attaches a
     cron schedule afterwards. Returns a ``live_record``. The customer's vault rides
     on the deployment (injected into every run session). Memory-store and deployment
@@ -136,24 +141,38 @@ def deploy_live(bundle, live_envelope_dict, connection_record, client,
                         + " — the agent would deploy green but reach Pipedream "
                           "unauthenticated. Reconnect the app(s) and redeploy.")
 
+    # WHO and WHAT, for every platform name: the account email when the app passed it
+    # through on the connection record, else the worker's confirmed identity, else the
+    # stable external user id — never anonymous.
+    owner = config.owner_label((connection_record or {}).get("owner_email"),
+                               (connection_record or {}).get("expected_identity"),
+                               external_user_id)
+    workflow = (live_envelope_dict.get("name") or bundle.get("name")
+                or bundle.get("id") or "agent")
+
     agent = client.create_or_reuse_agent(live_envelope_dict)
     agent_id = agent.get("id") if isinstance(agent, dict) else agent
-    environment_id = client.create_environment()
+    environment_id = client.create_environment(config.environment_defaults(owner, workflow))
 
+    # ONE store per user, shared across their agents; this agent's documents live in
+    # its own directory inside it (keyed on the workflow name, which survives
+    # redeploys — the platform agent id does not).
+    memory_dir = config.agent_memory_dir(workflow)
     store = client.create_or_reuse_memory_store(
-        name=config.memory_store_name(agent_id, external_user_id),
-        description=config.MEMORY_STORE_DESCRIPTION)
+        name=config.memory_store_name(external_user_id),
+        description=config.memory_store_description(owner),
+        documents=config.agent_memory_documents(memory_dir))
     memory_store_id = store.get("id") if isinstance(store, dict) else store
 
     base_trigger = trigger or (bundle.get("trigger") or "on a new matching event")
-    trigger_text = build_deployment_trigger(base_trigger, staged_apps)
+    trigger_text = build_deployment_trigger(base_trigger, staged_apps, memory_dir=memory_dir)
     # A cron ``schedule`` at deploy (the founder Test UI's "on a schedule" mode) is
     # honored as the deployment's cron; the end-user flow deploys manual (schedule=None)
     # and attaches a cadence afterwards from the dashboard.
     cron = ({"expression": schedule, "timezone": config.TRACE_SCHEDULE_TZ}
             if schedule else None)
     deployment_id = client.create_deployment(
-        name=f"trace-{bundle.get('id')}",
+        name=config.deployment_name(owner, workflow),
         agent_id=agent_id, environment_id=environment_id,
         trigger_text=trigger_text,
         schedule=cron,
@@ -170,8 +189,10 @@ def deploy_live(bundle, live_envelope_dict, connection_record, client,
         "deployment_id": deployment_id,
         "memory_store_id": memory_store_id,
         "memory_store_reused": bool(isinstance(store, dict) and store.get("reused")),
+        "memory_dir": memory_dir,
         "vault_ref": vault_ref,
         "external_user_id": external_user_id,
+        "owner_email": (connection_record or {}).get("owner_email"),
         "start": start,
         "status": "live",
         "error": None,

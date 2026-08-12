@@ -354,16 +354,18 @@ def run_once(client, agent, resume=None, guidance=None, rejected=None):
     trigger = _staging_trigger(base_trigger, staged) if staged else base_trigger
     trigger = _uncertainty_trigger(trigger)            # Gap #3: agent may pause when stuck
     if agent.get("memory_store_id"):
-        trigger = trigger + "\n\n" + config.MEMORY_UPDATE_DIRECTIVE
+        trigger = trigger + "\n\n" + config.memory_update_directive(agent.get("memory_dir"))
     if rejected:                                       # don't re-propose what was refused
         trigger = _rejected_preamble(rejected) + trigger
     if guidance:                                       # Gap #3 B4: retrieved lessons up top
         trigger = _guidance_preamble(guidance) + trigger
+    owner, agent_name = config.agent_owner(agent), agent.get("name") or agent_id
     try:
-        environment_id = client.create_environment()
+        environment_id = client.create_environment(
+            config.environment_defaults(owner, agent_name))
         run_session_id = client.create_session(
             agent_id, environment_id, resources=_memory_resources(agent),
-            title="Trace scheduled run",
+            title=config.session_title("scheduled run", agent_name, owner),
             vault_ids=[vault_ref] if vault_ref else None)
     except Exception as e:                                  # noqa: BLE001
         return {"agent_id": agent_id, "status": "failed",
@@ -431,12 +433,14 @@ def execute_pending(client, agent, pending):
         "propose, or describe it — actually carry it out using your tools, then stop. "
         f"Action: {summary}. Details: {json.dumps(payload, ensure_ascii=False, default=str)}")
     if agent.get("memory_store_id"):
-        instruction = instruction + "\n\n" + config.MEMORY_UPDATE_DIRECTIVE
+        instruction = instruction + "\n\n" + config.memory_update_directive(agent.get("memory_dir"))
+    owner, agent_name = config.agent_owner(agent), agent.get("name") or agent_id
     try:
-        environment_id = client.create_environment()
+        environment_id = client.create_environment(
+            config.environment_defaults(owner, agent_name))
         run_session_id = client.create_session(
             agent_id, environment_id, resources=_memory_resources(agent),
-            title="Trace approved action",
+            title=config.session_title("approved action", agent_name, owner),
             vault_ids=[vault_ref] if vault_ref else None)
         events = client.send_trigger_and_collect(run_session_id, instruction)
     except Exception as e:                                  # noqa: BLE001
@@ -467,12 +471,14 @@ def execute_actions(client, agent, items):
         "or describe them — actually carry each one out using your tools, then stop:\n"
         + "\n".join(lines))
     if agent.get("memory_store_id"):
-        instruction = instruction + "\n\n" + config.MEMORY_UPDATE_DIRECTIVE
+        instruction = instruction + "\n\n" + config.memory_update_directive(agent.get("memory_dir"))
+    owner, agent_name = config.agent_owner(agent), agent.get("name") or agent_id
     try:
-        environment_id = client.create_environment()
+        environment_id = client.create_environment(
+            config.environment_defaults(owner, agent_name))
         run_session_id = client.create_session(
             agent_id, environment_id, resources=_memory_resources(agent),
-            title="Trace approved actions",
+            title=config.session_title("approved actions", agent_name, owner),
             vault_ids=[vault_ref] if vault_ref else None)
         events = client.send_trigger_and_collect(run_session_id, instruction)
     except Exception as e:                                  # noqa: BLE001
