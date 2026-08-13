@@ -294,6 +294,36 @@ input:focus, textarea:focus { outline: none; border-color: var(--accent); backgr
 .pw-show { position: absolute; right: 12px; background: none; border: none; padding: 0;
   font-size: 12px; font-weight: 600; color: var(--accent); cursor: pointer; }
 
+/* settings (18): a second column of panes between the sidebar and the content. */
+.set-wrap { display: flex; gap: 0; align-items: flex-start; margin: -38px -46px; }
+.set-col { width: 200px; flex: none; border-right: 1px solid var(--line-2);
+  padding: 34px 14px; display: flex; flex-direction: column; gap: 3px; min-height: 70vh; }
+.set-title { font-family: var(--display); font-weight: 800; font-size: 20px;
+  letter-spacing: -0.02em; padding: 0 10px 14px; }
+.set-nav { text-align: left; background: none; border: none; padding: 9px 12px;
+  border-radius: 9px; font-size: 13px; color: var(--ink-2); cursor: pointer; }
+.set-nav:hover { background: var(--inset); }
+.set-nav.on { background: var(--inset); color: var(--ink); font-weight: 600; }
+.set-main { flex: 1; min-width: 0; padding: 36px 44px; max-width: 640px; }
+.set-card { background: var(--panel); border: 1px solid var(--line-2); border-radius: 14px;
+  padding: 20px 22px; display: flex; align-items: center; gap: 16px; }
+.set-card + .set-card, .stack .set-card { margin-top: 0; }
+.set-card-warn { border-color: var(--danger-line); }
+.set-av { width: 52px; height: 52px; border-radius: 999px; background: var(--accent-pill);
+  color: var(--accent); font-family: var(--display); font-weight: 800; font-size: 19px;
+  display: inline-flex; align-items: center; justify-content: center; flex: none; }
+.set-av-sm { width: 34px; height: 34px; font-size: 13px; }
+.set-name { font-weight: 700; font-size: 15px; }
+.set-sub { font-size: 13px; color: var(--ink-2); }
+.set-sub.warn { color: var(--danger); }
+.set-rows { display: block; padding: 8px 22px; }
+.set-row { width: 100%; display: flex; align-items: center; gap: 12px; padding: 14px 0;
+  background: none; border: none; cursor: pointer; text-align: left; }
+.set-row + .set-row { border-top: 1px solid var(--line); }
+.set-row-t { font-weight: 600; font-size: 13.5px; }
+.set-main .eyebrow { margin-bottom: 16px; }
+.set-main .stack { gap: 9px; }
+
 /* safety net (10): the rules that stop a run and come get you. Outbound sits first and
    carries a BUILT IN pill instead of a switch — it is the promise the product rests on,
    and a toggle would imply it were negotiable. */

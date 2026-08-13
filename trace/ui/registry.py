@@ -792,6 +792,46 @@ def user_flags_set(root, uid, **fields):
         _save(root, "user_flags.json", d)
 
 
+def user_profile_get(root, uid):
+    """Frame 18's Account pane: the human name and organisation, both from 017.
+
+    Read defensively like the other profile reads — an unapplied migration must not
+    break Settings, it should just show blanks.
+    """
+    if supa.is_configured():
+        try:
+            r = supa.get_admin().table("profiles").select("display_name, org_name") \
+                .eq("id", uid or "").maybe_single().execute() or supa.NO_ROW
+            d = r.data or {}
+        except Exception:                                  # noqa: BLE001 — pre-migration
+            d = {}
+    else:
+        d = (_load(root, "user_profile.json").get(str(uid)) or {})
+    return {"display_name": d.get("display_name") or "", "org_name": d.get("org_name") or ""}
+
+
+def user_profile_set(root, uid, display_name=None, org_name=None):
+    """Set either field. Empty string clears it; None leaves it alone."""
+    fields = {}
+    if display_name is not None:
+        fields["display_name"] = str(display_name).strip()[:120] or None
+    if org_name is not None:
+        fields["org_name"] = str(org_name).strip()[:120] or None
+    if not fields:
+        return user_profile_get(root, uid)
+    if supa.is_configured():
+        try:
+            supa.get_admin().table("profiles").update(fields).eq("id", uid).execute()
+        except Exception:                                  # noqa: BLE001 — pre-migration
+            pass
+        return user_profile_get(root, uid)
+    with _LOCK:
+        d = _load(root, "user_profile.json")
+        d.setdefault(str(uid), {}).update({k: v for k, v in fields.items()})
+        _save(root, "user_profile.json", d)
+    return user_profile_get(root, uid)
+
+
 _NOTIFY_DEFAULTS = {"notify_morning_brief": True, "notify_agent_blocked": True,
                     "notify_weekly_digest": False}
 

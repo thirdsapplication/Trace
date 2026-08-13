@@ -644,7 +644,9 @@ const NAV = [
   { key: "messages", label: "Messages", go: () => renderMessages() },
   { key: "groups", label: "Groups", go: () => renderGroups() },
   { key: "sharing", label: "Sharing", go: () => renderSettings() },
-  { key: "settings", label: "Settings", go: () => renderSettings() },
+  // Settings used to open renderSettings too — two sidebar items, one screen. Sharing
+  // (25) keeps that screen; Settings (18) is its own shell.
+  { key: "settings", label: "Settings", go: () => renderSettingsShell() },
 ];
 
 // Bumped by every screen paint. A render that awaits data captures this first and
@@ -822,6 +824,209 @@ async function renderSettings() {
       contribute_scope: picked.contribute, consume_scope: picked.consume });
   });
 
+}
+
+/* ---------------- SETTINGS (18) ---------------- */
+
+// Five panes behind a second column. Panels carry data-pane and an untagged panel
+// defaults to the first, so a pane added later can't silently vanish — the same trick
+// the profile tabs use.
+const SETTINGS_PANES = [
+  ["account", "Account"], ["notifications", "Notifications"],
+  ["privacy", "Privacy &amp; data"], ["apps", "Connected apps"],
+  ["appearance", "Appearance"],
+];
+
+async function renderSettingsShell(pane) {
+  clearTimers();
+  busy();
+  const want = pane || "account";
+  const home = S.igHome || await loadHome();
+  const tb = agentsTopbar(home.unread_total, null, home.needs_you_total, "settings");
+  const nav = SETTINGS_PANES.map(([k, label]) =>
+    `<button class="set-nav${k === want ? " on" : ""}" data-pane="${k}">${label}</button>`).join("");
+  tb.paint(`
+    <div class="set-wrap">
+      <div class="set-col">
+        <div class="set-title">Settings</div>
+        ${nav}
+      </div>
+      <div class="set-main">
+        <div class="eyebrow" id="setEyebrow">${
+          (SETTINGS_PANES.find(p => p[0] === want) || SETTINGS_PANES[0])[1]}</div>
+        <div id="setPane"><p class="muted">Loading…</p></div>
+      </div>
+    </div>`);
+  tb.wire();
+  root.querySelectorAll(".set-nav").forEach(b =>
+    b.onclick = () => renderSettingsShell(b.dataset.pane));
+  ({ account: setAccount, notifications: setNotifications, privacy: setPrivacy,
+     apps: setApps, appearance: setAppearance }[want] || setAccount)();
+}
+
+async function setAccount() {
+  const { data } = await api("GET", "/api/u/profile");
+  const p = data || {};
+  const initial = (p.email || "?").trim().charAt(0).toUpperCase();
+  const sub = [p.email, p.org_name].filter(Boolean).join(" · ");
+  $("#setPane").innerHTML = `
+    <div class="set-card">
+      <span class="set-av">${esc(initial)}</span>
+      <div class="grow">
+        <div class="set-name">${esc(p.display_name || p.email || "You")}</div>
+        <div class="set-sub">${esc(sub)}</div>
+      </div>
+      <button class="btn-secondary btn-sm" id="setEdit">Edit</button>
+    </div>`;
+  $("#setEdit").onclick = () => editAccount(p);
+}
+
+// Reuses the .pop modal every other dialog uses rather than inventing an inline form.
+function editAccount(p) {
+  const el = document.createElement("div");
+  el.className = "pop-back";
+  el.innerHTML = `<div class="pop" role="dialog" aria-modal="true">
+      <div class="row"><div class="pop-title">Edit your details</div>
+        <button class="pop-x" aria-label="Close">✕</button></div>
+      <div class="field"><span class="label">Name</span>
+        <input id="acName" type="text" value="${esc(p.display_name || "")}" placeholder="Your name"></div>
+      <div class="field"><span class="label">Organisation</span>
+        <input id="acOrg" type="text" value="${esc(p.org_name || "")}" placeholder="Where you work"></div>
+      <p class="pop-note">Your email is how you sign in and can't be changed here.</p>
+      <div class="cf-acts">
+        <button class="btn-secondary" id="acNo">Cancel</button>
+        <button class="btn-primary" id="acYes">Save</button>
+      </div>
+    </div>`;
+  document.body.appendChild(el);
+  const close = () => el.remove();
+  el.onclick = (e) => { if (e.target === el) close(); };
+  el.querySelector(".pop-x").onclick = close;
+  el.querySelector("#acNo").onclick = close;
+  el.querySelector("#acYes").onclick = async () => {
+    const btn = el.querySelector("#acYes");
+    btn.disabled = true; btn.textContent = "Saving…";
+    await api("POST", "/api/u/profile", {
+      display_name: el.querySelector("#acName").value,
+      org_name: el.querySelector("#acOrg").value,
+    });
+    close();
+    setAccount();
+  };
+  el.querySelector("#acName").focus();
+}
+
+async function setNotifications() {
+  const { data } = await api("GET", "/api/u/notifications");
+  const p = data || {};
+  const rows = [
+    ["notify_morning_brief", "Morning brief notification",
+     "One summary when overnight runs finish"],
+    ["notify_agent_blocked", "Ping me when an agent is blocked",
+     "Questions and approvals, as they happen"],
+    ["notify_weekly_digest", "Weekly digest email", "Runs, approvals, time saved"],
+  ];
+  // Saying so is better than switches that quietly do nothing: without a key and a
+  // verified sending domain, nothing can leave the building whatever these are set to.
+  const off = p.email_configured ? "" : `<p class="notice">Email isn't configured yet, so
+    these are saved but nothing is sent. Set RESEND_API_KEY and EMAIL_FROM to turn
+    delivery on — the in-app messages and badges work either way.</p>`;
+  $("#setPane").innerHTML = `${off}
+    <div class="set-card set-rows">${rows.map(([k, t, d]) => `
+      <button class="set-row" data-key="${k}" aria-pressed="${!!p[k]}">
+        <div class="grow"><div class="set-row-t">${t}</div><div class="set-sub">${d}</div></div>
+        <span class="tgl${p[k] ? " on" : ""}"><i></i></span>
+      </button>`).join("")}</div>`;
+  root.querySelectorAll(".set-row").forEach(b => b.onclick = async () => {
+    const key = b.dataset.key, next = b.getAttribute("aria-pressed") !== "true";
+    b.setAttribute("aria-pressed", String(next));
+    b.querySelector(".tgl").classList.toggle("on", next);
+    // Saves on toggle, like the sharing dials — a Save button would imply an unsaved
+    // state that doesn't exist.
+    await api("POST", "/api/u/notifications", { [key]: next });
+  });
+}
+
+async function setPrivacy() {
+  const home = S.igHome || await loadHome();
+  const agents = (home.agents || []).filter(a => a.capture_present);
+  $("#setPane").innerHTML = `
+    <div class="danger-card">
+      <div class="set-name" style="color:var(--danger);">Delete all capture data</div>
+      <div class="set-sub">Removes every recording from your device and the cloud. Your
+        agents keep working; they just can't be retrained from it.</div>
+      <div class="set-sub" style="margin-top:6px;">${agents.length
+        ? `${agents.length} agent${agents.length === 1 ? "" : "s"} still ${
+            agents.length === 1 ? "has" : "have"} a recording.`
+        : "Nothing recorded is being kept right now."}</div>
+      <button class="btn-danger btn-sm" id="setWipe" style="margin-top:12px;"
+        ${agents.length ? "" : "disabled"}>Delete…</button>
+      <p id="setWipeMsg" class="msg"></p>
+    </div>`;
+  $("#setWipe").onclick = async () => {
+    const ok = await confirmDestructive({
+      title: "Delete every recording?",
+      body: `This removes the capture data behind ${agents.length} agent${
+        agents.length === 1 ? "" : "s"}, from your device and the cloud, permanently. The
+        agents keep running — they just can't be retrained from it.`,
+    });
+    if (!ok) return;
+    const btn = $("#setWipe");
+    btn.disabled = true; btn.textContent = "Deleting…";
+    for (const a of agents) {
+      await api("POST", `/api/u/agents/${a.agent_id}/delete-capture-data`, {});
+    }
+    S.igHome = null;
+    renderSettingsShell("privacy");
+  };
+}
+
+async function setApps() {
+  // Read-only for now. Frame 26 also wants a last-used time and a Revoke action; the
+  // connection record carries neither, and both are changes in connect.py rather than
+  // anything this screen can derive.
+  const { data } = await api("GET", "/api/u/sessions");
+  const sess = ((data || {}).sessions || [])[0];
+  if (!sess) {
+    $("#setPane").innerHTML = `<p class="muted">No connected apps yet — you'll connect
+      them while setting up your first workflow.</p>`;
+    return;
+  }
+  const c = await uget(sess.id, "/connection-data");
+  const apps = ((c.data || {}).record || {}).apps || {};
+  const slugs = Object.keys(apps);
+  $("#setPane").innerHTML = slugs.length ? `
+    <div class="stack">${slugs.map(s => {
+      const a = apps[s];
+      const expired = a.connected && !a.usable;
+      return `<div class="set-card${expired ? " set-card-warn" : ""}">
+        <span class="set-av set-av-sm">${esc((a.label || s).charAt(0).toUpperCase())}</span>
+        <div class="grow">
+          <div class="set-row-t">${esc(a.label || s)}</div>
+          <div class="set-sub${expired ? " warn" : ""}">${expired
+            ? "Session expired — reconnect to let its agents run again"
+            : (a.usable ? "Connected · outbound actions are staged for your approval"
+                        : "Not connected")}</div>
+        </div>
+        <span class="pill ${a.usable ? "pill-on" : (expired ? "pill-warn" : "pill-off")}">${
+          a.usable ? "CONNECTED" : (expired ? "EXPIRED" : "OFF")}</span>
+      </div>`;
+    }).join("")}</div>
+    <p class="notice">Reconnecting and revoking happen in the setup flow for now.</p>`
+    : `<p class="muted">No apps connected yet.</p>`;
+}
+
+function setAppearance() {
+  // System + Light only, deliberately. A dark option needs a second complete token set
+  // in app.css plus an audit of the hard-coded hexes in inline styles; offering a Dark
+  // that half-works would be worse than not offering it.
+  $("#setPane").innerHTML = `
+    <div class="set-card"><div class="grow">
+      <div class="set-row-t">Theme</div>
+      <div class="set-sub">palza follows your system's light setting.</div>
+    </div><span class="pill pill-off">SYSTEM</span></div>
+    <p class="notice">A dark theme is coming — it needs a full second palette, and a
+      half-finished one looks worse than none.</p>`;
 }
 
 /* ---------------- GROUP CHAT: agents as contacts in a group ---------------- */

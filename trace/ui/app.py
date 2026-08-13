@@ -2579,6 +2579,10 @@ def make_handler(state):
                     except Exception:                    # noqa: BLE001 — never block sign-in
                         pass
                 return self._json(200, flags)
+            if rest == "/profile":                           # frame 18's Account pane
+                return self._json(200, dict(
+                    registry.user_profile_get(root, user["user_id"]),
+                    email=user.get("email") or ""))
             if rest == "/notifications":                     # frame 18's three toggles
                 prefs = registry.user_notify_prefs(root, user["user_id"])
                 # `email_configured` is the difference between "you turned this off" and
@@ -2698,6 +2702,11 @@ def make_handler(state):
                 registry.user_flags_set(root, user["user_id"],
                                         first_run_completed_at=sessions._now())
                 return self._json(200, registry.user_flags_get(root, user["user_id"]))
+            if rest == "/profile":                       # frame 18: name + organisation
+                b = body or {}
+                return self._json(200, registry.user_profile_set(
+                    root, user["user_id"],
+                    display_name=b.get("display_name"), org_name=b.get("org_name")))
             if rest == "/notifications":                 # frame 18: set the three toggles
                 prefs = registry.user_notify_set(root, user["user_id"], **{
                     k: v for k, v in (body or {}).items() if isinstance(v, bool)})
