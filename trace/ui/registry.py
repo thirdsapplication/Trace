@@ -47,6 +47,12 @@ def _agent_to_caller(row):
         # no effect anywhere in Supabase mode. File-mode returns the raw stored dict, so
         # it kept working and the tests never caught it.
         "color": row.get("color"),
+        # Same omission as color above, with worse consequences: agent_set_consent WRITES
+        # these (008 added the columns, NULL = inherit) and nothing read them back, so
+        # agent_lesson_scopes always fell through to the account default. A per-agent
+        # override could be set, stored, shown — and never actually applied.
+        "lesson_contribute_scope": row.get("lesson_contribute_scope"),
+        "lesson_consume_scope": row.get("lesson_consume_scope"),
     }
     return d
 

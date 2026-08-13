@@ -840,10 +840,25 @@ async function renderSettings() {
   const { data } = await api("GET", "/api/u/consent");
   const c = data || { contribute_scope: "global", consume_scope: "global" };
   const tb = agentsTopbar(home.unread_total, null, home.needs_you_total, "sharing");
+  // Frame 25's own words, which are shorter and say the load-bearing part — lessons
+  // only — before anything else.
+  const overrideLine = (a) => {
+    const c = a.lesson_contribute_scope, u = a.lesson_consume_scope;
+    if (!c && !u) return "follows your default";
+    const bits = [];
+    if (c === "owner") bits.push("contributes nothing");
+    else if (c === "team") bits.push("contributes to your team");
+    else if (c === "global") bits.push("contributes to everyone");
+    if (u === "owner") bits.push("uses only its own");
+    else if (u === "team") bits.push("asks first");
+    else if (u === "global") bits.push("auto-adopts");
+    return bits.join(" · ") || "follows your default";
+  };
   tb.paint(`
     <div class="panel">
-      <h2>Lesson sharing</h2>
-      <p class="lead">When your agents learn from your decisions, those anonymized lessons can help other similar agents — and theirs can help yours. Choose how much to share and use. This is your account default; each agent can override it on its own page.</p>
+      <h2>Sharing</h2>
+      <p class="lead">Teammates' agents can learn from yours — <b>lessons only</b>, never your
+        emails, data, or recordings. This is your account default; any agent can override it.</p>
       <div class="dial-row">
         <div class="dial-card">
           <div class="label">You contribute</div>
@@ -856,9 +871,19 @@ async function renderSettings() {
           <div class="dial-note">"Ask me first" surfaces a lesson to confirm on the agent's page.</div>
         </div>
       </div>
-      <button class="btn-primary btn-sm" id="saveConsent" style="margin-top:16px;">Save</button>
       <p class="sub muted" style="margin-top:12px;">"Anonymized" means names, emails, amounts and ids are stripped and a second privacy check runs before anything leaves your account. A shared lesson only ever guides someone else's agent after they confirm it once.</p>
-    </div>`);
+    </div>
+    ${(home.agents || []).length ? `<div class="panel">
+      <h2 style="font-size:16px;">Per agent</h2>
+      <p class="sub muted" style="margin-top:2px;">Anything set here wins over the dials above.
+        Change one on its own page.</p>
+      <div class="sh-rows">${home.agents.map(a => `
+        <button class="sh-row" data-agent="${esc(a.agent_id)}">
+          <span class="sh-chip" style="background:${esc(agentColor(a))};"></span>
+          <span class="sh-name">${esc(a.name)}</span>
+          <span class="sh-ov">${esc(overrideLine(a))} ›</span>
+        </button>`).join("")}</div>
+    </div>` : ""}`);
   tb.wire();
   // A dial saves on selection — a privacy choice shouldn't sit unsaved behind a button
   // you might not press. The Save button stays for the per-agent overrides below.
@@ -870,7 +895,10 @@ async function renderSettings() {
     await api("POST", "/api/u/consent", {
       contribute_scope: picked.contribute, consume_scope: picked.consume });
   });
-
+  // Each row opens that agent's page, which is where its override actually lives —
+  // rather than duplicating the control in two places that could then disagree.
+  root.querySelectorAll(".sh-row").forEach(b =>
+    b.onclick = () => renderProfile(b.dataset.agent));
 }
 
 /* ---------------- SETTINGS (18) ---------------- */

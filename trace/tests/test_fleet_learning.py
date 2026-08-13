@@ -33,6 +33,28 @@ class FleetStorageTest(unittest.TestCase):
         self.assertEqual(s["consume_scope"], "owner")        # agent override wins
         self.assertEqual(s["contribute_scope"], "global")    # inherits user default
 
+    def test_agent_row_carries_its_consent_override_back(self):
+        """agent_set_consent writes lesson_contribute_scope / lesson_consume_scope to the
+        agents table (008 added them, NULL = inherit) and _agent_to_caller never read them
+        back. So in Supabase mode agent_lesson_scopes always fell through to the account
+        default: an override could be set, stored and displayed, and never applied.
+
+        The test above cannot catch it — it hands agent_lesson_scopes a dict with the
+        override already in it, so the row mapping is never exercised. Exactly the same
+        omission as `color`, which had the same shape and the same blind spot.
+        """
+        row = {"id": "agent_1", "owner_id": "u1", "name": "Portal audit",
+               "lesson_contribute_scope": "owner", "lesson_consume_scope": None}
+        agent = registry._agent_to_caller(row)
+        self.assertEqual(agent["lesson_contribute_scope"], "owner")
+        self.assertIsNone(agent["lesson_consume_scope"])       # NULL stays inherit
+
+        registry.user_consent_set(self.root, "u1", contribute_scope="global",
+                                  consume_scope="global")
+        s = registry.agent_lesson_scopes(self.root, dict(agent, owner_user_id="u1"))
+        self.assertEqual(s["contribute_scope"], "owner")       # the override survives
+        self.assertEqual(s["consume_scope"], "global")         # the unset one inherits
+
     def test_promotion_lifecycle_and_distinct_user_count(self):
         registry.lesson_promotion_upsert(self.root, "a1", "u1", "d1")
         self.assertEqual(registry.lesson_promotion_get(self.root, "a1", "d1")["status"], "provisional")

@@ -1831,6 +1831,10 @@ class AppState:
                 # (group replies) — the same omission _agent_to_caller had.
                 "color": registry.agent_color(a),
                 "bundle_id": a.get("bundle_id"),
+                # frame 25 lists each agent's sharing override beside the account dials.
+                # Straight off the row — no extra query per agent.
+                "lesson_contribute_scope": a.get("lesson_contribute_scope"),
+                "lesson_consume_scope": a.get("lesson_consume_scope"),
                 "description": a.get("description") or "",
                 "trigger": a.get("trigger") or "",
                 "deployed_at": a.get("deployed_at"),
