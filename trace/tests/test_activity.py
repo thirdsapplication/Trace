@@ -107,6 +107,37 @@ class ProposalParsingTest(unittest.TestCase):
         self.assertEqual([p["summary"] for p in got],
                          ["Add ERP row for ORD-029", "Confirm order to Field Oak Bistro"])
 
+    def test_the_prompts_own_example_is_never_staged(self):
+        """Observed in production 2026-08-12: a freshly built agent staged
+        "Confirm PO-1234 to buyer@acme.com ($4,200, ships Aug 15)" — the worked example
+        out of its OWN system prompt, rationale and all — and it reached a human as an
+        approvable outbound email. It read like another account's data leaking in; it was
+        the model copying an illustration it had been told twice not to copy.
+
+        The prompt says "if your output resembles the example, you have made a mistake
+        and should output [] instead". Prose cannot be the only thing between a fictional
+        example and a real send, so the parser enforces it.
+        """
+        echoed = ('```proposed_actions\n[{"app": "Gmail", "action": "send email", '
+                  '"summary": "Confirm PO-1234 to buyer@acme.com ($4,200, ships Aug 15)", '
+                  '"rationale": "Inbound email from buyer@acme.com on Aug 9 asked for '
+                  'written confirmation of order PO-1234", '
+                  '"details": {"to": "buyer@acme.com"}}]\n```')
+        self.assertEqual(self._parse(echoed), [])
+
+    def test_a_canary_anywhere_in_the_item_drops_it(self):
+        """Only the details carry the canary here — a summary rewritten in the worker's
+        own words must not smuggle the example's recipient through."""
+        sneaky = ('```proposed_actions\n[{"app": "Gmail", "action": "send email", '
+                  '"summary": "Confirm this week\'s order", '
+                  '"details": {"to": "buyer@acme.com", "subject": "Confirmed"}}]\n```')
+        self.assertEqual(self._parse(sneaky), [])
+
+    def test_real_proposals_are_untouched_by_the_guard(self):
+        from trace.agent import runner
+        got = runner._parse_proposals(_PROPOSAL)
+        self.assertEqual(len(got), 2)                  # the guard is not over-eager
+
     def test_narration_shaped_like_an_action_is_dropped(self):
         """A summary is one line a human approves at a glance; an essay in that field is
         the tell that the object is narration, not an action."""

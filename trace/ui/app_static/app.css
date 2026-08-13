@@ -369,7 +369,17 @@ button.sn-row:hover { border-color: var(--line); }
 
 /* build (11): the phases describe what the build is doing. They only tick when the whole
    build lands, because the job reports a count and never says which phase it is in. */
-.bd-phases { display: flex; flex-direction: column; gap: 10px; }
+
+/* The block sits in the MIDDLE of the stage, not at the top — frame 11 gives it flex:1
+   and centres it, which is also what stops the finished state's button crowding the
+   last phase line. */
+.bd-mid { flex: 1; display: flex; flex-direction: column; align-items: center;
+  justify-content: center; gap: 18px; text-align: center; }
+/* 360px, per the frame. Wider than this and the rows spread past the headline above
+   them, which reads as misaligned rather than centred. */
+.bd-list { width: 360px; max-width: 100%; display: flex; flex-direction: column; gap: 9px; }
+.bd-go { margin-top: 20px; }
+.bd-phases { display: flex; flex-direction: column; gap: 10px; text-align: left; }
 .bd-phase { display: flex; align-items: center; gap: 11px; font-size: 13px; color: var(--ink-2); }
 .bd-phases.done .bd-phase { color: var(--ink); }
 .bd-dot { width: 18px; height: 18px; border-radius: 999px; flex: none;

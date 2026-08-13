@@ -211,7 +211,12 @@ def _parse_needs_input(text):
         return []
     if not isinstance(data, list):
         return []
-    return [q for q in data if isinstance(q, dict)][:_uncertainty_max_questions()]
+    # Same canary guard as proposals: the uncertainty prompt carries its own PO-1234
+    # example and tells the model not to copy it, so an echoed question is a mistake the
+    # model was already told to catch. A fabricated question is cheaper than a fabricated
+    # send but still stops a run and asks a human about an order that does not exist.
+    return _drop_example_echoes(
+        [q for q in data if isinstance(q, dict)], "questions")[:_uncertainty_max_questions()]
 
 
 def _looks_like_proposal(p):
@@ -230,6 +235,46 @@ def _looks_like_proposal(p):
     if not isinstance(summary, str) or not summary.strip() or len(summary) > 400:
         return False
     return bool(p.get("app") or p.get("action") or p.get("details"))
+
+
+# The prompt's worked examples are fictional, and it says so twice — "there is no
+# PO-1234 and no buyer@acme.com … if your output resembles the example, you have made a
+# mistake and should output [] instead". Models copy them anyway: a real agent staged
+# "Confirm PO-1234 to buyer@acme.com ($4,200, ships Aug 15)" verbatim, rationale and all,
+# and it reached a human as an approvable outbound email.
+#
+# Prose cannot be the only thing standing between an illustrative example and a staged
+# send. These are canaries: any proposal or question carrying one did not come from data
+# the agent read this run, so it is dropped — exactly what the prompt already asks the
+# model to do for itself.
+#
+# Only the fabricated IDENTITY is a canary. "PO-1234" on its own is not: it is an
+# ordinary-looking order number and a real customer could genuinely have one, so
+# matching it would block real work to prevent a fake send — a strictly worse trade.
+# The address is what cannot legitimately appear in a customer's data, and it is present
+# in the observed failure. (The suite's own fixtures use PO-1234 with real recipients,
+# which is exactly the collision this distinction avoids.)
+_EXAMPLE_CANARIES = ("buyer@acme.com",)
+
+
+def _is_example_echo(obj):
+    """True when a parsed item contains any canary from the prompt's fictional example."""
+    try:
+        blob = json.dumps(obj, default=str).lower()
+    except (TypeError, ValueError):
+        blob = str(obj).lower()
+    return any(c in blob for c in _EXAMPLE_CANARIES)
+
+
+def _drop_example_echoes(items, what):
+    kept = [it for it in items if not _is_example_echo(it)]
+    if len(kept) != len(items):
+        # Loud: this means the model ignored an explicit instruction, and the difference
+        # between "the agent found nothing" and "the agent invented something outbound"
+        # is worth a line in the log.
+        print(f"[runner] dropped {len(items) - len(kept)} {what} echoing the prompt's "
+              f"fictional example (PO-1234/buyer@acme.com)", flush=True)
+    return kept
 
 
 def _parse_proposals(text):
@@ -257,7 +302,8 @@ def _parse_proposals(text):
         except (ValueError, TypeError):
             continue
         if isinstance(data, list):
-            return [p for p in data if _looks_like_proposal(p)]
+            return _drop_example_echoes(
+                [p for p in data if _looks_like_proposal(p)], "proposals")
     return None
 
 

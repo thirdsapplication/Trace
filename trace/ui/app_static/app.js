@@ -2649,13 +2649,17 @@ const BUILD_PHASES = [
 
 function stepBuild() {
   const sid = S.session.id;
+  // Frame 11 centres the whole block vertically (flex:1 + justify-content:center) and
+  // keeps the checklist to 360px. At the full content width the rows spread wider than
+  // the headline above them and stop reading as centred, and with the block pinned to
+  // the top the finished state's button ends up crowding the last line.
   shell(`<div class="rec-stage">
-    <div class="wf-head">
+    <div class="bd-mid">
       ${searchMark()}
       <h1 class="rec-head" id="buildHead">Building your agents…</h1>
+      <div class="bd-list" id="buildBody"></div>
       <div class="wf-sub">Usually under two minutes.</div>
     </div>
-    <div class="wf-list" id="buildBody"></div>
   </div>`);
   runBuild(sid);
 }
@@ -2683,7 +2687,7 @@ function builtSummary() {
   return `
     <div class="bd-phases done">${BUILD_PHASES.map(p =>
       `<div class="bd-phase"><span class="bd-dot on">✓</span>${esc(p)}</div>`).join("")}</div>
-    <button id="buildGo" class="btn-primary full">Connect your apps</button>`;
+    <button id="buildGo" class="btn-primary full bd-go">Connect your apps</button>`;
 }
 function wireBuiltContinue() { $("#buildGo").onclick = () => goStep(5); }
 
