@@ -1613,6 +1613,26 @@ function confirmDestructive({ title, body, verb = "Delete forever", word = "dele
   });
 }
 
+// Frame 21's Overview reads the schedule as a sentence — "Every weekday · 6:00 AM" —
+// rather than only as a dropdown value.
+function cadenceLabel(sched) {
+  const v = cadenceToValue(sched && sched.cadence);
+  const hit = CADENCES.find(c => c.v === v);
+  return hit ? (hit.v ? "Runs " + hit.label : "Runs when you say so") : "Runs when you say so";
+}
+
+// "Next run tomorrow, 9:00 AM". The frame also says "takes ~9 min"; nothing measures run
+// duration, so that half is left off rather than guessed.
+function nextRunLine(sched) {
+  const v = cadenceToValue(sched && sched.cadence);
+  if (!v) return "Runs only when you ask it to.";
+  const m = /(\d{1,2})\s*(am|pm)/i.exec(String(sched && sched.cadence) || "");
+  const when = m ? ` at ${m[1]}${m[2].toLowerCase()}` : "";
+  return v === "daily" ? `Next run tomorrow${when}.`
+       : v === "weekly" ? `Next run next week${when}.`
+       : `Next run on its schedule${when}.`;
+}
+
 /* ---------------- identity popover (19) ---------------- */
 // Five core shades, then 20 extended (4 per family) behind "More shades" — same five
 // families, so a crowded team never drifts into a rainbow. A shade already in use shows
@@ -1791,17 +1811,37 @@ async function renderProfile(agentId) {
       <div class="row" style="margin-top:16px;gap:8px;flex-wrap:wrap;">
         <button class="btn-secondary btn-sm" id="pMsg">Message</button>
         <button class="btn-primary btn-sm" id="pRun">Run now</button>
-        <span class="label" style="margin-left:6px;">Runs</span>
-        <select class="sched" id="pSched">${opts}</select>
-        ${sched ? `<button class="btn-secondary btn-sm" id="pPause">${paused ? "Resume" : "Pause"}</button>` : ""}
+        ${sched ? `<button class="btn-secondary btn-sm" id="pPause">${paused ? "Resume" : "⏸ Pause"}</button>` : ""}
       </div>
       <div class="tabs" id="pTabs">
         ${["Overview", "Rules", "Lessons", "History"].map((t, n) =>
           `<button class="tab${n === 0 ? " on" : ""}" data-pane="${t.toLowerCase()}">${t}</button>`).join("")}
       </div>
-      <div class="row" style="margin-top:12px;">
+    </div>
+
+    <!-- Frame 21's Overview: Schedule, Permissions and the run stats as their own
+         cards. The schedule select used to sit loose in the header row beside Message
+         and Run now, which put a settings control among the actions and left Overview
+         with nothing of its own. -->
+    <div class="panel" data-pane="overview">
+      <div class="ov-block">
+        <div class="label">Schedule</div>
+        <div class="row" style="gap:10px;align-items:center;flex-wrap:wrap;margin-top:6px;">
+          <span class="ov-strong">${esc(cadenceLabel(sched))}</span>
+          <select class="sched" id="pSched">${opts}</select>
+        </div>
+        <div class="sub muted" style="margin-top:4px;">${paused
+          ? "Paused — it won't run until you resume it."
+          : esc(nextRunLine(sched))}</div>
+      </div>
+      <div class="ov-block" id="pPerms">
+        <div class="label">Permissions</div>
+        <p class="sub muted" style="margin-top:4px;">Loading…</p>
+      </div>
+      <div class="ov-stats" id="pStatRow"></div>
+      <div class="row" style="margin-top:14px;">
         ${a.capture_present
-          ? `<button id="pDelCap" class="btn-link" style="color:var(--danger,#b3261e);">Delete capture data</button>`
+          ? `<button id="pDelCap" class="btn-link" style="color:var(--danger);">Delete this agent's capture data</button>`
           : `<span class="muted" style="font-size:12px;">Capture data deleted</span>`}
       </div>
     </div>
@@ -1945,6 +1985,31 @@ async function renderProfile(agentId) {
       n + ((s.proposals || []).filter(p => !p.status || p.status === "pending").length), 0);
     stats.textContent = `${sessionsList.length} session${sessionsList.length === 1 ? "" : "s"}`
       + (staged ? ` · ${staged} staged action${staged === 1 ? "" : "s"} waiting` : "");
+  }
+  // Frame 21's stat row. "Runs" and "approved as-is" come from the activity log; the
+  // frame's third figure — hours saved — has nothing behind it, so there are two.
+  const statRow = $("#pStatRow");
+  if (statRow) {
+    const props = sessionsList.flatMap(s => s.proposals || []);
+    const decided = props.filter(p => p.status && p.status !== "pending");
+    const asIs = decided.filter(p => p.status === "executed" || p.status === "approved");
+    const pct = decided.length ? Math.round((asIs.length / decided.length) * 100) : null;
+    statRow.innerHTML = `
+      <div class="ov-stat"><b>${sessionsList.length}</b><span>run${
+        sessionsList.length === 1 ? "" : "s"}</span></div>
+      ${pct === null ? "" : `<div class="ov-stat"><b>${pct}%</b><span>approved as-is</span></div>`}`;
+  }
+  // Permissions (21): which apps it can touch, and whether each is held for approval.
+  const perms = $("#pPerms");
+  if (perms) {
+    perms.innerHTML = `<div class="label">Permissions</div>` + (availApps.length
+      ? `<div class="ov-perms">${availApps.map(ap => `
+          <div class="ov-perm"><span class="ov-perm-n">${esc(ap.label || ap.slug)}</span>
+            <span class="pill ${ap.staged ? "pill-warn" : "pill-on"}">${
+              ap.staged ? "ALWAYS STAGED" : "RUNS AUTOMATICALLY"}</span></div>`).join("")}</div>
+         <div class="sub muted" style="margin-top:8px;">Staged means it prepares the
+           action and waits for you. Change these under Rules.</div>`
+      : `<p class="sub muted" style="margin-top:4px;">No connected apps yet.</p>`);
   }
   const logRow = (s) => {
     const props = s.proposals || [];
