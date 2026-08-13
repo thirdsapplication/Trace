@@ -32,17 +32,15 @@ Edit `DEFAULT_CLOUD_BACKEND` in `src-tauri/src/main.rs` to your Render service U
 ## 2. Build the Python sidecar
 From the **repo root**:
 ```bash
-pyinstaller desktop/trace-node.spec      # → dist/trace-node
+pyinstaller desktop/trace-node.spec      # → dist/trace-node/ (onedir bundle)
 ```
-Tauri expects the sidecar named with the Rust target triple. Copy it in:
+The shell resolves the sidecar at `<resources>/binaries/trace-node/trace-node`
+and `tauri.conf.json` bundles `binaries/trace-node/**/*`, so copy the whole
+onedir output — directory name and all, **no target-triple suffix**:
 ```bash
 mkdir -p src-tauri/binaries
-# Apple Silicon:
-cp dist/trace-node src-tauri/binaries/trace-node-aarch64-apple-darwin
-# Intel:
-# cp dist/trace-node src-tauri/binaries/trace-node-x86_64-apple-darwin
+cp -R dist/trace-node src-tauri/binaries/trace-node
 ```
-(Find your triple with `rustc -Vv | grep host`.)
 
 ## 3. Build the app
 ```bash
@@ -56,8 +54,19 @@ Output (unsigned) under `src-tauri/target/release/bundle/`:
 ```bash
 cargo tauri dev
 ```
-Make sure `src-tauri/binaries/trace-node-<triple>` exists first (dev still spawns
+Make sure `src-tauri/binaries/trace-node/` exists first (dev still spawns
 the sidecar).
+
+## Troubleshooting a startup that won't finish
+The shell supervises the node: it waits (indefinitely, while the node is alive)
+for the node's portfile and a passing `/health`, restarts a node that dies during
+startup, and reports any hard failure on the splash screen together with the log
+path. Everything both sides print lands in one per-launch log:
+```
+~/Library/Application Support/com.trace.desktop/logs/trace-node.log
+```
+To simulate a slow start (and watch the splash status escalate instead of
+hanging), launch with `TRACE_STARTUP_DELAY_S=30`.
 
 ---
 
@@ -91,6 +100,7 @@ The node is switched only by configuration:
 ```
 Tauri shell ──spawns──▶ trace-node sidecar (127.0.0.1:<port>, desktop mode)
    │                         │  capture/* + /health + /permissions: LOCAL
-   └─ webview ─▶ /app        │  everything else (auth, /app, pipeline): PROXY ─▶ Render cloud
+   └─ webview ─▶ /app        │  /app UI assets: LOCAL (bundled; TRACE_DESKTOP_LOCAL_UI=0 re-proxies)
+                             │  everything else (auth, pipeline): PROXY ─▶ Render cloud
                              └─ on capture Stop: POST raw_events.jsonl ─▶ cloud (new session)
 ```

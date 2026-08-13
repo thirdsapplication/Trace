@@ -33,5 +33,15 @@ if __name__ == "__main__":
     t = threading.Thread(target=_watch_parent, daemon=True)
     t.start()
 
+    # Test hook: simulate a slow start (Gatekeeper scan, cold disk) to exercise
+    # the shell's readiness loop. Never set in production.
+    delay = os.environ.get("TRACE_STARTUP_DELAY_S")
+    if delay:
+        import time
+        try:
+            time.sleep(float(delay))
+        except ValueError:
+            pass
+
     from trace.ui.app import main
     main()

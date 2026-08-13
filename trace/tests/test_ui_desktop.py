@@ -13,8 +13,11 @@ the architecture over genuine loopback HTTP:
 
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -236,6 +239,110 @@ class DesktopProxyTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(stopped["session_id"], started["session_id"])
         self.assertNotIn("local_session_id", stopped)
+
+
+class DesktopStartupTest(unittest.TestCase):
+    """Startup-hang fixes: the desktop node's first paint must not depend on the
+    cloud (bundled UI is served locally), and binding the port must not wait on
+    the keystore (macOS Keychain reads can block on a modal prompt)."""
+
+    def _desktop_state(self, tmp):
+        # cloud_backend points at a dead port; proxy_fn raises so any proxied
+        # request surfaces as the standard 502 cloud_unreachable.
+        def unreachable(*a, **k):
+            raise OSError("cloud is down")
+        state = app.AppState(tmp, controller_factory=lambda out: FakeController(out),
+                             key_store=FakeKeystore(),
+                             cloud_backend="http://127.0.0.1:9")
+        state.proxy_fn = unreachable
+        return state
+
+    def _get(self, port, path):
+        try:
+            resp = urllib.request.urlopen(f"http://127.0.0.1:{port}{path}")
+        except urllib.error.HTTPError as e:
+            resp = e
+        return resp.status, resp.read()
+
+    def test_app_ui_serves_locally_with_cloud_down(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            httpd, port = _serve(self._desktop_state(tmp))
+            try:
+                status, body = self._get(port, "/app")
+                self.assertEqual(status, 200)
+                self.assertIn(b"splash", body)              # the SPA shell, not a 502 body
+                status, body = self._get(port, "/app/app.js")
+                self.assertEqual(status, 200)
+                self.assertIn(b"function boot", body)
+                # Data calls still proxy — and surface the cloud failure honestly.
+                status, body = self._get(port, "/api/auth/me")
+                self.assertEqual(status, 502)
+                self.assertEqual(json.loads(body)["error"], "cloud_unreachable")
+            finally:
+                httpd.shutdown(); httpd.server_close()
+
+    def test_local_ui_escape_hatch_restores_proxying(self):
+        os.environ["TRACE_DESKTOP_LOCAL_UI"] = "0"
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                httpd, port = _serve(self._desktop_state(tmp))
+                try:
+                    status, body = self._get(port, "/app")   # proxied → raising stub → 502
+                    self.assertEqual(status, 502)
+                    self.assertEqual(json.loads(body)["error"], "cloud_unreachable")
+                finally:
+                    httpd.shutdown(); httpd.server_close()
+        finally:
+            del os.environ["TRACE_DESKTOP_LOCAL_UI"]
+
+    def test_desktop_state_constructs_without_waiting_on_keystore(self):
+        # A keystore that stalls (Keychain prompt) must not delay AppState — and
+        # with it the port bind — on the desktop node.
+        class SlowKeystore(FakeKeystore):
+            def get_pipedream(self):
+                time.sleep(3)
+                return {}
+        with tempfile.TemporaryDirectory() as tmp:
+            t0 = time.time()
+            app.AppState(tmp, controller_factory=lambda out: FakeController(out),
+                         key_store=SlowKeystore(), cloud_backend="http://127.0.0.1:9")
+            self.assertLess(time.time() - t0, 1.0)
+
+
+class PortfileTest(unittest.TestCase):
+    def test_portfile_handoff(self):
+        # The handoff contract with the desktop shell, end to end: PORT=0 +
+        # TRACE_PORTFILE → the real process binds a port the OS picked, publishes
+        # it in the portfile, and answers /health there as trace-backend.
+        repo_root = os.path.abspath(
+            os.path.join(os.path.dirname(app.__file__), "..", ".."))
+        with tempfile.TemporaryDirectory() as tmp:
+            portfile = os.path.join(tmp, "node.port")
+            env = dict(os.environ, PORT="0", TRACE_PORTFILE=portfile,
+                       TRACE_SESSIONS_ROOT=os.path.join(tmp, "sessions"))
+            proc = subprocess.Popen(
+                [sys.executable, "-m", "trace.ui.app", "--no-open"],
+                cwd=repo_root, env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            try:
+                port = None
+                for _ in range(100):                      # ≤ 10s
+                    if proc.poll() is not None:
+                        self.fail("server exited during startup:\n"
+                                  + proc.stdout.read().decode(errors="replace"))
+                    if os.path.exists(portfile):
+                        with open(portfile) as f:
+                            port = int(f.read().strip())
+                        break
+                    time.sleep(0.1)
+                self.assertIsNotNone(port, "portfile never appeared")
+                resp = urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/health", timeout=5)
+                self.assertEqual(resp.status, 200)
+                self.assertIn(b"trace-backend", resp.read())
+            finally:
+                proc.terminate()
+                proc.wait(timeout=10)
 
 
 if __name__ == "__main__":
