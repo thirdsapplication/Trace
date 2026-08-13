@@ -35,6 +35,20 @@
 --
 -- Run this in the Supabase SQL Editor.
 
+-- DROP first, for two reasons, both of which this migration got wrong on the first
+-- attempt and Postgres caught:
+--
+--   * agent_id is TEXT, not uuid. Managed Agents issues ids like "agent_0181qZ…";
+--     012 retyped agents.id and every referencing column and recreated this function
+--     to match. Writing the signature from 009 — which predates 012 — silently
+--     reverted that and failed with
+--         42P13 return type mismatch … returns text instead of uuid at column 4.
+--
+--   * Adding parameters CHANGES the signature, so CREATE OR REPLACE would not replace
+--     anything — it would create a second, overloaded match_lessons alongside the
+--     8-argument one, and an 8-argument call would then be ambiguous.
+DROP FUNCTION IF EXISTS match_lessons(vector, uuid, vector, boolean, float, float, float, int);
+
 CREATE OR REPLACE FUNCTION match_lessons(
     situation_embedding   vector(1024),
     owner                 uuid,
@@ -48,7 +62,7 @@ CREATE OR REPLACE FUNCTION match_lessons(
     min_team_situation    float DEFAULT 0.58       -- NEW: between own and cross
 )
 RETURNS TABLE (decision_id uuid, generalized_lesson text, owner_id uuid,
-               agent_id uuid, similarity float, tier text)
+               agent_id text, similarity float, tier text)
 LANGUAGE sql
 STABLE
 SECURITY DEFINER
@@ -91,5 +105,9 @@ AS $$
 $$;
 
 -- Backwards compatible on purpose: both new parameters default, and with team_owners
--- NULL this behaves exactly as 009 did. Callers can adopt it one at a time, and an
--- unapplied 018 simply means team scope keeps collapsing to owner-only as it does today.
+-- NULL this behaves exactly as 012's version did. Callers can adopt it one at a time,
+-- and an unapplied 018 simply means team scope keeps collapsing to owner-only.
+--
+-- If you ever write another migration against this function, copy the signature from
+-- the LATEST one that touched it (012, then this), never from 009. That is exactly the
+-- mistake that made the first version of this file fail.
