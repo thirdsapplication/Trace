@@ -15,7 +15,23 @@ services:
     dockerfilePath: ./Dockerfile
     plan: starter
     healthCheckPath: /health
+    # Session artifacts — meta.json, connection.json, specs/*.yaml — are written to the
+    # filesystem. Without a disk that is the CONTAINER filesystem, which Render replaces
+    # on every deploy and restart, so a redeploy silently destroyed in-progress work.
+    #
+    # That is not only inconvenient. connection.json carries external_user_id, the key
+    # the per-agent memory store is named after; losing it let deploys name a store with
+    # no owner in it, which two accounts could then share. The code no longer trusts that
+    # file for the owner (sessions.owner_of), but the artifacts still need to survive.
+    disk:
+      name: trace-sessions
+      mountPath: /data
+      sizeGB: 10
     envVars:
+      # Point the app at the mounted disk. app.py already honours this (the --sessions
+      # default), so this is the only wiring the persistence needs.
+      - key: TRACE_SESSIONS_ROOT
+        value: /data/sessions
       # Bind all interfaces in the cloud; Render injects $PORT automatically, so
       # PORT is not declared here. Locally, HOST defaults to 127.0.0.1.
       - key: HOST
