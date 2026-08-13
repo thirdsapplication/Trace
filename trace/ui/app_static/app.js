@@ -521,22 +521,69 @@ function proposalRow(p) {
     const long = val.length > 90 || val.includes("\n");
     return `<div class="pp-field${long ? " pp-body" : ""}"><b>${esc(k)}:</b> ${esc(val)}</div>`;
   }).join("");
-  return `<div class="pp-card">
+  // The OUTCOME LEADS. Once an action has been carried out, what happened is the first
+  // thing on the card — above the title and the reasoning, which are now history. It
+  // used to be a small pill floating at the right-hand end of the title row, read after
+  // the description of something already done.
+  return `<div class="pp-card${done ? " pp-card-done" : ""}" data-card="${esc(p.id)}">
+    ${done ? `<div class="pp-outcome ${p.status === "executed" ? "ok" : "bad"}">${
+      p.status === "executed" ? "✓ Done — this was sent" : `Not sent — ${esc(p.status)}`}</div>` : ""}
     <div class="row" style="gap:9px;align-items:center;">
       <span class="pp-dot"></span>
       <span class="pp-title">${title}</span>
-      ${done ? `<span class="pill ${p.status === "executed" ? "pill-on" : "pill-off"}" style="margin-left:auto;">${esc(p.status)}</span>`
-             : `<button class="btn-link pp-toggle" data-id="${esc(p.id)}" style="margin-left:auto;">View full ▾</button>`}
+      ${done ? "" : `<button class="btn-link pp-toggle" data-id="${esc(p.id)}" style="margin-left:auto;">View full ▾</button>`}
     </div>
     ${why ? `<div class="pp-why">${esc(why)}</div>` : ""}
     <div class="pp-payload" data-for="${esc(p.id)}" hidden>${fields || `<div class="pp-field muted">No details captured.</div>`}</div>
-    ${done ? "" : `<div class="row" style="gap:9px;">
-      <button class="btn-primary prop-yes" data-id="${esc(p.id)}" style="flex:1;">Approve &amp; send</button>
-      <button class="btn-secondary prop-edit" data-id="${esc(p.id)}">Edit first</button>
-      <button class="btn-link prop-no" data-id="${esc(p.id)}" style="color:var(--ink-2);">Reject</button>
-    </div>
-    <div class="pp-note">Edits become lessons. Reject asks one line: why?</div>`}
+    ${done ? "" : `<div class="pp-acts" data-acts="${esc(p.id)}">
+      <div class="row" style="gap:9px;">
+        <button class="btn-primary prop-yes" data-id="${esc(p.id)}" style="flex:1;">Approve &amp; send</button>
+        <button class="btn-secondary prop-edit" data-id="${esc(p.id)}">Edit first</button>
+        <button class="btn-link prop-no" data-id="${esc(p.id)}" style="color:var(--ink-2);">Reject</button>
+      </div>
+      <div class="pp-note">Edits become lessons. Reject asks one line: why?</div>
+    </div>`}
   </div>`;
+}
+
+// Replace a card's buttons with what actually happened, the moment it happens. The
+// server takes seconds to carry an action out and the refresh is slower still; leaving
+// live Approve & send buttons under a thing you already approved invites a second click
+// on the same email.
+function settleProposalCard(id, text, ok) {
+  const card = document.querySelector(`[data-card="${CSS.escape(String(id))}"]`);
+  if (!card) return;
+  const acts = card.querySelector(`[data-acts="${CSS.escape(String(id))}"]`);
+  if (acts) acts.remove();
+  card.classList.add("pp-card-done");
+  const toggle = card.querySelector(".pp-toggle");
+  if (toggle) toggle.remove();
+  if (!card.querySelector(".pp-outcome")) {
+    card.insertAdjacentHTML("afterbegin",
+      `<div class="pp-outcome ${ok ? "ok" : "bad"}">${esc(text)}</div>`);
+  }
+}
+
+// Approve / reject wiring for the profile's Session history. prop-yes and prop-edit
+// were only ever wired inside the story overlay, so on this screen "Approve & send" and
+// "Edit first" were dead buttons — clicking them did nothing at all.
+function wireProposalActions(scope, agentId, after) {
+  const el = scope || document;
+  el.querySelectorAll(".prop-yes").forEach(b => b.onclick = async () => {
+    const id = b.dataset.id;
+    settleProposalCard(id, "Sending…", true);
+    const r = await api("POST", `/api/u/agents/${agentId}/approve-actions`,
+                        { pending_ids: [id] });
+    settleProposalCard(id, r.ok ? "✓ Done — this was sent"
+                                : "Couldn't send — try again from the agent's page", r.ok);
+    if (after) after(r);
+  });
+  el.querySelectorAll(".prop-no").forEach(b => b.onclick = async () => {
+    const id = b.dataset.id;
+    settleProposalCard(id, "Rejected — this won't be sent", false);
+    await api("POST", `/api/u/pending/${id}/reject`, {});
+    if (after) after({ ok: true });
+  });
 }
 
 // Disclosure + per-card actions. Delegated so it survives re-renders of the list.
@@ -1387,8 +1434,15 @@ function renderReview(agentId, startAt) {
     // Each card approves itself now — the checkbox-and-bulk-button flow made you decide
     // about several actions at once, which is the opposite of reading one and approving it.
     root.querySelectorAll(".prop-yes").forEach(b => b.onclick = async () => {
-      b.disabled = true; b.textContent = "Sending…";
-      await api("POST", `/api/u/agents/${agentId}/approve-actions`, { pending_ids: [b.dataset.id] });
+      const id = b.dataset.id;
+      // Settle the card first: buttons out, outcome in, the instant you click. The send
+      // takes seconds and the refresh longer, and a live Approve & send under something
+      // you already approved invites a second click on the same email.
+      settleProposalCard(id, "Sending…", true);
+      const r = await api("POST", `/api/u/agents/${agentId}/approve-actions`,
+                          { pending_ids: [id] });
+      settleProposalCard(id, r.ok ? "✓ Done — this was sent"
+                                  : "Couldn't send — try again from the agent's page", r.ok);
       await markReviewed(st);
       S._timers.push(setTimeout(async () => {
         await loadHome();
@@ -2042,9 +2096,15 @@ async function renderProfile(agentId) {
     await api("POST", `/api/u/agents/${agentId}/approve-actions`, { pending_ids: ids });
     S._timers.push(setTimeout(() => { S.igHome = null; renderProfile(agentId); }, 4000));
   });
-  root.querySelectorAll(".prop-no").forEach(b => b.onclick = async () => {
-    await api("POST", `/api/u/pending/${b.dataset.id}/reject`, {});
-    S.igHome = null; renderProfile(agentId);
+  // Approve & send / Edit first / Reject in Session history. These were never wired
+  // here — only in the story overlay — so all three did nothing on this screen.
+  wireProposalActions(root, agentId, () =>
+    S._timers.push(setTimeout(() => { S.igHome = null; renderProfile(agentId); }, 4000)));
+  root.querySelectorAll(".prop-edit").forEach(b => b.onclick = () => {
+    // Same as the overlay: opens the payload. Editing the content itself is still to
+    // build — the button at least does the visible half now instead of nothing.
+    const box = root.querySelector(`.pp-payload[data-for="${b.dataset.id}"]`);
+    if (box) box.hidden = false;
   });
   root.querySelectorAll(".prop-autoapprove").forEach(b => b.onclick = async () => {
     if (await autoApproveApp(agentId, b.dataset.app)) { S.igHome = null; renderProfile(agentId); }

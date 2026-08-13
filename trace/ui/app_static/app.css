@@ -294,6 +294,16 @@ input:focus, textarea:focus { outline: none; border-color: var(--accent); backgr
 .pw-show { position: absolute; right: 12px; background: none; border: none; padding: 0;
   font-size: 12px; font-weight: 600; color: var(--accent); cursor: pointer; }
 
+/* a settled proposal: what happened LEADS the card, above the title and the reasoning —
+   both of which describe something already done. It used to be a pill at the far right
+   of the title row, read after the description of the thing it was reporting on. */
+.pp-outcome { font-size: 12px; font-weight: 700; letter-spacing: .04em;
+  border-radius: 8px; padding: 6px 10px; margin-bottom: 10px; }
+.pp-outcome.ok { color: var(--ok); background: var(--ok-bg); }
+.pp-outcome.bad { color: var(--ink-2); background: var(--inset); }
+.pp-card-done { opacity: .82; }
+.pp-card-done .pp-title { font-weight: 600; }
+
 /* agent profile Overview (21): Schedule, Permissions and the run stats as blocks, so
    the tab has content of its own instead of a settings control loose in the header. */
 .ov-block { padding: 14px 0; }
