@@ -127,6 +127,38 @@ class ChatAndDMTest(unittest.TestCase):
         self.assertIn("ship date", decs[0]["question"])
         self.assertEqual(decs[0]["context"]["options"], ["Assume 5-day", "Ask the buyer"])
 
+    def test_both_surfaces_hand_the_stopped_card_the_same_shape(self):
+        """Frame 16's card is rendered from two places and they disagreed.
+
+        The registry keeps context, options and rule together in one JSON blob. home_data
+        flattened it; the activity path (Session history) returned the record raw. So the
+        card rendered the blob straight into its context line — "[object Object]" — and,
+        with no options key, drew no answer chips at all. Same card, two callers, two
+        shapes.
+
+        Also pins the rule through: the card has always rendered d.rule and nothing ever
+        put one in the payload, so every stopped run read a bare "STOPPED".
+        """
+        registry.decision_add(self.root, {
+            "agent_id": "agent-1", "owner_user_id": "usr_1", "run_session_id": "s9",
+            "question": "The price dropped 34% overnight — planned promo?",
+            "context": {"context": "Outside anything I've seen.",
+                        "options": ["Yes — planned promo", "No — flag it"],
+                        "rule": "numbers that look wrong"}})
+        raw = registry.decisions_for_user(self.root, "usr_1", status="pending")[0]
+        ui = self.state._decision_for_ui(raw)
+        self.assertEqual(ui["context"], "Outside anything I've seen.")   # a string, not a dict
+        self.assertEqual(ui["options"], ["Yes — planned promo", "No — flag it"])
+        self.assertEqual(ui["rule"], "numbers that look wrong")
+
+        # …and the same shape is what home_data puts on the agent's stories.
+        home = self.state.home_data({"user_id": "usr_1"})
+        decs = [d for a in home["agents"] for s in a["stories"] for d in s["decisions"]]
+        hit = [d for d in decs if d["id"] == ui["id"]]
+        if hit:                                     # only when the story is still open
+            self.assertEqual(hit[0]["rule"], "numbers that look wrong")
+            self.assertIsInstance(hit[0]["context"], str)
+
     def test_resume_after_answer_seeds_trigger_and_resolves(self):
         registry.decision_add(self.root, {
             "agent_id": "agent-1", "owner_user_id": "usr_1", "run_session_id": "s0",

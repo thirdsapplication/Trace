@@ -641,6 +641,24 @@ class AppState:
         return [p for p in registry.pending_for_user(root, owner, status="pending")
                 if p.get("run_session_id") == run_session_id]
 
+    @staticmethod
+    def _decision_for_ui(d):
+        """The one shape the stopped-run card (16) expects.
+
+        The registry stores context, options and rule together in a single JSON blob.
+        home_data flattened it; the activity path returned the raw record. So in Session
+        history the card rendered the blob straight into the context line — "[object
+        Object]" — and, with no options key, never drew the answer chips at all. Same
+        card, two callers, two different shapes.
+        """
+        ctx = d.get("context") or {}
+        if not isinstance(ctx, dict):
+            ctx = {"context": str(ctx)}
+        return {"id": d.get("id"), "question": d.get("question"),
+                "context": ctx.get("context") or "",
+                "options": [str(o) for o in (ctx.get("options") or [])],
+                "rule": ctx.get("rule") or ""}
+
     def _persist_decisions(self, agent, run_session_id, questions, owner):
         """Gap #3: persist a run's needs_input questions as answerable decision records
         (deduped), returning the still-open ones for this session for the UI."""
@@ -656,10 +674,16 @@ class AppState:
             registry.decision_add(root, {
                 "agent_id": agent.get("agent_id"), "owner_user_id": owner,
                 "run_session_id": run_session_id, "question": qt,
+                # `rule` rides in the same JSON blob as options — frame 16's card leads
+                # with the rule that stopped the run ("STOPPED — YOUR RULE: NUMBERS THAT
+                # LOOK WRONG"), and until now nothing ever put one there, so every
+                # stopped run rendered a bare "STOPPED".
                 "context": {"context": str(q.get("context") or ""),
-                            "options": [str(o) for o in (q.get("options") or [])]},
+                            "options": [str(o) for o in (q.get("options") or [])],
+                            "rule": str(q.get("rule") or "").strip()},
                 "tags": tags})
-        return [d for d in registry.decisions_for_user(root, owner, status="pending")
+        return [self._decision_for_ui(d)
+                for d in registry.decisions_for_user(root, owner, status="pending")
                 if d.get("run_session_id") == run_session_id]
 
     def _session_decisions(self, agent, run_session_id, events, owner):
@@ -1757,11 +1781,8 @@ class AppState:
                  "payload": p.get("payload") or {}})
         decisions_by_session = {}                           # Gap #3: unanswered questions
         for d in registry.decisions_for_user(root, uid, status="pending"):
-            ctx = d.get("context") or {}
             decisions_by_session.setdefault(d.get("run_session_id"), []).append(
-                {"id": d.get("id"), "question": d.get("question"),
-                 "context": ctx.get("context") if isinstance(ctx, dict) else "",
-                 "options": ctx.get("options") if isinstance(ctx, dict) else []})
+                self._decision_for_ui(d))
         confirms_by_agent = {}                              # Phase B: shared lessons to confirm
         for p in registry.lesson_promotions_for_user(root, uid, status="provisional"):
             confirms_by_agent.setdefault(p.get("agent_id"), []).append(
