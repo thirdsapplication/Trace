@@ -2537,6 +2537,19 @@ def make_handler(state):
             if rest == "/sessions":
                 mine = sessions.list_sessions(root, owner_id=user["user_id"])
                 return self._json(200, {"sessions": mine})
+            if rest == "/capture/status":
+                # The controller has always known whether it is running, paused, and for
+                # how long — but only POST pause/resume ever returned it. With no way to
+                # ASK, leaving the record step mid-capture and coming back showed the idle
+                # screen, and Start recording then answered already_running with no route
+                # to Stop. Read-only and cheap; safe to call on every mount.
+                with state.lock:
+                    c = state.controller
+                    if not (c and c.running):
+                        return self._json(200, {"running": False})
+                    s = c.status()
+                    s["session_id"] = state.current_sid
+                return self._json(200, s)
             if rest == "/fixtures":                          # demo entry without mac capture
                 return self._json(200, {"fixtures": [
                     {"name": f["name"]} for f in list_fixtures()]})

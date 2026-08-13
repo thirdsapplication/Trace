@@ -103,6 +103,29 @@ class DesktopProxyTest(unittest.TestCase):
         status, _, _ = self.desk("GET", "/api/u/sessions")
         self.assertEqual(status, 401)
 
+    def test_capture_status_reports_a_live_capture(self):
+        """Navigating away mid-capture and back showed the idle screen, and Start
+        recording then answered already_running with no route to Stop — because nothing
+        could ASK whether a capture was running. The controller always knew; only POST
+        pause/resume ever returned it."""
+        _, _, cookie = self.desk("POST", "/api/auth/signup",
+                                 {"email": "cap@x.com", "password": "password1"})
+        status, idle, _ = self.desk("GET", "/api/u/capture/status", cookie=cookie)
+        self.assertEqual(status, 200)
+        self.assertFalse(idle["running"])                  # nothing running yet
+
+        self.desk("POST", "/api/u/capture/start", cookie=cookie)
+        status, live, _ = self.desk("GET", "/api/u/capture/status", cookie=cookie)
+        self.assertEqual(status, 200)
+        self.assertTrue(live["running"])
+        self.assertFalse(live["paused"])
+        self.assertIn("elapsed_seconds", live)             # the clock resumes from this
+        self.assertTrue(live.get("session_id"))
+
+        self.desk("POST", "/api/u/capture/stop", cookie=cookie)
+        _, after, _ = self.desk("GET", "/api/u/capture/status", cookie=cookie)
+        self.assertFalse(after["running"])
+
     def test_capture_uploads_to_cloud_and_pipeline_reads_it(self):
         _, _, cookie = self.desk("POST", "/api/auth/signup",
                                  {"email": "c@d.com", "password": "password1"})

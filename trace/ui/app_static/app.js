@@ -1816,13 +1816,26 @@ function stepRecord() {
   // shape underneath you when you start.
   shell(`<div class="rec-stage" id="recBody"></div>`);
   renderRecBody("idle");
+  // If a capture is already running — you navigated away and came back — show the
+  // recording view rather than an idle screen whose Start button answers
+  // already_running with no route to Stop. The server owns the elapsed time, so the
+  // clock resumes where the capture actually is instead of at zero.
+  api("GET", "/api/u/capture/status").then(({ ok, data }) => {
+    if (!ok || !data || !data.running || !$("#recBody")) return;
+    const started = data.elapsed_seconds
+      ? Date.now() - Math.round(data.elapsed_seconds * 1000) : Date.now();
+    renderRecBody("recording", started, data.paused);
+  }).catch(() => { /* idle is the safe default */ });
 }
 
 // Frame 06's waveform: fixed heights rather than a formula, because the drawn rhythm is
 // deliberately irregular and `10 + (i % 4) * 8` reads as a sawtooth.
 const REC_BARS = [14, 26, 18, 34, 22, 38, 16, 28, 12];
 
-function renderRecBody(mode, started) {
+// `wasPaused` is only passed when resuming a capture that was already running — the
+// screen has to come back in the state the capture is actually in, not in the state it
+// was in when you last looked at it.
+function renderRecBody(mode, started, wasPaused) {
   const b = $("#recBody");
   if (mode === "recording") {
     b.innerHTML = `
@@ -1842,7 +1855,13 @@ function renderRecBody(mode, started) {
     // Elapsed is tracked as an origin that slides forward while paused, so the clock
     // reports time actually recorded rather than wall-clock since you pressed start.
     let t0 = started || Date.now();
-    let paused = false, pausedAt = 0;
+    let paused = !!wasPaused, pausedAt = paused ? Date.now() : 0;
+    if (paused) {                                // resumed onto a paused capture
+      const btn = $("#recPause"); if (btn) btn.textContent = "Resume";
+      const live = $("#recLive");
+      if (live) { live.classList.add("off"); live.lastChild.textContent = "PAUSED"; }
+      const wv = $("#recWave"); if (wv) wv.classList.add("still");
+    }
     const tick = () => {
       const el = $("#recTime");
       if (!el) return;
