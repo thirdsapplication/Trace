@@ -23,10 +23,20 @@ services:
     # the per-agent memory store is named after; losing it let deploys name a store with
     # no owner in it, which two accounts could then share. The code no longer trusts that
     # file for the owner (sessions.owner_of), but the artifacts still need to survive.
+    # COSTS MONEY (~$0.25/GB/month) and pins the service to ONE instance — Render
+    # cannot run two against a single disk, so this also gives up zero-downtime
+    # deploys. 1GB because these are JSON and YAML artifacts, not media.
+    #
+    # If neither trade is worth it, delete this block and the env var below: the
+    # cross-account leak it relates to is already closed in code (sessions.owner_of
+    # resolves the owner from Supabase, not from the file). What you lose without a
+    # disk is in-progress sessions surviving a redeploy. The other way out is moving
+    # artifacts to Supabase Storage, which costs nothing extra and is already on the
+    # roadmap for large artifacts.
     disk:
       name: trace-sessions
       mountPath: /data
-      sizeGB: 10
+      sizeGB: 1
     envVars:
       # Point the app at the mounted disk. app.py already honours this (the --sessions
       # default), so this is the only wiring the persistence needs.
