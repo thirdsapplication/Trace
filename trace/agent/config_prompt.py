@@ -53,6 +53,16 @@ Rules for the content you write:
   a destination, a one-vs-many layout) into the steps or working rules.
 - Fold any test_feedback corrections into the step or working rule they concern.
 - Requirements are must-hold conditions; they double as the agent's guardrails.
+- Trace's runtime itself stages outbound actions for human approval, outside these
+  instructions. NEVER write a step, working rule, or requirement saying that
+  outbound actions in general (sending, creating, updating, uploading, posting)
+  must be staged, held, drafted-only, or pre-approved by a human before being
+  executed, or that such review cannot be turned off — the same instructions are
+  reused for the run that EXECUTES an already-approved action, and such a clause
+  would make the agent wrongly refuse. This does NOT forbid the worker's own
+  stop-and-ask conditions (an unfamiliar contact, numbers off the usual pattern,
+  low confidence, topics they named): keep those as requirements about WHEN to
+  pause and ask.
 - Do NOT invent any step, value, or rule that has no source.
 - Every step, working rule, and requirement MUST carry a source tag:
   {type:'events', ids:[...]} or {type:'discovery'} or {type:'user_answer', q:'..'}

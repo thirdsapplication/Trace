@@ -390,6 +390,66 @@ class UserDescriptionTest(unittest.TestCase):
         self.assertIn("{type:'user_description'}", SYSTEM_PROMPT.replace('"', "'"))
 
 
+class StagingBulletStripTest(unittest.TestCase):
+    """The safety_rules answer's locked "Anything outbound" bullet describes runtime
+    staging and must never reach the Config Generator — an approved-execution run
+    reuses the generated system prompt and a baked-in "must be staged" requirement
+    makes the agent refuse. build_prompt_material strips it (covering answers stored
+    before the UI stopped emitting it), and the meta-prompt forbids re-inventing it."""
+
+    OUTBOUND = ("- Anything outbound: Emails, sheet edits, uploads are staged for "
+                "your approval. Can't be turned off")
+    HEADER = "Stop and ask me when any of these is true:"
+
+    def test_outbound_bullet_stripped_others_kept(self):
+        answers = [
+            {"q": "q1", "question": "Where do rows go?", "answer": "The Orders tab."},
+            {"q": "safety_rules", "question": "When should this agent stop?",
+             "answer": self.HEADER + "\n" + self.OUTBOUND
+                       + "\n- Someone new: A contact, portal, or file it hasn't touched before"},
+        ]
+        material = configgen.build_prompt_material({}, [], answers)
+        self.assertNotIn("Anything outbound", material)
+        self.assertIn(self.HEADER, material)
+        self.assertIn("Someone new", material)
+        self.assertIn("The Orders tab.", material)
+        # caller's list is not mutated
+        self.assertIn("Anything outbound", answers[1]["answer"])
+
+    def test_outbound_only_answer_dropped_entirely(self):
+        answers = [{"q": "safety_rules", "question": "When should this agent stop?",
+                    "answer": self.HEADER + "\n" + self.OUTBOUND}]
+        material = configgen.build_prompt_material({}, [], answers)
+        self.assertNotIn("safety_rules", material)
+        self.assertNotIn(self.HEADER, material)
+
+    def test_variants_stripped_and_odd_entries_survive(self):
+        answers = [
+            "not-a-dict",
+            {"q": "safety_rules", "question": "When should this agent stop?",
+             "answer": self.HEADER + "\n  -   ANYTHING OUTBOUND: staged for approval"
+                       + "\n- Low confidence: asks instead of guessing"},
+            {"q": "extra_notes"},                       # no 'answer' key
+        ]
+        material = configgen.build_prompt_material({}, [], answers)
+        self.assertNotIn("OUTBOUND", material)
+        self.assertIn("Low confidence", material)
+        self.assertIn("not-a-dict", material)
+
+    def test_other_answers_and_bullets_untouched(self):
+        # A non-safety_rules answer mentioning outbound stays verbatim.
+        answers = [{"q": "q2", "question": "Anything else?",
+                    "answer": "Anything outbound goes to the ops alias."}]
+        self.assertIn("Anything outbound goes to the ops alias.",
+                      configgen.build_prompt_material({}, [], answers))
+
+    def test_config_prompt_forbids_staging_requirements(self):
+        from trace.agent.config_prompt import SYSTEM_PROMPT
+        self.assertIn("NEVER write a step, working rule, or requirement", SYSTEM_PROMPT)
+        self.assertIn("cannot be turned off", SYSTEM_PROMPT)
+        self.assertIn("WHEN to", SYSTEM_PROMPT)          # stop-and-ask rules still allowed
+
+
 def _retag(out, bid):
     """Replace the bundle id in the live yaml so two runs with different ids compare equal
     on everything structural."""

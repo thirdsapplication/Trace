@@ -95,14 +95,43 @@ def make_engine_inputs(bundle, event_log, user_answers=None):
     return workflow_description, observed_events, list(user_answers or [])
 
 
+# The safety-net UI posts the reserved 'safety_rules' answer. Its locked "Anything
+# outbound" bullet describes RUNTIME staging (config.STAGING_DIRECTIVE, prepended to
+# run triggers) and must never reach the Config Generator: the approved-execution run
+# reuses the generated system prompt with an execute-for-real trigger, and a baked-in
+# "must be staged" requirement makes the agent refuse. New saves no longer include the
+# bullet, but answers stored by older sessions still carry it (the interview preserves
+# answers across question regeneration), so it is stripped here — the one point where
+# answers become prompt material.
+_SAFETY_RULES_QID = "safety_rules"          # mirrors ui.app.SAFETY_RULES_ID
+_RULES_HEADER = "stop and ask me when any of these is true:"
+_OUTBOUND_BULLET = re.compile(r"^\s*-\s*anything outbound\b", re.IGNORECASE)
+
+
+def _strip_staging_bullet(user_answers):
+    """``user_answers`` minus the safety_rules outbound bullet; the whole answer is
+    dropped when nothing but the header would remain."""
+    out = []
+    for a in user_answers:
+        if isinstance(a, dict) and a.get("q") == _SAFETY_RULES_QID:
+            lines = [l for l in str(a.get("answer", "")).splitlines()
+                     if l.strip() and not _OUTBOUND_BULLET.match(l)]
+            if not [l for l in lines if l.strip().lower() != _RULES_HEADER]:
+                continue                    # only the header left: drop the answer
+            a = dict(a, answer="\n".join(lines))
+        out.append(a)
+    return out
+
+
 def build_prompt_material(workflow_description, observed_events, user_answers,
                           test_feedback=None):
     """The model's USER message: the inputs as one JSON object (also what the CLI
     ``--dry-run`` prints). ``test_feedback`` (Phase 5: dry-run corrections) is included
-    only when present, so existing callers/output are unchanged."""
+    only when present. Callers' inputs pass through unchanged except the safety_rules
+    answer, which has its outbound-staging bullet stripped (see above)."""
     obj = {"workflow_description": workflow_description,
            "observed_events": observed_events,
-           "user_answers": list(user_answers or [])}
+           "user_answers": _strip_staging_bullet(list(user_answers or []))}
     if test_feedback:
         obj["test_feedback"] = list(test_feedback)
     return json.dumps(obj, ensure_ascii=False, indent=2)

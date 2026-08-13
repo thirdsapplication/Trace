@@ -2596,6 +2596,11 @@ function renderInterview(sid, data) {
 //
 // Outbound is first and has no switch on purpose. It is the promise the whole product
 // rests on, and a toggle would imply it is negotiable.
+// The locked card is DISPLAY ONLY: staging is enforced at runtime by the staging
+// directive prepended to every run's trigger, never by the agent's system prompt — a
+// baked-in "must be staged, cannot be turned off" requirement made the
+// approved-execution run (same system prompt + an execute-for-real trigger) refuse
+// to act.
 // Mirrors SAFETY_RULES_ID in app.py — the reserved answer key the rules ride in on.
 const SAFETY_RULES_ID = "safety_rules";
 
@@ -2614,11 +2619,11 @@ const SAFETY_RULES = [
 // agent config on the path answers already use. Rendered back as a sentence because that
 // is what the config consumes — a list of conditions in the worker's own terms.
 function safetyRulesText(on, own) {
-  const lines = SAFETY_RULES.filter(r => r.locked || on[r.id])
+  const lines = SAFETY_RULES.filter(r => !r.locked && on[r.id])
     .map(r => "- " + r.title.replace(" — always", "") + ": "
               + r.sub.replace(/<[^>]+>/g, "").replace(/\.$/, ""));
   if (own.trim()) lines.push("- " + own.trim());
-  return "Stop and ask me when any of these is true:\n" + lines.join("\n");
+  return lines.length ? "Stop and ask me when any of these is true:\n" + lines.join("\n") : "";
 }
 
 // `saved` is the answers map the interview just posted, keyed by bundle. It has to be
