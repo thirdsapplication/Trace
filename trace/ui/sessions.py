@@ -63,6 +63,19 @@ def path(root, sid, name):
 # Supabase helpers
 # ---------------------------------------------------------------------------
 
+# How far through the wizard a session got. Every one of these is written by
+# update_meta — to meta.json, on disk — and NONE is synced to Supabase. The UI's
+# deriveStep reads them by exactly these names, so a session meta assembled from the
+# database alone reports no progress at all and the wizard snaps back to Review after a
+# deploy that actually succeeded.
+#
+# Note the names: deriveStep wants build_at and deploy_at. The row mapping used to
+# claim built_at and deployed_at — columns nothing writes and nothing reads — so even
+# where the DB had a value it went to a key no caller looks at.
+_PROGRESS_FIELDS = ("reviewed_at", "interview_at", "interview_complete_at",
+                    "build_at", "deploy_at")
+
+
 def _sb_row_to_meta(row):
     """Convert a Supabase sessions row to the meta dict shape callers expect."""
     return {
@@ -74,8 +87,6 @@ def _sb_row_to_meta(row):
         "stopped_at": row.get("stopped_at"),
         "reconstructed_at": row.get("reconstructed_at"),
         "discovered_at": row.get("discovered_at"),
-        "built_at": row.get("built_at"),
-        "deployed_at": row.get("deployed_at"),
         "event_count": row.get("event_count"),
         "fixture": row.get("fixture"),
     }
@@ -435,6 +446,13 @@ def list_sessions(root, owner_id=None):
             # Merge local artifacts if directory exists
             if os.path.isdir(session_dir(root, local_sid)):
                 meta["artifacts"] = artifacts(root, local_sid)
+                # …and the wizard progress, which lives ONLY in meta.json. Without this
+                # the session reports no progress and deriveStep sends you back to
+                # Review — after a deploy that worked.
+                local = read_meta(root, local_sid)
+                for k in _PROGRESS_FIELDS:
+                    if local.get(k) is not None:
+                        meta[k] = local[k]
             else:
                 meta["artifacts"] = _artifacts_from_db(row)
             out.append(meta)
