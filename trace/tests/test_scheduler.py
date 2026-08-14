@@ -5,6 +5,8 @@ MA client + file-mode registry (no DATABASE_URL).
 """
 
 import datetime
+import json
+import os
 import tempfile
 import time
 import unittest
@@ -15,12 +17,16 @@ from trace.tests.test_ui import FakeKeystore
 
 
 class FakeMA:
-    """Minimal Managed Agents client for the run path."""
+    """Minimal Managed Agents client for the run path. Sessions get DISTINCT ids
+    (run-sess-1, run-sess-2, …) and events can differ per session via session_events —
+    the approval-resurrection regression only reproduces when the execution session is
+    distinguishable from the session that proposed."""
     def __init__(self, events=None, held=None, fail=False):
         self.events = events if events is not None else [{"type": "session.status_idle", "text": "Handled 2 emails"}]
         self.held = held or []
         self.fail = fail
         self.sessions = []
+        self.session_events = {}
         self.approved, self.rejected, self.triggers = [], [], []
 
     def create_environment(self, defaults=None):
@@ -33,15 +39,15 @@ class FakeMA:
             raise RuntimeError("platform down")
         self.sessions.append({"agent_id": agent_id, "vault_ids": vault_ids,
                               "resources": resources, "title": title})
-        return "run-sess-1"
+        return f"run-sess-{len(self.sessions)}"
 
     def send_trigger_and_collect(self, sid, trigger, timeout=None, max_events=None):
         self.triggers.append(trigger)
-        return self.events
+        return self.session_events.get(sid, self.events)
 
     def list_session_events(self, session_id):
         self.listed = getattr(self, "listed", 0) + 1
-        return self.events
+        return self.session_events.get(session_id, self.events)
 
     def list_pending_approvals(self, sid):
         return self.held
@@ -420,9 +426,10 @@ class SchedulerPassTest(unittest.TestCase):
 
     def test_approve_actions_executes_selected_and_marks_processed(self):
         agent = self._staged_agent()
-        self.state._live_client = lambda: self._staging_ma()
+        ma = self._staging_ma()
+        self.state._live_client = lambda: ma                  # ONE client: session ids stay distinct
         self.state.summarize_fn = lambda s, u: "x"
-        self.state.run_agent(agent)
+        self.state.run_agent(agent)                           # run-sess-1 proposes
         self.state.agent_activity(agent)                      # creates the pending item
         pend = registry.pending_for_user(self.root, "usr_1")
         self.assertEqual(len(pend), 1)
@@ -430,6 +437,81 @@ class SchedulerPassTest(unittest.TestCase):
         self.assertEqual(res["status"], "executed")
         self.assertEqual(registry.pending_count_for_user(self.root, "usr_1"), 0)
         self.assertEqual(registry.pending_get(self.root, pend[0]["id"])["status"], "executed")
+        # The reload. The execution session's transcript is a prose completion report —
+        # exactly what used to be manufactured back into a fresh "pending" proposal
+        # with live Approve buttons.
+        ma.session_events["run-sess-2"] = [
+            {"type": "agent.message", "text": "Both actions are complete: sent the email."},
+            {"type": "session.status_idle", "text": ""}]
+        act = self.state.agent_activity(agent)
+        self.assertEqual(registry.pending_count_for_user(self.root, "usr_1"), 0)  # no phantom
+        by_sid = {e["run_session_id"]: e for e in act}
+        self.assertEqual(by_sid["run-sess-2"]["proposals"], [])   # approval run: never mined
+        self.assertEqual(registry.runs_for_agent(self.root, "agent-1")[0]["kind"], "approval")
+        origin = by_sid["run-sess-1"]["proposals"]                # decided card still renders…
+        self.assertEqual([p["status"] for p in origin], ["executed"])  # …as its outcome
+        # And the id can't be approved twice.
+        res2 = self.state.approve_actions(agent, [pend[0]["id"]])
+        self.assertEqual(res2["summary"], "Nothing to approve.")
+
+    def test_rejected_and_failed_proposals_do_not_resurrect_on_reload(self):
+        # The source session's transcript keeps its proposals fence forever and every
+        # activity view re-reads it — a decided proposal must stay decided.
+        ma = self._staging_ma()                               # shared: session ids stay unique
+        self.state._live_client = lambda: ma
+        self.state.summarize_fn = lambda s, u: "x"
+        for i, outcome in enumerate(("rejected", "failed"), start=1):
+            with self.subTest(outcome=outcome):
+                # A distinct agent per outcome: the content hash covers agent_id, and
+                # the widened dedupe would (correctly) swallow a same-agent restage.
+                agent = _agent(agent_id=f"agent-{outcome}", staged_apps=["gmail"])
+                registry.agent_upsert(self.root, agent)
+                self.state.run_agent(agent)                   # -> run-sess-<i>
+                self.state.agent_activity(agent)
+                pend = [p for p in registry.pending_for_user(self.root, "usr_1")
+                        if p["agent_id"] == agent["agent_id"]]
+                registry.pending_set_status(self.root, pend[0]["id"], outcome)
+                for _ in range(2):                            # two reloads, no resurrection
+                    act = self.state.agent_activity(agent)
+                self.assertEqual(registry.pending_count_for_user(self.root, "usr_1"), 0)
+                props = {e["run_session_id"]: e for e in act}[f"run-sess-{i}"]["proposals"]
+                self.assertEqual([p["status"] for p in props], [outcome])
+
+    def test_pending_claim_is_exclusive(self):
+        agent = self._staged_agent()
+        ma = self._staging_ma()
+        self.state._live_client = lambda: ma
+        self.state.summarize_fn = lambda s, u: "x"
+        self.state.run_agent(agent)
+        self.state.agent_activity(agent)
+        pid = registry.pending_for_user(self.root, "usr_1")[0]["id"]
+        self.assertIsNone(registry.pending_claim(self.root, pid, "someone_else"))
+        first = registry.pending_claim(self.root, pid, "usr_1")
+        self.assertEqual(first["status"], "executing")
+        self.assertIsNone(registry.pending_claim(self.root, pid, "usr_1"))  # double click
+
+    def test_stale_executing_claim_settles_failed_on_view(self):
+        # A claim orphaned by a crash mid-execution must not say "Sending…" forever:
+        # the activity view settles anything executing for >15 minutes to failed.
+        agent = self._staged_agent()
+        ma = self._staging_ma()
+        self.state._live_client = lambda: ma
+        self.state.summarize_fn = lambda s, u: "x"
+        self.state.run_agent(agent)
+        self.state.agent_activity(agent)
+        pid = registry.pending_for_user(self.root, "usr_1")[0]["id"]
+        registry.pending_claim(self.root, pid, "usr_1")
+        path = os.path.join(self.root, "_registry", "pending.json")
+        with open(path, encoding="utf-8") as f:
+            d = json.load(f)
+        d[str(pid)]["processed_at"] = (datetime.datetime.now().astimezone()
+                                       - datetime.timedelta(minutes=16)).isoformat(timespec="seconds")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(d, f)
+        act = self.state.agent_activity(agent)
+        self.assertEqual(registry.pending_get(self.root, pid)["status"], "failed")
+        props = {e["run_session_id"]: e for e in act}["run-sess-1"]["proposals"]
+        self.assertEqual([p["status"] for p in props], ["failed"])
 
     def test_schedule_persists_across_restart(self):
         registry.agent_upsert(self.root, _agent())
