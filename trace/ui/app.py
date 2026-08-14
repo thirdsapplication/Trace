@@ -629,7 +629,11 @@ class AppState:
                 if summ:
                     entry["summary"] = summ
                     registry.summary_set(root, sid, summ, entry["status"])
-            if staged:                                     # surface proposals as approvable items
+            # Surface proposals as approvable items — but never from an approval-
+            # execution run: that session was told to act, not propose, and re-reading
+            # its completion report as a fresh proposal is how an approved action's
+            # buttons came back after every reload.
+            if staged and run.get("kind") != "approval":
                 entry["proposals"] = self._session_proposals(agent, sid, events, owner)
             if entry["status"] == "needs_input":           # Gap #3: surface open questions
                 entry["decisions"] = self._session_decisions(agent, sid, events, owner)
@@ -638,8 +642,9 @@ class AppState:
 
     def _session_proposals(self, agent, run_session_id, events, owner):
         """Persist this session's proposed actions as pending items (deduped) and return
-        them (with their stored status) for the activity screen. Falls back to the final
-        message text when the agent didn't emit a structured block, so nothing is lost."""
+        them — every status, not just pending, so a decided card renders its outcome on
+        reload instead of vanishing. Falls back to the final message text when the agent
+        didn't emit a structured block, so nothing is lost."""
         root = self.sessions_root
         agent_id = agent.get("agent_id")
         proposals = agent_activity.extract_proposals(events)
@@ -656,8 +661,31 @@ class AppState:
                 "kind": it.get("kind"), "summary": it.get("summary"),
                 "rationale": it.get("rationale"),
                 "payload": it.get("payload"), "content_hash": it.get("content_hash")})
-        return [p for p in registry.pending_for_user(root, owner, status="pending")
-                if p.get("run_session_id") == run_session_id]
+        out = []
+        for p in registry.pending_for_user(root, owner, status=None):
+            if p.get("run_session_id") != run_session_id:
+                continue
+            # Self-heal a claim orphaned by a crash mid-execution: without this the
+            # card would say "Sending…" forever. This screen is where approvals live,
+            # so read time here is the reliable place to notice.
+            if p.get("status") == "executing" and self._executing_went_stale(p):
+                registry.pending_set_status(root, p["id"], "failed")
+                p = {**p, "status": "failed"}
+            out.append(p)
+        return out
+
+    @staticmethod
+    def _executing_went_stale(p, max_minutes=15):
+        """True when an "executing" claim is old enough that its process must have died
+        (a real send takes seconds to a couple of minutes). Malformed or missing
+        timestamps never strand the list — they just read as not stale."""
+        import datetime
+        try:
+            ts = datetime.datetime.fromisoformat(p.get("processed_at") or "")
+            now = datetime.datetime.now(ts.tzinfo)
+            return (now - ts) > datetime.timedelta(minutes=max_minutes)
+        except (TypeError, ValueError):
+            return False
 
     @staticmethod
     def _decision_for_ui(d):
@@ -824,8 +852,11 @@ class AppState:
         root = self.sessions_root
         items = []
         for pid in pending_ids or []:
-            it = registry.pending_get(root, pid)
-            if it and it.get("owner_user_id") == agent.get("owner_user_id") and it.get("status") == "pending":
+            # Claim, not read: the row flips to "executing" atomically, so a reload
+            # (or a racing second click) during the multi-second execution can't
+            # approve the same action again.
+            it = registry.pending_claim(root, pid, agent.get("owner_user_id"))
+            if it:
                 items.append(it)
         if not items:
             return {"status": "failed", "summary": "Nothing to approve."}
@@ -843,7 +874,7 @@ class AppState:
             "agent_id": agent.get("agent_id"), "owner_user_id": agent.get("owner_user_id"),
             "status": "completed" if res["status"] == "executed" else "failed",
             "summary": res.get("summary") or "", "details": [it.get("summary") for it in items],
-            "run_session_id": res.get("run_session_id")})
+            "run_session_id": res.get("run_session_id"), "kind": "approval"})
         return res
 
     def _approved_for_stage4(self, sid):
@@ -1796,7 +1827,7 @@ class AppState:
         for p in registry.pending_for_user(root, uid):
             pending_by_session.setdefault(p.get("run_session_id"), []).append(
                 {"id": p.get("id"), "app": p.get("app"), "summary": p.get("summary"),
-                 "payload": p.get("payload") or {}})
+                 "payload": p.get("payload") or {}, "status": p.get("status")})
         decisions_by_session = {}                           # Gap #3: unanswered questions
         for d in registry.decisions_for_user(root, uid, status="pending"):
             decisions_by_session.setdefault(d.get("run_session_id"), []).append(
@@ -2030,7 +2061,8 @@ class AppState:
                         agent, rec["run_session_id"], events, agent.get("owner_user_id"))
                 except Exception:                          # noqa: BLE001 — view-time still covers it
                     staged_props = []
-            n = (len(staged_props) or len(rec.get("pending") or [])
+            n = (len([p for p in staged_props if p.get("status") == "pending"])
+                 or len(rec.get("pending") or [])
                  or (1 if rec["status"] == "needs_approval" else 0))
             if n:
                 self._agent_dm(agent, f"I've staged {n} action{'s' if n != 1 else ''} for "
@@ -2057,7 +2089,7 @@ class AppState:
             "agent_id": agent.get("agent_id"), "owner_user_id": agent.get("owner_user_id"),
             "status": "completed" if res["status"] == "executed" else "failed",
             "summary": res.get("summary") or "", "details": [item.get("summary") or item.get("kind") or "action"],
-            "run_session_id": res.get("run_session_id")})
+            "run_session_id": res.get("run_session_id"), "kind": "approval"})
         return res
 
     def _agent_row(self, agent_id, owner_user_id):
@@ -2371,9 +2403,9 @@ def make_handler(state):
             item = registry.pending_get(root, pending_id)
             if not item or item.get("owner_user_id") != user["user_id"]:
                 return self._json(404, {"error": "not_found"})
-            if item.get("status") != "pending":
-                return self._json(409, {"error": "already_processed"})
             if action == "reject":
+                if item.get("status") != "pending":
+                    return self._json(409, {"error": "already_processed"})
                 registry.pending_set_status(root, pending_id, "rejected")
                 # A deployment-backed agent runs against text baked in at deploy time, so
                 # the rejection only reaches it by recreating the deployment. Async and
@@ -2382,6 +2414,11 @@ def make_handler(state):
                 threading.Thread(target=lambda: state.refresh_deployment_trigger(
                     item.get("agent_id"), user["user_id"]), daemon=True).start()
                 return self._json(200, {"id": pending_id, "status": "rejected"})
+            # Claim before the thread spawns: the atomic pending→executing flip is what
+            # makes a double click (or a click from a stale reload) a 409, not a resend.
+            item = registry.pending_claim(root, pending_id, user["user_id"])
+            if not item:
+                return self._json(409, {"error": "already_processed"})
             threading.Thread(target=lambda: state.approve_pending(item), daemon=True).start()
             return self._json(202, {"id": pending_id, "state": "running"})
 

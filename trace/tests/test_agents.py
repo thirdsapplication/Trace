@@ -282,6 +282,22 @@ class ActivityEndpointTest(AgentsEndpointTest):
         status, _, _ = self._req("POST", "/api/u/agents/agent-1/approve-actions",
                                  {"pending_ids": [pend[0]["id"]]}, cookie=cookie)
         self.assertEqual(status, 202)
+        # The 202 is fire-and-forget; wait out the worker thread, then take the exact
+        # user path that used to resurrect the button — reload the activity view and
+        # look for anything still approvable.
+        deadline = time.time() + 2
+        st = None
+        while time.time() < deadline:
+            st = registry.pending_get(self.root, pend[0]["id"])["status"]
+            if st not in ("pending", "executing"):
+                break
+            time.sleep(0.02)
+        self.assertEqual(st, "executed")
+        status, data, _ = self._req("GET", "/api/u/agents/agent-1/activity", cookie=cookie)
+        self.assertEqual(status, 200)
+        live = [p for e in data["activity"] for p in e["proposals"]
+                if p["status"] == "pending"]
+        self.assertEqual(live, [])
 
 
 class DeploymentAgentActionsTest(AgentsEndpointTest):

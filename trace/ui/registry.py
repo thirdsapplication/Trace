@@ -83,6 +83,7 @@ def _run_to_caller(row):
         "details": row.get("details") or [],
         "run_session_id": row.get("run_session_id"),
         "drun_id": row.get("drun_id"),
+        "kind": row.get("kind"),
     }
 
 
@@ -311,7 +312,10 @@ def schedule_mark_run(root, agent_id):
 
 # --- runs ------------------------------------------------------------------
 def run_add(root, rec):
-    """rec: {agent_id, owner_user_id, status, summary, details, run_session_id, drun_id}."""
+    """rec: {agent_id, owner_user_id, status, summary, details, run_session_id, drun_id,
+    kind}. kind="approval" marks a run whose session EXECUTED already-approved actions
+    (rather than proposing new ones) — the activity view must not mine those sessions
+    for proposals."""
     if supa.is_configured():
         admin = supa.get_admin()
         row = {
@@ -323,6 +327,8 @@ def run_add(root, rec):
             "run_session_id": rec.get("run_session_id"),
             "drun_id": rec.get("drun_id"),
         }
+        if rec.get("kind"):                                # column arrives with 019
+            row["kind"] = rec["kind"]
         admin.table("agent_runs").insert(row).execute()
         return
     with _LOCK:
@@ -366,15 +372,16 @@ def run_seen_drun_ids(root, agent_id):
 
 # --- pending (staged) actions — Spec 8 -------------------------------------
 def pending_add(root, rec):
-    """Deduped on (agent_id, content_hash) against pending/executed items.
-    Returns True if inserted, False if deduped."""
+    """Deduped on (agent_id, content_hash) against ANY existing item: once a proposal
+    has been surfaced, it never re-stages, whatever its outcome — the source session's
+    transcript is re-read on every activity view, and a rejected or failed decision
+    must not resurrect from it. Returns True if inserted, False if deduped."""
     if supa.is_configured():
         admin = supa.get_admin()
         # Check for existing
         r = admin.table("pending_actions").select("id") \
             .eq("agent_id", rec.get("agent_id")) \
             .eq("content_hash", rec.get("content_hash")) \
-            .in_("status", ["pending", "executed"]) \
             .limit(1).execute()
         if r.data:
             return False
@@ -394,8 +401,7 @@ def pending_add(root, rec):
         d = _load(root, "pending.json")
         for it in d.values():
             if (it.get("agent_id") == rec.get("agent_id")
-                    and it.get("content_hash") == rec.get("content_hash")
-                    and it.get("status") in ("pending", "executed")):
+                    and it.get("content_hash") == rec.get("content_hash")):
                 return False
         nid = str(max((int(k) for k in d), default=0) + 1)
         d[nid] = {**rec, "id": nid, "status": "pending",
@@ -405,16 +411,20 @@ def pending_add(root, rec):
 
 
 def pending_for_user(root, owner_user_id, status="pending"):
+    """status=None returns every status — the activity view renders decided cards
+    (executed/rejected/failed) alongside pending ones, not just the live queue."""
     if supa.is_configured():
         admin = supa.get_admin()
-        r = admin.table("pending_actions").select("*") \
-            .eq("owner_id", owner_user_id) \
-            .eq("status", status) \
-            .order("created_at", desc=True).execute()
+        q = admin.table("pending_actions").select("*") \
+            .eq("owner_id", owner_user_id)
+        if status:
+            q = q.eq("status", status)
+        r = q.order("created_at", desc=True).execute()
         return [_pending_to_caller(row) for row in (r.data or [])]
     d = _load(root, "pending.json")
     return sorted((it for it in d.values()
-                   if it.get("owner_user_id") == owner_user_id and it.get("status") == status),
+                   if it.get("owner_user_id") == owner_user_id
+                   and (status is None or it.get("status") == status)),
                   key=lambda it: it.get("created_at") or "", reverse=True)
 
 
@@ -425,6 +435,31 @@ def pending_get(root, pending_id):
             .eq("id", str(pending_id)).maybe_single().execute() or supa.NO_ROW
         return _pending_to_caller(r.data) if r.data else None
     return _load(root, "pending.json").get(str(pending_id))
+
+
+def pending_claim(root, pending_id, owner_user_id):
+    """Atomically move one of this owner's rows from "pending" to "executing" and
+    return it, or None if it wasn't claimable (already claimed, already decided, or
+    not theirs). The status predicate makes the claim exclusive — of two racing
+    approvals exactly one gets the row, so the same action can't be sent twice."""
+    if supa.is_configured():
+        admin = supa.get_admin()
+        r = admin.table("pending_actions").update({
+            "status": "executing", "processed_at": _now_iso()
+        }).eq("id", str(pending_id)) \
+            .eq("owner_id", owner_user_id) \
+            .eq("status", "pending").execute()
+        return _pending_to_caller(r.data[0]) if r.data else None
+    with _LOCK:
+        d = _load(root, "pending.json")
+        it = d.get(str(pending_id))
+        if (not it or it.get("owner_user_id") != owner_user_id
+                or it.get("status") != "pending"):
+            return None
+        it["status"] = "executing"
+        it["processed_at"] = _now_iso()
+        _save(root, "pending.json", d)
+        return dict(it)
 
 
 def pending_set_status(root, pending_id, status):
