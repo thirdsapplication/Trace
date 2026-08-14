@@ -1364,6 +1364,34 @@ def summary_get(root, session_id):
     return _load(root, "session_summaries.json").get(session_id)
 
 
+def summaries_many(root, session_ids):
+    """Every run summary in ONE query, keyed by session id.
+
+    home_data called summary_get inside its per-run loop — one round trip per run, per
+    agent. runs_for_agents already caps at 20 runs each, so five agents cost up to a
+    hundred sequential queries before Home could paint, and it got worse with every
+    agent deployed. The three neighbouring reads were batched for exactly this reason;
+    this one was missed.
+    """
+    ids = [s for s in (session_ids or []) if s]
+    if not ids:
+        return {}
+    if supa.is_configured():
+        out = {}
+        # Chunked: a session id list grows with runs × agents, and PostgREST puts the
+        # whole `in_` set in the URL.
+        for i in range(0, len(ids), 100):
+            r = supa.get_admin().table("session_summaries") \
+                .select("session_id, summary, status") \
+                .in_("session_id", ids[i:i + 100]).execute()
+            for row in (r.data or []):
+                out[str(row.get("session_id"))] = {"summary": row.get("summary"),
+                                                   "status": row.get("status")}
+        return out
+    store = _load(root, "session_summaries.json")
+    return {s: store[s] for s in ids if s in store}
+
+
 def summary_set(root, session_id, summary, status):
     if supa.is_configured():
         admin = supa.get_admin()

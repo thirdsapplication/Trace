@@ -531,10 +531,15 @@ function proposalRow(p) {
     <div class="row" style="gap:9px;align-items:center;">
       <span class="pp-dot"></span>
       <span class="pp-title">${title}</span>
-      ${done ? "" : `<button class="btn-link pp-toggle" data-id="${esc(p.id)}" style="margin-left:auto;">View full ▾</button>`}
+      ${done ? "" : `<button class="btn-link pp-toggle" data-id="${esc(p.id)}" style="margin-left:auto;">Hide full ▴</button>`}
     </div>
     ${why ? `<div class="pp-why">${esc(why)}</div>` : ""}
-    <div class="pp-payload" data-for="${esc(p.id)}" hidden>${fields || `<div class="pp-field muted">No details captured.</div>`}</div>
+    <!-- OPEN BY DEFAULT. You are approving the payload, not the summary — a one-line
+         "send confirmation email" can sit above a body promising a delivery date, and
+         hiding the text behind a click means the thing actually being approved is the
+         thing you did not read. Frame 27's canonical state is open too ("payload open
+         + edit"); collapsing it was a scannability choice that cost more than it paid. -->
+    <div class="pp-payload" data-for="${esc(p.id)}">${fields || `<div class="pp-field muted">No details captured.</div>`}</div>
     ${done ? "" : `<div class="pp-acts" data-acts="${esc(p.id)}">
       <div class="row" style="gap:9px;">
         <button class="btn-primary prop-yes" data-id="${esc(p.id)}" style="flex:1;">Approve &amp; send</button>

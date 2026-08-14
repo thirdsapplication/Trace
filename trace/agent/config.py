@@ -167,6 +167,15 @@ STAGING_DIRECTIVE = (
     "verbatim (e.g. to/subject/body for an email, or every column value for a row). Put "
     "ONLY real action parameters here — no commentary, no rationale, nothing the "
     "executor would have to re-derive. Whoever approves will run it exactly as given.\n"
+    "    WRITE THE CONTENT IN FULL. Every word that will be sent or written, exactly as "
+    "it will appear. Never abbreviate, never summarise, never elide with \"...\" or "
+    "\"[rest of email]\" — a body you shortened is a body nobody approved. If you cannot "
+    "write the final text yet, you are not ready to propose the action.\n"
+    "    THE SUMMARY MUST NOT UNDERSELL THE CONTENT. If the text commits to anything the "
+    "summary does not say — a date, a price, a quantity, a promise, a deadline — the "
+    "summary is wrong. \"Send confirmation email\" is NOT an acceptable summary for a "
+    "message that promises delivery by a specific date; say the date. A human approving "
+    "the one line must not be surprised by the other.\n"
     "If there are no outbound actions to take, output an EMPTY array `[]`. That is a "
     "complete, correct answer — a run with nothing to do is normal and expected. Never "
     "invent an action to fill the block. Take outbound actions normally in any app NOT "
@@ -183,7 +192,14 @@ STAGING_DIRECTIVE = (
     "buyer@acme.com ($4,200, ships Aug 15)\", \"rationale\": \"Inbound email from "
     "buyer@acme.com on Aug 9 asked for written confirmation of order PO-1234; the order "
     "is in Sheets marked 'ready to ship'\", \"details\": {\"to\": \"buyer@acme.com\", "
-    "\"subject\": \"Order PO-1234 confirmed\", \"body\": \"...\"}}]\n"
+    # The body here is written out in full ON PURPOSE. It used to read "body": "..." —
+    # which taught the model that an elided body was acceptable, two lines under an
+    # instruction demanding the exact verbatim text. An agent then proposed "send
+    # confirmation email" whose real text promised a delivery date the summary never
+    # mentioned, and a human approved the one line without seeing the other.
+    "\"subject\": \"Order PO-1234 confirmed\", \"body\": \"Hi — confirming PO-1234 for "
+    "$4,200. Shipping Aug 15 by standard ground. Reply here if anything looks wrong."
+    "\\n\\nThanks,\\nOps\"}}]\n"
     "```\n")
 
 

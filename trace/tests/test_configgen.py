@@ -261,6 +261,38 @@ class ConfigGenTest(unittest.TestCase):
         configgen.validate_config_envelope(out["live"]["dict"])
 
 
+class ProposalPromptTest(unittest.TestCase):
+    """What a human approves is the payload, not the one-line summary.
+
+    Reported 2026-08-14: an agent proposed "send confirmation email" and the actual text
+    promised a specific delivery date. Approving the summary was not approving the
+    action. Part of the cause was in this prompt — the instruction demanded the exact
+    verbatim content and the worked example two lines below it wrote `"body": "..."`,
+    teaching that an elided body was fine.
+    """
+
+    def _directive(self):
+        return "".join(v for k, v in vars(config).items()
+                       if isinstance(v, str) and "proposed_actions" in v)
+
+    def test_the_example_body_is_not_elided(self):
+        d = self._directive()
+        self.assertNotIn('"body": "..."', d)
+        self.assertNotIn('"body": "…"', d)
+
+    def test_the_prompt_demands_the_full_text(self):
+        d = self._directive().lower()
+        self.assertIn("write the content in full", d)
+        self.assertIn("never abbreviate", d)
+
+    def test_the_prompt_forbids_a_summary_that_hides_a_commitment(self):
+        """The specific failure: a summary that says less than the body commits to."""
+        d = self._directive().lower()
+        self.assertIn("must not undersell", d)
+        for word in ("date", "price", "quantity", "promise", "deadline"):
+            self.assertIn(word, d)
+
+
 class GenerateConfigsFileTest(unittest.TestCase):
     """The file-driven engine entrypoint over a synthesized reviewed file."""
 

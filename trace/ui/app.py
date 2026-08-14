@@ -586,9 +586,28 @@ class AppState:
             model_fn = self._summarize_model_fn()
         except Exception:
             model_fn = None
+        runs = list(registry.runs_for_agent(root, agent.get("agent_id"), limit))
+
+        # This screen is where approvals live, and it used to fetch one session's events
+        # from the platform at a time, in a loop — up to `limit` sequential round trips
+        # to Managed Agents before anything could render. That is the wait: it is not the
+        # database, it is a queue of network calls waiting on each other for no reason.
+        # _fanout exists for precisely this and every other caller already uses it.
+        want = []
+        seen = set()
+        for run in runs:
+            sid = run.get("run_session_id")
+            if sid and sid not in seen and client is not None:
+                seen.add(sid)
+                want.append(sid)
+        fetched = dict(zip(want, self._fanout(
+            [lambda s=s: client.list_session_events(s) for s in want]))) if want else {}
+        # …and every summary in one query rather than one per run (see summaries_many).
+        cached_summaries = registry.summaries_many(root, want)
+
         out = []
         seen = set()
-        for run in registry.runs_for_agent(root, agent.get("agent_id"), limit):
+        for run in runs:
             sid = run.get("run_session_id")
             entry = {"ran_at": run.get("ran_at"), "run_session_id": sid,
                      "status": run.get("status"), "summary": run.get("summary") or "",
@@ -597,13 +616,12 @@ class AppState:
                 out.append(entry)
                 continue
             seen.add(sid)
-            try:
-                events = client.list_session_events(sid)
-            except Exception:
+            events = fetched.get(sid)
+            if events is None:                             # a failed fetch, per _fanout
                 out.append(entry)
                 continue
             entry["status"] = agent_activity.session_status(events)
-            cached = registry.summary_get(root, sid)
+            cached = cached_summaries.get(sid)
             if cached and cached.get("summary"):
                 entry["summary"] = cached["summary"]
             elif model_fn is not None and agent_activity.is_terminal(events):
@@ -1799,6 +1817,12 @@ class AppState:
         reviewed_by_agent = registry.reviewed_keys_many(root, agent_ids)
         runs_by_agent = registry.runs_for_agents(root, agent_ids, 20)
         schedules_by_agent = registry.schedules_for_agents(root, agent_ids)
+        # The fourth batched read. summary_get was still being called inside the per-run
+        # loop below — up to 20 round trips per agent, sequentially, before Home painted,
+        # and worse with every agent deployed. Its three neighbours were batched for
+        # exactly this reason and this one was missed.
+        summaries = registry.summaries_many(root, [
+            r.get("run_session_id") for runs in runs_by_agent.values() for r in runs])
         for a in all_agents:
             aid = a.get("agent_id")
             reviewed = reviewed_by_agent.get(aid) or set()
@@ -1810,9 +1834,7 @@ class AppState:
                 decs = decisions_by_session.get(sid, []) if sid else []
                 if key in reviewed and not props and not decs:   # reviewed AND fully processed
                     continue
-                note = None
-                if sid:
-                    note = (registry.summary_get(root, sid) or {}).get("summary")
+                note = (summaries.get(sid) or {}).get("summary") if sid else None
                 stories.append({"key": key, "ran_at": r.get("ran_at"),
                                 "status": r.get("status"),
                                 "note": note or r.get("summary") or "Ran.",
