@@ -18,6 +18,7 @@ import concurrent.futures
 import hmac
 import json
 import os
+import queue
 import re
 import shutil
 import ssl
@@ -251,6 +252,8 @@ class AppState:
         self._scheduler_thread = None
         self._vault_refreshed = {}   # vault_ref -> epoch of last rolling refresh (deployment sync)
         self.chat_jobs = {}          # agent_id -> {state, error} (a DM reply in flight)
+        self._approval_queues = {}   # agent_id -> queue.Queue of tasks (FIFO per agent)
+        self._approval_workers = {}  # agent_id -> live drain thread
         self._msg_rate = {}          # uid -> [recent message epochs] (group-chat rate limit)
         # Admin portal: live-only LLM prompt log (a bounded in-memory ring; nothing is
         # persisted — prompts embed capture-derived user data). Served exclusively
@@ -852,14 +855,24 @@ class AppState:
         root = self.sessions_root
         items = []
         for pid in pending_ids or []:
-            # Claim, not read: the row flips to "executing" atomically, so a reload
-            # (or a racing second click) during the multi-second execution can't
-            # approve the same action again.
+            # Claim, not read: the row flips atomically, so a reload (or a racing
+            # second click) during the multi-second execution can't approve the
+            # same action again.
             it = registry.pending_claim(root, pid, agent.get("owner_user_id"))
             if it:
                 items.append(it)
+        return self.execute_claimed_actions(agent, items)
+
+    def execute_claimed_actions(self, agent, items):
+        """Perform already-claimed staged actions in ONE fresh session and mark each
+        executed. Runs on the agent's approval-queue worker, so the items may have
+        waited in status "queued" — the flip to "executing" here (not at claim time)
+        is what starts the stale-executing clock. Never raises."""
+        root = self.sessions_root
         if not items:
             return {"status": "failed", "summary": "Nothing to approve."}
+        for it in items:
+            registry.pending_set_status(root, it.get("id"), "executing")
         agent = self._with_owner(agent)
         self._refresh_agent_binding(agent)
         try:
@@ -1449,6 +1462,53 @@ class AppState:
 
         self._scheduler_thread = threading.Thread(target=loop, daemon=True)
         self._scheduler_thread.start()
+
+    # --- Approval queue: one MA session at a time per agent --------------
+    def enqueue_approval(self, agent_id, fn):
+        """FIFO-enqueue one approval-triggered execution. Approvals for the same
+        agent run strictly one after another in the order they were approved (a
+        single drain thread per agent — a bare Lock wouldn't be FIFO-fair);
+        different agents drain independently. Workers start lazily and exit when
+        their queue empties, so no main()-time setup is needed."""
+        key = str(agent_id or "")
+        with self.lock:
+            q = self._approval_queues.setdefault(key, queue.Queue())
+            q.put({"fn": fn})
+            w = self._approval_workers.get(key)
+            if w is None or not w.is_alive():
+                w = threading.Thread(target=self._drain_approvals,
+                                     args=(key, q), daemon=True)
+                self._approval_workers[key] = w
+                w.start()
+
+    def _drain_approvals(self, key, q):
+        while True:
+            with self.lock:              # puts also happen under self.lock, so the
+                if q.empty():            # empty-check + self-removal is race-free
+                    self._approval_workers.pop(key, None)
+                    self._approval_queues.pop(key, None)
+                    return
+            task = q.get()
+            try:
+                task["fn"]()             # bodies never raise; belt-and-braces anyway
+            except Exception:            # noqa: BLE001 — a bad task must not kill the drain
+                pass
+            finally:
+                q.task_done()
+
+    def flush_approvals(self, timeout=10):
+        """Block until every queued approval has finished (workers self-terminate
+        when drained, so joining them = drained). Test/shutdown helper."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with self.lock:
+                workers = list(self._approval_workers.values())
+            if not workers:
+                return True
+            for w in workers:
+                w.join(timeout=max(0.0, deadline - time.time()))
+        with self.lock:
+            return not self._approval_workers
 
     def run_due_schedules(self, now=None):
         """One scheduler pass: run every due LEGACY schedule (agents without a platform
@@ -2071,11 +2131,15 @@ class AppState:
 
     def approve_pending(self, item):
         """Spec 8: perform a staged action on the user's approval (the "quick fresh
-        task"), then mark it processed. Returns the execution record. Never raises."""
+        task"), then mark it processed. Runs on the agent's approval-queue worker;
+        the item arrives claimed to "queued" and flips to "executing" only now, so
+        queue wait never counts against the stale-executing clock. Returns the
+        execution record. Never raises."""
         agent = self._agent_row(item.get("agent_id"), item.get("owner_user_id"))
         if not agent:
             registry.pending_set_status(self.sessions_root, item.get("id"), "failed")
             return {"status": "failed", "summary": "The agent is no longer available."}
+        registry.pending_set_status(self.sessions_root, item.get("id"), "executing")
         agent = self._with_owner(agent)
         self._refresh_agent_binding(agent)
         try:
@@ -2414,12 +2478,17 @@ def make_handler(state):
                 threading.Thread(target=lambda: state.refresh_deployment_trigger(
                     item.get("agent_id"), user["user_id"]), daemon=True).start()
                 return self._json(200, {"id": pending_id, "status": "rejected"})
-            # Claim before the thread spawns: the atomic pending→executing flip is what
-            # makes a double click (or a click from a stale reload) a 409, not a resend.
-            item = registry.pending_claim(root, pending_id, user["user_id"])
+            # Claim before dispatch: the atomic pending→queued flip is what makes a
+            # double click (or a click from a stale reload) a 409, not a resend. The
+            # send itself runs on the agent's approval queue, one at a time in
+            # approval order — concurrent MA sessions from rapid approvals caused
+            # real interference.
+            item = registry.pending_claim(root, pending_id, user["user_id"],
+                                          to_status="queued")
             if not item:
                 return self._json(409, {"error": "already_processed"})
-            threading.Thread(target=lambda: state.approve_pending(item), daemon=True).start()
+            state.enqueue_approval(item.get("agent_id"),
+                                   lambda it=item: state.approve_pending(it))
             return self._json(202, {"id": pending_id, "state": "running"})
 
         def _set_staging(self, agent_id, body, user):
@@ -2787,7 +2856,16 @@ def make_handler(state):
                 if not agent:
                     return self._json(404, {"error": "not_found"})
                 ids = (body or {}).get("pending_ids") or []
-                threading.Thread(target=lambda: state.approve_actions(agent, ids), daemon=True).start()
+                # Claim to "queued" here (the double-click guard), then hand the batch
+                # to the agent's approval queue so back-to-back approvals run their MA
+                # sessions one after another in approval order, never concurrently.
+                items = [it for pid in ids
+                         if (it := registry.pending_claim(root, pid, user["user_id"],
+                                                          to_status="queued"))]
+                if items:
+                    state.enqueue_approval(
+                        agent["agent_id"],
+                        lambda a=agent, its=items: state.execute_claimed_actions(a, its))
                 return self._json(202, {"state": "running"})
             mst = re.match(r"^/agents/([^/]+)/staging$", rest)
             if mst:                                      # Spec 8: edit which apps are staged (no redeploy)
@@ -3808,6 +3886,16 @@ def main():
                                 collector_port=args.collector_port,
                                 cloud_backend=args.cloud_backend)
     state.start_scheduler()   # Spec 4 (no-op on the desktop node; see start_scheduler)
+    # Approval-queue boot recovery: a "queued" row's in-memory queue died with the
+    # previous process and its action was never sent — release it back to "pending"
+    # so the approve button honestly reappears. Skipped on the desktop node (it
+    # proxies approvals to the cloud, where the authoritative queue lives), and
+    # never run from the enqueue path (it would un-claim freshly queued rows).
+    if not state.cloud_backend:
+        try:
+            registry.pending_release_queued(state.sessions_root)
+        except Exception:                # noqa: BLE001 — recovery is best-effort
+            pass
     # The OS assigns the real port when PORT=0 (the desktop shell passes 0 so the
     # bind can never race another process) — report the bound port, not the request.
     port = httpd.server_address[1]

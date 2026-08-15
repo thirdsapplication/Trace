@@ -529,6 +529,7 @@ function proposalRow(p) {
   // lands on the state the user already saw rather than a different phrasing of it.
   const outcome = {
     executed: { cls: "ok", text: "✓ Done — this was sent" },
+    queued: { cls: "ok", text: "Queued…" },
     executing: { cls: "ok", text: "Sending…" },
     rejected: { cls: "bad", text: "Rejected — this won't be sent" },
   }[p.status] || { cls: "bad", text: `Not sent — ${esc(p.status)}` };
@@ -2085,7 +2086,8 @@ async function renderProfile(agentId) {
   if (statRow) {
     const props = sessionsList.flatMap(s => s.proposals || []);
     const decided = props.filter(p =>
-      p.status && p.status !== "pending" && p.status !== "executing");
+      p.status && p.status !== "pending" && p.status !== "queued"
+      && p.status !== "executing");
     const asIs = decided.filter(p => p.status === "executed" || p.status === "approved");
     const pct = decided.length ? Math.round((asIs.length / decided.length) * 100) : null;
     statRow.innerHTML = `

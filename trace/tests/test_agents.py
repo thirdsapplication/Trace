@@ -4,6 +4,7 @@ path so it doubles as a dual-run check. Two deploys add two agents (no clobber),
 scoped to the owner.
 """
 
+import datetime
 import json
 import os
 import tempfile
@@ -14,6 +15,7 @@ import urllib.error
 import urllib.request
 
 from trace.ui import app, registry, sessions, users
+from trace.tests.test_scheduler import FakeMA
 from trace.tests.test_ui import FakeController, FakeKeystore, fake_reconstruct
 
 
@@ -289,7 +291,7 @@ class ActivityEndpointTest(AgentsEndpointTest):
         st = None
         while time.time() < deadline:
             st = registry.pending_get(self.root, pend[0]["id"])["status"]
-            if st not in ("pending", "executing"):
+            if st not in ("pending", "queued", "executing"):
                 break
             time.sleep(0.02)
         self.assertEqual(st, "executed")
@@ -404,6 +406,225 @@ class DeploymentAgentActionsTest(AgentsEndpointTest):
             time.sleep(0.02)
         self.assertTrue(ma.sessions)                          # legacy path composed a session
         self.assertEqual(ma.manual_runs, [])
+
+
+class SerialMA(FakeMA):
+    """FakeMA that records how many sends overlap and in what order, with an
+    optional per-agent gate so a test can hold one agent's send open."""
+    def __init__(self, *args, delay=0.05, **kw):
+        super().__init__(*args, **kw)
+        self.delay = delay
+        self.gates = {}              # agent_id -> Event the send blocks on until set
+        self.sid_agent = {}          # run-sess-N -> agent_id
+        self.active = 0
+        self.max_active = 0
+        self.send_order = []         # trigger texts, in actual send order
+        self._track = threading.Lock()
+
+    def create_session(self, agent_id, env, resources, title=None, vault_ids=None):
+        sid = super().create_session(agent_id, env, resources, title, vault_ids)
+        self.sid_agent[sid] = agent_id
+        return sid
+
+    def send_trigger_and_collect(self, sid, trigger, timeout=None, max_events=None):
+        with self._track:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            self.send_order.append(trigger)
+        gate = self.gates.get(self.sid_agent.get(sid))
+        if gate is not None:
+            gate.wait(timeout=10)
+        elif self.delay:
+            time.sleep(self.delay)
+        with self._track:
+            self.active -= 1
+        return super().send_trigger_and_collect(sid, trigger, timeout, max_events)
+
+
+class ApprovalQueueTest(AgentsEndpointTest):
+    """Two quick approvals used to run their MA sessions concurrently (one bare
+    thread each). They now drain through a per-agent FIFO queue: same agent =
+    strictly one session at a time in approval order; different agents stay
+    independent."""
+
+    def _stage_two(self, uid, agent_id="agent-1"):
+        registry.agent_upsert(self.root, {
+            "agent_id": agent_id, "owner_user_id": uid, "external_user_id": "x",
+            "bundle_id": "wf", "name": f"WF {agent_id}", "vault_ref": "v",
+            "trigger": "t", "session_id": "s"})
+        for i in (1, 2):
+            registry.pending_add(self.root, {
+                "agent_id": agent_id, "owner_user_id": uid, "run_session_id": "rs",
+                "app": "gmail", "kind": "gmail-send-email",
+                "summary": f"Email {agent_id}-{i}",
+                "payload": {"to": f"{i}@x.com"}, "content_hash": f"{agent_id}-h{i}"})
+        pend = sorted((p for p in registry.pending_for_user(self.root, uid)
+                       if p["agent_id"] == agent_id), key=lambda p: int(p["id"]))
+        return [p["id"] for p in pend]
+
+    def _wait_for_send(self, ma, deadline_s=5):
+        deadline = time.time() + deadline_s
+        while time.time() < deadline and ma.active == 0:
+            time.sleep(0.01)
+        self.assertEqual(ma.active, 1)                        # a send is in flight
+
+    def test_same_agent_approvals_serialize_fifo(self):
+        uid, cookie = self._signup("q1@x.com")
+        id1, id2 = self._stage_two(uid)
+        ma = SerialMA()
+        self.state._live_client = lambda: ma
+        s1, _, _ = self._req("POST", f"/api/u/pending/{id1}/approve", {}, cookie=cookie)
+        s2, _, _ = self._req("POST", f"/api/u/pending/{id2}/approve", {}, cookie=cookie)
+        self.assertEqual((s1, s2), (202, 202))
+        self.assertTrue(self.state.flush_approvals())
+        self.assertEqual(ma.max_active, 1)                    # sessions never overlapped
+        self.assertIn("Email agent-1-1", ma.send_order[0])    # …and ran in approval order
+        self.assertIn("Email agent-1-2", ma.send_order[1])
+        for pid in (id1, id2):
+            self.assertEqual(registry.pending_get(self.root, pid)["status"], "executed")
+
+    def test_second_approval_waits_as_queued(self):
+        uid, cookie = self._signup("q2@x.com")
+        id1, id2 = self._stage_two(uid)
+        ma = SerialMA()
+        gate = threading.Event()
+        ma.gates["agent-1"] = gate
+        self.state._live_client = lambda: ma
+        try:
+            self._req("POST", f"/api/u/pending/{id1}/approve", {}, cookie=cookie)
+            self._wait_for_send(ma)
+            self._req("POST", f"/api/u/pending/{id2}/approve", {}, cookie=cookie)
+            # first is mid-send, so the second sits honestly queued, not executing
+            self.assertEqual(registry.pending_get(self.root, id1)["status"], "executing")
+            self.assertEqual(registry.pending_get(self.root, id2)["status"], "queued")
+        finally:
+            gate.set()
+        self.assertTrue(self.state.flush_approvals())
+        for pid in (id1, id2):
+            self.assertEqual(registry.pending_get(self.root, pid)["status"], "executed")
+
+    def test_different_agents_run_independently(self):
+        uid, cookie = self._signup("q3@x.com")
+        a1, _ = self._stage_two(uid, agent_id="agent-1")
+        b1, _ = self._stage_two(uid, agent_id="agent-2")
+        ma = SerialMA(delay=0)
+        gate = threading.Event()
+        ma.gates["agent-1"] = gate
+        self.state._live_client = lambda: ma
+        try:
+            self._req("POST", f"/api/u/pending/{a1}/approve", {}, cookie=cookie)
+            self._wait_for_send(ma)
+            self._req("POST", f"/api/u/pending/{b1}/approve", {}, cookie=cookie)
+            deadline = time.time() + 5
+            st = None
+            while time.time() < deadline:
+                st = registry.pending_get(self.root, b1)["status"]
+                if st == "executed":
+                    break
+                time.sleep(0.01)
+            self.assertEqual(st, "executed")     # agent-2 ran while agent-1 was held
+            self.assertEqual(registry.pending_get(self.root, a1)["status"], "executing")
+        finally:
+            gate.set()
+        self.assertTrue(self.state.flush_approvals())
+        self.assertEqual(registry.pending_get(self.root, a1)["status"], "executed")
+
+    def test_double_click_still_409(self):
+        uid, cookie = self._signup("q4@x.com")
+        id1, _ = self._stage_two(uid)
+        ma = SerialMA()
+        self.state._live_client = lambda: ma
+        s1, _, _ = self._req("POST", f"/api/u/pending/{id1}/approve", {}, cookie=cookie)
+        s2, d2, _ = self._req("POST", f"/api/u/pending/{id1}/approve", {}, cookie=cookie)
+        self.assertEqual(s1, 202)
+        self.assertEqual(s2, 409)                             # claim-to-queued is the guard
+        self.assertEqual(d2["error"], "already_processed")
+        self.assertTrue(self.state.flush_approvals())
+
+    def test_batch_approve_runs_once_through_queue(self):
+        uid, cookie = self._signup("q5@x.com")
+        id1, id2 = self._stage_two(uid)
+        ma = SerialMA(delay=0.2)
+        self.state._live_client = lambda: ma
+        s1, _, _ = self._req("POST", "/api/u/agents/agent-1/approve-actions",
+                             {"pending_ids": [id1, id2]}, cookie=cookie)
+        # both rows were claimed to "queued" before the 202 returned, so a repeat
+        # click claims nothing and enqueues nothing — yet still answers 202
+        s2, _, _ = self._req("POST", "/api/u/agents/agent-1/approve-actions",
+                             {"pending_ids": [id1, id2]}, cookie=cookie)
+        self.assertEqual((s1, s2), (202, 202))
+        self.assertTrue(self.state.flush_approvals())
+        self.assertEqual(len(ma.sessions), 1)                 # ONE batch session, not two
+        for pid in (id1, id2):
+            self.assertEqual(registry.pending_get(self.root, pid)["status"], "executed")
+
+    def test_worker_survives_bad_task(self):
+        ran = threading.Event()
+        def boom():
+            raise RuntimeError("bad task")
+        self.state.enqueue_approval("agent-x", boom)
+        self.state.enqueue_approval("agent-x", ran.set)
+        self.assertTrue(self.state.flush_approvals())
+        self.assertTrue(ran.is_set())                         # drain outlived the bad task
+
+
+class QueuedReaperTest(AgentsEndpointTest):
+    """The stale-"executing" reaper on the activity read path must never settle a
+    row that is only waiting in the approval queue — queue wait is not a crash."""
+
+    _TWO_ACTIONS = ('```proposed_actions\n'
+                    '[{"app": "Gmail", "action": "send email", "summary": "Email One", '
+                    '"details": {"to": "one@x.com"}}, '
+                    '{"app": "Gmail", "action": "send email", "summary": "Email Two", '
+                    '"details": {"to": "two@x.com"}}]\n```')
+
+    def test_reaper_leaves_queued_rows_alone(self):
+        uid, cookie = self._signup("qr@x.com")
+        registry.agent_upsert(self.root, {
+            "agent_id": "agent-1", "owner_user_id": uid, "external_user_id": "x",
+            "bundle_id": "wf", "name": "WF", "vault_ref": "v", "trigger": "t",
+            "session_id": "s", "staged_apps": ["gmail"]})
+        registry.run_add(self.root, {"agent_id": "agent-1", "owner_user_id": uid,
+                                     "status": "ran", "summary": "ran", "details": [],
+                                     "run_session_id": "sess-1"})
+        ma = SerialMA(events=[{"type": "agent.message", "text": self._TWO_ACTIONS},
+                              {"type": "session.thread_status_idle",
+                               "stop_reason": {"type": "end_turn"}}])
+        gate = threading.Event()
+        ma.gates["agent-1"] = gate
+        self.state._live_client = lambda: ma
+        self.state.summarize_fn = lambda s, u: "x"
+        try:
+            self._req("GET", "/api/u/agents/agent-1/activity", cookie=cookie)
+            id1, id2 = sorted((p["id"] for p in registry.pending_for_user(self.root, uid)),
+                              key=int)
+            self._req("POST", f"/api/u/pending/{id1}/approve", {}, cookie=cookie)
+            deadline = time.time() + 5
+            while time.time() < deadline and ma.active == 0:
+                time.sleep(0.01)
+            self._req("POST", f"/api/u/pending/{id2}/approve", {}, cookie=cookie)
+            self.assertEqual(registry.pending_get(self.root, id2)["status"], "queued")
+            # Backdate the queued row past the 15-minute stale-executing window,
+            # then reload the activity view — the read path that reaps. Safe to
+            # write the file directly: the worker is held inside the gated send.
+            path = os.path.join(self.root, "_registry", "pending.json")
+            with open(path, encoding="utf-8") as f:
+                d = json.load(f)
+            d[str(id2)]["processed_at"] = (
+                datetime.datetime.now().astimezone()
+                - datetime.timedelta(minutes=16)).isoformat(timespec="seconds")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(d, f)
+            _, data, _ = self._req("GET", "/api/u/agents/agent-1/activity", cookie=cookie)
+            self.assertEqual(registry.pending_get(self.root, id2)["status"], "queued")
+            statuses = {p["id"]: p["status"]
+                        for e in data["activity"] for p in e["proposals"]}
+            self.assertEqual(statuses[id2], "queued")         # rendered as waiting, not failed
+        finally:
+            gate.set()
+        self.assertTrue(self.state.flush_approvals())
+        for pid in (id1, id2):
+            self.assertEqual(registry.pending_get(self.root, pid)["status"], "executed")
 
 
 if __name__ == "__main__":

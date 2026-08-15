@@ -490,6 +490,37 @@ class SchedulerPassTest(unittest.TestCase):
         self.assertEqual(first["status"], "executing")
         self.assertIsNone(registry.pending_claim(self.root, pid, "usr_1"))  # double click
 
+    def test_pending_claim_to_status_queued(self):
+        # The approval queue claims into "queued" (send happens later, on the
+        # agent's worker) — same atomic pending-only predicate, same exclusivity.
+        registry.pending_add(self.root, {
+            "agent_id": "agent-1", "owner_user_id": "usr_1", "run_session_id": "rs",
+            "app": "gmail", "kind": "gmail-send-email", "summary": "Email Bob",
+            "payload": {}, "content_hash": "hq1"})
+        pid = registry.pending_for_user(self.root, "usr_1")[0]["id"]
+        it = registry.pending_claim(self.root, pid, "usr_1", to_status="queued")
+        self.assertEqual(it["status"], "queued")
+        self.assertIsNone(registry.pending_claim(self.root, pid, "usr_1"))  # double click
+
+    def test_release_queued_on_boot(self):
+        # Boot recovery: a "queued" row's in-memory queue died with the previous
+        # process and its action was never sent — release it back to approvable.
+        # An "executing" row is left for the stale reaper (outcome unknown).
+        for i, h in enumerate(("hr1", "hr2"), 1):
+            registry.pending_add(self.root, {
+                "agent_id": "agent-1", "owner_user_id": "usr_1", "run_session_id": "rs",
+                "app": "gmail", "kind": "gmail-send-email", "summary": f"Email {i}",
+                "payload": {}, "content_hash": h})
+        p1, p2 = sorted(registry.pending_for_user(self.root, "usr_1"),
+                        key=lambda p: int(p["id"]))
+        registry.pending_claim(self.root, p1["id"], "usr_1", to_status="queued")
+        registry.pending_claim(self.root, p2["id"], "usr_1")            # executing
+        registry.pending_release_queued(self.root)
+        r1 = registry.pending_get(self.root, p1["id"])
+        self.assertEqual(r1["status"], "pending")                       # approvable again
+        self.assertIsNone(r1["processed_at"])
+        self.assertEqual(registry.pending_get(self.root, p2["id"])["status"], "executing")
+
     def test_stale_executing_claim_settles_failed_on_view(self):
         # A claim orphaned by a crash mid-execution must not say "Sending…" forever:
         # the activity view settles anything executing for >15 minutes to failed.
