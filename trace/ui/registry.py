@@ -437,15 +437,17 @@ def pending_get(root, pending_id):
     return _load(root, "pending.json").get(str(pending_id))
 
 
-def pending_claim(root, pending_id, owner_user_id):
-    """Atomically move one of this owner's rows from "pending" to "executing" and
+def pending_claim(root, pending_id, owner_user_id, to_status="executing"):
+    """Atomically move one of this owner's rows from "pending" to ``to_status`` and
     return it, or None if it wasn't claimable (already claimed, already decided, or
     not theirs). The status predicate makes the claim exclusive — of two racing
-    approvals exactly one gets the row, so the same action can't be sent twice."""
+    approvals exactly one gets the row, so the same action can't be sent twice.
+    ``to_status="queued"`` claims into the approval queue (the send happens later,
+    when the agent's worker reaches it) without starting the stale-executing clock."""
     if supa.is_configured():
         admin = supa.get_admin()
         r = admin.table("pending_actions").update({
-            "status": "executing", "processed_at": _now_iso()
+            "status": to_status, "processed_at": _now_iso()
         }).eq("id", str(pending_id)) \
             .eq("owner_id", owner_user_id) \
             .eq("status", "pending").execute()
@@ -456,7 +458,7 @@ def pending_claim(root, pending_id, owner_user_id):
         if (not it or it.get("owner_user_id") != owner_user_id
                 or it.get("status") != "pending"):
             return None
-        it["status"] = "executing"
+        it["status"] = to_status
         it["processed_at"] = _now_iso()
         _save(root, "pending.json", d)
         return dict(it)
@@ -475,6 +477,28 @@ def pending_set_status(root, pending_id, status):
         if it:
             it["status"] = status
             it["processed_at"] = _now_iso()
+            _save(root, "pending.json", d)
+
+
+def pending_release_queued(root):
+    """Boot recovery: a "queued" row belongs to an in-memory approval queue that no
+    longer exists after a restart, and its action was provably never sent — release
+    it back to "pending" so the approve button honestly reappears. Never touches
+    "executing" rows (outcome unknown; the stale reaper owns those — an auto-requeue
+    could double-send)."""
+    if supa.is_configured():
+        admin = supa.get_admin()
+        admin.table("pending_actions").update({
+            "status": "pending", "processed_at": None
+        }).eq("status", "queued").execute()
+        return
+    with _LOCK:
+        d = _load(root, "pending.json")
+        changed = False
+        for it in d.values():
+            if it.get("status") == "queued":
+                it["status"], it["processed_at"], changed = "pending", None, True
+        if changed:
             _save(root, "pending.json", d)
 
 
