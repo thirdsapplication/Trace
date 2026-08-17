@@ -436,6 +436,15 @@ button.sn-row:hover { border-color: var(--line); }
   animation: skPulse 1.6s ease-in-out infinite; }
 .bd-dot.on { background: var(--ok); border-color: var(--ok); animation: none; }
 
+/* review (08): one row of three exclusive answers. Sized so all three read as peers —
+   "Not a workflow" is a normal answer, not a destructive one. */
+.rev-acts { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
+.rev-3 { flex: 1; min-width: 132px; background: var(--panel); border: 1.5px solid var(--line-2);
+  border-radius: 11px; padding: 10px 14px; font: inherit; font-size: 13px; font-weight: 600;
+  color: var(--ink-2); cursor: pointer; }
+.rev-3:hover { border-color: var(--line); color: var(--ink); }
+.rev-3.on { border-color: var(--accent); background: var(--accent-bg); color: var(--accent); }
+
 /* review (08): the cadence sits under the name, where it reads as part of the workflow's
    identity rather than one more labelled field in the body. */
 .rev-cadence { font-size: 12px; color: var(--ink-3); margin-top: 2px; }

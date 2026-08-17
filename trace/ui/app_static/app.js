@@ -2489,8 +2489,8 @@ async function stepReview() {
   const sid = S.session.id;
   // Frame 08's voice: it asks, rather than announcing what it produced.
   shell(`<div class="panel"><h1 class="rec-head" style="font-size:26px;">Did I get these right?</h1>
-    <p class="lead">Correct anything — this is what your agents will be built from. What you
-      mark <b>Automate</b> gets built; <b>Manual</b> stays yours to handle.</p>
+    <p class="lead">Correct anything — this is what your agents will be built from.
+      Anything you mark <b>not a workflow</b> stays yours to handle.</p>
     <div id="revBody"><p class="muted">Loading…</p></div></div>`);
   const { ok, data } = await uget(sid, "/review-data");
   if (!ok) { $("#revBody").innerHTML = `<p class="msg err">${friendly(data.error)}</p>`; return; }
@@ -2508,6 +2508,27 @@ async function stepReview() {
     corr[it.id] = it.user_description || "";
   });
   const resolved = (id) => und[id] === "confirmed" || (und[id] === "corrected" && corr[id].trim());
+
+  // Frame 08 is ONE row of three, not two rows of two. It used to ask twice — first
+  // "Looks right / Not quite", then "Automate / Manual" — which are the same decision
+  // seen from two angles, and left you able to mark a workflow correct AND manual with
+  // no idea which mattered. Three exclusive answers, and each writes both pieces of
+  // state, so `understanding` and `classification` can no longer disagree.
+  const REV_CHOICES = [["ok", "✓ Looks right"], ["fix", "Fix details"],
+                       ["no", "Not a workflow"]];
+  const choiceOf = (id) => {
+    if (cls[id] === "anti_bundle" && und[id]) return "no";
+    if (und[id] === "corrected") return "fix";
+    if (und[id] === "confirmed") return "ok";
+    return "";                                       // unanswered — Continue stays gated
+  };
+  const setChoice = (id, k) => {
+    if (k === "ok") { und[id] = "confirmed"; cls[id] = "bundle"; }
+    else if (k === "fix") { und[id] = "corrected"; cls[id] = "bundle"; }
+    // "Not a workflow" IS the answer — there is nothing left to correct about a thing
+    // you have just said is not a workflow, so it resolves rather than re-asking.
+    else if (k === "no") { und[id] = "confirmed"; cls[id] = "anti_bundle"; }
+  };
   // the one-line reason the engine gave (fall back to the internal "why" fields)
   const reasonOf = (it) => it.rationale || it.why_automatable || it.why_judgment || "";
   // plain-language summary of what palza thinks this workflow is (anti_bundles
@@ -2537,17 +2558,14 @@ async function stepReview() {
       <div class="sub" style="margin-top:6px;">${reason ? esc(reason) : `<span class="muted">no reason given</span>`}</div>
       <div class="sub" style="margin-top:10px;"><b>What we think this workflow is</b></div>
       ${summary(it)}
-      <div class="row" style="margin-top:10px;gap:6px;">
-        <button class="und ${und[id] === "confirmed" ? "btn-accent" : "btn-secondary"} btn-sm" data-id="${esc(id)}" data-act="confirmed">Looks right</button>
-        <button class="und ${und[id] === "corrected" ? "btn-accent" : "btn-secondary"} btn-sm" data-id="${esc(id)}" data-act="corrected">Not quite — fix it</button>
+      <div class="rev-acts">
+        ${REV_CHOICES.map(([k, label]) =>
+          `<button class="rev-3${choiceOf(id) === k ? " on" : ""}" data-id="${esc(id)}"
+            data-choice="${k}">${label}</button>`).join("")}
       </div>
-      ${und[id] === "corrected" ? `<div class="field" style="margin-top:8px;">
+      ${choiceOf(id) === "fix" ? `<div class="field" style="margin-top:8px;">
         <textarea class="corr" data-id="${esc(id)}" rows="3" placeholder="In a line or two: what actually happens — what kicks it off, what you do, and where the result ends up.">${esc(corr[id])}</textarea>
       </div>` : ""}
-      <div class="row" style="margin-top:10px;gap:6px;">
-        <button class="flip ${auto ? "btn-accent" : "btn-secondary"} btn-sm" data-id="${esc(id)}" data-to="bundle">Automate</button>
-        <button class="flip ${auto ? "btn-secondary" : "btn-accent"} btn-sm" data-id="${esc(id)}" data-to="anti_bundle">Manual</button>
-      </div>
     </div>`;
   };
 
@@ -2556,18 +2574,15 @@ async function stepReview() {
     const n = items.filter(it => cls[it.id] === "bundle").length;
     $("#revGo").disabled = !!left;
     $("#revGo").textContent = left
-      ? `Confirm or fix ${left} more`
+      ? `Answer ${left} more`                              // three choices now, not two
       : (n ? `Continue · ${n} confirmed` : "Continue");        // frame 08's wording
   };
 
   const paint = () => {
     $("#revStack").innerHTML = items.length
       ? items.map(card).join("") : `<p class="muted">Nothing to review.</p>`;
-    root.querySelectorAll(".flip").forEach(b => b.onclick = () => {
-      cls[b.dataset.id] = b.dataset.to; paint();
-    });
-    root.querySelectorAll(".und").forEach(b => b.onclick = () => {
-      und[b.dataset.id] = b.dataset.act; paint();
+    root.querySelectorAll(".rev-3").forEach(b => b.onclick = () => {
+      setChoice(b.dataset.id, b.dataset.choice); paint();
     });
     // update state + gating without repainting, so typing is never interrupted
     root.querySelectorAll(".corr").forEach(t => t.oninput = () => {
