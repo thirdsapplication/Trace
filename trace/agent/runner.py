@@ -363,7 +363,10 @@ def _rejected_preamble(rejected):
     Rejecting only set the row's status, which the agent never sees — so the next run
     re-proposed the identical action and rejecting taught the system nothing. A rejection
     is a signal ("don't do this"), and it has to reach the agent to act like one.
-    ``rejected`` is a list of ``{summary, app}`` from recently rejected proposals.
+    ``rejected`` is a list of ``{summary, app, why_rejected}`` from recently rejected
+    proposals. The REASON matters more than the fact: "don't propose this" stops one
+    action, while "the ship date isn't confirmed yet" tells the agent what to do
+    differently — and the card has always promised to ask for it.
     """
     lines = []
     for r in rejected or []:
@@ -371,7 +374,9 @@ def _rejected_preamble(rejected):
         if not summary:
             continue
         app = str((r or {}).get("app") or "").strip()
-        lines.append(f"- {summary}" + (f"  [{app}]" if app else ""))
+        why = str((r or {}).get("why_rejected") or "").strip()
+        lines.append(f"- {summary}" + (f"  [{app}]" if app else "")
+                     + (f"\n    they said: {why}" if why else ""))
     if not lines:
         return ""
     return ("ALREADY REJECTED BY THE HUMAN — do NOT propose these again, and do not "

@@ -643,9 +643,49 @@ function wireProposalActions(scope, agentId, after) {
   });
   el.querySelectorAll(".prop-no").forEach(b => b.onclick = async () => {
     const id = b.dataset.id;
+    const reason = await askWhy();
+    if (reason === null) return;                     // cancelled — nothing rejected
     settleProposalCard(id, "Rejected — this won't be sent", false);
-    await api("POST", `/api/u/pending/${id}/reject`, {});
+    await api("POST", `/api/u/pending/${id}/reject`, { reason });
     if (after) after({ ok: true });
+  });
+}
+
+// The card has always said "Reject asks one line: why?" and nothing ever asked. A
+// rejection with no reason tells the agent an action was unwanted and never what was
+// wrong with it — and the reason is what the next proposal could actually use. Optional
+// on purpose: a required field would just collect "no" from people in a hurry.
+function askWhy() {
+  return new Promise(resolve => {
+    const el = document.createElement("div");
+    el.className = "pop-back";
+    el.innerHTML = `<div class="pop pop-confirm" role="dialog" aria-modal="true">
+        <div class="pop-title">Why not?</div>
+        <p class="cf-body">One line is enough. The agent uses it so the same thing
+          doesn't come back next run — and it becomes a lesson it remembers.</p>
+        <input type="text" id="whyText" class="cf-input" autocomplete="off"
+               placeholder="e.g. the ship date isn't confirmed yet">
+        <div class="cf-acts">
+          <button class="btn-secondary" id="whyNo">Cancel</button>
+          <button class="btn-primary" id="whyGo">Reject</button>
+        </div>
+      </div>`;
+    document.body.appendChild(el);
+    const input = el.querySelector("#whyText");
+    const done = (v) => {
+      document.removeEventListener("keydown", onKey);
+      el.remove();
+      resolve(v);
+    };
+    const onKey = (e) => {
+      if (e.key === "Escape") done(null);
+      if (e.key === "Enter") done(input.value.trim());
+    };
+    el.onclick = (e) => { if (e.target === el) done(null); };
+    el.querySelector("#whyNo").onclick = () => done(null);
+    el.querySelector("#whyGo").onclick = () => done(input.value.trim());
+    document.addEventListener("keydown", onKey);
+    input.focus();
   });
 }
 
@@ -1566,7 +1606,9 @@ function renderReview(agentId, startAt) {
       }, 3500));
     });
     root.querySelectorAll(".prop-no").forEach(b => b.onclick = async () => {
-      await api("POST", `/api/u/pending/${b.dataset.id}/reject`, {});
+      const reason = await askWhy();                 // same prompt as Session history
+      if (reason === null) return;
+      await api("POST", `/api/u/pending/${b.dataset.id}/reject`, { reason });
       st.proposals = (st.proposals || []).filter(p => String(p.id) !== String(b.dataset.id));
       draw();
     });

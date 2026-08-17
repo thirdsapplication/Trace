@@ -464,12 +464,28 @@ def pending_claim(root, pending_id, owner_user_id, to_status="executing"):
         return dict(it)
 
 
-def pending_set_status(root, pending_id, status):
+# The human's reason for rejecting, kept inside the payload JSON under a reserved key.
+# There is no column for it, and `rationale` is the AGENT's reason for proposing — a
+# different thing by a different author. This avoids a migration for one string.
+REJECT_REASON_KEY = "_reject_reason"
+
+
+def pending_set_status(root, pending_id, status, reason=None):
+    """Set a pending action's status, optionally recording WHY it was rejected.
+
+    The proposal card promises "Reject asks one line: why?" and nothing ever captured
+    one, so a rejection told the agent an action was unwanted and never what was wrong
+    with it — which is the half that could have changed the next proposal.
+    """
+    reason = str(reason or "").strip()[:500]
     if supa.is_configured():
         admin = supa.get_admin()
-        admin.table("pending_actions").update({
-            "status": status, "processed_at": _now_iso()
-        }).eq("id", str(pending_id)).execute()
+        fields = {"status": status, "processed_at": _now_iso()}
+        if reason:
+            cur = pending_get(root, pending_id) or {}
+            fields["payload"] = dict(cur.get("payload") or {},
+                                     **{REJECT_REASON_KEY: reason})
+        admin.table("pending_actions").update(fields).eq("id", str(pending_id)).execute()
         return
     with _LOCK:
         d = _load(root, "pending.json")
@@ -477,6 +493,9 @@ def pending_set_status(root, pending_id, status):
         if it:
             it["status"] = status
             it["processed_at"] = _now_iso()
+            if reason:
+                it["payload"] = dict(it.get("payload") or {},
+                                     **{REJECT_REASON_KEY: reason})
             _save(root, "pending.json", d)
 
 

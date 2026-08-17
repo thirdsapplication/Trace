@@ -2063,7 +2063,11 @@ class AppState:
         except Exception:                              # noqa: BLE001 — best-effort
             return []
         aid = agent.get("agent_id")
-        return [{"summary": r.get("summary"), "app": r.get("app")}
+        # Carry the human's stated reason where there is one. "Don't propose this again"
+        # tells the agent an action was unwanted; "the customer hasn't confirmed the ship
+        # date yet" tells it what to do differently, which is the whole point of asking.
+        return [{"summary": r.get("summary"), "app": r.get("app"),
+                 "why_rejected": (r.get("payload") or {}).get(registry.REJECT_REASON_KEY, "")}
                 for r in rows if r.get("agent_id") == aid][:limit]
 
     def _refresh_agent_binding(self, agent):
@@ -2481,7 +2485,7 @@ def make_handler(state):
                 return self._json(202, {"state": "running"})
             return self._json(404, {"error": "not_found"})
 
-        def _pending_action(self, pending_id, action, user):
+        def _pending_action(self, pending_id, action, user, body=None):
             """Spec 8: approve (Trace performs the staged action) or reject (discard) one
             pending item. Scoped to the owner. Approve runs async (a real connector call
             can take time); the dashboard polls /api/u/pending for the outcome."""
@@ -2491,7 +2495,8 @@ def make_handler(state):
             if action == "reject":
                 if item.get("status") != "pending":
                     return self._json(409, {"error": "already_processed"})
-                registry.pending_set_status(root, pending_id, "rejected")
+                registry.pending_set_status(root, pending_id, "rejected",
+                                            reason=(body or {}).get("reason"))
                 # A deployment-backed agent runs against text baked in at deploy time, so
                 # the rejection only reaches it by recreating the deployment. Async and
                 # best-effort: the rejection itself is already saved, and a platform
@@ -2869,7 +2874,7 @@ def make_handler(state):
                 return self._json(202, {"state": "running"})
             mp = re.match(r"^/pending/([^/]+)/(approve|reject)$", rest)
             if mp:                                       # Spec 8: approve/reject a staged action
-                return self._pending_action(mp.group(1), mp.group(2), user)
+                return self._pending_action(mp.group(1), mp.group(2), user, body)
             md = re.match(r"^/agents/([^/]+)/delete-capture-data$", rest)
             if md:                                       # delete this workflow's capture data
                 return self._delete_capture_data(md.group(1), user)
