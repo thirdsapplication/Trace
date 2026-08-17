@@ -1142,9 +1142,14 @@ async function setApps() {
         <div class="grow">
           <div class="set-row-t">${esc(a.label || s)}</div>
           <div class="set-sub${expired ? " warn" : ""}">${expired
-            ? "Session expired — reconnect to let its agents run again"
+            ? `Session expired — ${(a.used_by || []).length
+                ? esc((a.used_by || []).join(", ")) + " " +
+                  ((a.used_by || []).length === 1 ? "is" : "are") + " paused until you reconnect"
+                : "reconnect to let its agents run again"}`
             : (a.usable ? "Connected · outbound actions are staged for your approval"
                         : "Not connected")}</div>
+          ${!expired && (a.used_by || []).length
+            ? `<div class="set-sub">${esc((a.used_by || []).join(", "))}</div>` : ""}
         </div>
         <span class="pill ${a.usable ? "pill-on" : (expired ? "pill-warn" : "pill-off")}">${
           a.usable ? "CONNECTED" : (expired ? "EXPIRED" : "OFF")}</span>
@@ -2974,7 +2979,10 @@ async function renderConnect(sid) {
     let action = `<button class="btn-primary btn-sm conn-go" data-slug="${esc(slug)}">Connect</button>`;
     if (a.usable) { status = `<span class="pill pill-on">● connected</span>`; action = ""; }
     else if (a.connected && a.flag) { status = `<span class="pill pill-warn">check email</span>`; }
+    // Frame 12 captions each app with the workflows that need it, and why it's staged.
+    const used = (a.used_by || []).join(" · ");
     return `<div class="card spread"><div><div class="title">${esc(a.label || slug)}</div>
+      ${used ? `<div class="sub muted">${esc(used)} — outbound stays staged for you</div>` : ""}
       ${a.flag ? `<div class="sub" style="color:#b06a14;">${esc(a.flag)}</div>` : ""}</div>
       <div class="row">${status}${action}</div></div>`;
   };

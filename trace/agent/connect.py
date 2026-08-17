@@ -74,6 +74,19 @@ def app_union(approved_bundles, event_log):
     event-driven: prose naming an unknown app is not deterministically detectable."""
     idx = {e.get("id"): e for e in (event_log or []) if isinstance(e, dict)}
     by_slug, unmapped, seen_unmapped = {}, [], set()
+    # WHICH WORKFLOWS NEED EACH APP. This loop already knows — it is iterating bundles —
+    # and the answer was thrown away when everything collapsed into by_slug. Frames 12 and
+    # 26 both caption an app with the agents that need it ("Retail recap · Inbox triage"),
+    # and neither could, for want of keeping a name we already had in hand.
+    def _note(slug, bundle):
+        name = (bundle.get("user_description") or bundle.get("name")
+                or bundle.get("id") or "").strip()
+        if not name:
+            return
+        used = by_slug[slug].setdefault("used_by", [])
+        if name not in used:
+            used.append(name)
+
     for b in approved_bundles or []:
         for eid in b.get("evidence_event_ids", []):
             ev = idx.get(eid)
@@ -88,6 +101,7 @@ def app_union(approved_bundles, event_log):
                                          "observed_as": [m["observed_as"]]}
                     elif m["observed_as"] not in by_slug[slug]["observed_as"]:
                         by_slug[slug]["observed_as"].append(m["observed_as"])
+                    _note(slug, b)
                 continue
             app = (ev.get("app") or "").strip()            # nothing matched -> surface it
             if app and app.lower() not in seen_unmapped:
@@ -101,6 +115,7 @@ def app_union(approved_bundles, event_log):
                 by_slug[m["slug"]] = {"slug": m["slug"], "label": m["label"],
                                       "observed_as": [f"named in workflow: "
                                                       f"{b.get('name') or b.get('id') or '?'}"]}
+            _note(m["slug"], b)
     return list(by_slug.values()), unmapped
 
 
@@ -124,6 +139,8 @@ def new_record(external_user_id, union=None, expected_identity=""):
     apps = {}
     for a in (union or []):
         apps[a["slug"]] = {"label": a["label"], "observed_as": a.get("observed_as", []),
+                           # which workflows need this app (12, 26)
+                           "used_by": list(a.get("used_by") or []),
                            "connected": False, "usable": False,
                            "account": {"account_id": None, "identity_email": None},
                            "verified": "unverified", "flag": None, "binding_ref": None}
@@ -137,11 +154,14 @@ def merge_union(record, union, unmapped):
     for a in union:
         record["apps"].setdefault(a["slug"], {
             "label": a["label"], "observed_as": a.get("observed_as", []),
+            "used_by": list(a.get("used_by") or []),
             "connected": False, "usable": False,
             "account": {"account_id": None, "identity_email": None},
             "verified": "unverified", "flag": None, "binding_ref": None})
         record["apps"][a["slug"]]["label"] = a["label"]
         record["apps"][a["slug"]]["observed_as"] = a.get("observed_as", [])
+        # recomputed each time: a re-review can add or drop a workflow
+        record["apps"][a["slug"]]["used_by"] = list(a.get("used_by") or [])
     record["unmapped"] = list(unmapped)
     record["updated_at"] = _now()
     return record

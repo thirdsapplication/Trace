@@ -82,6 +82,30 @@ class AppUnionTest(unittest.TestCase):
                 self.assertIn("slug", a)
                 self.assertIn("label", a)
 
+    def test_union_records_which_workflows_need_each_app(self):
+        """Frames 12 and 26 caption an app with the workflows that need it. app_union was
+        already iterating bundles when it found each app and threw that away collapsing
+        into by_slug — so neither screen could say it, for want of a name already in hand.
+        """
+        bundles, ev = _approved("marcy")
+        apps, _ = connect.app_union(bundles, ev)
+        named = {a["slug"]: a.get("used_by") or [] for a in apps}
+        self.assertTrue(any(named.values()), "no app recorded a workflow")
+        for slug, used in named.items():
+            self.assertEqual(len(used), len(set(used)), f"{slug} repeated a workflow")
+            for name in used:
+                self.assertTrue(name.strip())              # never a blank caption
+
+    def test_used_by_survives_into_the_record_and_a_refresh(self):
+        bundles, ev = _approved("marcy")
+        union, unmapped = connect.app_union(bundles, ev)
+        rec = connect.new_record("trace-user-x", union)
+        pick = next(s for s, a in rec["apps"].items() if a["used_by"])
+        before = list(rec["apps"][pick]["used_by"])
+        # a re-review recomputes the union; the caption must follow it, not go stale
+        connect.merge_union(rec, union, unmapped)
+        self.assertEqual(rec["apps"][pick]["used_by"], before)
+
     def test_union_maps_known_apps_and_surfaces_unmapped(self):
         bundles, ev = _approved("marcy")
         apps, unmapped = connect.app_union(bundles, ev)
