@@ -1983,8 +1983,13 @@ class AppState:
                 "needs_you": needs_you, "fyi_reviews": fyi_reviews,
                 "unread": unread.get(aid, 0),
                 "replying": (self.chat_jobs.get(aid) or {}).get("state") == "running"})
+        # Frame 14's strip. Two figures, both counted; the frame's third — hours of
+        # busywork handled — has nothing behind it, so it is left out rather than guessed.
+        week = registry.week_stats(root, uid, agent_ids,
+                                   sessions.iso_days_ago(7))
         return {"agents": agents_out, "unread_total": sum(unread.values()),
-                "needs_you_total": sum(a["needs_you"] for a in agents_out)}
+                "needs_you_total": sum(a["needs_you"] for a in agents_out),
+                "week": week}
 
     def apply_platform_schedule(self, agent, cadence):
         """Re-point a deployment agent at the requested cadence. Deployments are

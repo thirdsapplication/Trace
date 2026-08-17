@@ -1449,6 +1449,18 @@ async function renderHome() {
   if (SCREEN === token && JSON.stringify(fresh) !== JSON.stringify(cached)) drawHome(fresh);
 }
 
+// Frame 14's footer strip. TWO figures, not the frame's three — "about 2h 10m of busywork
+// handled" has no source, and nothing measures run duration. Hidden entirely in a week
+// with nothing in it, because "0 runs · 0 actions approved" is a worse thing to read
+// under your morning brief than no line at all.
+function weekLine(week) {
+  const runs = (week && week.runs) || 0, ok = (week && week.approved) || 0;
+  if (!runs && !ok) return "";
+  const bits = [`${runs} run${runs === 1 ? "" : "s"}`];
+  if (ok) bits.push(`${ok} action${ok === 1 ? "" : "s"} approved`);
+  return `<div class="wk-line">This week: ${bits.join(" · ")}</div>`;
+}
+
 function drawHome(home) {
   const agents = home.agents || [];
   const tb = agentsTopbar(home.unread_total, null, home.needs_you_total, "home");
@@ -1505,6 +1517,7 @@ function drawHome(home) {
         <div class="label">Overnight</div>
         <div class="ov-row">${need.concat(clean).map(card).join("")}</div>
       </div>` : `<p class="muted">No agents yet — record a workflow to build your first.</p>`}
+      ${weekLine(home.week)}
     </div>`);
   tb.wire();
   const first = need[0] || agents[0];

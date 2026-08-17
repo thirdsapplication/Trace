@@ -1442,6 +1442,47 @@ def summary_get(root, session_id):
     return _load(root, "session_summaries.json").get(session_id)
 
 
+def week_stats(root, owner_user_id, agent_ids, since_iso):
+    """Frame 14's strip: runs, and actions you approved, over a window.
+
+    Two counts, two queries. The frame shows a third — "about 2h 10m of busywork
+    handled" — and nothing measures run duration, so it is not here: two true numbers
+    beat three where one is guessed.
+
+    "Approved" counts EXECUTED and FAILED together, because both were approved by a
+    human; only the outcome differed. Counting executed alone would quietly undercount
+    the thing the number is actually about.
+    """
+    ids = [a for a in (agent_ids or []) if a]
+    out = {"runs": 0, "approved": 0}
+    _APPROVED = ("executed", "failed")
+    if supa.is_configured():
+        try:
+            if ids:
+                r = supa.get_admin().table("agent_runs").select("id", count="exact") \
+                    .in_("agent_id", ids).gte("started_at", since_iso).execute()
+                out["runs"] = r.count or 0
+            p = supa.get_admin().table("pending_actions").select("id", count="exact") \
+                .eq("owner_id", owner_user_id).in_("status", list(_APPROVED)) \
+                .gte("processed_at", since_iso).execute()
+            out["approved"] = p.count or 0
+        except Exception:                                  # noqa: BLE001 — Home must paint
+            pass
+        return out
+    # File mode keeps runs as one JSONL per agent (runs_<agent>.jsonl), not a single
+    # dict — reuse runs_for_agent rather than re-deriving the layout here and getting it
+    # wrong. The limit is generous: this is a 7-day count, not a feed.
+    for aid in ids:
+        for r in runs_for_agent(root, aid, 500):
+            if str(r.get("ran_at") or "") >= since_iso:
+                out["runs"] += 1
+    for it in _load(root, "pending.json").values():
+        if it.get("owner_user_id") == owner_user_id and it.get("status") in _APPROVED \
+                and str(it.get("processed_at") or "") >= since_iso:
+            out["approved"] += 1
+    return out
+
+
 def summaries_many(root, session_ids):
     """Every run summary in ONE query, keyed by session id.
 

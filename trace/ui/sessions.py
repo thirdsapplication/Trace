@@ -46,6 +46,13 @@ def _now():
     return datetime.datetime.now().astimezone().isoformat(timespec="seconds")
 
 
+def iso_days_ago(days):
+    """Timestamp `days` back, same shape as _now() so string comparison holds in file
+    mode and PostgREST's gte() gets a value it can parse."""
+    return (datetime.datetime.now().astimezone()
+            - datetime.timedelta(days=days)).isoformat(timespec="seconds")
+
+
 def new_session_id():
     # filesystem-safe, sortable
     return datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
