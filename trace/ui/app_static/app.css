@@ -436,6 +436,11 @@ button.sn-row:hover { border-color: var(--line); }
   animation: skPulse 1.6s ease-in-out infinite; }
 .bd-dot.on { background: var(--ok); border-color: var(--ok); animation: none; }
 
+/* team (30): a pending invite reads as provisional — dashed, not filled. */
+.tm-pending { background: var(--inset); color: var(--ink-3);
+  border: 1.5px dashed var(--line-2); }
+.tm-invite { margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--line); }
+
 /* home (14): the week's tally, under the brief. Quiet — it is context, not a call. */
 .wk-line { margin-top: 26px; padding-top: 16px; border-top: 1px solid var(--line);
   font-size: 12.5px; color: var(--ink-3); }

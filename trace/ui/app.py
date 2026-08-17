@@ -64,7 +64,7 @@ from ..agent import activity as agent_activity
 from ..agent import embeddings as agent_embeddings
 from ..agent import generalize as agent_generalize
 from . import (cloud, keystore, notify, permissions, registry, sessions,
-               supabase_client, users)
+               supabase_client, teams, users)
 
 
 def _write_json(path, obj):
@@ -556,6 +556,40 @@ class AppState:
         return self._tap("activity", None, agent_config.SUMMARY_MODEL,
                          lambda: agent_configgen._default_model_fn(agent_config.SUMMARY_MODEL))
 
+    # --- teams (frame 30) -------------------------------------------------
+    def team_view(self, user):
+        """The whole Team tab in one read: the team, its members with their agent counts,
+        and the invites nobody has accepted. No team yet is a normal state, not an error —
+        one is created by the first invite."""
+        root, uid = self.sessions_root, user["user_id"]
+        t = teams.team_for_user(root, uid)
+        if not t:
+            return {"team": None, "members": [], "invites": [],
+                    "email_configured": notify.is_configured()}
+        rows = []
+        for m in teams.members(root, t["team_id"]):
+            who = users.get(m["user_id"]) or {}
+            try:
+                live = len(registry.agents_for_user(root, m["user_id"]))
+            except Exception:                              # noqa: BLE001
+                live = 0
+            rows.append({"user_id": m["user_id"], "email": who.get("email") or "",
+                         "role": m.get("role"), "agents_live": live,
+                         "is_you": m["user_id"] == uid})
+        return {"team": t, "members": rows,
+                "invites": teams.pending_invites(root, t["team_id"]),
+                "email_configured": notify.is_configured()}
+
+    def _team_admin(self, user):
+        """``(team, None)`` when this user may change the team, ``(None, response)`` when
+        not. Membership alone is not enough — only an admin mutates."""
+        t = teams.team_for_user(self.sessions_root, user["user_id"])
+        if not t:
+            return None, None                              # caller decides (invite creates)
+        if t.get("role") != "admin":
+            return None, {"error": "not_admin"}
+        return t, None
+
     def agent_safety_rules(self, agent):
         """The escalation rules this agent stops for — what frame 10 collected.
 
@@ -812,8 +846,12 @@ class AppState:
             if kvecs:
                 kind_emb = kvecs[0]
                 registry.agent_embedding_upsert(root, aid, kind_emb)
-        hits = registry.retrieve_lessons(root, svecs[0], agent, agent_kind_embedding=kind_emb,
-                                         consume_scope=scopes["consume_scope"])
+        hits = registry.retrieve_lessons(
+            root, svecs[0], agent, agent_kind_embedding=kind_emb,
+            consume_scope=scopes["consume_scope"],
+            # Migration 018 has been applied and its parameters went unused — team scope
+            # kept collapsing to owner-only for want of this argument.
+            team_owners=teams.owner_ids(root, agent.get("owner_user_id")))
         inject = []
         for h in hits:
             if h["tier"] == "own":
@@ -2238,6 +2276,19 @@ def make_handler(state):
                 return {}
 
         # --- auth (WS3): cookie <-> end-user; the Test UI never uses any of this ---
+        def _app_url(self):
+            """Where to send an invited person. Built from the request's own Host so the
+            link matches however the sender reached the app — a hard-coded base URL is
+            wrong for whichever of local / Render / a custom domain it wasn't written for.
+            Honours X-Forwarded-Proto, since Render terminates TLS in front of us."""
+            host = (self.headers.get("X-Forwarded-Host")
+                    or self.headers.get("Host") or "").strip()
+            if not host:
+                return "/app"
+            proto = (self.headers.get("X-Forwarded-Proto") or "").strip() \
+                or ("http" if host.startswith(("localhost", "127.0.0.1")) else "https")
+            return f"{proto}://{host}/app"
+
         def _cookie(self, name):
             for part in (self.headers.get("Cookie", "") or "").split(";"):
                 k, _, v = part.strip().partition("=")
@@ -2405,6 +2456,14 @@ def make_handler(state):
                 u, token = users.create_user((body or {}).get("email"), (body or {}).get("password"))
             except ValueError as e:
                 return self._json(400, {"error": str(e)})
+            # If somebody invited this address, joining is the whole point of the invite.
+            # Without this, an invite can be created, listed, resent and cancelled and
+            # never once put anybody in a team. Best-effort: a team problem must not cost
+            # someone their account.
+            try:
+                teams.accept_for(root, u.get("email"), u["user_id"])
+            except Exception:                              # noqa: BLE001
+                traceback.print_exc()
             return self._json_auth(200, {"user": u}, set_token=users.start_session(u["user_id"], token))
 
         def _auth_login(self, body):
@@ -2489,6 +2548,78 @@ def make_handler(state):
                     threading.Thread(target=lambda: state.run_agent(agent), daemon=True).start()
                 return self._json(202, {"state": "running"})
             return self._json(404, {"error": "not_found"})
+
+        def _team_invite(self, body, user):
+            """Invite an address — and CREATE the team if there isn't one. That is the
+            whole model: a team exists because somebody was invited to it."""
+            email = str((body or {}).get("email", "") or "").strip().lower()
+            role = (body or {}).get("role")
+            if "@" not in email or "." not in email.split("@")[-1]:
+                return self._json(400, {"error": "bad_email"})
+            t, denied = state._team_admin(user)
+            if denied:
+                return self._json(403, denied)
+            if not t:
+                prof = registry.user_profile_get(root, user["user_id"])
+                t = teams.create(root, user["user_id"],
+                                 prof.get("org_name") or "Your team")
+                if not t:
+                    return self._json(500, {"error": "team_create_failed"})
+            if email == (user.get("email") or "").strip().lower():
+                return self._json(400, {"error": "thats_you"})
+            teams.invite(root, t["team_id"], email, role, user["user_id"])
+            # The invite row exists either way; delivery is best-effort and the UI is
+            # told whether email is even configured, so a silent non-send is visible.
+            try:
+                notify.team_invite(email, t["name"], user.get("email"),
+                                   self._app_url())
+            except Exception:                              # noqa: BLE001
+                pass
+            return self._json(200, state.team_view(user))
+
+        def _team_invite_action(self, invite_id, what, body, user):
+            t, denied = state._team_admin(user)
+            if denied:
+                return self._json(403, denied)
+            if not t:
+                return self._json(404, {"error": "no_team"})
+            pending = {i["id"]: i for i in teams.pending_invites(root, t["team_id"])}
+            inv = pending.get(invite_id)
+            if not inv:
+                return self._json(404, {"error": "not_found"})   # never another team's
+            if what == "cancel":
+                teams.cancel_invite(root, invite_id)
+            else:                                          # resend = refresh + send again
+                teams.invite(root, t["team_id"], inv["email"], inv.get("role"),
+                             user["user_id"])
+                try:
+                    notify.team_invite(inv["email"], t["name"], user.get("email"),
+                                       self._app_url())
+                except Exception:                          # noqa: BLE001
+                    pass
+            return self._json(200, state.team_view(user))
+
+        def _team_member_action(self, member_id, what, body, user):
+            t, denied = state._team_admin(user)
+            if denied:
+                return self._json(403, denied)
+            if not t:
+                return self._json(404, {"error": "no_team"})
+            mem = teams.members(root, t["team_id"])
+            if not any(m["user_id"] == member_id for m in mem):
+                return self._json(404, {"error": "not_found"})
+            admins = [m for m in mem if m.get("role") == "admin"]
+            if what == "role":
+                role = (body or {}).get("role")
+                # Never leave a team with nobody who can administer it.
+                if role == "member" and len(admins) == 1 and admins[0]["user_id"] == member_id:
+                    return self._json(409, {"error": "last_admin"})
+                teams.set_role(root, t["team_id"], member_id, role)
+            else:
+                if len(admins) == 1 and admins[0]["user_id"] == member_id:
+                    return self._json(409, {"error": "last_admin"})
+                teams.remove_member(root, t["team_id"], member_id)
+            return self._json(200, state.team_view(user))
 
         def _pending_action(self, pending_id, action, user, body=None):
             """Spec 8: approve (Trace performs the staged action) or reject (discard) one
@@ -2782,6 +2913,8 @@ def make_handler(state):
                     except Exception:                    # noqa: BLE001 — never block sign-in
                         pass
                 return self._json(200, flags)
+            if rest == "/team":                              # frame 30
+                return self._json(200, state.team_view(user))
             if rest == "/profile":                           # frame 18's Account pane
                 return self._json(200, dict(
                     registry.user_profile_get(root, user["user_id"]),
@@ -2917,6 +3050,15 @@ def make_handler(state):
                 registry.user_flags_set(root, user["user_id"],
                                         first_run_completed_at=sessions._now())
                 return self._json(200, registry.user_flags_get(root, user["user_id"]))
+            # --- team (30). Every mutation is admin-only; that check IS the model. ---
+            if rest == "/team/invite":
+                return self._team_invite(body, user)
+            mtr = re.match(r"^/team/invites/([^/]+)/(resend|cancel)$", rest)
+            if mtr:
+                return self._team_invite_action(mtr.group(1), mtr.group(2), body, user)
+            mtm = re.match(r"^/team/members/([^/]+)/(role|remove)$", rest)
+            if mtm:
+                return self._team_member_action(mtm.group(1), mtm.group(2), body, user)
             if rest == "/profile":                       # frame 18: name + organisation
                 b = body or {}
                 return self._json(200, registry.user_profile_set(

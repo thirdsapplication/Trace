@@ -762,7 +762,8 @@ def _lesson_hit(row):
 
 def retrieve_lessons(root, situation_embedding, agent, agent_kind_embedding=None,
                      consume_scope="global", k=5, min_situation=0.5,
-                     min_cross_situation=0.65, min_agent_kind=0.6):
+                     min_cross_situation=0.65, min_agent_kind=0.6,
+                     team_owners=None, min_team_situation=0.58):
     """Phase B (B5b) double-gated retrieval. Reusable lessons whose SITUATION matches the
     query AND — for cross-owner lessons — whose SOURCE AGENT is similar-kind to ``agent``.
     ``consume_scope`` gates breadth: 'owner' = own only; 'global' = all owners; 'team' is
@@ -774,13 +775,22 @@ def retrieve_lessons(root, situation_embedding, agent, agent_kind_embedding=None
         return []
     owner = agent.get("owner_user_id")
     allow_cross = consume_scope == "global"
+    # Teammates' lessons are in scope at 'team' AND at 'global' — 'global' is the wider
+    # setting, so it cannot exclude the narrower one. Empty list when the user has no
+    # team, which is byte-for-byte the old behaviour.
+    mates = [m for m in (team_owners or []) if m and m != owner] \
+        if consume_scope in ("team", "global") else []
     try:
         if supa.is_configured():
             r = supa.get_admin().rpc("match_lessons", {
                 "situation_embedding": situation_embedding, "owner": owner,
                 "agent_kind_embedding": agent_kind_embedding, "allow_cross": allow_cross,
                 "min_situation": min_situation, "min_cross_situation": min_cross_situation,
-                "min_agent_kind": min_agent_kind, "match_count": k}).execute()
+                "min_agent_kind": min_agent_kind, "match_count": k,
+                # 018's parameters. Both default in SQL, so an unapplied 018 just ignores
+                # them rather than erroring — adopt-early is safe.
+                "team_owners": mates or None,
+                "min_team_situation": min_team_situation}).execute()
             return [_lesson_hit(row) for row in (r.data or [])]
         embs = _load(root, "decision_embeddings.json")
         decs = _load(root, "decisions.json")
@@ -792,11 +802,25 @@ def retrieve_lessons(root, situation_embedding, agent, agent_kind_embedding=None
                 continue
             src_owner = dec.get("owner_user_id")
             is_own = src_owner == owner
-            if not is_own and not allow_cross:
+            # This branch mirrors match_lessons by hand, so the team tier has to be added
+            # in BOTH places or the offline path and Supabase disagree about who can see
+            # what — which is the worst kind of divergence to have in a sharing gate.
+            is_mate = not is_own and src_owner in mates
+            if not is_own and not is_mate and not allow_cross:
                 continue                                   # scope gate
             sit = _cosine(situation_embedding, sit_emb)
             if is_own:
                 if sit < min_situation:
+                    continue
+            elif is_mate:
+                # 018's team tier: no global_verified (sharing with colleagues must not
+                # require publishing to strangers), no kind gate (the context is already
+                # shared), and a bar between own and cross. The source must still have
+                # chosen to contribute at team scope or wider.
+                if sit < min_team_situation:
+                    continue
+                src_scopes = agent_lesson_scopes(root, {"owner_user_id": src_owner})
+                if src_scopes["contribute_scope"] not in ("team", "global"):
                     continue
             else:                                          # cross-owner: higher bar + gates
                 if not dec.get("global_verified"):
@@ -810,7 +834,8 @@ def retrieve_lessons(root, situation_embedding, agent, agent_kind_embedding=None
                     continue
             hits.append({"decision_id": did, "lesson": dec["generalized_lesson"],
                          "source_owner_id": src_owner, "source_agent_id": dec.get("agent_id"),
-                         "similarity": sit, "tier": "own" if is_own else "cross"})
+                         "similarity": sit,
+                         "tier": "own" if is_own else ("team" if is_mate else "cross")})
         hits.sort(key=lambda h: h["similarity"], reverse=True)
         return hits[:k]
     except Exception:                                      # noqa: BLE001

@@ -1010,7 +1010,7 @@ async function renderSettings() {
 // defaults to the first, so a pane added later can't silently vanish — the same trick
 // the profile tabs use.
 const SETTINGS_PANES = [
-  ["account", "Account"], ["notifications", "Notifications"],
+  ["account", "Account"], ["team", "Team"], ["notifications", "Notifications"],
   ["privacy", "Privacy &amp; data"], ["apps", "Connected apps"],
   ["appearance", "Appearance"],
 ];
@@ -1038,8 +1038,8 @@ async function renderSettingsShell(pane) {
   tb.wire();
   root.querySelectorAll(".set-nav").forEach(b =>
     b.onclick = () => renderSettingsShell(b.dataset.pane));
-  ({ account: setAccount, notifications: setNotifications, privacy: setPrivacy,
-     apps: setApps, appearance: setAppearance }[want] || setAccount)();
+  ({ account: setAccount, team: setTeam, notifications: setNotifications,
+     privacy: setPrivacy, apps: setApps, appearance: setAppearance }[want] || setAccount)();
 }
 
 async function setAccount() {
@@ -1092,6 +1092,83 @@ function editAccount(p) {
     setAccount();
   };
   el.querySelector("#acName").focus();
+}
+
+// Frame 30. No team yet is a normal state, not an empty one — a team comes into being
+// when you invite somebody, so the pane leads with the invite rather than a Create button.
+async function setTeam() {
+  const { data } = await api("GET", "/api/u/team");
+  const d = data || {};
+  const admin = !d.team || (d.team.role === "admin");
+  const memberRow = (m) => `
+    <div class="set-card">
+      <span class="set-av set-av-sm">${esc((m.email || "?").charAt(0).toUpperCase())}</span>
+      <div class="grow">
+        <div class="set-row-t">${esc(m.email)}${m.is_you ? " · you" : ""}</div>
+        <div class="set-sub">${m.agents_live} agent${m.agents_live === 1 ? "" : "s"} live</div>
+      </div>
+      <span class="pill ${m.role === "admin" ? "pill-on" : "pill-off"}">${esc((m.role || "member").toUpperCase())}</span>
+      ${admin && !m.is_you ? `<button class="btn-link tm-del" data-id="${esc(m.user_id)}"
+        style="color:var(--danger);">Remove</button>` : ""}
+    </div>`;
+  const inviteRow = (i) => `
+    <div class="set-card">
+      <span class="set-av set-av-sm tm-pending">${esc((i.email || "?").charAt(0).toUpperCase())}</span>
+      <div class="grow">
+        <div class="set-row-t">${esc(i.email)}</div>
+        <div class="set-sub">Invited ${esc(threadStamp(i.invited_at))} — pending</div>
+      </div>
+      ${admin ? `<button class="btn-secondary btn-sm tm-resend" data-id="${esc(i.id)}">Resend</button>
+      <button class="btn-link tm-cancel" data-id="${esc(i.id)}" style="color:var(--ink-2);">Cancel</button>` : ""}
+    </div>`;
+  $("#setPane").innerHTML = `
+    ${d.team ? `<p class="set-sub" style="margin:-8px 0 14px;">${esc(d.team.name)} ·
+      ${d.members.length} member${d.members.length === 1 ? "" : "s"} — lesson sharing set
+      to "my team" runs inside this group.</p>` : `
+      <p class="set-sub" style="margin:-8px 0 14px;">You don't have a team yet. Inviting
+      someone creates one, with you as its admin.</p>`}
+    ${d.email_configured ? "" : `<p class="notice">Email isn't configured, so an invite is
+      recorded but nothing is sent. Set RESEND_API_KEY and EMAIL_FROM, or pass the link on
+      yourself.</p>`}
+    <div class="stack">${(d.members || []).map(memberRow).join("")}${(d.invites || []).map(inviteRow).join("")}</div>
+    ${admin ? `<div class="tm-invite">
+      <div class="set-row-t">Invite someone</div>
+      <div class="row" style="gap:8px;margin-top:8px;flex-wrap:wrap;">
+        <input type="text" id="tmEmail" placeholder="name@company.com" style="flex:1;min-width:200px;padding:9px 12px;">
+        <select id="tmRole" style="padding:9px 10px;"><option value="member">Member</option><option value="admin">Admin</option></select>
+        <button class="btn-primary btn-sm" id="tmGo">Send invite</button>
+      </div>
+      <p class="set-sub" style="margin-top:8px;">Members build their own agents and choose
+        their own sharing. Admins also manage members and invites.</p>
+      <p id="tmMsg" class="msg err"></p>
+    </div>` : `<p class="notice">Only an admin can invite or remove people.</p>`}`;
+  const post = async (path, body) => {
+    const r = await api("POST", path, body || {});
+    if (!r.ok) {
+      const m = $("#tmMsg");
+      if (m) m.textContent = { bad_email: "that doesn't look like an email address",
+        thats_you: "that's your own address", not_admin: "only an admin can do that",
+        last_admin: "there'd be no admin left — promote someone first",
+      }[r.data && r.data.error] || friendly(r.data && r.data.error);
+      return false;
+    }
+    renderSettingsShell("team");
+    return true;
+  };
+  const go = $("#tmGo");
+  if (go) go.onclick = () => post("/api/u/team/invite", {
+    email: $("#tmEmail").value, role: $("#tmRole").value });
+  root.querySelectorAll(".tm-resend").forEach(b => b.onclick = () =>
+    post(`/api/u/team/invites/${b.dataset.id}/resend`));
+  root.querySelectorAll(".tm-cancel").forEach(b => b.onclick = () =>
+    post(`/api/u/team/invites/${b.dataset.id}/cancel`));
+  root.querySelectorAll(".tm-del").forEach(b => b.onclick = async () => {
+    if (!await confirmDestructive({
+      title: "Remove them from the team?",
+      body: "Their agents and data are untouched — they just stop sharing lessons with your team, and stop seeing yours.",
+      verb: "Remove", word: null, tone: "primary" })) return;
+    post(`/api/u/team/members/${b.dataset.id}/remove`);
+  });
 }
 
 async function setNotifications() {
