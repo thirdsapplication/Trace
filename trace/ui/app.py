@@ -556,6 +556,27 @@ class AppState:
         return self._tap("activity", None, agent_config.SUMMARY_MODEL,
                          lambda: agent_configgen._default_model_fn(agent_config.SUMMARY_MODEL))
 
+    def agent_safety_rules(self, agent):
+        """The escalation rules this agent stops for — what frame 10 collected.
+
+        They ride in the interview record as the reserved SAFETY_RULES_ID answer, keyed
+        by the agent's bundle inside its build session, so this is a file read rather
+        than a query. Empty string when the agent predates frame 10 or the session's
+        artifacts are gone; the Rules tab says so rather than showing a blank.
+        """
+        sid, bid = agent.get("session_id"), agent.get("bundle_id")
+        if not sid or not bid:
+            return ""
+        try:
+            rec = sessions.read_json_artifact(
+                self.sessions_root, sid, sessions.interview_filename(bid)) or {}
+            for a in rec.get("answers") or []:
+                if a.get("q") == SAFETY_RULES_ID:
+                    return str(a.get("answer") or "").strip()
+        except Exception:                                  # noqa: BLE001 — never break the page
+            pass
+        return ""
+
     def agent_available_apps(self, agent):
         """The agent's usable connected apps, each flagged whether it's currently staged
         (held for approval). Drives the post-deploy staging toggle. Reads the agent's
@@ -2786,6 +2807,9 @@ def make_handler(state):
                                                   "name": agent.get("name") or agent.get("bundle_id"),
                                                   "staged_apps": agent.get("staged_apps") or [],
                                                   "available_apps": state.agent_available_apps(agent),
+                                                  # frame 21's Rules tab: the escalation
+                                                  # rules set at frame 10, read back
+                                                  "rules": state.agent_safety_rules(agent),
                                                   "consent": {
                                                       "effective": registry.agent_lesson_scopes(root, agent),
                                                       "override": {

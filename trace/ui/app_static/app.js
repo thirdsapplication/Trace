@@ -2008,17 +2008,26 @@ async function renderProfile(agentId) {
           </div>
         </div>`).join("")}</div>
     </div>` : ""}
-    <div class="panel" id="pApprovalsPanel" style="display:none;">
+    <!-- Rules and History were both EMPTY: every panel below the header was untagged, so
+         showPane treated them all as Overview and those two tabs displayed nothing at
+         all. Tagging them is the fix; the escalation block below is what Rules is for. -->
+    <div class="panel" data-pane="rules">
+      <h2>When it stops and asks you</h2>
+      <p class="sub muted" style="margin-top:2px;">Set for every agent when you built
+        them. Anything outbound is always staged — that part can't be switched off.</p>
+      <div id="pRules" style="margin-top:10px;"><p class="muted">Loading…</p></div>
+    </div>
+    <div class="panel" data-pane="rules" id="pApprovalsPanel" style="display:none;">
       <h2>Approvals</h2>
       <p class="sub muted" style="margin-top:2px;">Choose which apps need your approval before the agent acts. Others run automatically. Takes effect on the next run.</p>
       <div id="pApprovals" style="margin-top:10px;"></div>
     </div>
-    <div class="panel" id="pSharingPanel" style="display:none;">
+    <div class="panel" data-pane="rules" id="pSharingPanel" style="display:none;">
       <h2>Lesson sharing (this agent)</h2>
       <p class="sub muted" style="margin-top:2px;">Override your account default for just this agent, or leave it to inherit.</p>
       <div id="pSharing" style="margin-top:10px;"></div>
     </div>
-    <div class="panel">
+    <div class="panel" data-pane="history">
       <div class="spread"><h2>Session history</h2>
         ${a.unreviewed ? `<button class="btn-secondary btn-sm" id="pReview">Review ${a.unreviewed} waiting →</button>` : ""}</div>
       <div id="pLog"><p class="muted">Loading…</p></div>
@@ -2055,7 +2064,11 @@ async function renderProfile(agentId) {
     root.querySelectorAll(".panel").forEach((el, idx) => {
       if (idx === 0) return;                        // the header panel is always visible
       const pane = el.dataset.pane || "overview";
-      el.style.display = (pane === want) ? "" : "none";
+      // `pane-empty` is how a panel says it has nothing to show — Approvals with no
+      // connected apps, for instance. Without this, showPane's blanket display write
+      // overrode the conditional reveal and those panels appeared empty regardless.
+      el.style.display = (pane === want && !el.classList.contains("pane-empty"))
+        ? "" : "none";
     });
     root.querySelectorAll("#pTabs .tab").forEach(t =>
       t.classList.toggle("on", t.dataset.pane === want));
@@ -2080,10 +2093,34 @@ async function renderProfile(agentId) {
   const sessionsList = (data && data.activity) || [];
   // Approvals: per-app staged/autonomous toggles (post-deploy, no redeploy). All
   // interpolated values are escaped via esc() (the file's XSS-safe rendering idiom).
+  // Rules (21): the escalation rules from frame 10, read back. Stored as one sentence
+  // per agent — "Stop and ask me when any of these is true:" then a line per rule — so
+  // it renders as the list it was written as rather than as a paragraph.
+  const rulesBox = $("#pRules");
+  if (rulesBox) {
+    const raw = (data && data.agent && data.agent.rules) || "";
+    const lines = raw.split("\n").map(s => s.trim())
+      .filter(s => s.startsWith("-")).map(s => s.replace(/^-\s*/, ""));
+    rulesBox.innerHTML = lines.length
+      ? `<div class="sn-list">${lines.map(l => {
+          const [head, ...rest] = l.split(":");
+          const tail = rest.join(":").trim();
+          return `<div class="sn-row">
+            <div class="sn-mid"><div class="sn-title">${esc(head.trim())}</div>
+              ${tail ? `<div class="sn-sub">${esc(tail)}</div>` : ""}</div>
+            ${/outbound/i.test(head) ? `<span class="sn-built">BUILT IN</span>` : ""}
+          </div>`;
+        }).join("")}</div>
+        <p class="sub muted" style="margin-top:10px;">Changing these per agent isn't built
+          yet — they come from what you set when the agents were created.</p>`
+      : `<p class="muted">No rules recorded for this agent. Agents built before the safety
+          step still stage everything outbound — that part is always on.</p>`;
+  }
   const availApps = (data && data.agent && data.agent.available_apps) || [];
   const apPanel = $("#pApprovalsPanel");
+  if (apPanel && !availApps.length) apPanel.classList.add("pane-empty");
   if (apPanel && availApps.length) {
-    apPanel.style.display = "";
+    apPanel.classList.remove("pane-empty");
     const apMarkup = availApps.map(ap => `
       <label class="row" style="gap:8px;margin-top:6px;cursor:pointer;">
         <input type="checkbox" class="stage-toggle" data-slug="${esc(ap.slug)}" ${ap.staged ? "checked" : ""}>
@@ -2108,8 +2145,9 @@ async function renderProfile(agentId) {
   // Per-agent lesson-sharing override (Phase B). Empty override = inherit account default.
   const consent = data && data.agent && data.agent.consent;
   const shPanel = $("#pSharingPanel");
+  if (shPanel && !consent) shPanel.classList.add("pane-empty");
   if (shPanel && consent) {
-    shPanel.style.display = "";
+    shPanel.classList.remove("pane-empty");
     const ov = consent.override || {};
     $("#pSharing").insertAdjacentHTML("beforeend", `
       <div class="row" style="gap:10px;align-items:center;">
