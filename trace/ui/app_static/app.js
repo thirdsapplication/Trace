@@ -2709,11 +2709,84 @@ function renderInterview(sid, data) {
     return "";
   })();
   const nameOf = (bid) => (data.names && data.names[bid]) || bid;
+
+  // Frame 09's "Everyone" tab: a question several agents both need — tone, priority
+  // contacts — asked ONCE instead of once per agent.
+  //
+  // Grouped here rather than tagged by the detector. A model deciding "this is a shared
+  // question" can be wrong, and a wrong merge silently answers one agent's question with
+  // another agent's answer. Normalised exact text is conservative: it only ever merges
+  // questions that really are the same question, and a near-miss just stays per-agent,
+  // which is the harmless direction to fail in.
+  const qKey = (t) => String(t || "").toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ").trim();
+  const shared = new Map();                            // key -> {question, suggested, owners}
+  for (const bid of ids) {
+    for (const q of (interviews[bid] || {}).questions || []) {
+      const k = qKey(q.question);
+      if (!k) continue;
+      if (!shared.has(k)) {
+        shared.set(k, { question: q.question, suggested: q.suggested_answers || [], owners: [] });
+      }
+      shared.get(k).owners.push({ bid, qid: q.id });
+    }
+  }
+  for (const [k, v] of Array.from(shared)) {
+    // Shared means MORE THAN ONE AGENT asks it. One owner is an ordinary question.
+    if (new Set(v.owners.map(o => o.bid)).size < 2) shared.delete(k);
+  }
+  const sharedKeys = Array.from(shared.keys());
+  const isShared = (bid, qid) => sharedKeys.some(k =>
+    shared.get(k).owners.some(o => o.bid === bid && o.qid === qid));
+  // A prior answer to any owner of a shared question pre-fills the single field.
+  const sharedPrior = (k) => {
+    for (const o of shared.get(k).owners) {
+      const hit = ((interviews[o.bid] || {}).answers || []).find(a => a.q === o.qid);
+      if (hit && String(hit.answer || "").trim()) return hit.answer;
+    }
+    return "";
+  };
+
   let page = 0;
+  // Declared HERE, not beside the paging helpers: pills() reads it and pills() is called
+  // inside the innerHTML template below, so a later `const` would be a TDZ crash on the
+  // whole interview step rather than a subtle bug.
+  //
+  // Page order: Everyone first when it exists, then the agents that still have questions
+  // of their own. An agent whose every question was shared gets no page — it is already
+  // fully answered from the Everyone tab.
+  const pageIds = (sharedKeys.length ? ["__everyone"] : []).concat(
+    ids.filter(bid => ((interviews[bid] || {}).questions || [])
+      .some(q => !isShared(bid, q.id))));
+
+  const everyoneBlock = sharedKeys.length ? `
+    <div class="iv-page" data-bid="__everyone" style="display:none;">
+      <div class="card" style="padding:16px;">
+        <div class="label" style="margin-bottom:10px;">Everyone</div>
+        <p class="sub muted" style="margin:-4px 0 12px;">${sharedKeys.length}
+          question${sharedKeys.length === 1 ? "" : "s"} more than one agent needs. Answer
+          once and every one of them gets it.</p>
+        ${sharedKeys.map(k => {
+          const v = shared.get(k);
+          return `<div class="field">
+            <div class="title" style="margin-bottom:8px;">${esc(v.question)}</div>
+            <input type="text" class="iv-a" data-shared="${esc(k)}"
+              value="${esc(sharedPrior(k))}" placeholder="one line — every question needs an answer">
+            ${v.suggested.length ? `<div class="chips" style="margin-top:8px;">${
+              v.suggested.map(s => `<button class="suggest" data-shared="${esc(k)}">${esc(s)}</button>`).join("")}</div>` : ""}
+            <div class="sub muted" style="margin-top:6px;">Applies to ${esc(
+              Array.from(new Set(v.owners.map(o => nameOf(o.bid)))).join(", "))}</div>
+          </div>`;
+        }).join("")}
+      </div>
+    </div>` : "";
+
   const blocks = ids.map(bid => {
     const iv = interviews[bid] || { questions: [] };
     const prior = {}; (iv.answers || []).forEach(a => prior[a.q] = a.answer);
-    const qs = (iv.questions || []).map(q => `
+    // Asked on the Everyone tab instead — never in both places, or answering one would
+    // leave the other looking unanswered and the gate would never clear.
+    const qs = (iv.questions || []).filter(q => !isShared(bid, q.id)).map(q => `
       <div class="field">
         <div class="title" style="margin-bottom:8px;">${esc(q.question)}</div>
         <input type="text" class="iv-a" data-bid="${esc(bid)}" data-q="${esc(q.id)}"
@@ -2745,17 +2818,38 @@ function renderInterview(sid, data) {
     const iv = interviews[bid] || {};
     const total = (iv.questions || []).length;
     const live = root.querySelectorAll(`.iv-a[data-bid="${bid}"]`);
-    const done = live.length
-      ? Array.from(live).filter(i => i.value.trim()).length
-      : total - ((iv.unresolved || []).length);
-    return { done, total };
+    if (!live.length && !sharedKeys.length) {
+      return { done: total - ((iv.unresolved || []).length), total };
+    }
+    let done = Array.from(live).filter(i => i.value.trim()).length;
+    // A shared answer counts for every agent it covers, or an agent whose questions were
+    // all shared would sit at 0 of 3 while fully answered.
+    for (const k of sharedKeys) {
+      if (!shared.get(k).owners.some(o => o.bid === bid)) continue;
+      const f = root.querySelector(`.iv-a[data-shared="${k}"]`);
+      if (f && f.value.trim()) done += 1;
+    }
+    return { done: Math.min(done, total), total };
   };
-  const pills = () => ids.map((bid, i) => {
-    const { done, total } = answeredCount(bid);
-    const state = done >= total ? "done" : (i === page ? "on" : "");
-    return `<span class="iv-pill ${state}">${esc(nameOf(bid))}
-      <b>${done >= total ? "✓" : `${done} of ${total}`}</b></span>`;
-  }).join("");
+  const pills = () => {
+    // Frame 09 shows Everyone as a pill beside the agents, with "✓ done" of its own.
+    const ev = sharedKeys.length ? (() => {
+      const done = sharedKeys.filter(k => {
+        const f = root.querySelector(`.iv-a[data-shared="${k}"]`);
+        return f && f.value.trim();
+      }).length;
+      const on = pageIds[page] === "__everyone";
+      const state = done >= sharedKeys.length ? "done" : (on ? "on" : "");
+      return `<span class="iv-pill ${state}">Everyone
+        <b>${done >= sharedKeys.length ? "✓" : `${done} of ${sharedKeys.length}`}</b></span>`;
+    })() : "";
+    return ev + ids.map((bid) => {
+      const { done, total } = answeredCount(bid);
+      const state = done >= total ? "done" : (pageIds[page] === bid ? "on" : "");
+      return `<span class="iv-pill ${state}">${esc(nameOf(bid))}
+        <b>${done >= total ? "✓" : `${done} of ${total}`}</b></span>`;
+    }).join("");
+  };
 
   const qTotal = ids.reduce((n, bid) => n + ((interviews[bid] || {}).questions || []).length, 0);
 
@@ -2765,7 +2859,7 @@ function renderInterview(sid, data) {
         ${ids.length} agent${ids.length === 1 ? "" : "s"}</div>
       <div class="iv-pills" id="ivPills">${pills()}</div>
     </div>` : ""}
-    ${blocks || `<p class="muted">No questions needed — you're good to go.</p>`}
+    ${(everyoneBlock + blocks) || `<p class="muted">No questions needed — you're good to go.</p>`}
     <p id="ivProg" class="sub muted" style="margin-top:10px;"></p>
     <p id="ivMsg" class="msg ok" style="margin-top:6px;"></p>
     <div class="row" style="margin-top:6px;gap:10px;">
@@ -2782,16 +2876,19 @@ function renderInterview(sid, data) {
     root.querySelectorAll(".iv-page").forEach((el, i) => {
       el.style.display = (i === page) ? "" : "none";
     });
-    const last = page >= ids.length - 1;
+    const last = page >= pageIds.length - 1;
     const prog = $("#ivProg");
     if (prog) {
-      prog.textContent = ids.length > 1
-        ? `Workflow ${page + 1} of ${ids.length} — ${nameOf(ids[page])}` : "";
+      const cur = pageIds[page];
+      prog.textContent = pageIds.length > 1
+        ? `${page + 1} of ${pageIds.length} — ${cur === "__everyone" ? "Everyone" : nameOf(cur)}`
+        : "";
     }
     const back = $("#ivBack");
     if (back) back.style.display = (page > 0) ? "" : "none";
     const go = $("#ivGo");
-    if (go) go.textContent = last ? "Save & continue" : "Next workflow";
+    if (go) go.textContent = last ? "Save & continue"
+      : (pageIds[page] === "__everyone" ? "Next" : "Next workflow");
     updateGo();
     if (typeof window.scrollTo === "function") window.scrollTo(0, 0);
   };
@@ -2802,7 +2899,9 @@ function renderInterview(sid, data) {
   };
   root.querySelectorAll(".iv-a").forEach(inp => inp.oninput = updateGo);
   root.querySelectorAll(".suggest").forEach(btn => btn.onclick = () => {
-    const inp = root.querySelector(`.iv-a[data-bid="${btn.dataset.bid}"][data-q="${btn.dataset.q}"]`);
+    const inp = btn.dataset.shared
+      ? root.querySelector(`.iv-a[data-shared="${btn.dataset.shared}"]`)
+      : root.querySelector(`.iv-a[data-bid="${btn.dataset.bid}"][data-q="${btn.dataset.q}"]`);
     if (inp) { inp.value = btn.textContent; updateGo(); }
   });
   const back = $("#ivBack");
@@ -2812,6 +2911,15 @@ function renderInterview(sid, data) {
     const byB = {};
     root.querySelectorAll(".iv-a").forEach(inp => {
       const v = inp.value.trim(); if (!v) return;
+      if (inp.dataset.shared) {
+        // One field, every agent that asked it — written to each owner's own question id,
+        // so the answer lands in the existing per-bundle slot and nothing new is invented
+        // to store it.
+        for (const o of (shared.get(inp.dataset.shared) || { owners: [] }).owners) {
+          (byB[o.bid] = byB[o.bid] || {})[o.qid] = v;
+        }
+        return;
+      }
       (byB[inp.dataset.bid] = byB[inp.dataset.bid] || {})[inp.dataset.q] = v;
     });
     root.querySelectorAll(".iv-extra").forEach(t => {
@@ -2827,7 +2935,7 @@ function renderInterview(sid, data) {
     return byB;                 // the safety net re-posts these alongside its rules
   };
   $("#ivGo").onclick = async () => {
-    if (page < ids.length - 1) { page += 1; showPage(); return; }   // next workflow
+    if (page < pageIds.length - 1) { page += 1; showPage(); return; }   // next page
     $("#ivGo").disabled = true; $("#ivGo").textContent = "Saving…";
     try {
       const saved = await saveAll();          // every page's answers, in one pass
