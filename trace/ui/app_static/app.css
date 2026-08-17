@@ -297,6 +297,16 @@ input:focus, textarea:focus { outline: none; border-color: var(--accent); backgr
 .pw-show { position: absolute; right: 12px; background: none; border: none; padding: 0;
   font-size: 12px; font-weight: 600; color: var(--accent); cursor: pointer; }
 
+/* terms + privacy (05): real controls, not grey text. Styled as links because that is
+   what they are — the affordance has to say "this opens something". */
+.fr-link { background: none; border: none; padding: 0; font: inherit; font-size: 12.5px;
+  color: var(--accent); text-decoration: underline; cursor: pointer; }
+.pol-body { display: flex; flex-direction: column; gap: 14px; max-height: 46vh;
+  overflow-y: auto; }
+.pol-sec { display: flex; flex-direction: column; gap: 3px; }
+.pol-h { font-weight: 700; font-size: 13.5px; }
+.pol-p { font-size: 13px; color: var(--ink-2); line-height: 1.55; }
+
 /* sharing (25): each agent's override listed beside the account dials, so you can see at
    a glance which agents are not following them. */
 .sh-rows { display: flex; flex-direction: column; margin-top: 10px; }

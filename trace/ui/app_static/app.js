@@ -292,17 +292,68 @@ function renderTerms() {
       </div>`).join("")}
       <label class="row" style="gap:10px;margin-top:4px;cursor:pointer;">
         <input type="checkbox" id="frAgree">
-        <span style="font-size:12.5px;color:var(--ink-2);">I agree to the terms of service and privacy policy</span>
+        <span style="font-size:12.5px;color:var(--ink-2);">I agree to the
+          <button type="button" class="fr-link" id="frTerms">terms of service</button> and
+          <button type="button" class="fr-link" id="frPriv">privacy policy</button></span>
       </label>
       <button id="frAccept" class="btn-primary full" disabled>Agree &amp; continue</button>
     </div>`;
   $("#frAgree").onchange = (e) => { $("#frAccept").disabled = !e.target.checked; };
+  // Frame 05 makes these links. They were flat grey text, which meant asking someone to
+  // agree to documents they could not open — on the one screen where that matters, since
+  // the thing being agreed to is recording their work.
+  //
+  // No formal documents exist in this repo yet. Rather than a dead link or invented legal
+  // prose, each opens what the product ACTUALLY does — enforced in code, and checkable —
+  // and says plainly that the formal document is still to be published.
+  $("#frTerms").onclick = (e) => { e.preventDefault(); showPolicy("terms"); };
+  $("#frPriv").onclick = (e) => { e.preventDefault(); showPolicy("privacy"); };
   $("#frAccept").onclick = async () => {
     $("#frAccept").disabled = true;
     await api("POST", "/api/u/first-run/terms", {});
     await api("POST", "/api/u/first-run/complete", {});
     await loadAndRender();                       // straight into the wizard at Record
   };
+}
+
+// What the product commits to, stated as behaviour rather than as law. Every line here
+// is enforced somewhere in the code and can be checked; none of it is drafted legal
+// prose, because inventing that would be worse than admitting it isn't written yet.
+const POLICY = {
+  terms: ["Terms of service", [
+    ["What palza does", "Records a workday you start, finds the work that repeats, and builds an agent for each. You decide which workflows become agents and you can delete any of them."],
+    ["Nothing outbound without you", "Every email, sheet edit and upload an agent proposes is staged and shown to you in full before it happens. That gate cannot be turned off for outbound actions."],
+    ["Your agents are yours", "You can pause, rename, recolour or delete any agent at any time, and revoke an app's access from Settings."],
+  ]],
+  privacy: ["Privacy policy", [
+    ["Recording is opt-in and visible", "Capture only runs during a session you start, with a live indicator, and you can pause or stop it at any moment."],
+    ["What is captured", "Window titles and activity in the apps you name — no screenshots, and sensitive text is removed before anything is saved."],
+    ["What it is used for", "Building and improving your own agents. Delete every recording at any time from Settings → Privacy & data."],
+    ["Sharing is yours to set", "Lessons your agents learn can be shared with your team or turned off entirely, in Sharing. Lessons carry the rule, never the email, data or recording it came from."],
+  ]],
+};
+
+function showPolicy(kind) {
+  const [title, sections] = POLICY[kind] || POLICY.terms;
+  const el = document.createElement("div");
+  el.className = "pop-back";
+  el.innerHTML = `<div class="pop" role="dialog" aria-modal="true" aria-label="${esc(title)}">
+      <div class="row"><div class="pop-title">${esc(title)}</div>
+        <button class="pop-x" aria-label="Close">✕</button></div>
+      <div class="pol-body">${sections.map(([h, b]) =>
+        `<div class="pol-sec"><div class="pol-h">${esc(h)}</div>
+          <div class="pol-p">${esc(b)}</div></div>`).join("")}</div>
+      <p class="pop-note">This describes how palza behaves today, and each point is
+        enforced in the product. The full legal document is not published yet — ask us
+        before relying on it for anything contractual.</p>
+      <div class="cf-acts"><button class="btn-primary" id="polOk">Close</button></div>
+    </div>`;
+  document.body.appendChild(el);
+  const close = () => el.remove();
+  el.onclick = (e) => { if (e.target === el) close(); };
+  el.querySelector(".pop-x").onclick = close;
+  el.querySelector("#polOk").onclick = close;
+  el.querySelector("#polOk").focus();
 }
 
 /* ---------------- auth ---------------- */
@@ -2974,10 +3025,39 @@ async function renderGolive(sid) {
         <div class="sub" style="margin-top:4px;">For anything you'd rather check first, keep it staged: the agent prepares the action and you approve it here before it actually happens. Unchecked apps run automatically.</div>
         ${staging.map(stageRow).join("")}
       </div>` : "";
+    // Frame 13 introduces the agent BY NAME — "Meet Retail recap", its avatar in its
+    // colour, its schedule, and what happens on the first run. We showed a generic
+    // "Ready to go live" tile with no agent on it, even though /deploy-bundles returns
+    // the names right here.
+    let toDeploy = [];
+    try { toDeploy = ((await uget(sid, "/deploy-bundles")).data || {}).bundles || []; }
+    catch (e) { /* the generic tile below still stands in */ }
+    const startLine = (b) => {
+      const v = (b.start || {}).value || "";
+      const sched = v ? `Runs ${esc(v)}` : "Runs when you say so";
+      return staging.length ? `${sched} · outbound staged for you` : sched;
+    };
+    const meetCard = (b, i) => `<div class="card" style="text-align:left;display:flex;gap:14px;align-items:center;">
+        ${avatar(b.name || b.id, 44, { agent_id: b.id, color: pickShade(
+          toDeploy.slice(0, i).map(x => agentColor({ agent_id: x.id }))) })}
+        <div style="flex:1;min-width:0;">
+          <div class="title" style="font-size:15px;">${esc(b.name || b.id)}</div>
+          <div class="sub muted">${startLine(b)}</div>
+        </div>
+      </div>`;
+    const meet = toDeploy.length ? `
+      <h1 class="rec-head" style="font-size:22px;margin-bottom:10px;">${toDeploy.length === 1
+        ? `Meet ${esc(toDeploy[0].name || toDeploy[0].id)}`
+        : `Meet your ${toDeploy.length} agents`}</h1>
+      <div class="stack">${toDeploy.map(meetCard).join("")}</div>
+      <p class="sub muted" style="margin-top:10px;">${toDeploy.length === 1 ? "It" : "They"}
+        start on the next matching task, and will show you everything before anything is
+        sent.</p>`
+      : `<div class="card center" style="padding:22px;"><div class="big-check">↑</div>
+          <div class="title" style="font-size:17px;">Ready to go live</div>
+          <div class="notice">They'll start on the next matching task.</div></div>`;
     $("#liveBody").innerHTML = `
-      <div class="card center" style="padding:22px;"><div class="big-check">↑</div>
-        <div class="title" style="font-size:17px;">Ready to go live</div>
-        <div class="notice">They'll start on the next matching task.</div></div>
+      ${meet}
       ${stagingHtml}
       <p id="liveMsg" class="msg err" style="margin-top:12px;"></p>
       <button id="liveGo" class="btn-primary full" style="margin-top:6px;">Go live</button>`;
