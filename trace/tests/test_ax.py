@@ -59,6 +59,13 @@ class FakeAX:
     def focused_window_title(self):
         return self.title
 
+    def content_root(self):
+        # Same rule the real adapter uses, so tests exercise find_web_area.
+        return ax.find_web_area(self, self.window_el) or self.window_el
+
+    def content_url(self):
+        return "https://admin.shopify.com/products/new" if self.window_el else ""
+
     def element_at(self, x, y):
         return self.window_el
 
@@ -334,6 +341,69 @@ class TitleFallbackTest(unittest.TestCase):
             raise RuntimeError("AX unavailable")
         self.assertEqual(window._fallback_title(boom), "")
         self.assertEqual(window._fallback_title(None), "")
+
+
+def safari_like_window():
+    """A browser window shaped like the real thing: the page buried under chrome.
+
+    Modelled on Safari measured on 2026-08-19 — tab bar, toolbar buttons and one
+    radio per open tab sitting above an AXWebArea six levels down.
+    """
+    page = FakeElement({"AXRole": "AXWebArea"}, [
+        el("AXTextField", "Title", "Blue Hoodie"),
+        el("AXPopUpButton", "Status", "Active"),
+        el("AXButton", "Save", ""),
+    ])
+    deep = page
+    for _ in range(5):                       # bury it the way a real browser does
+        deep = FakeElement({"AXRole": "AXGroup"}, [deep])
+    chrome = [el("AXButton", "History"), el("AXButton", "AutoFill"),
+              el("AXButton", "Share"), el("AXButton", "New Tab")]
+    chrome += [el("AXRadioButton", f"Untitled query | SQL Editor | Supabase {i}", "False")
+               for i in range(70)]           # every open tab's title
+    return FakeElement({"AXRole": "AXWindow"}, chrome + [deep])
+
+
+class WebAreaTest(unittest.TestCase):
+    """The browser anchoring bug: a structured read taken from the WINDOW captures
+    the browser, not the page — and quietly records every open tab's title while
+    it does."""
+
+    def test_the_page_is_found_beneath_the_chrome(self):
+        web = ax.find_web_area(FakeAX(), safari_like_window())
+        self.assertIsNotNone(web)
+        labels = [d["label"] for d in ax.walk(FakeAX(), web)]
+        self.assertEqual(sorted(labels), ["Save", "Status", "Title"])
+
+    def test_a_native_window_has_no_web_area(self):
+        native = FakeElement({"AXRole": "AXWindow"}, [el("AXButton", "Send")])
+        self.assertIsNone(ax.find_web_area(FakeAX(), native))
+
+    def test_the_search_is_depth_bounded(self):
+        deep = FakeElement({"AXRole": "AXWebArea"})
+        for _ in range(30):
+            deep = FakeElement({"AXRole": "AXGroup"}, [deep])
+        self.assertIsNone(ax.find_web_area(FakeAX(), deep, max_depth=4))
+
+    def test_walking_from_the_window_is_what_went_wrong(self):
+        """The control. Anchored on the window, the element budget is spent on tab
+        titles and the form is never reached — which is what shipped."""
+        labels = [d["label"] for d in ax.walk(FakeAX(), safari_like_window())]
+        self.assertNotIn("Title", labels)
+        self.assertNotIn("Status", labels)
+        self.assertTrue(any("SQL Editor" in l for l in labels))
+
+    def test_a_structured_read_captures_the_page_and_its_url(self):
+        rec = Recorder()
+        fake = FakeAX([el("AXTextField", "Title", "Blue Hoodie")],
+                      window_el=safari_like_window())
+        ax.ax_loop(NTicks(1), rec, fake, clock=clock_from())
+        [read] = rec.of("structured_read")
+        labels = [e["label"] for e in read["payload"]["elements"]]
+        self.assertEqual(sorted(labels), ["Save", "Status", "Title"])
+        self.assertFalse([l for l in labels if "SQL Editor" in l],
+                         "another tab's title leaked into the capture")
+        self.assertTrue(read["payload"]["url"], "AXURL should give the real page URL")
 
 
 def _ax_granted():

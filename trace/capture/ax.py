@@ -85,6 +85,9 @@ SECURE_ROLES = {"password"}
 MAX_VALUE_CHARS = 500      # a text area can hold a novel; the label is the signal
 MAX_WALK_ELEMENTS = 60     # a structured read is a sample, not a DOM dump
 MAX_WALK_DEPTH = 12
+# The page in a browser window sits several levels below the window root (6 in
+# Safari, measured). Bounded so the search cannot wander a deep native tree.
+WEB_AREA_MAX_DEPTH = 10
 
 
 def normalize_role(ax_role):
@@ -153,6 +156,30 @@ def walk(ax, root, max_elements=MAX_WALK_ELEMENTS, max_depth=MAX_WALK_DEPTH):
                 nxt.append(child)
         frontier, depth = nxt, depth + 1
     return out
+
+
+def find_web_area(ax, root, max_depth=WEB_AREA_MAX_DEPTH):
+    """The ``AXWebArea`` under ``root`` — the page inside a browser window — or None.
+
+    Anchoring a structured read on the WINDOW is wrong in a browser, and wrong in a
+    way that looks like it is working. Measured in Safari on 2026-08-19: the web
+    area sits 6 levels down, and a breadth-first walk from the window spent 54 of
+    its 60-element budget on the tab bar, History, AutoFill, Share and the titles
+    of every open tab — reaching ZERO page content. Those tab titles are also other
+    people's business ending up in a capture, which is its own reason not to.
+
+    Depth-first, because the page is deep and narrow rather than wide, and bounded
+    because every step is IPC into the browser.
+    """
+    if root is None or max_depth < 0:
+        return None
+    if ax.attr(root, "AXRole") == "AXWebArea":
+        return root
+    for child in ax.children(root) or []:
+        found = find_web_area(ax, child, max_depth - 1)
+        if found is not None:
+            return found
+    return None
 
 
 def focus_signature(detail):
@@ -250,6 +277,23 @@ class AXAdapter:
         """
         return _clip(self._copy(self.focused_window(), "AXTitle")) or None
 
+    def content_root(self):
+        """Where a structured read should start: the PAGE in a browser window, the
+        window itself in a native app. See ``find_web_area`` for why the window is
+        the wrong anchor in a browser."""
+        window = self.focused_window()
+        return find_web_area(self, window) or window
+
+    def content_url(self):
+        """The page URL, or "" outside a browser.
+
+        Only the browser extension supplied a URL before; window titles are all the
+        local capturer had, so an SPA route change was at best a changed title.
+        ``AXURL`` on the web area gives the real address under the Accessibility
+        grant alone — verified returning a full admin.shopify.com URL."""
+        url = self._copy(find_web_area(self, self.focused_window()), "AXURL")
+        return _clip(str(url)) if url else ""
+
     def element_at(self, x, y):
         """The element under the cursor. Resolved against the frontmost app rather
         than system-wide, for the reason in the class docstring — and the frontmost
@@ -325,10 +369,10 @@ def ax_loop(stop, writer, ax=None, interval=0.4, read_interval=20.0, clock=now_i
             if window_title and (read_window != window_title
                                  or last_read_at is None
                                  or _seconds_between(last_read_at, now) >= read_interval):
-                elements = walk(ax, ax.focused_window())
+                elements = walk(ax, ax.content_root())
                 if elements:
                     writer.write("structured_read",
-                                 {"anchor": "focus", "url": "",
+                                 {"anchor": "focus", "url": ax.content_url(),
                                   "window": window_title, "elements": elements},
                                  ts=now)
                 last_read_at, read_window = now, window_title
