@@ -191,6 +191,18 @@ events. Measured 2026-08-19: the app produced 3-5 blank window events while the
 probe, running from a granted Terminal at the same moment on the same Shopify
 work, produced 134 fully semantic ones.
 
+## An invalid signature makes every permission grant a no-op
+
+Before blaming permissions, verify the signature:
+
+```bash
+codesign --verify --deep --strict --verbose=2 /Applications/Trace.app
+```
+
+Anything other than `valid on disk` means macOS will ignore every grant you make,
+however many times you tick the box. `cargo tauri build` produces exactly this
+defect on every build — see `desktop/README.md` for the required re-sign step.
+
 ## Not done yet
 
 - Go-live is **not** gated on capture health. `capture_health()` reports a warning

@@ -104,3 +104,38 @@ Tauri shell ──spawns──▶ trace-node sidecar (127.0.0.1:<port>, desktop 
                              │  everything else (auth, pipeline): PROXY ─▶ Render cloud
                              └─ on capture Stop: POST raw_events.jsonl ─▶ cloud (new session)
 ```
+
+## Re-sign after every build (REQUIRED on macOS)
+
+`cargo tauri build` emits a bundle whose signature claims sealed resources while
+sealing none:
+
+    /Applications/Trace.app: code has no resources but signature indicates they must be present
+
+macOS silently refuses to honour ANY permission grant for an app whose signature
+does not verify. The symptom is brutal to debug: System Settings shows Trace
+ticked under Accessibility, and the app still reports `granted: false` forever.
+Diagnosed 2026-08-19 after several wasted capture sessions.
+
+Run these after every build, before installing:
+
+```bash
+BUNDLE=src-tauri/target/release/bundle/macos/Trace.app
+xattr -cr "$BUNDLE"                       # extended attributes block signing
+codesign --force --deep --sign - "$BUNDLE"
+codesign --verify --deep --strict "$BUNDLE"   # must say "valid on disk"
+```
+
+`xattr -cr` is not optional — without it codesign fails with "resource fork,
+Finder information, or similar detritus not allowed".
+
+Re-signing changes the code hash, so every existing TCC entry goes stale: remove
+Trace from Accessibility / Screen Recording / Input Monitoring with the minus
+button, re-add it, and relaunch. Verify with:
+
+```bash
+grep "reported port" ~/Library/Application\ Support/com.trace.desktop/logs/trace-node.log
+curl -s http://127.0.0.1:<port>/api/permissions | python -m json.tool
+```
+
+A Developer ID signature removes this whole dance permanently and is the real fix.
