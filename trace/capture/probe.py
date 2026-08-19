@@ -10,6 +10,7 @@ UI.
     python -m trace.capture.probe               # 30 seconds, live
     python -m trace.capture.probe --seconds 60
     python -m trace.capture.probe --tree        # dump the focused window's tree once
+    python -m trace.capture.probe --seconds 900 --out /tmp/shopify.jsonl
 
 Use it by running it, switching to the app you want to test — Shopify admin,
 Safari, a native client — and working normally for the duration. Every line it
@@ -27,6 +28,7 @@ Reading the output:
 """
 
 import argparse
+import os
 import tempfile
 import threading
 import time
@@ -102,6 +104,9 @@ def main():
     ap.add_argument("--seconds", type=int, default=30)
     ap.add_argument("--tree", action="store_true",
                     help="dump the focused window's element tree and exit")
+    ap.add_argument("--out", default=None,
+                    help="write the raw stream to this path instead of a temp file, "
+                         "so it can be handed to someone else to read")
     args = ap.parse_args()
 
     checks = show_permissions()
@@ -115,9 +120,14 @@ def main():
         print("Accessibility capture is OFF — nothing below would be captured.")
         return
 
-    tmp = tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False)
-    tmp.close()
-    writer = Tee(tmp.name, reset=True)
+    if args.out:
+        out_path = os.path.abspath(args.out)
+        os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    else:
+        tmp = tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False)
+        tmp.close()
+        out_path = tmp.name
+    writer = Tee(out_path, reset=True)
     stop = threading.Event()
 
     print(f"Recording for {args.seconds}s. Switch to the app you want to test and "
@@ -134,7 +144,7 @@ def main():
         listener.stop()
     time.sleep(0.6)                       # let the last poll land
 
-    rows = read_raw_rows(tmp.name)
+    rows = read_raw_rows(out_path)
     health = sources.capture_health(sources.summarize_sources(rows), rows=rows)
     print(f"\n--- {health['total']} events ---")
     for src, n in sorted(health["by_source"].items()):
@@ -150,7 +160,7 @@ def main():
               "not be recoverable from this session.")
     else:
         print("\n  Looks healthy.")
-    print(f"\nRaw stream kept at: {tmp.name}")
+    print(f"\nRaw stream kept at: {out_path}")
 
 
 if __name__ == "__main__":
