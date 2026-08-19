@@ -127,13 +127,45 @@ is not now.
 A stable Developer ID signature is the fix. Until then, expect to re-grant after
 each build and check the probe first when a session looks empty.
 
+## Browsers anchor differently from native apps
+
+A structured read starts at `content_root()`, which is the page's `AXWebArea` in a
+browser and the window itself in a native app. This is not a detail — anchoring on
+the window in a browser was a real bug, fixed 2026-08-19.
+
+Measured in Safari: the web area sits **6 levels below the window**, and a walk
+from the window spent **54 of its 60-element budget** on the tab bar, History,
+AutoFill, Share and one entry per open tab, reaching **zero page content**. It also
+recorded the titles of every other open tab, which is a privacy problem on its own.
+
+When testing a browser workflow, check the probe's `READ` lines name things from
+the *page* (`Title`, `Status`, `Save`) and never another tab's title. If you see
+tab names, the anchoring has regressed.
+
+`content_url()` reads `AXURL` off the same web area, so browser captures now carry
+a real URL — previously only the Chrome extension could supply one.
+
+## If the desktop shell hangs on "Starting…"
+
+Not a capture problem. The Aug 2026 build bundles the sidecar as PyInstaller
+*onefile*, which forks; orphaned children accumulate and never clean up their
+`/var/folders/.../_MEI*` extraction dirs. 43 orphans and 1.5 GB of stale dirs were
+found on one machine. Clean up with:
+
+```bash
+pkill -f "/Applications/Trace.app/Contents/MacOS/trace-node"
+lsof | grep -c _MEI          # must be 0
+rm -rf /var/folders/*/*/T/_MEI*
+```
+
+The real fix is rebuilding onedir per `desktop/README.md` — no extraction, no fork,
+no orphans.
+
 ## Not done yet
 
 - Go-live is **not** gated on capture health. `capture_health()` reports a warning
   and nothing blocks, so an agent can still be built from a session with no
   semantic signal. Making it blocking is a flow change that wants a decision.
-- `structured_read` carries no `url`. The browser extension supplies one; AX could
-  read `AXURL` from a web area, which would give Safari real URLs.
 - The AX click resolver uses the frontmost app element. A click into a
   non-frontmost window resolves against the wrong app; rare, and it degrades to
   `target=None` rather than to a wrong answer.
