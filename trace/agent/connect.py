@@ -59,6 +59,28 @@ def _apps_in_text(text):
     return out
 
 
+# Browsers are never the app a worker needs to connect — the SERVICE is, and in a
+# browser capture the service name appears only in the window title.
+BROWSER_APPS = {"safari", "google chrome", "chrome", "firefox", "arc", "brave",
+                "microsoft edge", "edge", "opera", "chromium"}
+
+
+def _unmapped_names(event):
+    """Best names for an app we observed but cannot connect, most specific first.
+
+    Reporting ``event["app"]`` alone told the worker "Safari" — true, useless, and
+    actively misleading, since Safari is not the thing they needed to connect. For a
+    browser the service lives in the window title, so that is what is surfaced;
+    for a native app the app name is already right.
+    """
+    app = (event.get("app") or "").strip()
+    window = (event.get("window") or "").strip()
+    if app.lower() in BROWSER_APPS:
+        return [window] if window else []
+    return [app] if app else []
+
+
+
 def app_union(approved_bundles, event_log):
     """The de-duplicated set of connectable apps across the customer's approved bundles.
     Returns ``(apps, unmapped)`` where ``apps`` is ``[{slug, label, observed_as}]`` in
@@ -103,10 +125,10 @@ def app_union(approved_bundles, event_log):
                         by_slug[slug]["observed_as"].append(m["observed_as"])
                     _note(slug, b)
                 continue
-            app = (ev.get("app") or "").strip()            # nothing matched -> surface it
-            if app and app.lower() not in seen_unmapped:
-                seen_unmapped.add(app.lower())
-                unmapped.append(app)
+            for name in _unmapped_names(ev):           # nothing matched -> surface it
+                if name.lower() not in seen_unmapped:
+                    seen_unmapped.add(name.lower())
+                    unmapped.append(name)
         text = " ".join([str(b.get("name") or ""), str(b.get("description") or ""),
                          str(b.get("trigger") or ""), str(b.get("user_description") or "")] +
                         [str(s) for s in (b.get("steps") or [])])

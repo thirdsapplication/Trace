@@ -459,16 +459,81 @@ def cadence_to_cron(cadence):
 # idiom as APP_MCP_TABLE. Apps with no row are surfaced as 'unmapped', never guessed.
 # The exact Pipedream slugs are placeholders — confirm against the Pipedream app registry.
 CONNECT_APP_TABLE = {
-    "gmail":         {"slug": "gmail",           "label": "Gmail"},
-    "google sheets": {"slug": "google_sheets",   "label": "Google Sheets"},
-    "sheets":        {"slug": "google_sheets",   "label": "Google Sheets"},
-    "google drive":  {"slug": "google_drive",    "label": "Google Drive"},
-    "drive":         {"slug": "google_drive",    "label": "Google Drive"},
-    "google docs":   {"slug": "google_docs",     "label": "Google Docs"},
-    "docs":          {"slug": "google_docs",     "label": "Google Docs"},
-    "slack":         {"slug": "slack",           "label": "Slack"},
-    "outlook":       {"slug": "outlook",         "label": "Outlook"},
-    "calendar":      {"slug": "google_calendar", "label": "Google Calendar"},
+    # Observed text -> the Pipedream app to connect. Matched as a SUBSTRING of an
+    # event's app/window/detail (connect._slug_for), so ORDER MATTERS: the most
+    # specific key must come first or "docs" swallows "google docs".
+    #
+    # Domains are keys too. A browser capture puts the browser in `app` and the
+    # service only in the window title — and now that Accessibility capture reads
+    # AXURL, the real address often reaches the event log as well. A domain is a
+    # far more reliable signal than a window title a user can rename.
+    #
+    # SLUGS ARE UNVERIFIED unless checked against the live catalogue. A wrong slug
+    # fails at connect time, in front of the worker, rather than at build time —
+    # so run `python -m trace.agent.verify_apps` (needs Pipedream credentials)
+    # after touching this table, and before trusting a new entry.
+
+    # --- Google ---
+    "docs.google.com":      {"slug": "google_docs",      "label": "Google Docs"},
+    "sheets.google.com":    {"slug": "google_sheets",    "label": "Google Sheets"},
+    "drive.google.com":     {"slug": "google_drive",     "label": "Google Drive"},
+    "calendar.google.com":  {"slug": "google_calendar",  "label": "Google Calendar"},
+    "mail.google.com":      {"slug": "gmail",            "label": "Gmail"},
+    "gmail":                {"slug": "gmail",            "label": "Gmail"},
+    "google sheets":        {"slug": "google_sheets",    "label": "Google Sheets"},
+    "google drive":         {"slug": "google_drive",     "label": "Google Drive"},
+    "google docs":          {"slug": "google_docs",      "label": "Google Docs"},
+    "google calendar":      {"slug": "google_calendar",  "label": "Google Calendar"},
+
+    # --- commerce + payments ---
+    "admin.shopify.com":    {"slug": "shopify",          "label": "Shopify"},
+    "shopify":              {"slug": "shopify",          "label": "Shopify"},
+    "dashboard.stripe.com": {"slug": "stripe",           "label": "Stripe"},
+    "stripe":               {"slug": "stripe",           "label": "Stripe"},
+    "squareup.com":         {"slug": "square",           "label": "Square"},
+    "woocommerce":          {"slug": "woocommerce",      "label": "WooCommerce"},
+    "bigcommerce":          {"slug": "bigcommerce",      "label": "BigCommerce"},
+
+    # --- accounting ---
+    "quickbooks":           {"slug": "quickbooks",       "label": "QuickBooks"},
+    "xero":                 {"slug": "xero",             "label": "Xero"},
+
+    # --- CRM + support ---
+    "hubspot":              {"slug": "hubspot",          "label": "HubSpot"},
+    "salesforce":           {"slug": "salesforce",       "label": "Salesforce"},
+    "pipedrive":            {"slug": "pipedrive",        "label": "Pipedrive"},
+    "zendesk":              {"slug": "zendesk",          "label": "Zendesk"},
+    "intercom":             {"slug": "intercom",         "label": "Intercom"},
+    "freshdesk":            {"slug": "freshdesk",        "label": "Freshdesk"},
+
+    # --- docs, tables, project tracking ---
+    "airtable":             {"slug": "airtable",         "label": "Airtable"},
+    "notion":               {"slug": "notion",           "label": "Notion"},
+    "clickup":              {"slug": "clickup",          "label": "ClickUp"},
+    "trello":               {"slug": "trello",           "label": "Trello"},
+    "asana":                {"slug": "asana",            "label": "Asana"},
+    "atlassian.net":        {"slug": "jira",             "label": "Jira"},
+    "jira":                 {"slug": "jira",             "label": "Jira"},
+    "linear.app":           {"slug": "linear",           "label": "Linear"},
+    "monday.com":           {"slug": "monday",           "label": "Monday.com"},
+
+    # --- comms + files ---
+    "slack":                {"slug": "slack",            "label": "Slack"},
+    "outlook":              {"slug": "outlook",          "label": "Outlook"},
+    "calendar":             {"slug": "google_calendar",  "label": "Google Calendar"},
+    "dropbox":              {"slug": "dropbox",          "label": "Dropbox"},
+    "calendly":             {"slug": "calendly",         "label": "Calendly"},
+    "mailchimp":            {"slug": "mailchimp",        "label": "Mailchimp"},
+    "typeform":             {"slug": "typeform",         "label": "Typeform"},
+    "github":               {"slug": "github",           "label": "GitHub"},
+
+    # Deliberately NOT keys: "sheets"/"docs"/"drive" bare (they matched
+    # "spreadsheets", "documents", "driver"), "box" (inbox, dropbox), "square"
+    # (squarespace), "front" (frontend). _apps_in_text does word-boundary matching
+    # for prose, but _slug_for is substring — short keys are a false-positive trap.
+    "sheets":               {"slug": "google_sheets",    "label": "Google Sheets"},
+    "drive":                {"slug": "google_drive",     "label": "Google Drive"},
+    "docs":                 {"slug": "google_docs",      "label": "Google Docs"},
 }
 
 # Worker-facing expectation copy shown BEFORE Google's OAuth window (spec step 2).

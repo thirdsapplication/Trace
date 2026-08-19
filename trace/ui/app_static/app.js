@@ -3250,6 +3250,22 @@ function builtSummary() {
 function wireBuiltContinue() { $("#buildGo").onclick = () => goStep(5); }
 
 /* ---------------- 06 CONNECT ---------------- */
+
+/* Apps we watched someone use but cannot connect. The backend has always computed
+   this list and nothing ever rendered it, so an unsupported app was not merely
+   unavailable — it was invisible, and the connect step looked simply empty. Saying
+   so is the difference between "palza is broken" and "palza does not support this
+   one yet". */
+function unmappedNote(unmapped) {
+  const list = (unmapped || []).filter(Boolean);
+  if (!list.length) return "";
+  const names = list.slice(0, 4).map(esc).join(", ")
+    + (list.length > 4 ? ` and ${list.length - 4} more` : "");
+  return `<p class="notice" style="margin-top:12px;">Palza saw you working in
+    <b>${names}</b> but can't connect ${list.length === 1 ? "it" : "them"} yet, so your
+    agent won't act there. Everything else above still works.</p>`;
+}
+
 async function stepConnect() {
   const sid = S.session.id;
   // Frame 12. The frame captions each app with the agents that need it ("Retail recap ·
@@ -3289,6 +3305,7 @@ async function renderConnect(sid) {
         <button id="connEmailGo" class="btn-secondary btn-sm">Confirm</button></div></div>
     <p id="connMsg" class="msg"></p>
     <div class="stack" style="margin-top:8px;">${slugs.map(appCard).join("") || `<p class="muted">No apps to connect for these routines.</p>`}</div>
+    ${unmappedNote(rec.unmapped)}
     <button id="connContinue" class="btn-primary full" style="margin-top:16px;" ${connectionUsable() ? "" : "disabled"}>Continue</button>`;
   $("#connEmailGo").onclick = async () => {
     const e = $("#connEmail").value.trim();

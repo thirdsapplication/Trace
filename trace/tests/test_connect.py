@@ -13,7 +13,7 @@ import time
 import unittest
 import urllib.request
 
-from trace.agent import connect
+from trace.agent import config, connect, verify_apps
 from trace.tests.test_configgen import _bundle, _load
 from trace.tests.test_ui_agent import EVENTS, REVIEWED, FakeKeystore
 from trace.ui import app, sessions
@@ -659,6 +659,88 @@ class UIConnectTest(unittest.TestCase):
         self.assertEqual(g["verified"], "no")
         self.assertFalse(g["usable"])
         self.assertTrue(g["flag"])
+
+
+class BroaderAppTableTest(unittest.TestCase):
+    """The connect table was ten Google-and-friends entries, so a Shopify capture
+    reached the connect step with nothing to connect — and said nothing about why.
+    """
+
+    def _shopify_event(self):
+        # Shaped like the real capture: the browser in `app`, the service only in
+        # the window title.
+        return {"id": "e001", "app": "Safari",
+                "window": "My Store · Products · Add product · Shopify",
+                "detail": "entered the product title and price, set Status to Active"}
+
+    def test_shopify_is_found_in_a_browser_window_title(self):
+        apps, unmapped = connect.app_union(
+            [{"id": "B1", "name": "Add products", "evidence_event_ids": ["e001"]}],
+            [self._shopify_event()])
+        self.assertIn("shopify", [a["slug"] for a in apps])
+        self.assertEqual(unmapped, [])
+
+    def test_a_domain_is_enough_on_its_own(self):
+        """Now that Accessibility capture reads AXURL, the address is a stronger
+        signal than a window title anyone can rename."""
+        ev = {"id": "e001", "app": "Safari", "window": "",
+              "detail": "opened https://admin.shopify.com/store/90fb08-32/products/new"}
+        apps, _ = connect.app_union(
+            [{"id": "B1", "name": "x", "evidence_event_ids": ["e001"]}], [ev])
+        self.assertEqual([a["slug"] for a in apps], ["shopify"])
+
+    def test_an_unknown_service_is_named_not_its_browser(self):
+        """Reporting 'Safari' was true, useless, and pointed at the wrong thing."""
+        ev = {"id": "e001", "app": "Safari",
+              "window": "Widgets Inc — Fulfilment Console", "detail": ""}
+        apps, unmapped = connect.app_union(
+            [{"id": "B1", "name": "x", "evidence_event_ids": ["e001"]}], [ev])
+        self.assertEqual(apps, [])
+        self.assertEqual(unmapped, ["Widgets Inc — Fulfilment Console"])
+        self.assertNotIn("Safari", unmapped)
+
+    def test_a_native_app_still_reports_its_own_name(self):
+        ev = {"id": "e001", "app": "Riverbend ERP", "window": "Orders", "detail": ""}
+        _, unmapped = connect.app_union(
+            [{"id": "B1", "name": "x", "evidence_event_ids": ["e001"]}], [ev])
+        self.assertEqual(unmapped, ["Riverbend ERP"])
+
+    def test_specific_keys_still_beat_general_ones(self):
+        """Substring matching means order is load-bearing: 'docs' must not swallow
+        'google docs', and a domain must not be shadowed by a bare word."""
+        self.assertEqual(connect._slug_for("Google Docs")["slug"], "google_docs")
+        self.assertEqual(connect._slug_for("sheets.google.com")["slug"], "google_sheets")
+        self.assertEqual(connect._slug_for("admin.shopify.com")["slug"], "shopify")
+
+    def test_every_entry_is_well_formed(self):
+        """A malformed row fails at connect time in front of the worker."""
+        for observed, entry in config.CONNECT_APP_TABLE.items():
+            self.assertEqual(observed, observed.lower(),
+                             f"{observed!r} must be lowercase to match")
+            self.assertTrue(entry.get("slug"), f"{observed!r} has no slug")
+            self.assertTrue(entry.get("label"), f"{observed!r} has no label")
+
+
+class VerifyAppsTest(unittest.TestCase):
+    """The slugs are ours to guess and Pipedream's to define. verify_apps turns a
+    guess into a checkable fact BEFORE a worker hits it."""
+
+    def test_a_slug_missing_from_the_catalogue_is_reported(self):
+        unknown, known = verify_apps.check([{"slug": "shopify", "name": "Shopify"}])
+        self.assertIn("shopify", known)
+        self.assertTrue(unknown, "everything else should be unconfirmed here")
+
+    def test_the_report_says_what_would_break(self):
+        unknown, _ = verify_apps.check([])
+        self.assertIn("shopify", unknown)
+        self.assertIn("admin.shopify.com", unknown["shopify"]["observed"])
+
+    def test_a_full_catalogue_confirms_everything(self):
+        catalogue = [{"slug": e["slug"], "name": e["label"]}
+                     for e in config.CONNECT_APP_TABLE.values()]
+        unknown, known = verify_apps.check(catalogue)
+        self.assertEqual(unknown, {})
+        self.assertTrue(known)
 
 
 if __name__ == "__main__":
