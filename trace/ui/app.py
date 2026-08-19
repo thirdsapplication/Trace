@@ -3166,7 +3166,12 @@ def make_handler(state):
             if p == "/health":                              # Phase 1: liveness probe
                 # Dependency-free on purpose: Render's health check and the
                 # human's first smoke test must pass even before keys/DB are set.
+                # `commit` answers the question that cost a whole day: is the code
+                # I just pushed actually the code that is running? Render injects
+                # RENDER_GIT_COMMIT on every deploy, so this needs no build step and
+                # is empty (not wrong) anywhere else.
                 return self._json(200, {"status": "ok", "service": "trace-backend",
+                                        "commit": os.environ.get("RENDER_GIT_COMMIT", "")[:7],
                                         "database": "supabase" if supabase_client.is_configured()
                                         else "local"})
             if p == "/" or p == "/index.html":
