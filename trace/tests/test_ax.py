@@ -343,6 +343,85 @@ class TitleFallbackTest(unittest.TestCase):
         self.assertEqual(window._fallback_title(None), "")
 
 
+class SecureFieldTest(unittest.TestCase):
+    """Web password fields do not report AXSecureTextField.
+
+    Observed 2026-08-19 on the real Shopify and palza sign-in forms: WebKit
+    renders <input type=password> as a plain AXTextField, so the role check alone
+    never fired. Nothing leaked only because WebKit handed back masking glyphs
+    instead of characters — luck, not design.
+    """
+
+    def test_a_native_secure_field_is_still_caught(self):
+        d = ax.detail_of(FakeAX(), el("AXSecureTextField", "Password", "hunter2"))
+        self.assertEqual((d["role"], d["value"]), ("password", ""))
+
+    def test_a_web_password_field_is_caught_by_its_label(self):
+        d = ax.detail_of(FakeAX(), el("AXTextField", "Password", "hunter2"))
+        self.assertEqual(d["role"], "password")
+        self.assertEqual(d["value"], "", "a web password value reached the payload")
+
+    def test_a_masked_value_is_caught_even_with_no_useful_label(self):
+        """The palza form labelled its field '••••••••' — no word 'password'
+        anywhere, so only the glyph test catches it."""
+        d = ax.detail_of(FakeAX(), el("AXTextField", "•" * 8, "" * 9))
+        self.assertEqual((d["role"], d["value"]), ("password", ""))
+
+    def test_a_subrole_secure_field_is_caught(self):
+        e = FakeElement({"AXRole": "AXTextField", "AXSubrole": "AXSecureTextField",
+                         "AXTitle": "PIN", "AXValue": "1234"})
+        self.assertEqual(ax.detail_of(FakeAX(), e)["value"], "")
+
+    def test_ordinary_fields_are_untouched(self):
+        """The guard must not swallow real data — an asterisked note or a
+        required-field marker is not a password."""
+        d = ax.detail_of(FakeAX(), el("AXTextField", "Price $", "24.99"))
+        self.assertEqual((d["role"], d["value"]), ("textbox", "24.99"))
+        d2 = ax.detail_of(FakeAX(), el("AXTextField", "Title *", "Blue Hoodie"))
+        self.assertEqual(d2["value"], "Blue Hoodie")
+
+
+def shopify_status_option():
+    """Shopify's Status control, exactly as it came back from the real page.
+
+    The clicked option is an unlabelled cell; the text the worker chose sits in a
+    child. Captured as-is, the single most important fact about the action — which
+    option — is absent.
+    """
+    return FakeElement({"AXRole": "AXCell"}, [
+        FakeElement({"AXRole": "AXGroup"}, [el("AXStaticText", "", "Active")]),
+    ])
+
+
+class ClickTargetTest(unittest.TestCase):
+    def test_an_unlabelled_option_reports_the_text_beneath_it(self):
+        d = ax.target_detail(FakeAX(), shopify_status_option())
+        self.assertEqual(d["label"], "Active",
+                         "the chosen dropdown value was not recovered")
+
+    def test_plain_detail_still_misses_it(self):
+        """The control: this is what shipped, and why Status came back empty."""
+        d = ax.detail_of(FakeAX(), shopify_status_option())
+        self.assertEqual(d["label"], "")
+        self.assertEqual(d["value"], "")
+
+    def test_a_labelled_target_is_not_second_guessed(self):
+        d = ax.target_detail(FakeAX(), el("AXButton", "Save", ""))
+        self.assertEqual(d["label"], "Save")
+
+    def test_a_password_container_is_never_descended_into(self):
+        secure = FakeElement({"AXRole": "AXSecureTextField"},
+                             [el("AXStaticText", "", "hunter2")])
+        self.assertEqual(ax.target_detail(FakeAX(), secure)["value"], "")
+        self.assertEqual(ax.target_detail(FakeAX(), secure)["label"], "")
+
+    def test_the_descent_is_bounded(self):
+        deep = el("AXStaticText", "", "buried")
+        for _ in range(10):
+            deep = FakeElement({"AXRole": "AXGroup"}, [deep])
+        self.assertEqual(ax.descendant_text(FakeAX(), deep, max_depth=2), "")
+
+
 def safari_like_window():
     """A browser window shaped like the real thing: the page buried under chrome.
 

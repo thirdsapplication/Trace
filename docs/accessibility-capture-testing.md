@@ -161,6 +161,36 @@ rm -rf /var/folders/*/*/T/_MEI*
 The real fix is rebuilding onedir per `desktop/README.md` — no extraction, no fork,
 no orphans.
 
+## Permissions are per-BINARY, and a rebuild silently invalidates them
+
+The most common reason a session records nothing. Terminal and Trace.app are
+different binaries with separate grants — the probe working from Terminal says
+nothing about whether the app can capture.
+
+Worse, ad-hoc signing changes the code identity on every rebuild, so macOS keeps
+showing the old "Trace" entry **ticked** in System Settings while the grant no
+longer applies. It looks granted and is not.
+
+After any rebuild: System Settings -> Privacy & Security -> Accessibility, remove
+the Trace entry with the minus button, re-add it, then quit with Cmd-Q and
+relaunch. Same for Screen Recording and Input Monitoring.
+
+Verify rather than assume. Launch the app, then:
+
+```bash
+grep "reported port" ~/Library/Application\ Support/com.trace.desktop/logs/trace-node.log
+curl -s http://127.0.0.1:<port>/api/permissions | python -m json.tool
+```
+
+`"ready": true` with `accessibility.granted: true` means capture will work.
+
+Signature of this failure in a recorded session: every event is `window`, and
+`titled=0/N`. That is both permissions absent at once — Screen Recording would
+have supplied titles, Accessibility would have supplied titles AND semantic
+events. Measured 2026-08-19: the app produced 3-5 blank window events while the
+probe, running from a granted Terminal at the same moment on the same Shopify
+work, produced 134 fully semantic ones.
+
 ## Not done yet
 
 - Go-live is **not** gated on capture health. `capture_health()` reports a warning

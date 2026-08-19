@@ -34,15 +34,20 @@ Four decisions worth knowing:
    into the target app. Without ``AXUIElementSetMessagingTimeout`` a wedged app
    blocks the capture thread indefinitely.
 
-4. **Secure fields are never read.** ``AXSecureTextField`` values are dropped
-   before they are built into a payload, closing the native-password gap the
-   README lists as a v1 limitation.
+4. **Secure fields are never read.** Password values are dropped before they are
+   built into a payload, closing the native-password gap the README lists as a v1
+   limitation. The role alone is not sufficient: a NATIVE field reports
+   ``AXSecureTextField``, but WebKit renders a web ``<input type=password>`` as a
+   plain ``AXTextField``, so subrole, label and an all-masking-glyph value are all
+   checked (see ``is_secure``).
 
 Requires macOS Accessibility permission (``AXIsProcessTrusted``), which
 ``trace.ui.permissions`` already checks. Everything degrades to "emit nothing"
 rather than raising, so an ungranted or non-macOS environment simply captures
 what it captured before.
 """
+
+import re
 
 from .raw_writer import now_iso
 
@@ -88,6 +93,14 @@ MAX_WALK_DEPTH = 12
 # The page in a browser window sits several levels below the window root (6 in
 # Safari, measured). Bounded so the search cannot wander a deep native tree.
 WEB_AREA_MAX_DEPTH = 10
+# How far to descend for a container's own text (see descendant_text).
+DESCENDANT_TEXT_DEPTH = 3
+
+# Glyphs a masked field hands back instead of characters: bullet, black circle,
+# asterisk, and the private-use codepoint WebKit uses on macOS. A value made
+# ENTIRELY of these is a password field however it reports its role.
+_MASK_CHARS = set("\u2022\u25cf\u25cb*\uf79a\u00b7")
+_PASSWORD_LABEL = re.compile(r"(?i)\b(password|passcode|passwd)\b")
 
 
 def normalize_role(ax_role):
@@ -111,6 +124,29 @@ def _clip(value):
 
 # --- pure logic (adapter-injected, so it is testable without a Mac) --------
 
+def is_secure(ax, element, role, label, value):
+    """Whether this element is a password field, by any signal available.
+
+    The role alone is not enough. ``AXSecureTextField`` is what a NATIVE password
+    field reports, but WebKit renders a web ``<input type=password>`` as a plain
+    ``AXTextField`` — observed on the Shopify and palza sign-in forms, where the
+    only reason nothing leaked is that WebKit happened to hand back the masking
+    glyphs rather than the characters. That is luck, not a design, so three
+    independent signals are checked and any one is enough:
+
+    1. the subrole, which some web contexts do set,
+    2. the label naming it a password,
+    3. a value made entirely of masking glyphs, which no real field ever is.
+    """
+    if role in SECURE_ROLES:
+        return True
+    if normalize_role(ax.attr(element, "AXSubrole")) in SECURE_ROLES:
+        return True
+    if _PASSWORD_LABEL.search(label or ""):
+        return True
+    return bool(value) and all(ch in _MASK_CHARS for ch in value)
+
+
 def detail_of(ax, element):
     """Build the ``{role, label, value}`` detail for one element, or None if the
     element yields nothing worth recording.
@@ -124,10 +160,56 @@ def detail_of(ax, element):
     label = _clip(ax.attr(element, "AXTitle")
                   or ax.attr(element, "AXDescription")
                   or ax.attr(element, "AXPlaceholderValue"))
-    value = "" if role in SECURE_ROLES else _clip(ax.attr(element, "AXValue"))
+    value = _clip(ax.attr(element, "AXValue"))
+    if is_secure(ax, element, role, label, value):
+        role, value = "password", ""
     if not role and not label and not value:
         return None
     return {"role": role, "label": label, "value": value}
+
+
+def descendant_text(ax, element, max_depth=DESCENDANT_TEXT_DEPTH, max_nodes=12):
+    """First meaningful text beneath an element, for containers carrying none.
+
+    Custom widgets hand back containers with nothing on them. Measured on
+    Shopify's Status control: choosing a value produced
+    ``CLICK cell/'' = ''`` — the option the worker picked, with its text one level
+    down in a child. Without this the single most important fact about the action
+    (which option) is simply absent.
+
+    Deliberately shallow and capped: this runs per click, and a click can land on
+    a container with a large subtree.
+    """
+    if element is None or max_depth < 0:
+        return ""
+    seen = 0
+    for child in ax.children(element) or []:
+        seen += 1
+        if seen > max_nodes:
+            break
+        text = _clip(ax.attr(child, "AXTitle") or ax.attr(child, "AXValue")
+                     or ax.attr(child, "AXDescription"))
+        if text:
+            return text
+        deeper = descendant_text(ax, child, max_depth - 1, max_nodes)
+        if deeper:
+            return deeper
+    return ""
+
+
+def target_detail(ax, element):
+    """``detail_of`` plus a descent for containers that describe themselves with
+    nothing. Used for CLICK targets only — clicks are infrequent and each one is
+    the record of a decision, so the extra reads are worth it there and would not
+    be on the focus path."""
+    detail = detail_of(ax, element)
+    if detail is None:
+        return None
+    if not detail["label"] and not detail["value"] and detail["role"] not in SECURE_ROLES:
+        text = descendant_text(ax, element)
+        if text:
+            detail = dict(detail, label=text)
+    return detail
 
 
 def walk(ax, root, max_elements=MAX_WALK_ELEMENTS, max_depth=MAX_WALK_DEPTH):
@@ -424,7 +506,7 @@ def click_listener(writer, ax=None, clock=now_iso):
         if not pressed:
             return
         try:
-            detail = detail_of(ax, ax.element_at(x, y))
+            detail = target_detail(ax, ax.element_at(x, y))
             writer.write("click",
                          {"x": x, "y": y, "button": _button_name(button),
                           "target": detail},
