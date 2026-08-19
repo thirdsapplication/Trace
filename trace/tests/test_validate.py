@@ -106,5 +106,71 @@ class StitchTest(unittest.TestCase):
         self.assertEqual(log[0]["action"], "read_email")  # r0001 is earliest
 
 
+class AccessibilityEvidenceTest(unittest.TestCase):
+    """Regression guard for the breakage Accessibility capture would otherwise
+    introduce silently.
+
+    ``target`` is classified as navigation CONTEXT, which was correct while the
+    only producer was the browser extension: a target there rides alongside the
+    click that carries the action. Accessibility capture breaks that assumption —
+    in a native app, or a workflow that is mostly button-pushing, a value the
+    worker selected can arrive as a target and NOTHING else. If those stay
+    "context" they contribute no material span, and two chunk-overlap views of one
+    action stop being recognisable as the same action. Nothing raises; the event
+    log just quietly fills with duplicates.
+    """
+
+    def _raw(self, changed=True):
+        rows = [
+            {"id": "r0010", "ts": "2026-08-19T10:00:10.000", "source": "target",
+             "payload": {"role": "combobox", "label": "Status", "value": "Active",
+                         "window": "Add product · Shopify", "origin": "local"}},
+            {"id": "r0011", "ts": "2026-08-19T10:00:11.000", "source": "target",
+             "payload": {"role": "combobox", "label": "Vendor", "value": "Acme",
+                         "window": "Add product · Shopify", "origin": "local"}},
+            {"id": "r0012", "ts": "2026-08-19T10:00:12.000", "source": "target",
+             "payload": {"role": "textbox", "label": "Price", "value": "24.99",
+                         "window": "Add product · Shopify", "origin": "local"}},
+        ]
+        if changed:
+            for r in rows:
+                r["payload"]["changed"] = True
+        return {r["id"]: r for r in rows}
+
+    def _view(self, evidence):
+        return {"action": "enter_data", "detail": "set the product's fields",
+                "evidence": evidence, "confidence": "high"}
+
+    def test_two_chunk_views_of_one_ax_action_collapse_to_one(self):
+        """Neither evidence set contains the other, so only the material-span
+        overlap can catch this. Before value-changing targets counted as material
+        it produced two events."""
+        rep = validate.ValidationReport()
+        out = validate.stitch([[self._view(["r0010", "r0011"])],
+                               [self._view(["r0011", "r0012"])]], self._raw(), rep)
+        self.assertEqual(len(out), 1)
+        # Equally complete views tie, so the incumbent is kept — the point here is
+        # that the second was recognised as the same action at all.
+        self.assertEqual(out[0]["evidence"], ["r0010", "r0011"])
+
+    def test_a_focus_move_stays_context_and_does_not_merge_distinct_actions(self):
+        """The other half: a bare focus change is still navigation, so two
+        genuinely distinct actions that merely passed through the same element
+        must survive as two."""
+        rep = validate.ValidationReport()
+        out = validate.stitch([[self._view(["r0010", "r0011"])],
+                               [self._view(["r0011", "r0012"])]],
+                              self._raw(changed=False), rep)
+        self.assertEqual(len(out), 2)
+
+    def test_window_backfills_from_an_ax_target(self):
+        """window is the strong identifier _same_action dedupes on. Backfilling it
+        used to look only at window/keystroke events, so an AX-only action got an
+        empty window and became indistinguishable from any other."""
+        rep = validate.ValidationReport()
+        out = validate.stitch([[self._view(["r0010"])]], self._raw(), rep)
+        self.assertEqual(out[0]["window"], "Add product · Shopify")
+
+
 if __name__ == "__main__":
     unittest.main()

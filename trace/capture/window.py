@@ -18,8 +18,45 @@ event, then (3) point the coalescer at the new window.
 from .raw_writer import now_iso
 
 
-def frontmost():
+def frontmost_pid():
+    """PID of the frontmost application, or None.
+
+    Split out because Accessibility capture needs the PID specifically: the
+    system-wide AX element (``AXUIElementCreateSystemWide``) returns
+    kAXErrorCannotComplete in this process, exactly as NSWorkspace silently
+    stalls here — both want a run loop the capture sidecar does not pump. Reading
+    the PID from the same CGWindowList call that already works and creating a
+    per-application AX element from it is the path that does work. Kept beside
+    ``frontmost`` so the two never disagree about which app is in front.
+    """
+    try:
+        from Quartz import (
+            CGWindowListCopyWindowInfo,
+            kCGWindowListOptionOnScreenOnly,
+            kCGWindowListExcludeDesktopElements,
+            kCGNullWindowID,
+        )
+
+        windows = CGWindowListCopyWindowInfo(
+            kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
+            kCGNullWindowID,
+        ) or []
+        for w in windows:
+            if w.get("kCGWindowLayer", -1) == 0 and w.get("kCGWindowOwnerName"):
+                return w.get("kCGWindowOwnerPID")
+    except Exception:
+        pass
+    return None
+
+
+def frontmost(title_fallback=None):
     """Return ``(app, title)`` for the active window, or ``None`` on failure.
+
+    ``title_fallback`` is an optional zero-arg callable consulted only when Quartz
+    yields a blank title — in practice ``AXAdapter.focused_window_title``, which
+    reads the same title under the Accessibility grant. That is what demotes Screen
+    Recording from load-bearing to optional: without the fallback a missing Screen
+    Recording permission silently collapses a whole session to one blank event.
 
     Reads BOTH values from CGWindowList rather than asking NSWorkspace which app is
     active. NSWorkspace.frontmostApplication() refreshes off the AppKit run loop, and
@@ -69,16 +106,27 @@ def frontmost():
             title = w.get("kCGWindowName") or ""
             if title:
                 return (app_name, title)
-        return (app_name, "")
+        return (app_name, _fallback_title(title_fallback))
     except Exception:
         return None
 
 
-def window_loop(stop, writer, coalescer, interval=0.5):
+def _fallback_title(title_fallback):
+    """Ask the fallback for a title, tolerating any failure — a broken fallback
+    must degrade to today's blank title, never take the window poller down."""
+    if title_fallback is None:
+        return ""
+    try:
+        return title_fallback() or ""
+    except Exception:
+        return ""
+
+
+def window_loop(stop, writer, coalescer, interval=0.5, title_fallback=None):
     """Poll the active window and log changes until ``stop`` is set."""
     last = None
     while not stop.is_set():
-        cur = frontmost()
+        cur = frontmost(title_fallback)
         if cur and cur != last:
             ts = now_iso()
             # 1. close out the typed segment in the *previous* window.

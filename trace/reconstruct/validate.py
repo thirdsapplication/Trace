@@ -166,9 +166,15 @@ def validate_event(ev, raw_by_id, report):
             app = app or win["payload"].get("app", "")
             window = window or win["payload"].get("title", "")
         else:
-            ks = next((c for c in cited if c["source"] == "keystroke"), None)
-            if ks:
-                window = window or ks["payload"].get("window", "")
+            # Keystrokes carry the window they were typed into; Accessibility
+            # targets and structured reads carry the window they were read from.
+            # Without the second, an action evidenced only by AX events backfills
+            # an empty window — and window is the strong identifier _same_action
+            # dedupes on, so empty windows quietly make distinct actions look alike.
+            ctx = next((c for c in cited
+                        if (c.get("payload") or {}).get("window")), None)
+            if ctx:
+                window = window or ctx["payload"].get("window", "")
 
     cleaned = {
         "id": ev.get("id", ""),
@@ -224,10 +230,17 @@ def _check_fragmentation(ev, raw_by_id, report):
         )
 
 
-# Raw sources that are pure navigation/context and may be legitimately cited by
-# more than one distinct action. Everything else is "material": a discrete signal
-# the worker authored that belongs to exactly one logical action, so two events
-# citing overlapping material evidence are two views of the *same* action.
+# Raw sources that are USUALLY pure navigation/context and may be legitimately
+# cited by more than one distinct action. Everything else is "material": a discrete
+# signal the worker authored that belongs to exactly one logical action, so two
+# events citing overlapping material evidence are two views of the *same* action.
+#
+# "Usually", because ``target`` straddles both. From the browser extension a target
+# is a focus change riding alongside the click that carries the action — context.
+# From the Accessibility capturer it is often the ONLY record of an action: in a
+# native app, or a workflow that is mostly button-pushing, a value the worker
+# selected may arrive as a target and nothing else. Treating those as context is
+# what would break dedupe — see ``_is_material``.
 _CONTEXT_SOURCES = {"window", "structured_read", "target"}
 _CONFIDENCE_RANK = {"high": 3, "medium": 2, "low": 1}
 
@@ -237,13 +250,36 @@ def _evidence_index(rid):
     return int(digits) if digits else None
 
 
+def _is_material(raw):
+    """True if this raw event is content the worker authored, rather than the
+    navigation context around it.
+
+    Source type alone is not sufficient. A ``target`` carrying ``changed`` records
+    a value the worker actually entered or selected — authored content by any
+    reasonable reading — and if it were classified as context, an action evidenced
+    only by targets would have NO material span. Two consequences follow from that,
+    both silent: ``_is_same_underlying`` could not tell that two chunk-overlap views
+    are the same action, so duplicates would survive into the event log; and
+    ``_has_material`` would be False, so ``coalesce_contiguous`` would never
+    reassemble fragments. Nothing raises — the log just quietly gets worse.
+    """
+    if not isinstance(raw, dict):
+        return False
+    src = raw.get("source")
+    if not src:
+        return False
+    if src not in _CONTEXT_SOURCES:
+        return True
+    return src == "target" and bool((raw.get("payload") or {}).get("changed"))
+
+
 def _material_range(ev, raw_by_id):
-    """The [min, max] raw-index span of an event's *material* evidence (keystroke/
-    click/clipboard — not navigation context), or None if it cites none."""
+    """The [min, max] raw-index span of an event's *material* evidence (keystrokes,
+    clicks, clipboard, and value-changing targets — not navigation context), or
+    None if it cites none."""
     idxs = []
     for r in ev["evidence"]:
-        src = raw_by_id.get(r, {}).get("source")
-        if src and src not in _CONTEXT_SOURCES:
+        if _is_material(raw_by_id.get(r)):
             i = _evidence_index(r)
             if i is not None:
                 idxs.append(i)
@@ -291,10 +327,7 @@ def _completeness(ev, raw_by_id):
     a wider material span, then higher confidence, then more total evidence."""
     rng = _material_range(ev, raw_by_id)
     span = (rng[1] - rng[0] + 1) if rng else 0
-    material_count = sum(
-        1 for r in ev["evidence"]
-        if raw_by_id.get(r, {}).get("source") not in _CONTEXT_SOURCES
-    )
+    material_count = sum(1 for r in ev["evidence"] if _is_material(raw_by_id.get(r)))
     return (material_count, span, _CONFIDENCE_RANK.get(ev["confidence"], 0), len(ev["evidence"]))
 
 

@@ -24,6 +24,7 @@ import argparse
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from . import raw_writer
 from .raw_writer import RawWriter
 
 # CORS: a Chrome extension service worker / content script posts here from a
@@ -124,7 +125,8 @@ def make_handler(writer, stats=None):
                 source = ev.get("source")
                 if source not in _BROWSER_SOURCES:
                     continue
-                rec = writer.write(source, ev.get("payload", {}), ts=ev.get("ts"))
+                rec = writer.write(source, ev.get("payload", {}), ts=ev.get("ts"),
+                                   origin=raw_writer.BROWSER)
                 written += 1
                 if stats is not None and rec is not None:
                     stats.record(rec["ts"])

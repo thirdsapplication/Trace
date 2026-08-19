@@ -1,14 +1,23 @@
 """macOS permission + browser-capture status checks (handoff §4.1).
 
-Capture needs three macOS permissions that tripped up earlier manual runs:
-- **Accessibility** — legacy window-title path (the ``osascript`` spine).
-- **Input Monitoring** — to read keystrokes.
-- **Screen Recording** — to read window TITLES. Since window capture moved to the
-  Quartz CGWindowList API, ``kCGWindowName`` is only populated for a process that
-  holds Screen Recording; without it the API still returns every window, just with
-  an empty name. That failure is silent: events keep flowing with ``title: ""``,
-  and because ``window_loop`` only emits on change, a whole session inside one
-  browser collapses to a single event.
+Capture uses three macOS permissions, and which of them matter changed when
+Accessibility capture landed:
+
+- **Accessibility** — now the important one. It reads the focused element, its
+  label and value, and the element under a click, which is what makes a native-app
+  or non-Chrome session legible at all. It ALSO supplies the window title via
+  ``kAXTitleAttribute``. Without it, work outside Chrome records as window titles
+  and loose keystrokes.
+- **Input Monitoring** — to read keystrokes and mouse clicks. Unchanged.
+- **Screen Recording** — reads window TITLES via ``kCGWindowName``, which is only
+  populated for a process that holds it. Its absence used to be catastrophic and
+  silent: events kept flowing with ``title: ""``, and since ``window_loop`` only
+  emits on change, a whole session inside one browser collapsed to a single blank
+  event. Now that Accessibility supplies the same title, this is a **fallback**
+  rather than a requirement — it only bites when neither permission is granted.
+
+``REQUIRED`` below is the machine-readable version of that, so the UI ranks these
+by consequence instead of listing three equal-looking switches.
 
 We detect them best-effort via pyobjc if present, and degrade gracefully to
 ``granted: None`` ("can't auto-detect") with fix-it instructions otherwise. These
@@ -17,6 +26,15 @@ checks never raise and are safe to call on any platform.
 
 import sys
 
+# Permission key -> whether capture is meaningfully degraded without it.
+# "required": semantic capture does not happen at all.
+# "recommended": there is a working fallback, but a narrower one.
+REQUIRED = {
+    "accessibility": "required",
+    "input_monitoring": "required",
+    "screen_recording": "recommended",
+}
+
 
 def _is_macos():
     return sys.platform == "darwin"
@@ -24,7 +42,9 @@ def _is_macos():
 
 ACCESSIBILITY_FIX = (
     "Grant in System Settings → Privacy & Security → Accessibility, then add/enable "
-    "the app running Trace (e.g. your Terminal or the Trace launcher)."
+    "the app running Trace (e.g. your Terminal or the Trace launcher). Without it "
+    "Trace can see that you worked in an app but not which buttons you pressed or "
+    "which fields you filled, so workflows outside Chrome cannot be rebuilt."
 )
 INPUT_MONITORING_FIX = (
     "Grant in System Settings → Privacy & Security → Input Monitoring, then add/enable "
@@ -33,14 +53,34 @@ INPUT_MONITORING_FIX = (
 SCREEN_RECORDING_FIX = (
     "Grant in System Settings → Privacy & Security → Screen Recording, then add/enable "
     "the app running Trace and FULLY QUIT AND RELAUNCH it — macOS does not apply this "
-    "permission to an already-running process. Without it window titles are blank, so "
-    "Trace cannot tell which app or page you were working in."
+    "permission to an already-running process. Trace reads window titles from "
+    "Accessibility when this is off, so grant it only if titles still come back blank."
 )
 
 
+def request_accessibility():
+    """Trigger the system's Accessibility prompt and report whether it is granted.
+
+    ``AXIsProcessTrustedWithOptions`` with the prompt option is the only way to
+    make macOS show the grant dialog; ``AXIsProcessTrusted`` alone silently returns
+    False forever, which is why the permission has sat unrequested. Safe to call
+    repeatedly — macOS shows the dialog at most once per process.
+    """
+    if not _is_macos():
+        return False
+    try:
+        from ApplicationServices import (
+            AXIsProcessTrustedWithOptions, kAXTrustedCheckOptionPrompt,
+        )
+        return bool(AXIsProcessTrustedWithOptions({kAXTrustedCheckOptionPrompt: True}))
+    except Exception:
+        return False
+
+
 def check_accessibility():
-    """Accessibility (window titles). Uses AXIsProcessTrusted via pyobjc when
-    available; otherwise falls back to probing the active-window poller."""
+    """Accessibility (element labels/values, click targets, window titles). Uses
+    AXIsProcessTrusted via pyobjc when available; otherwise falls back to probing
+    the active-window poller."""
     if not _is_macos():
         return {"name": "Accessibility", "granted": None,
                 "detail": "Not macOS — capture is macOS-only.", "fix": ACCESSIBILITY_FIX}
@@ -115,9 +155,25 @@ def check_screen_recording():
 
 
 def check_all():
-    return {
-        "platform": sys.platform,
+    """All three checks plus a single verdict the UI can gate a recording on.
+
+    ``ready`` is False only when a *required* permission is known-denied. An
+    undetectable permission (``granted: None``) does not block — a check we cannot
+    run is not evidence of a problem, and refusing to record on that basis would
+    be worse than recording and warning afterwards.
+    """
+    checks = {
         "accessibility": check_accessibility(),
         "input_monitoring": check_input_monitoring(),
         "screen_recording": check_screen_recording(),
+    }
+    for key, check in checks.items():
+        check["importance"] = REQUIRED.get(key, "recommended")
+    blocking = [c["name"] for k, c in checks.items()
+                if REQUIRED.get(k) == "required" and c["granted"] is False]
+    return {
+        "platform": sys.platform,
+        "ready": not blocking,
+        "blocking": blocking,
+        **checks,
     }

@@ -29,6 +29,7 @@ import time
 
 from pynput import keyboard
 
+from . import ax
 from .clipboard import clipboard_loop
 from .keystrokes import KeystrokeCoalescer
 from .raw_writer import RawWriter, now_iso
@@ -53,14 +54,33 @@ def main():
                     help="append to an existing stream instead of resetting it")
     ap.add_argument("--no-clipboard", action="store_true",
                     help="disable the outside-browser clipboard poll")
+    ap.add_argument("--no-accessibility", action="store_true",
+                    help="disable Accessibility capture of native-app elements")
     args = ap.parse_args()
 
     writer = RawWriter(args.out, reset=not args.append)
     coalescer = KeystrokeCoalescer(writer)
     stop = threading.Event()
 
+    # Accessibility capture first, so the window poller can borrow its title
+    # reader. Silently absent when the permission is missing.
+    adapter = None
+    if not args.no_accessibility:
+        adapter = ax.AXAdapter()
+        if adapter.available():
+            threading.Thread(target=ax.ax_loop, args=(stop, writer, adapter),
+                             daemon=True).start()
+            ax.click_listener(writer, adapter)
+            print("[capture] Accessibility capture ON (native-app elements + clicks)")
+        else:
+            adapter = None
+            print("[capture] Accessibility capture OFF — grant Accessibility in "
+                  "System Settings → Privacy & Security to capture native apps")
+
     # Window poll (also drives keystroke-segment flushing on navigation).
     threading.Thread(target=window_loop, args=(stop, writer, coalescer),
+                     kwargs={"title_fallback":
+                             adapter.focused_window_title if adapter else None},
                      daemon=True).start()
     if not args.no_clipboard:
         threading.Thread(target=clipboard_loop, args=(stop, writer),

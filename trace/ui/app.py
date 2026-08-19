@@ -2308,6 +2308,12 @@ def make_handler(state):
             else — auth, all pipeline actions — is proxied to the cloud."""
             if p == "/health" or p in ("/api/status", "/api/permissions"):
                 return True
+            # Permission probes describe THIS Mac. Proxied, they would faithfully
+            # report the Render container's permissions — which are always absent —
+            # and the UI would tell every desktop user to grant something they had
+            # already granted.
+            if p.startswith("/api/u/permissions") or p.startswith("/api/permissions"):
+                return True
             # The end-user UI shell is bundled into the desktop node, so serve it
             # locally: first paint stops depending on a cloud round-trip (60s
             # timeout per request, cold starts included). The page is public and
@@ -3207,7 +3213,7 @@ def make_handler(state):
             if p == "/api/settings/pipedream":
                 pinfo = getattr(state.keystore, "pipedream_info", None)
                 return self._json(200, pinfo() if callable(pinfo) else {"configured": False})
-            if p == "/api/permissions":
+            if p in ("/api/permissions", "/api/u/permissions"):
                 return self._json(200, permissions.check_all())
             if p == "/api/preflight":
                 return self._json(200, _preflight(state))
@@ -3274,6 +3280,12 @@ def make_handler(state):
                 return self._save_pipedream(body)
             if p == "/api/settings/test-key":
                 return self._json(200, _test_key(state))
+            if p in ("/api/permissions/request", "/api/u/permissions/request"):
+                # Triggers the macOS Accessibility dialog. AXIsProcessTrusted on its
+                # own returns False forever without ever asking, which is why this
+                # permission has sat unrequested since it was first checked.
+                permissions.request_accessibility()
+                return self._json(200, permissions.check_all())
             if p == "/api/capture/start":
                 return self._capture_start()
             if p == "/api/capture/stop":

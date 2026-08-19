@@ -64,13 +64,36 @@ class WarningTest(unittest.TestCase):
         self.assertTrue(sources.capture_health(summary, min_browser_events=2)["warning"])
         self.assertFalse(sources.capture_health(summary, min_browser_events=1)["warning"])
 
-    def test_browser_only_set_excludes_clipboard(self):
-        bo = sources.browser_only_sources()
-        self.assertIn("click", bo)
-        self.assertIn("target", bo)
-        self.assertIn("structured_read", bo)
-        self.assertNotIn("clipboard", bo)
-        self.assertNotIn("keystroke", bo)
+    def test_semantic_set_is_the_meaning_carrying_sources(self):
+        """What the warning keys off. Deliberately independent of which capturer
+        supplied them — the extension and Accessibility both produce all three, so
+        asking "was the browser connected?" is the wrong question now."""
+        sem = sources.semantic_sources()
+        self.assertIn("click", sem)
+        self.assertIn("target", sem)
+        self.assertIn("structured_read", sem)
+        self.assertNotIn("clipboard", sem)   # can't prove either capturer was live
+        self.assertNotIn("keystroke", sem)
+        self.assertNotIn("window", sem)
+
+    def test_nothing_is_browser_only_any_more(self):
+        """The emptiness is the point: Accessibility produces all three semantic
+        sources for native apps, so no source type implies the extension."""
+        self.assertEqual(sources.browser_only_sources(), set())
+
+    def test_accessibility_alone_satisfies_the_check(self):
+        """A Safari/native session with no extension is now a HEALTHY session, as
+        long as something captured what the actions meant."""
+        rows = rows_with(window=5, keystroke=5, target=4, click=2)
+        for r in rows:
+            r["payload"] = {"origin": "local"}
+            if r["source"] == "window":
+                # Titles supplied by AX rather than Screen Recording — the whole
+                # point of the fallback, and the other half of a healthy session.
+                r["payload"]["title"] = "Add product · Shopify"
+        health = sources.capture_health(sources.summarize_sources(rows), rows=rows)
+        self.assertFalse(health["warning"])
+        self.assertEqual(health["by_origin"], {"local": 16})
 
 
 if __name__ == "__main__":

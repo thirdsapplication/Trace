@@ -68,15 +68,24 @@ class CaptureController:
     raw stream, collector stats, and timers are isolated.
     """
 
-    def __init__(self, out_path, collector_port=8137, enable_clipboard=True):
+    def __init__(self, out_path, collector_port=8137, enable_clipboard=True,
+                 enable_ax=True, ax_adapter=None):
         self.out_path = out_path
         self.collector_port = collector_port
         self.enable_clipboard = enable_clipboard
+        # Accessibility capture is the native-app half of the semantic layer. It is
+        # opt-out rather than opt-in because without it a non-Chrome session
+        # records no semantic signal at all; ``AXAdapter`` reports itself
+        # unavailable when the permission is missing, so leaving it on costs
+        # nothing on a machine that has not granted it.
+        self.enable_ax = enable_ax
 
         self._writer = None
         self._coalescer = None
         self._stop = None
         self._listener = None
+        self._mouse_listener = None
+        self._ax = ax_adapter
         self._httpd = None
         self._stats = CollectorStats()
         self._started_at = None
@@ -98,9 +107,17 @@ class CaptureController:
             self._coalescer = KeystrokeCoalescer(self._writer)
             self._stop = threading.Event()
 
+            # Accessibility capture, started first so the window poller can use it
+            # as a title fallback. An adapter that reports itself unavailable
+            # (permission not granted, not macOS) yields None here and every
+            # AX-dependent piece below simply does not run.
+            ax = self._start_ax()
+
             # window poll (also flushes keystroke segments on navigation)
             threading.Thread(target=window_loop,
                              args=(self._stop, self._writer, self._coalescer),
+                             kwargs={"title_fallback":
+                                     ax.focused_window_title if ax else None},
                              daemon=True).start()
             if self.enable_clipboard:
                 threading.Thread(target=clipboard_loop,
@@ -140,6 +157,29 @@ class CaptureController:
             self._started_at = now_iso()
             self._running = True
 
+    def _start_ax(self):
+        """Start the Accessibility poller + click resolver. Returns the adapter, or
+        None when AX is disabled or unavailable.
+
+        Never raises: a machine without the permission (or without pyobjc) must
+        capture exactly what it captured before, not fail to start a session.
+        """
+        if not self.enable_ax:
+            return None
+        try:
+            from . import ax as ax_mod
+            adapter = self._ax or ax_mod.AXAdapter()
+            if not adapter.available():
+                return None
+            self._ax = adapter
+            threading.Thread(target=ax_mod.ax_loop,
+                             args=(self._stop, self._writer, adapter),
+                             daemon=True).start()
+            self._mouse_listener = ax_mod.click_listener(self._writer, adapter)
+            return adapter
+        except Exception:
+            return None
+
     def pause(self):
         """Stop writing without ending the session (reuses the engine's pause).
         Flushes the in-flight typed segment so it isn't carried across the pause."""
@@ -167,6 +207,12 @@ class CaptureController:
                 self._coalescer.flush(ts_end=now_iso())
             if self._listener:
                 self._listener.stop()
+            if self._mouse_listener:
+                try:
+                    self._mouse_listener.stop()
+                except Exception:
+                    pass
+                self._mouse_listener = None
             if self._httpd:
                 self._httpd.shutdown()
                 self._httpd.server_close()
@@ -197,6 +243,10 @@ class CaptureController:
             "event_count": count_events(self.out_path),
             "out_path": self.out_path,
             "browser": self._stats.snapshot(),
+            # Whether native-app semantic capture is live this session. Surfaced so
+            # the UI can say "recording, but only window titles outside Chrome"
+            # while there is still time to fix it, rather than after the fact.
+            "accessibility": bool(self._ax and self._ax.available()),
         }
 
     def summary(self, min_browser_events=1):

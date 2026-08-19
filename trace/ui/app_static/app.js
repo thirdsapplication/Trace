@@ -327,7 +327,7 @@ const POLICY = {
   ]],
   privacy: ["Privacy policy", [
     ["Recording is opt-in and visible", "Capture only runs during a session you start, with a live indicator, and you can pause or stop it at any moment."],
-    ["What is captured", "Window titles and activity in the apps you name — no screenshots, and sensitive text is removed before anything is saved."],
+    ["What is captured", "Window titles, the text you type, and the labels and values of the controls you use — the buttons, fields and dropdowns you actually touch. Still no screenshots and no images of your screen: palza reads these as text, the same way a screen reader does. Password fields are never read, and sensitive text is removed before anything is saved."],
     ["What it is used for", "Building and improving your own agents. Delete every recording at any time from Settings → Privacy & data."],
     ["Sharing is yours to set", "Lessons your agents learn can be shared with your team or turned off entirely, in Sharing. Lessons carry the rule, never the email, data or recording it came from."],
   ]],
@@ -2543,7 +2543,9 @@ function renderRecBody(mode, started, wasPaused) {
     <div class="rec-mid">
       <h1 class="rec-head">Record your day</h1>
       <p class="rec-copy">Palza watches how you work for a while and learns your routines.
-        On your Mac · no screenshots · sensitive text removed before saving.</p>
+        On your Mac · no screenshots · reads the fields and buttons you use ·
+        sensitive text removed before saving.</p>
+      <div id="permStrip"></div>
       <p id="recMsg" class="msg err"></p>
     </div>
     <div class="rec-acts rec-acts-col">
@@ -2568,6 +2570,46 @@ function renderRecBody(mode, started, wasPaused) {
     await loadAndRender();
   };
   $("#recDescribe").onclick = () => renderRecBody("describe");
+  paintPermissions();
+}
+
+/* Capture pre-flight. /api/permissions has existed since the first desktop build and
+   nothing has ever called it, so the one failure that makes a whole session worthless
+   has been invisible at the only moment it is still cheap to fix — before recording.
+   Runs after paint (never blocking it) and says nothing when there is nothing wrong.
+
+   A permission we cannot detect (granted === null) is deliberately silent: a check we
+   could not run is not evidence of a problem, and nagging on it would train people to
+   ignore the strip that matters. */
+async function paintPermissions() {
+  const host = $("#permStrip");
+  if (!host) return;
+  const { ok, data } = await api("GET", "/api/u/permissions");
+  if (!ok || !data || data.platform !== "darwin") return;   // capture is macOS-only
+  const denied = ["accessibility", "input_monitoring", "screen_recording"]
+    .map((k) => data[k]).filter((c) => c && c.granted === false);
+  if (!denied.length) { host.innerHTML = ""; return; }
+
+  const blocking = denied.filter((c) => c.importance === "required");
+  const names = (list) => list.map((c) => c.name).join(" and ");
+  const lead = blocking.length
+    ? `${names(blocking)} ${blocking.length > 1 ? "are" : "is"} off, so palza would see
+       that you worked in an app but not which buttons you pressed or which fields you
+       filled — not enough to rebuild a workflow.`
+    : `${names(denied)} is off. Palza reads window titles another way, so recording still
+       works; grant it only if titles come back blank.`;
+  const needsAX = data.accessibility && data.accessibility.granted === false;
+  host.innerHTML = `<p class="notice">${esc(lead.replace(/\s+/g, " "))}${needsAX
+    ? ' <button type="button" class="fr-link" id="permGrant">Grant Accessibility</button>'
+    : ""}</p>`;
+
+  const grant = $("#permGrant");
+  if (grant) grant.onclick = async () => {
+    grant.disabled = true;
+    grant.textContent = "Approve it in System Settings, then come back…";
+    await api("POST", "/api/u/permissions/request", {});
+    paintPermissions();                       // re-read rather than assume it took
+  };
 }
 
 /* ---------------- 02 FIND WORKFLOWS (reconstruct + discover) ---------------- */
