@@ -9,6 +9,18 @@ anthropic>=0.40.0
 # the test suite; install on the capture machine.
 pynput>=1.7.6 ; sys_platform == "darwin"
 
+# The macOS capture spine has depended on these since window capture moved to
+# CGWindowList, and Accessibility capture (trace/capture/ax.py) needs
+# ApplicationServices for AXUIElement — but neither was ever declared. That gap
+# fails the worst possible way: every import is inside a try/except so capture
+# degrades silently to "no events" rather than erroring, which is indistinguishable
+# from a quiet workday. Declared now so a fresh machine or a bundled build cannot
+# ship without them.
+#   Quartz              -> CGWindowList (window titles), IOHIDCheckAccess
+#   ApplicationServices -> AXUIElement* (focused element, click targets, AX titles)
+pyobjc-framework-Quartz>=9.0 ; sys_platform == "darwin"
+pyobjc-framework-ApplicationServices>=9.0 ; sys_platform == "darwin"
+
 # Local test UI (trace.ui) — secure API-key storage in the macOS Keychain.
 # Optional: without it, the UI falls back to a 0600 config file. The UI backend
 # itself uses only the standard library (http.server).
