@@ -63,8 +63,8 @@ class FakeAX:
         # Same rule the real adapter uses, so tests exercise find_web_area.
         return ax.find_web_area(self, self.window_el) or self.window_el
 
-    def content_url(self):
-        return "https://admin.shopify.com/products/new" if self.window_el else ""
+    def url_of(self, element):
+        return "https://admin.shopify.com/products/new" if element is not None else ""
 
     def element_at(self, x, y):
         return self.window_el

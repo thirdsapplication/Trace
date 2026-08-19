@@ -284,14 +284,20 @@ class AXAdapter:
         window = self.focused_window()
         return find_web_area(self, window) or window
 
-    def content_url(self):
-        """The page URL, or "" outside a browser.
+    def url_of(self, element):
+        """The page URL for an already-resolved content root, or "" for a native
+        window.
 
-        Only the browser extension supplied a URL before; window titles are all the
-        local capturer had, so an SPA route change was at best a changed title.
-        ``AXURL`` on the web area gives the real address under the Accessibility
-        grant alone — verified returning a full admin.shopify.com URL."""
-        url = self._copy(find_web_area(self, self.focused_window()), "AXURL")
+        Takes the element rather than finding it again: ``find_web_area`` is a
+        depth-first descent through the browser's whole chrome subtree, and doing
+        that twice per structured read would double the IPC for no new information.
+
+        Only the browser extension could supply a URL before, so a local capture in
+        Safari had none and an SPA route change was at best a changed window title.
+        ``AXURL`` gives the real address under the Accessibility grant alone —
+        verified returning a full admin.shopify.com URL.
+        """
+        url = self._copy(element, "AXURL")
         return _clip(str(url)) if url else ""
 
     def element_at(self, x, y):
@@ -369,10 +375,11 @@ def ax_loop(stop, writer, ax=None, interval=0.4, read_interval=20.0, clock=now_i
             if window_title and (read_window != window_title
                                  or last_read_at is None
                                  or _seconds_between(last_read_at, now) >= read_interval):
-                elements = walk(ax, ax.content_root())
+                root = ax.content_root()
+                elements = walk(ax, root)
                 if elements:
                     writer.write("structured_read",
-                                 {"anchor": "focus", "url": ax.content_url(),
+                                 {"anchor": "focus", "url": ax.url_of(root),
                                   "window": window_title, "elements": elements},
                                  ts=now)
                 last_read_at, read_window = now, window_title
