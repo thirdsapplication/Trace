@@ -1,3 +1,4 @@
+import http.client
 import json
 import tempfile
 import threading
@@ -256,6 +257,119 @@ class UIBackendTest(unittest.TestCase):
                 f.write(json.dumps({"ts": f"2026-06-04T10:00:{i:02d}.000",
                                     "source": "window",
                                     "payload": {"app": "A", "title": f"w{i}"}}) + "\n")
+
+
+class CloudSurfaceLockdownTest(unittest.TestCase):
+    """A non-loopback bind (Render sets HOST=0.0.0.0) must serve ONLY the product
+    surface. The founder Test UI is unauthenticated and owner-blind, so on a public
+    host every one of its routes has to vanish — reading any session's raw capture
+    and overwriting the server's keys were both open to the internet before this
+    gate existed."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.ks = FakeKeystore()
+        self.state = app.AppState(
+            self._tmp.name,
+            reconstruct_fn=fake_reconstruct,
+            controller_factory=lambda out: FakeController(out),
+            key_store=self.ks,
+        )
+        self.httpd, _ = app.build_server(host="0.0.0.0", port=0, state=self.state)
+        self.port = self.httpd.server_address[1]
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self._tmp.cleanup()
+
+    def req(self, method, path, body=None):
+        url = f"http://127.0.0.1:{self.port}{path}"
+        data = json.dumps(body).encode() if body is not None else None
+        r = urllib.request.Request(url, data=data, method=method,
+                                   headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(r) as resp:
+                return resp.status, json.loads(resp.read() or b"null")
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read() or b"null")
+
+    def test_flag_computed_from_bind_host(self):
+        self.assertFalse(self.state.test_ui_enabled)
+
+    def test_session_data_routes_are_gone(self):
+        sid = sessions.create_session(self._tmp.name)
+        for path in ("/api/sessions", f"/api/sessions/{sid}/raw",
+                     f"/api/sessions/{sid}/event_log", "/api/status",
+                     "/api/preflight", "/api/fixtures", "/api/permissions"):
+            code, data = self.req("GET", path)
+            self.assertEqual(code, 404, f"GET {path} must 404 on a public bind")
+            self.assertEqual(data["error"], "not_found")
+
+    def test_key_settings_routes_are_gone(self):
+        self.assertEqual(self.req("GET", "/api/settings")[0], 404)
+        code, _ = self.req("POST", "/api/settings/key", {"key": "sk-ant-evil"})
+        self.assertEqual(code, 404)
+        self.assertIsNone(self.ks.key)   # the write must not have happened
+        self.assertEqual(self.req("DELETE", "/api/settings/key")[0], 404)
+        self.assertEqual(self.req("POST", "/api/settings/pipedream", {})[0], 404)
+
+    def test_pipeline_routes_are_gone(self):
+        sid = sessions.create_session(self._tmp.name)
+        self.assertEqual(self.req("POST", f"/api/sessions/{sid}/deploy", {})[0], 404)
+        self.assertEqual(self.req("POST", f"/api/sessions/{sid}/reconstruct", {})[0], 404)
+        self.assertEqual(self.req("POST", "/api/load-fixture", {"name": "x"})[0], 404)
+        self.assertEqual(self.req("POST", "/api/capture/start", {})[0], 404)
+
+    def test_test_ui_static_is_gone_and_root_redirects_to_app(self):
+        self.assertEqual(self.req("GET", "/static/app.js")[0], 404)
+        # "/" must send a human to the product, not the Test UI (and not follow
+        # the redirect here — assert the 302 itself).
+        conn = http.client.HTTPConnection("127.0.0.1", self.port)
+        conn.request("GET", "/")
+        resp = conn.getresponse()
+        self.assertEqual(resp.status, 302)
+        self.assertEqual(resp.getheader("Location"), "/app")
+        conn.close()
+
+    def test_product_surface_still_served(self):
+        code, data = self.req("GET", "/api/auth/me")
+        self.assertEqual(code, 200)             # auth probe stays public
+        code, _ = self.req("GET", "/api/u/agents")
+        self.assertEqual(code, 401)             # auth gate, not the 404 gate
+        code, data = self.req("GET", "/api/admin/overview")
+        self.assertEqual(code, 403)             # admin gate fails closed, still reachable
+        url = f"http://127.0.0.1:{self.port}/health"
+        with urllib.request.urlopen(url) as resp:
+            self.assertEqual(resp.status, 200)
+        url = f"http://127.0.0.1:{self.port}/app"
+        with urllib.request.urlopen(url) as resp:
+            self.assertEqual(resp.status, 200)  # end-user UI
+
+    def test_loopback_bind_keeps_test_ui(self):
+        # Control: a loopback bind keeps today's behavior, so local dev and the
+        # desktop node are untouched by the gate. Fresh state — build_server sets
+        # the flag on the state it is given, and self.state belongs to the locked
+        # server above.
+        control_state = app.AppState(
+            self._tmp.name,
+            reconstruct_fn=fake_reconstruct,
+            controller_factory=lambda out: FakeController(out),
+            key_store=FakeKeystore(),
+        )
+        httpd, state = app.build_server(port=0, state=control_state)
+        try:
+            self.assertTrue(state.test_ui_enabled)
+            port = httpd.server_address[1]
+            t = threading.Thread(target=httpd.serve_forever, daemon=True)
+            t.start()
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/sessions") as resp:
+                self.assertEqual(resp.status, 200)
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
 
 
 if __name__ == "__main__":

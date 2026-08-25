@@ -38,6 +38,11 @@ services:
     envVars:
       # Bind all interfaces in the cloud; Render injects $PORT automatically, so
       # PORT is not declared here. Locally, HOST defaults to 127.0.0.1.
+      # A non-loopback HOST also LOCKS the founder Test UI (`/`, `/static/`, the
+      # unauthenticated `/api/*` routes) — only /app, /api/u/*, /api/auth/*, the
+      # token-gated admin API and /health are served publicly. Never set
+      # TRACE_ENABLE_TEST_UI=1 on this service: it re-opens unauthenticated access
+      # to every session's raw capture and to the server's key settings.
       - key: HOST
         value: 0.0.0.0
       # Secrets — Render prompts for these on deploy; values never live in the repo.

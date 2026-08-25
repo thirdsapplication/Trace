@@ -339,8 +339,9 @@ def memory_store_name(external_user_id, workflow_name):
     e.g. ``trace-user-<id>-order-intake-memory`` — so every agent keeps its own
     store while the name still tells an administrator whose it is.
 
-    The workflow-name half is the platform agent name ``create_or_reuse_agent``
-    reuses by, which is what makes it the right key: it survives redeploys — the
+    The workflow-name half is the same workflow key the platform agent name is
+    built from (see ``agent_platform_name``), which is what makes it the right
+    key: it survives redeploys — the
     platform agent ID does NOT (redeploys delete+recreate the agent under a new
     id, so the previous id-keyed name minted a fresh store on every redeploy and
     orphaned what the agent had learned) — and a display rename
@@ -654,6 +655,23 @@ def deployment_name(owner, workflow):
     platform-fired run session identically."""
     return "-".join(p for p in ("trace", _owner_slug(owner),
                                 name_slug(workflow, "agent")) if p)[:100]
+
+
+def agent_platform_name(owner, workflow):
+    """The platform AGENT object's name, owner-scoped like every other platform
+    name (``trace-jane-acme-com-order-intake-agent``).
+
+    This one is load-bearing, not just Console legibility: ``create_or_reuse_agent``
+    finds-and-DELETES by exact name across the whole Anthropic account, and the
+    config-gen envelope used to carry the bare LLM-chosen workflow name ("Inbox
+    triage") — so two customers whose workflows happened to share a name collided,
+    and customer B's deploy silently deleted customer A's live agent, orphaning A's
+    deployment on a dead agent id. Owner-scoping confines the delete-and-recreate
+    to the one (owner, workflow) it belongs to. The bare workflow name remains the
+    UI display name and the memory store's reuse key; only the platform object
+    carries this name."""
+    return "-".join(p for p in ("trace", _owner_slug(owner),
+                                name_slug(workflow, "agent"), "agent") if p)[:100]
 
 # --- P4 — observed application identity -> MCP server entry -----------------
 # Keys are lowercased application-identity substrings matched against the app/window

@@ -192,6 +192,12 @@ class AppState:
                  summarize_fn=None):
         self.sessions_root = sessions_root
         self.collector_port = collector_port
+        # The founder Test UI (`/`, `/static/`, the unauthenticated `/api/*` routes)
+        # is a loopback development tool. On a public bind it would expose every
+        # session's raw capture and let anyone overwrite the server's keys, so
+        # build_server() flips this off for any non-loopback host. True here so a
+        # bare AppState (tests, embedding) keeps today's local behavior.
+        self.test_ui_enabled = True
         # Phase 2 (desktop app): when a cloud backend URL is configured, this
         # process is the local "desktop node" — it runs capture locally and
         # proxies auth + pipeline to the cloud. Unset (env or arg) → today's exact
@@ -3175,8 +3181,18 @@ def make_handler(state):
                                         "database": "supabase" if supabase_client.is_configured()
                                         else "local"})
             if p == "/" or p == "/index.html":
+                if not state.test_ui_enabled:
+                    # Public deployment: the bare domain lands on the product,
+                    # never on the founder Test UI.
+                    self.send_response(302)
+                    self.send_header("Location", "/app")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
                 return self._serve_static("index.html")
             if p.startswith("/static/"):
+                if not state.test_ui_enabled:
+                    return self._json(404, {"error": "not_found"})
                 return self._serve_static(p[len("/static/"):])
             if p == "/app" or p == "/app/":                 # end-user UI (WS2)
                 return self._serve_app("index.html")
@@ -3211,6 +3227,11 @@ def make_handler(state):
                 if not u:
                     return self._json(401, {"error": "auth_required"})
                 return self._user_get(p[len("/api/u"):], u)
+            # Everything below is the founder Test UI's API: unauthenticated and
+            # owner-blind by design, safe only on a loopback bind. On a public
+            # bind it does not exist — 404, not 403, so nothing is advertised.
+            if not state.test_ui_enabled:
+                return self._json(404, {"error": "not_found"})
             if p == "/api/status":
                 return self._status()
             if p == "/api/settings":
@@ -3266,6 +3287,10 @@ def make_handler(state):
                 if not u:
                     return self._json(401, {"error": "auth_required"})
                 return self._user_post(p[len("/api/u"):], body, u)
+            # Test-UI API from here down (unauthenticated pipeline control, and
+            # /api/settings/* which can REPLACE the server's keys): loopback only.
+            if not state.test_ui_enabled:
+                return self._json(404, {"error": "not_found"})
             # save one bundle's interview answers
             mi = re.match(r"^/api/sessions/([^/]+)/interview/([^/]+)$", p)
             if mi:
@@ -3312,6 +3337,9 @@ def make_handler(state):
 
         def do_DELETE(self):
             dp = self.path.split("?", 1)[0]
+            # Both DELETE routes are Test-UI key management: loopback only.
+            if not state.test_ui_enabled:
+                return self._json(404, {"error": "not_found"})
             if dp == "/api/settings/key":
                 state.keystore.clear_key()
                 return self._json(200, {"saved": False})
@@ -4054,6 +4082,15 @@ def build_server(host="127.0.0.1", port=8765, sessions_root="captures/sessions",
     # No init_db() needed — Supabase handles this externally.
     state = state or AppState(sessions_root, collector_port=collector_port,
                               cloud_backend=cloud_backend)
+    # The founder Test UI exists only on a loopback bind. Render sets HOST=0.0.0.0,
+    # so the cloud deployment locks it automatically; the desktop node and local dev
+    # both bind 127.0.0.1 and keep it. Keyed off the CONFIGURED bind, not the request
+    # source, so the decision is deterministic and cannot be spoofed by a client.
+    # TRACE_ENABLE_TEST_UI=1 is a deliberate operator override — it re-opens
+    # unauthenticated access to every session on the host, so never set it on a
+    # public service.
+    state.test_ui_enabled = (host in ("127.0.0.1", "localhost", "::1")
+                             or os.environ.get("TRACE_ENABLE_TEST_UI") == "1")
     httpd = ThreadingHTTPServer((host, port), make_handler(state))
     return httpd, state
 
@@ -4103,6 +4140,8 @@ def main():
             f.write(str(port))
         os.replace(tmp, portfile)
     print(f"Trace test UI: {url}", flush=True)
+    print(f"  test UI   -> {'enabled (loopback)' if state.test_ui_enabled else 'LOCKED (non-loopback bind; product surface only)'}",
+          flush=True)
     print(f"  sessions  -> {os.path.abspath(args.sessions_root)}", flush=True)
     print(f"  collector -> 127.0.0.1:{args.collector_port} (browser extension target)", flush=True)
     if args.cloud_backend:

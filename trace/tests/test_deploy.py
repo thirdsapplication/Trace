@@ -310,6 +310,33 @@ class DeployTest(unittest.TestCase):
         self.assertEqual(c2.last_vault_ids, ["vlt-s2"])
         self.assertNotEqual(c1.last_vault_ids, c2.last_vault_ids)
 
+    def test_platform_agent_name_is_owner_scoped(self):
+        # create_or_reuse_agent deletes by exact name across the whole platform
+        # account, so the bare workflow name must never reach it: two customers
+        # whose workflows share a name ("Inbox triage") would delete each other's
+        # live agents on deploy.
+        bundle, live = _live_dict()
+        c1, c2 = FakeDeployClient(), FakeDeployClient()
+        conn1 = dict(CONNECTION, owner_email="jane@acme.com")
+        conn2 = {"external_user_id": "trace-s2", "vault_ref": "vlt-s2",
+                 "apps": {"gmail": {"usable": True}}, "owner_email": "bob@blep.io"}
+        deploy.deploy_live(bundle, live, conn1, c1)
+        deploy.deploy_live(bundle, live, conn2, c2)      # same workflow, other owner
+        n1, n2 = c1.agents[0]["name"], c2.agents[0]["name"]
+        self.assertEqual(n1, config.agent_platform_name("jane@acme.com", live["name"]))
+        self.assertIn("jane-acme-com", n1)
+        self.assertIn("bob-blep-io", n2)
+        self.assertNotEqual(n1, n2)
+        # same owner redeploying keeps the same name — that IS the reuse key
+        c1b = FakeDeployClient()
+        deploy.deploy_live(bundle, live, conn1, c1b)
+        self.assertEqual(c1b.agents[0]["name"], n1)
+        # the memory store stays keyed on the BARE workflow name: renaming the
+        # platform agent must not orphan what the agent has learned
+        self.assertEqual(
+            c1.memory_stores[0]["name"],
+            config.memory_store_name(CONNECTION["external_user_id"], live["name"]))
+
     def test_runs_on_both_domains(self):
         for dom in ("marcy", "recruiter"):
             bundle, live = _live_dict(dom)
