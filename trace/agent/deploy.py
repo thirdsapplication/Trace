@@ -148,6 +148,15 @@ def deploy_live(bundle, live_envelope_dict, connection_record, client,
     workflow = (live_envelope_dict.get("name") or bundle.get("name")
                 or bundle.get("id") or "agent")
 
+    # Owner-scope the platform agent's name BEFORE create_or_reuse_agent: it
+    # deletes any same-named agent account-wide, and the envelope arrives carrying
+    # the bare workflow name ("Inbox triage"), which repeats across customers —
+    # without this, one customer's deploy could delete another's live agent. The
+    # bare name stays in ``workflow`` above: it is the memory store's reuse key
+    # and the UI display name; only the platform object is renamed.
+    live_envelope_dict = dict(live_envelope_dict,
+                              name=config.agent_platform_name(owner, workflow))
+
     agent = client.create_or_reuse_agent(live_envelope_dict)
     agent_id = agent.get("id") if isinstance(agent, dict) else agent
     environment_id = client.create_environment(config.environment_defaults(owner, workflow))
