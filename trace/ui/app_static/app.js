@@ -2204,7 +2204,9 @@ async function renderProfile(agentId) {
             a.shared_from ? ` · ${esc(a.shared_from)}'s agent` : ""}</p>
         </div>
         <div class="row" style="gap:9px;flex:none;">
-          ${a.can_edit === false ? `<span class="pill pill-off">SHARED WITH YOU</span>` : `
+          ${a.can_edit === false ? `
+          <span class="pill pill-off">SHARED WITH YOU</span>
+          <button class="btn-primary btn-sm" id="pTemplate">Build my own</button>` : `
           <button class="btn-secondary btn-sm" id="pMsg">Message</button>
           <button class="btn-primary btn-sm" id="pRun">Run now</button>
           ${sched ? `<button class="btn-secondary btn-sm" id="pPause">${
@@ -2371,6 +2373,24 @@ async function renderProfile(agentId) {
   // early here instead would ALSO skip the async fills further down, and the
   // Permissions, Rules and Recent-runs cards would sit on "Loading…" forever. The
   // point of team visibility is seeing those, so the fills must run.
+  // "Build my own" on a teammate's agent: their workflow description seeds a session
+  // owned by ME, and the ordinary wizard takes it from there against my accounts. No
+  // agent changes hands and no recording is copied.
+  const tpl = $("#pTemplate");
+  if (tpl) tpl.onclick = async () => {
+    tpl.disabled = true; tpl.textContent = "Setting up…";
+    const { ok, data } = await api("POST", `/api/u/agents/${agentId}/use-as-template`, {});
+    if (!ok) {
+      // The profile has no message row of its own, and the button is the thing the
+      // user is looking at — so it carries the failure rather than a bare alert().
+      tpl.disabled = false;
+      tpl.textContent = friendly((data || {}).error || "could not start");
+      return;
+    }
+    S.igHome = null;
+    await loadAndRender();
+  };
+
   const dc = $("#pDelCap");
   if (dc) dc.onclick = async () => {
     const okd = await confirmDestructive({

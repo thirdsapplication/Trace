@@ -3182,6 +3182,9 @@ def make_handler(state):
                 return self._set_agent_name(mnm.group(1), body, user)
             if rest == "/load-fixture":
                 return self._load_fixture(body, owner=uid)
+            mtpl = re.match(r"^/agents/([^/]+)/use-as-template$", rest)
+            if mtpl:
+                return self._use_as_template(mtpl.group(1), user)
             if rest == "/describe-workflow":                 # skip-recording path
                 return self._describe_workflow(body, owner=uid)
             m = re.match(r"^/sessions/([^/]+)/(.+)$", rest)
@@ -3807,6 +3810,54 @@ def make_handler(state):
             return self._json(202, {"state": "running", "session_id": sid})
 
         # --- describe (skip-recording path) ---
+        def _use_as_template(self, agent_id, user):
+            """Start MY OWN build of a workflow a teammate already automated.
+
+            Not a copy of their agent. An agent is welded to its creator's Pipedream
+            vault (``trace-user-<owner_id>``), so handing one over would leave it acting
+            as the wrong person; and cloning their session would copy a recording of
+            their screen into someone else's account, which is not a thing to do
+            quietly.
+
+            What travels is the workflow DESCRIPTION — prose already written to be
+            shown to the worker, carrying no capture. It seeds a session owned by the
+            caller, and the existing describe path writes the same artifacts a capture
+            would, so review -> questions -> build -> connect -> go live all run
+            unchanged, against this person's own accounts.
+
+            Pull, not push: you can only template an agent you can already see, so
+            visibility is the whole permission model and there is nothing new to
+            consent to.
+            """
+            agent = next((a for a in registry.agents_visible_to(
+                              root, user["user_id"],
+                              teams.owner_ids(root, user["user_id"]))
+                          if a.get("agent_id") == agent_id), None)
+            if not agent:
+                return self._json(404, {"error": "not_found"})
+            if not state.keystore.get_key():
+                return self._json(400, {"error": "no_api_key"})
+
+            parts = [str(agent.get("description") or "").strip()]
+            trigger = str(agent.get("trigger") or "").strip()
+            if trigger:
+                parts.append(f"This runs when: {trigger}.")
+            rules = str(state.agent_safety_rules(agent) or "").strip()
+            if rules:
+                parts.append(rules)
+            seed = "\n\n".join([p for p in parts if p])
+            if not seed:
+                return self._json(400, {"error": "nothing_to_template"})
+
+            sid = sessions.create_session(root, label="template",
+                                          owner_id=user["user_id"])
+            sessions.update_meta(root, sid, owner_user_id=user["user_id"],
+                                 described=True, description=seed,
+                                 template_of=agent_id)
+            with state.lock:
+                state.start_describe(sid, seed)
+            return self._json(202, {"state": "running", "session_id": sid})
+
         def _describe_workflow(self, body, owner):
             """Create a session from a TYPED workflow description (no capture). The
             describe job then writes the same artifacts the capture path produces

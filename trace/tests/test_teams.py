@@ -225,5 +225,42 @@ class TeamVisibilityTest(unittest.TestCase):
         self.assertEqual(len(seen), 2)
 
 
+class UseAsTemplateTest(unittest.TestCase):
+    """Templating must not become a back door to someone else's agent or recording.
+
+    An agent is welded to its creator's Pipedream vault, so it cannot change hands;
+    and their session holds a recording of THEIR screen, so it must not be copied.
+    What travels is the workflow description, into a session owned by the caller.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = self._tmp.name
+        registry.agent_upsert(self.root, {
+            "agent_id": "a-theirs", "owner_user_id": "u2", "name": "Order entry",
+            "bundle_id": "B1", "owner_email": "u2@x.com",
+            "description": "Copy each order email into the ERP sheet",
+            "trigger": "a new order email arrives"})
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_a_teammates_agent_is_templatable_and_a_strangers_is_not(self):
+        mates = registry.agents_visible_to(self.root, "u1", ["u1", "u2"])
+        self.assertTrue(any(a["agent_id"] == "a-theirs" for a in mates))
+        alone = registry.agents_visible_to(self.root, "u1", [])
+        self.assertFalse(any(a["agent_id"] == "a-theirs" for a in alone),
+                         "an agent outside your team was templatable")
+
+    def test_templating_never_transfers_the_agent(self):
+        """The recipient must end up building their OWN, not holding theirs."""
+        before = [a["agent_id"] for a in registry.agents_for_user(self.root, "u1")]
+        registry.agents_visible_to(self.root, "u1", ["u1", "u2"])
+        after = [a["agent_id"] for a in registry.agents_for_user(self.root, "u1")]
+        self.assertEqual(before, after)
+        still_theirs = [a["agent_id"] for a in registry.agents_for_user(self.root, "u2")]
+        self.assertIn("a-theirs", still_theirs)
+
+
 if __name__ == "__main__":
     unittest.main()
