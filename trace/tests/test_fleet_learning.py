@@ -7,7 +7,7 @@ import os
 import tempfile
 import unittest
 
-from trace.ui import registry
+from trace.ui import app, registry
 
 
 class FleetStorageTest(unittest.TestCase):
@@ -150,6 +150,73 @@ class RetrieveLessonsTest(unittest.TestCase):
                          agent_kind_embedding=[1.0, 0.0], consume_scope="global"), [])
         self.assertEqual(len(registry.retrieve_lessons(self.root, [1.0, 0.0], agent,
                          agent_kind_embedding=[1.0, 0.0], consume_scope="global")), 1)
+
+
+class SharedAppGateTest(unittest.TestCase):
+    """Cross-owner lessons must come from somewhere this agent actually works.
+
+    The similarity gate compares two agents' descriptions — prose a model wrote —
+    and calls that "same kind". A shared app is a fact instead. But the fallback is
+    the part that matters: unknown provenance must NOT be read as "no overlap", or
+    every decision written before migration 020 silently stops being shareable.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = self._tmp.name
+        self.state = app.AppState(sessions_root=self.root)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _hit(self, did, tier="cross"):
+        return {"decision_id": did, "lesson": "a rule", "tier": tier,
+                "source_owner_id": "u2", "source_agent_id": "a2", "similarity": 0.9}
+
+    def _decision_from(self, did, apps):
+        registry.decision_add(self.root, {
+            "agent_id": "a2", "owner_user_id": "u2", "run_session_id": f"s-{did}",
+            "question": f"q{did}", "context": {}})
+        real = registry.decisions_for_user(self.root, "u2")[-1]["id"]
+        registry.decision_set_provenance(self.root, real, source_apps=apps)
+        return real
+
+    def test_a_lesson_from_a_shared_app_survives(self):
+        did = self._decision_from("1", ["shopify", "gmail"])
+        agent = {"agent_id": "a1", "owner_user_id": "u1", "staged_apps": ["shopify"]}
+        kept = self.state._same_context_only(self.root, agent, [self._hit(did)])
+        self.assertEqual(len(kept), 1)
+
+    def test_a_lesson_from_somewhere_else_is_dropped(self):
+        did = self._decision_from("2", ["xero"])
+        agent = {"agent_id": "a1", "owner_user_id": "u1", "staged_apps": ["shopify"]}
+        self.assertEqual(
+            self.state._same_context_only(self.root, agent, [self._hit(did)]), [])
+
+    def test_unrecorded_provenance_is_kept_not_dropped(self):
+        """Every row written before migration 020 has no source_apps. Reading that as
+        'no overlap' would switch off cross-user sharing for the whole corpus."""
+        registry.decision_add(self.root, {
+            "agent_id": "a2", "owner_user_id": "u2", "run_session_id": "s-old",
+            "question": "old", "context": {}})
+        did = registry.decisions_for_user(self.root, "u2")[-1]["id"]
+        agent = {"agent_id": "a1", "owner_user_id": "u1", "staged_apps": ["shopify"]}
+        self.assertEqual(
+            len(self.state._same_context_only(self.root, agent, [self._hit(did)])), 1)
+
+    def test_an_agent_with_no_apps_filters_nothing(self):
+        did = self._decision_from("3", ["xero"])
+        agent = {"agent_id": "a1", "owner_user_id": "u1", "staged_apps": []}
+        self.assertEqual(
+            len(self.state._same_context_only(self.root, agent, [self._hit(did)])), 1)
+
+    def test_your_own_lessons_are_never_gated(self):
+        """Your own agents share a context by definition; requiring an app match
+        between them would be a filter with nothing to protect against."""
+        did = self._decision_from("4", ["xero"])
+        agent = {"agent_id": "a1", "owner_user_id": "u1", "staged_apps": ["shopify"]}
+        kept = self.state._same_context_only(self.root, agent, [self._hit(did, "own")])
+        self.assertEqual(len(kept), 1)
 
 
 if __name__ == "__main__":

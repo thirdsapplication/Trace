@@ -156,6 +156,37 @@ def agent_upsert(root, agent):
         _save(root, "agents.json", d)
 
 
+def agents_visible_to(root, owner_user_id, team_owner_ids=None):
+    """Agents this user may SEE: their own, plus their teammates', read-only.
+
+    Deliberately a separate function from ``agents_for_user`` rather than a widened
+    one. agents_for_user IS the ownership check — a dozen mutating endpoints are
+    written as ``next(a for a in agents_for_user(...) if a.agent_id == x)`` and 404
+    when it misses. Widening it to include teammates would hand every one of those
+    endpoints write access to other people's agents, silently, with no line of code
+    appearing to change permissions. So visibility gets its own door.
+
+    A teammate's agent comes back with ``shared_from`` (whose it is) and
+    ``can_edit: False``. Those are for rendering; they are NOT the security boundary,
+    which remains that mutations resolve through agents_for_user and cannot see these
+    rows at all.
+    """
+    mine = agents_for_user(root, owner_user_id)
+    mates = [o for o in (team_owner_ids or []) if o and o != owner_user_id]
+    if not mates:
+        return mine
+    seen = {a.get("agent_id") for a in mine}
+    out = list(mine)
+    for owner in mates:
+        for a in agents_for_user(root, owner):
+            if a.get("agent_id") in seen:
+                continue
+            seen.add(a.get("agent_id"))
+            out.append({**a, "shared_from": a.get("owner_email") or owner,
+                        "can_edit": False})
+    return out
+
+
 def agents_for_user(root, owner_user_id):
     if supa.is_configured():
         admin = supa.get_admin()
@@ -660,6 +691,61 @@ def decision_set_status(root, decision_id, status):
         if it:
             it["status"] = status
             _save(root, "decisions.json", d)
+
+
+def decision_set_provenance(root, decision_id, source_apps=None, source_team_id=None):
+    """Record WHERE a lesson came from: the apps its source agent touches, and the org.
+
+    Applicability is currently decided by cosine between two agent descriptions, which
+    compares how agents were WRITTEN rather than what they do. Shared apps are a fact —
+    an agent either touches Shopify or it does not — and a rule learned in an app is
+    likelier to hold for someone else in that app than for someone whose description
+    merely reads alike. The org is here so corroboration can count distinct
+    ORGANISATIONS later; two people at one company are one observation, not two.
+
+    Best-effort and never raises: this is provenance, not correctness, and a failure
+    here must not cost the lesson itself.
+    """
+    fields = {}
+    if source_apps is not None:
+        fields["source_apps"] = list(source_apps)
+    if source_team_id is not None:
+        fields["source_team_id"] = source_team_id
+    if not fields:
+        return
+    try:
+        if supa.is_configured():
+            supa.get_admin().table("agent_decisions").update(fields) \
+                .eq("id", str(decision_id)).execute()
+            return
+        with _LOCK:
+            d = _load(root, "decisions.json")
+            if str(decision_id) in d:
+                d[str(decision_id)].update(fields)
+                _save(root, "decisions.json", d)
+    except Exception:                                      # noqa: BLE001
+        pass
+
+
+def decisions_source_apps(root, decision_ids):
+    """``{decision_id: [app slugs]}`` for the given decisions — the apps each lesson was
+    learned in. Missing or unrecorded comes back absent, and callers must treat that as
+    "unknown", never as "no apps": every row written before migration 020 is unrecorded,
+    and dropping those would silently disable sharing for the entire existing corpus."""
+    ids = [str(i) for i in (decision_ids or []) if i]
+    if not ids:
+        return {}
+    try:
+        if supa.is_configured():
+            r = supa.get_admin().table("agent_decisions") \
+                .select("id,source_apps").in_("id", ids).execute()
+            return {str(row["id"]): list(row.get("source_apps") or [])
+                    for row in (r.data or []) if row.get("source_apps")}
+        d = _load(root, "decisions.json")
+        return {i: list(d[i]["source_apps"]) for i in ids
+                if i in d and d[i].get("source_apps")}
+    except Exception:                                      # noqa: BLE001
+        return {}
 
 
 def decision_set_generalization(root, decision_id, reusable, lesson):

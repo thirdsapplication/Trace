@@ -2178,6 +2178,7 @@ function openIdentityPopover(agent, agentId) {
   };
 }
 
+
 async function renderProfile(agentId) {
   clearTimers();
   busy();
@@ -2199,13 +2200,15 @@ async function renderProfile(agentId) {
             <span class="pill ${paused ? "pill-warn" : "pill-on"}">${paused ? "PAUSED" : "LIVE"}</span></div>
           <p class="ag-bio wrap" style="margin:5px 0 0;">${esc(
             a.description || ("Runs when: " + (a.trigger || "you say so")))}${
-            a.deployed_at ? ` · live since ${esc(onDate(a.deployed_at))}` : ""}</p>
+            a.deployed_at ? ` · live since ${esc(onDate(a.deployed_at))}` : ""}${
+            a.shared_from ? ` · ${esc(a.shared_from)}'s agent` : ""}</p>
         </div>
         <div class="row" style="gap:9px;flex:none;">
+          ${a.can_edit === false ? `<span class="pill pill-off">SHARED WITH YOU</span>` : `
           <button class="btn-secondary btn-sm" id="pMsg">Message</button>
           <button class="btn-primary btn-sm" id="pRun">Run now</button>
           ${sched ? `<button class="btn-secondary btn-sm" id="pPause">${
-            paused ? "Resume" : "⏸ Pause"}</button>` : ""}
+            paused ? "Resume" : "⏸ Pause"}</button>` : ""}`}
         </div>
       </div>
       <div class="tabs" id="pTabs">
@@ -2225,7 +2228,7 @@ async function renderProfile(agentId) {
             <div class="label">Schedule</div>
             <div class="row" style="gap:10px;align-items:center;flex-wrap:wrap;">
               <span class="ov-strong">${esc(cadenceLabel(sched))}</span>
-              <select class="sched" id="pSched">${opts}</select>
+              ${a.can_edit === false ? "" : `<select class="sched" id="pSched">${opts}</select>`}
             </div>
             <div class="sub muted" id="pNext">${paused
               ? "Paused — it won't run until you resume it."
@@ -2363,6 +2366,11 @@ async function renderProfile(agentId) {
     t.onclick = () => showPane(t.dataset.pane));
   showPane("overview");
 
+  // A shared agent has no run/pause/schedule/delete controls, so the handlers below
+  // simply find nothing to wire — every one is already guarded by an if. Returning
+  // early here instead would ALSO skip the async fills further down, and the
+  // Permissions, Rules and Recent-runs cards would sit on "Loading…" forever. The
+  // point of team visibility is seeing those, so the fills must run.
   const dc = $("#pDelCap");
   if (dc) dc.onclick = async () => {
     const okd = await confirmDestructive({

@@ -20,6 +20,10 @@ from . import registry as reg
 from . import supabase_client as supa
 
 ROLES = ("admin", "member")
+# Roles that may change the team. "owner" is not written by this module — a trigger in
+# the live database sets it on the creator — but it is unambiguously an admin, and
+# treating it as a plain member locked the person who created a team out of it.
+ADMIN_ROLES = ("admin", "owner")
 
 
 def _now():
@@ -93,8 +97,17 @@ def create(root, uid, name):
             r = supa.get_admin().table("teams").insert({
                 "name": str(name or "Your team")[:120], "created_by": uid}).execute()
             tid = str((r.data or [{}])[0].get("id"))
-            supa.get_admin().table("team_members").insert({
-                "team_id": tid, "user_id": uid, "role": "admin"}).execute()
+            # The creator's membership row may already exist: the live database has a
+            # trigger that adds it (as "owner") the moment the team is inserted. Doing it
+            # again raised a duplicate-key error which this except swallowed into None,
+            # and the caller reported team_create_failed -- while the TEAM row stayed
+            # committed. Every first invite therefore failed, and left the user owning a
+            # team the code then refused to let them administer.
+            try:
+                supa.get_admin().table("team_members").insert({
+                    "team_id": tid, "user_id": uid, "role": "admin"}).execute()
+            except Exception:                              # noqa: BLE001
+                pass                                       # already a member, by trigger
         except Exception:                                  # noqa: BLE001
             return None
         return team_for_user(root, uid)

@@ -592,7 +592,10 @@ class AppState:
         t = teams.team_for_user(self.sessions_root, user["user_id"])
         if not t:
             return None, None                              # caller decides (invite creates)
-        if t.get("role") != "admin":
+        # "owner" comes from the database trigger that creates the first membership; it
+        # is the strongest role there is, and requiring exactly "admin" locked the
+        # person who created the team out of administering it.
+        if t.get("role") not in teams.ADMIN_ROLES:
             return None, {"error": "not_admin"}
         return t, None
 
@@ -858,6 +861,7 @@ class AppState:
             # Migration 018 has been applied and its parameters went unused — team scope
             # kept collapsing to owner-only for want of this argument.
             team_owners=teams.owner_ids(root, agent.get("owner_user_id")))
+        hits = self._same_context_only(root, agent, hits)
         inject = []
         for h in hits:
             if h["tier"] == "own":
@@ -884,6 +888,42 @@ class AppState:
             registry.lesson_application_add(root, aid, owner, h["decision_id"], None)
         return [h["lesson"] for h in inject]
 
+    @staticmethod
+    def _same_context_only(root, agent, hits):
+        """Drop cross-owner lessons learned somewhere this agent does not work.
+
+        The similarity gate upstream compares two agents' DESCRIPTIONS — prose a model
+        wrote from a capture — and calls that "same kind of agent". Identical workflows
+        worded differently score low; unrelated ones in similar corporate language score
+        high. It is a similarity of writing standing in for a similarity of work.
+
+        A shared app is not a similarity, it is a fact. An agent either touches Shopify
+        or it does not, and a rule learned while working in an app is far likelier to
+        hold for someone else in that same app. So this ANDs a factual test onto the
+        fuzzy one, for other people's lessons only.
+
+        Deliberately permissive when either side is UNRECORDED. Every decision written
+        before migration 020 has no source_apps, and every agent built before staging
+        existed has none either — treating unknown as "no overlap" would silently
+        switch off cross-user sharing for the whole existing corpus, which is a far
+        worse failure than admitting a lesson that turns out not to apply (the human
+        still has to confirm it).
+        """
+        cross = [h for h in hits if h.get("tier") != "own"]
+        if not cross:
+            return hits
+        mine = {a for a in (agent.get("staged_apps") or []) if a}
+        if not mine:
+            return hits                                    # unknown -> do not filter
+        by_id = registry.decisions_source_apps(root, [h["decision_id"] for h in cross])
+        keep = []
+        for h in hits:
+            theirs = by_id.get(str(h["decision_id"]))
+            # own-tier, or provenance we never recorded -> unchanged behaviour
+            keep.append(h if (h.get("tier") == "own" or not theirs
+                              or mine & set(theirs)) else None)
+        return [h for h in keep if h is not None]
+
     def _learn_from_decision(self, decision, answer, agent=None):
         """Gap #3 B3/B5d: distill a de-identified, reusable lesson from an answered decision
         and embed it. If the source consents to share GLOBALLY (contribute scope) AND the
@@ -907,6 +947,16 @@ class AppState:
         vecs = agent_embeddings.embed(result["lesson"], input_type="document")
         if vecs:
             registry.decision_embedding_add(root, did, vecs[0])
+        # Provenance, captured HERE because it is only knowable here: which apps the
+        # source agent works in, and which org it belongs to. Recorded at distillation
+        # time or not at all — an agent can be renamed, reconfigured or deleted long
+        # before anyone asks whether its lesson applies to someone else.
+        if agent:
+            team = teams.team_for_user(root, agent.get("owner_user_id")) or {}
+            registry.decision_set_provenance(
+                root, did,
+                source_apps=[s for s in (agent.get("staged_apps") or []) if s],
+                source_team_id=team.get("team_id"))
         # T3 gate: only cross-user-shareable if the source consents to global AND it scrubs clean
         contribute = (registry.agent_lesson_scopes(root, agent)["contribute_scope"] if agent
                       else registry.user_consent_get(root, decision.get("owner_user_id"))["contribute_scope"])
@@ -1976,7 +2026,10 @@ class AppState:
             active_by_agent.setdefault(p.get("agent_id"), []).append(
                 {"decision_id": p.get("decision_id"), "lesson": p.get("lesson")})
         agents_out = []
-        all_agents = registry.agents_for_user(root, uid)
+        # READ path: teammates' agents are visible here and nowhere else. Every
+        # mutation still resolves through agents_for_user, which cannot see them.
+        all_agents = registry.agents_visible_to(
+            root, uid, teams.owner_ids(root, uid))
         # Batched: one query each instead of three per agent (the home screen used to
         # cost 3N round trips and got slower with every agent deployed).
         agent_ids = [a.get("agent_id") for a in all_agents]
@@ -2966,7 +3019,14 @@ def make_handler(state):
                     "agent": {"agent_id": aid, "name": agent.get("name") or aid}})
             maa = re.match(r"^/agents/([^/]+)/activity$", rest)
             if maa:                                          # real session activity (Haiku summaries)
-                agent = next((a for a in registry.agents_for_user(root, user["user_id"])
+                # Reading a teammate's runs IS team visibility — without it a shared
+                # agent renders as an empty shell claiming zero runs, which is worse
+                # than not showing it. Resolved through agents_visible_to, which is
+                # read-only by construction; every MUTATION on this agent still goes
+                # through agents_for_user and cannot see it.
+                agent = next((a for a in registry.agents_visible_to(
+                                  root, user["user_id"],
+                                  teams.owner_ids(root, user["user_id"]))
                               if a.get("agent_id") == maa.group(1)), None)
                 if not agent:
                     return self._json(404, {"error": "not_found"})
