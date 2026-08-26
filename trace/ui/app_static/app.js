@@ -1280,10 +1280,33 @@ async function setPrivacy() {
   };
 }
 
+
+/* Frame 26 ends each connected-app row with "last used 7:04 AM". Nothing records a
+   per-app timestamp, and inventing one would be a claim about someone's account
+   activity — but the agents that USE the app do have run history, and the most recent
+   of those runs is when the app was last touched on your behalf. That is the same fact
+   the frame is after, derived rather than asserted. Silent when no agent using it has
+   run, because "last used never" is noise. */
+function lastUsedSuffix(app) {
+  const home = S.igHome;
+  if (!home || !(app.used_by || []).length) return "";
+  const names = new Set(app.used_by);
+  let latest = null;
+  for (const ag of (home.agents || [])) {
+    if (!names.has(ag.name)) continue;
+    for (const st of (ag.stories || [])) {
+      const t = Date.parse(st.ran_at || "");
+      if (isFinite(t) && (latest === null || t > latest)) latest = t;
+    }
+  }
+  return latest === null ? "" : ` · last used ${whenShort(new Date(latest).toISOString())}`;
+}
+
 async function setApps() {
-  // Read-only for now. Frame 26 also wants a last-used time and a Revoke action; the
-  // connection record carries neither, and both are changes in connect.py rather than
-  // anything this screen can derive.
+  // Frame 26 wants a last-used time and a Revoke action. Last-used IS derivable — the
+  // agents using an app have run history, and their most recent run is when the app was
+  // last touched on your behalf. Revoke genuinely is not: it needs a Pipedream call that
+  // connect_client does not expose, so the screen says so rather than pretending.
   const { data } = await api("GET", "/api/u/sessions");
   const sess = ((data || {}).sessions || [])[0];
   if (!sess) {
@@ -1310,13 +1333,16 @@ async function setApps() {
             : (a.usable ? "Connected · outbound actions are staged for your approval"
                         : "Not connected")}</div>
           ${!expired && (a.used_by || []).length
-            ? `<div class="set-sub">${esc((a.used_by || []).join(", "))}</div>` : ""}
+            ? `<div class="set-sub">${esc((a.used_by || []).join(", "))}${
+                lastUsedSuffix(a)}</div>` : ""}
         </div>
         <span class="pill ${a.usable ? "pill-on" : (expired ? "pill-warn" : "pill-off")}">${
           a.usable ? "CONNECTED" : (expired ? "EXPIRED" : "OFF")}</span>
       </div>`;
     }).join("")}</div>
-    <p class="notice">Reconnecting and revoking happen in the setup flow for now.</p>`
+    <p class="notice">Reconnecting and revoking happen in the setup flow for now —
+       there is no revoke endpoint yet, and a button that only looks like one would be
+       worse than none.</p>`
     : `<p class="muted">No apps connected yet.</p>`;
 }
 
@@ -1447,6 +1473,44 @@ async function renderGroups() {
   $("#grpName").onkeydown = (e) => { if (e.key === "Enter") create(); };
 }
 
+
+/* s17's "+ Add agent". _update_group has accepted agent_ids since groups landed, so
+   this is UI only — a group's membership was simply fixed at creation because nothing
+   ever offered to change it. Only agents NOT already in the group are listed; an
+   "add" list that includes the members is a list of things that do nothing. */
+async function wireGroupAdd(group, redraw) {
+  const btn = $("#grpAdd"), box = $("#grpAddBox");
+  if (!btn || !box) return;
+  btn.onclick = async () => {
+    if (box.style.display !== "none") { box.style.display = "none"; return; }
+    box.style.display = "";
+    box.innerHTML = `<p class="sub muted">Loading…</p>`;
+    const home = S.igHome || await loadHome();
+    const inGroup = new Set((group.members || []).map(m => m.agent_id));
+    const rest = (home.agents || []).filter(a => !inGroup.has(a.agent_id));
+    if (!rest.length) {
+      box.innerHTML = `<p class="sub muted">Every agent you have is already in this group.</p>`;
+      return;
+    }
+    box.innerHTML = `<div class="row" style="gap:6px;flex-wrap:wrap;">${rest.map(a =>
+      `<button class="chip grp-add-one" data-id="${esc(a.agent_id)}">${
+        esc(a.name || a.agent_id)}</button>`).join("")}</div>`;
+    box.querySelectorAll(".grp-add-one").forEach(c => c.onclick = async () => {
+      c.disabled = true; c.textContent = "Adding…";
+      const ids = Array.from(inGroup).concat([c.dataset.id]);
+      // POST, not PATCH: _update_group is routed inside the POST block at
+      // /groups/<id> alongside create and delete.
+      const { ok, data } = await api("POST", `/api/u/groups/${group.id}`,
+                                     { agent_ids: ids });
+      if (!ok) { c.textContent = friendly((data || {}).error || "could not add"); return; }
+      const fresh = ((data || {}).groups || []).find(g => g.id === group.id);
+      if (fresh) { group.members = fresh.members; }
+      box.style.display = "none";
+      redraw();
+    });
+  };
+}
+
 function renderGroupChat(group) {
   clearTimers();
   if (!group) { renderGroups(); return; }
@@ -1468,7 +1532,9 @@ function renderGroupChat(group) {
     tb.paint(`
       <div class="panel">
         <div class="row" style="gap:8px;align-items:baseline;"><h2 style="margin:0;">${esc(group.name)}</h2>
-          <span class="sub muted">${group.members.map(m => `<span style="color:${esc(m.color)};">${esc(m.name)}</span>`).join(", ") || "no members"}</span></div>
+          <span class="sub muted">${group.members.map(m => `<span style="color:${esc(m.color)};">${esc(m.name)}</span>`).join(", ") || "no members"}</span>
+          <button class="btn-link btn-sm" id="grpAdd" style="margin-left:auto;">+ Add agent</button></div>
+        <div id="grpAddBox" style="display:none;margin-top:8px;"></div>
         <div id="grpMsgs" style="margin-top:12px;min-height:140px;max-height:60vh;overflow:auto;">${
           msgs.map(bubble).join("") || `<p class="muted">Try "what did y'all get up to today?" — or @${esc((group.members[0] || {}).name || "agent")} to direct one.</p>`}</div>
         <div class="row" style="gap:6px;margin-top:12px;">
@@ -1477,6 +1543,7 @@ function renderGroupChat(group) {
         </div>
       </div>`);
     tb.wire();
+    wireGroupAdd(group, draw);
     const send = async () => {
       const text = ($("#grpInput").value || "").trim();
       if (!text) return;
@@ -3045,7 +3112,7 @@ function renderInterview(sid, data) {
         <div class="field" style="margin-top:14px;">
           <div class="title" style="margin-bottom:6px;">Anything else we should know? <span class="muted" style="font-weight:400;">(optional)</span></div>
           <textarea class="iv-extra" data-bid="${esc(bid)}" rows="3" style="min-height:72px;"
-            placeholder="Anything the questions above didn't cover — exceptions, preferences, things to avoid">${esc(extra)}</textarea>
+            placeholder="Type it like you'd explain to a new hire — exceptions, preferences, things to avoid">${esc(extra)}</textarea>
         </div>
       </div></div>`;
   }).join("");
