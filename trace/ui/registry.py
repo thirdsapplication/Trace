@@ -78,6 +78,12 @@ def _run_to_caller(row):
     """Convert a Supabase agent_runs row to the dict shape callers expect."""
     return {
         "ran_at": row.get("started_at"),
+        # Both ends, not just the start. agent_runs has recorded ended_at all along and
+        # this mapping quietly dropped it, so run DURATION — the figure frame 21's
+        # "takes ~9 min" needs, and the only honest basis for any time claim on the
+        # profile — was unavailable to every caller despite sitting in the row.
+        "started_at": row.get("started_at"),
+        "ended_at": row.get("ended_at"),
         "status": row.get("status"),
         "summary": row.get("summary"),
         "details": row.get("details") or [],

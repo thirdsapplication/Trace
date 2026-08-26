@@ -627,5 +627,31 @@ class QueuedReaperTest(AgentsEndpointTest):
             self.assertEqual(registry.pending_get(self.root, pid)["status"], "executed")
 
 
+class RunMappingTest(unittest.TestCase):
+    """Every field the UI needs must survive _run_to_caller.
+
+    This is the fourth instance of one bug: a column written faithfully and never
+    mapped back, so the data exists in Supabase and is invisible to every caller.
+    color, owner_email and the two consent scopes went the same way in
+    _agent_to_caller. File mode returns the raw row, so the suite passes either way
+    and only a Supabase deployment shows the gap — which is exactly why this asserts
+    on the mapping function rather than on behaviour.
+    """
+
+    def test_both_timestamps_survive(self):
+        row = {"started_at": "2026-08-26T06:00:00Z", "ended_at": "2026-08-26T06:09:00Z",
+               "status": "clean", "summary": "s", "run_session_id": "sess", "kind": None}
+        out = registry._run_to_caller(row)
+        self.assertEqual(out["started_at"], "2026-08-26T06:00:00Z")
+        self.assertEqual(out["ended_at"], "2026-08-26T06:09:00Z",
+                         "ended_at dropped again — run duration becomes uncomputable")
+        self.assertEqual(out["ran_at"], "2026-08-26T06:00:00Z")   # kept for old callers
+
+    def test_a_run_still_in_flight_maps_cleanly(self):
+        out = registry._run_to_caller({"started_at": "2026-08-26T06:00:00Z",
+                                       "status": "running"})
+        self.assertIsNone(out["ended_at"])
+
+
 if __name__ == "__main__":
     unittest.main()

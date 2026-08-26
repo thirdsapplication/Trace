@@ -1992,6 +1992,8 @@ class AppState:
                     continue
                 note = (summaries.get(sid) or {}).get("summary") if sid else None
                 stories.append({"key": key, "ran_at": r.get("ran_at"),
+                                "started_at": r.get("started_at"),
+                                "ended_at": r.get("ended_at"),
                                 "status": r.get("status"),
                                 "note": note or r.get("summary") or "Ran.",
                                 "proposals": props, "decisions": decs})

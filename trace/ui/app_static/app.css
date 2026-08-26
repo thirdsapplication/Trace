@@ -719,3 +719,57 @@ button.sn-row:hover { border-color: var(--line); }
   transition: transform .15s; }
 .tgl.on { background: var(--accent); }
 .tgl.on i { transform: translateX(16px); }
+
+/* ---- agent profile (21) -------------------------------------------------
+   The frame is a TWO-COLUMN screen: a flexible left column of cards and a fixed
+   400px rail carrying lessons and recent runs. It shipped as a single stack of
+   full-width panels, which is why it never matched — the rail content existed but
+   only inside the Lessons and History tabs, so Overview was half a screen wide with
+   the right-hand third of the design missing entirely. */
+.pane-bare { background: none; border: none; padding: 0; box-shadow: none; }
+.prof-grid { display: flex; gap: 20px; align-items: flex-start; }
+.prof-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 12px; }
+.prof-rail { width: 400px; flex: none; display: flex; flex-direction: column; gap: 12px; }
+
+.prof-card { background: var(--panel); border: 1px solid var(--line-2);
+  border-radius: 14px; padding: 16px 19px; display: flex; flex-direction: column; gap: 9px; }
+.prof-card > .label { margin: 0; }
+
+/* Three figures as their own cards, not a bare flex row of numbers. */
+.prof-stats { display: flex; gap: 12px; }
+.prof-stat { flex: 1; background: var(--panel); border: 1px solid var(--line-2);
+  border-radius: 14px; padding: 14px 17px; }
+.prof-stat b { display: block; font-family: var(--display); font-weight: 800;
+  font-size: 21px; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; }
+.prof-stat span { font-size: 11.5px; color: var(--ink-3, var(--ink-2)); }
+
+/* Deleting capture data is a bordered card with its own button, not a loose link —
+   it reads as consequential, which it is. */
+.prof-danger { border-color: var(--danger-line); flex-direction: row;
+  align-items: center; gap: 12px; }
+.prof-danger .t { font-weight: 700; font-size: 13px; color: var(--danger); }
+.prof-danger .d { font-size: 11.5px; color: var(--ink-2); margin-top: 2px; }
+
+/* A shared lesson awaiting confirmation is the one amber thing on the screen. */
+.rail-confirm { background: var(--warn-bg); border-color: #FFE2B8; }
+.rail-confirm .label { color: var(--warn); }
+.rail-confirm .body { font-size: 13px; line-height: 1.5; }
+
+.rail-lesson { display: flex; gap: 10px; align-items: flex-start; }
+.rail-dot { width: 7px; height: 7px; border-radius: 999px; background: var(--ok, #45B86B);
+  margin-top: 6px; flex: none; }
+.rail-lesson .txt { flex: 1; font-size: 12.5px; line-height: 1.5; }
+
+.rail-run { padding: 9px 0; border-bottom: 1px solid var(--line); }
+.rail-run:last-child { border-bottom: 0; }
+.rail-run .hd { display: flex; gap: 8px; font-size: 12.5px; align-items: baseline; }
+.rail-run .hd b { font-weight: 700; }
+.rail-run .st { font-weight: 600; }
+.rail-run .st.ok { color: var(--ok-fg, #2E8F50); }
+.rail-run .st.stop { color: var(--danger); }
+.rail-run .dt { font-size: 12px; color: var(--ink-2); padding-top: 2px; }
+
+@media (max-width: 1000px) {
+  .prof-grid { flex-direction: column; }
+  .prof-rail { width: 100%; }
+}

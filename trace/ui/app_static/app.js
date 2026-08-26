@@ -756,6 +756,34 @@ async function answerDecision(id, answer) {
 // Phase B: a "confirm this shared lesson?" card — a lesson a SIMILAR agent (possibly
 // another user's) learned. Confirming lets it guide this agent autonomously from now on;
 // dismissing means it never resurfaces here. This is the one-time human touch per lesson.
+
+/* Typical run length, in whole minutes, from the run log's own timestamps. Median
+   rather than mean so one pathological run (a stop waiting hours on a human) doesn't
+   describe the rest. null when nothing has a measurable duration, which reads as
+   "don't show the card" — better than a confident 0. */
+function runMinutes(runs) {
+  const spans = (runs || []).map(r => {
+    const a = Date.parse(r.started_at || r.ran_at || ""), b = Date.parse(r.ended_at || "");
+    return (isFinite(a) && isFinite(b) && b > a) ? (b - a) / 60000 : null;
+  }).filter(v => v !== null).sort((x, y) => x - y);
+  if (!spans.length) return null;
+  const mid = spans[Math.floor(spans.length / 2)];
+  return Math.max(1, Math.round(mid));
+}
+
+/* "Today 6:04" / "Mon 6:02" — the frame's own shorthand. */
+function whenShort(ts) {
+  const d = new Date(ts || "");
+  if (isNaN(d)) return "—";
+  const now = new Date();
+  const time = d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+  const sameDay = d.toDateString() === now.toDateString();
+  if (sameDay) return `Today ${time}`;
+  const days = (now - d) / 86400000;
+  if (days < 7) return `${d.toLocaleDateString(undefined, { weekday: "short" })} ${time}`;
+  return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+}
+
 function lessonConfirmCard(agentId, c) {
   return `<div class="card lesson-card" style="margin-top:8px;border-left:3px solid var(--accent,#5b8def);">
     <div class="sub muted" style="margin-bottom:4px;">A similar agent learned this — apply it here?</div>
@@ -2080,20 +2108,22 @@ async function renderProfile(agentId) {
   const tb = agentsTopbar(home.unread_total, null, home.needs_you_total, "home");
   tb.paint(`
     <div class="panel">
-      <div class="row" style="gap:16px;align-items:flex-start;">
+      <div class="row" style="gap:16px;align-items:center;">
         ${avatar(name, 64, a)}
-        <div style="flex:1;">
-          <div class="row" style="gap:10px;"><h2 id="pTitle" style="margin:0;">${esc(name)}</h2>
+        <div style="flex:1;min-width:0;">
+          <div class="row" style="gap:9px;"><h2 id="pTitle" style="margin:0;">${esc(name)}</h2>
             <button id="pEdit" class="pencil" title="Rename or recolor">✎</button>
             <span class="pill ${paused ? "pill-warn" : "pill-on"}">${paused ? "PAUSED" : "LIVE"}</span></div>
-          <p class="ag-bio wrap" style="margin:6px 0 0;">${esc(a.description || ("Runs when: " + (a.trigger || "you say so")))}</p>
-          <p class="sub muted" style="margin-top:4px;"><span id="pStats">…</span>${a.deployed_at ? ` · live since ${esc(onDate(a.deployed_at))}` : ""}</p>
+          <p class="ag-bio wrap" style="margin:5px 0 0;">${esc(
+            a.description || ("Runs when: " + (a.trigger || "you say so")))}${
+            a.deployed_at ? ` · live since ${esc(onDate(a.deployed_at))}` : ""}</p>
         </div>
-      </div>
-      <div class="row" style="margin-top:16px;gap:8px;flex-wrap:wrap;">
-        <button class="btn-secondary btn-sm" id="pMsg">Message</button>
-        <button class="btn-primary btn-sm" id="pRun">Run now</button>
-        ${sched ? `<button class="btn-secondary btn-sm" id="pPause">${paused ? "Resume" : "⏸ Pause"}</button>` : ""}
+        <div class="row" style="gap:9px;flex:none;">
+          <button class="btn-secondary btn-sm" id="pMsg">Message</button>
+          <button class="btn-primary btn-sm" id="pRun">Run now</button>
+          ${sched ? `<button class="btn-secondary btn-sm" id="pPause">${
+            paused ? "Resume" : "⏸ Pause"}</button>` : ""}
+        </div>
       </div>
       <div class="tabs" id="pTabs">
         ${["Overview", "Rules", "Lessons", "History"].map((t, n) =>
@@ -2105,26 +2135,62 @@ async function renderProfile(agentId) {
          cards. The schedule select used to sit loose in the header row beside Message
          and Run now, which put a settings control among the actions and left Overview
          with nothing of its own. -->
-    <div class="panel" data-pane="overview">
-      <div class="ov-block">
-        <div class="label">Schedule</div>
-        <div class="row" style="gap:10px;align-items:center;flex-wrap:wrap;margin-top:6px;">
-          <span class="ov-strong">${esc(cadenceLabel(sched))}</span>
-          <select class="sched" id="pSched">${opts}</select>
+    <div class="panel pane-bare" data-pane="overview">
+      <div class="prof-grid">
+        <div class="prof-main">
+          <div class="prof-card">
+            <div class="label">Schedule</div>
+            <div class="row" style="gap:10px;align-items:center;flex-wrap:wrap;">
+              <span class="ov-strong">${esc(cadenceLabel(sched))}</span>
+              <select class="sched" id="pSched">${opts}</select>
+            </div>
+            <div class="sub muted">${paused
+              ? "Paused — it won't run until you resume it."
+              : esc(nextRunLine(sched))}</div>
+          </div>
+          <div class="prof-card" id="pPerms">
+            <div class="label">Permissions</div>
+            <p class="sub muted">Loading…</p>
+          </div>
+          <div class="prof-stats" id="pStatRow"></div>
+          ${a.capture_present ? `
+          <div class="prof-card prof-danger">
+            <div style="flex:1;">
+              <div class="t">Delete this agent's capture data</div>
+              <div class="d">Keeps the agent; removes its recordings. This can't be undone.</div>
+            </div>
+            <button id="pDelCap" class="btn-danger btn-sm">Delete…</button>
+          </div>` : `
+          <div class="prof-card"><div class="sub muted">Capture data deleted.</div></div>`}
         </div>
-        <div class="sub muted" style="margin-top:4px;">${paused
-          ? "Paused — it won't run until you resume it."
-          : esc(nextRunLine(sched))}</div>
-      </div>
-      <div class="ov-block" id="pPerms">
-        <div class="label">Permissions</div>
-        <p class="sub muted" style="margin-top:4px;">Loading…</p>
-      </div>
-      <div class="ov-stats" id="pStatRow"></div>
-      <div class="row" style="margin-top:14px;">
-        ${a.capture_present
-          ? `<button id="pDelCap" class="btn-link" style="color:var(--danger);">Delete this agent's capture data</button>`
-          : `<span class="muted" style="font-size:12px;">Capture data deleted</span>`}
+        <div class="prof-rail">
+          ${(a.lesson_confirmations || []).map(c => `
+          <div class="prof-card rail-confirm">
+            <div class="label">Shared lesson — confirm?</div>
+            <div class="body">${esc(c.lesson || "")}</div>
+            <div class="row" style="gap:8px;">
+              <button class="btn-primary btn-sm lesson-yes" data-agent="${esc(agentId)}"
+                data-id="${esc(c.decision_id)}">Adopt</button>
+              <button class="btn-secondary btn-sm lesson-no" data-agent="${esc(agentId)}"
+                data-id="${esc(c.decision_id)}">Ignore</button>
+            </div>
+          </div>`).join("")}
+          ${(a.active_lessons && a.active_lessons.length) ? `
+          <div class="prof-card">
+            <div class="label">Active lessons · ${a.active_lessons.length}</div>
+            ${a.active_lessons.map(c => `
+            <div class="rail-lesson">
+              <span class="rail-dot"></span>
+              <div class="txt">${esc(c.lesson || "")}</div>
+              <button class="btn-link lesson-retire" data-agent="${esc(agentId)}"
+                data-id="${esc(c.decision_id)}" style="font-size:11px;">Retire</button>
+            </div>`).join("")}
+          </div>` : ""}
+          <div class="prof-card" id="pRail">
+            <div class="label">Recent runs</div>
+            <p class="sub muted">Loading…</p>
+          </div>
+        </div>
       </div>
     </div>
     ${(a.lesson_confirmations && a.lesson_confirmations.length) ? `
@@ -2299,15 +2365,6 @@ async function renderProfile(agentId) {
       e.target.textContent = "Saved ✓";
     };
   }
-  const stats = $("#pStats");
-  if (stats) {
-    const staged = sessionsList.reduce((n, s) =>
-      n + ((s.proposals || []).filter(p => !p.status || p.status === "pending").length), 0);
-    stats.textContent = `${sessionsList.length} session${sessionsList.length === 1 ? "" : "s"}`
-      + (staged ? ` · ${staged} staged action${staged === 1 ? "" : "s"} waiting` : "");
-  }
-  // Frame 21's stat row. "Runs" and "approved as-is" come from the activity log; the
-  // frame's third figure — hours saved — has nothing behind it, so there are two.
   const statRow = $("#pStatRow");
   if (statRow) {
     const props = sessionsList.flatMap(s => s.proposals || []);
@@ -2316,10 +2373,38 @@ async function renderProfile(agentId) {
       && p.status !== "executing");
     const asIs = decided.filter(p => p.status === "executed" || p.status === "approved");
     const pct = decided.length ? Math.round((asIs.length / decided.length) * 100) : null;
+    // Frame 21 shows three figures as cards. The third is "saved", which nothing
+    // measures — hours a human DIDN'T spend is not observable from a run log, and
+    // guessing it would put an invented number on the one screen a customer uses to
+    // judge whether the agent is worth keeping. agent_runs does carry started_at and
+    // ended_at, so typical run length is real, and it answers the question the schedule
+    // card actually needs ("takes ~9 min" in the frame).
+    const mins = runMinutes(sessionsList);
     statRow.innerHTML = `
-      <div class="ov-stat"><b>${sessionsList.length}</b><span>run${
+      <div class="prof-stat"><b>${sessionsList.length}</b><span>run${
         sessionsList.length === 1 ? "" : "s"}</span></div>
-      ${pct === null ? "" : `<div class="ov-stat"><b>${pct}%</b><span>approved as-is</span></div>`}`;
+      ${pct === null ? "" : `<div class="prof-stat"><b>${pct}%</b><span>approved as-is</span></div>`}
+      ${mins === null ? "" : `<div class="prof-stat"><b>${mins}m</b><span>typical run</span></div>`}`;
+  }
+  // Recent runs — the rail's third card in frame 21.
+  const rail = $("#pRail");
+  if (rail) {
+    const recent = sessionsList.slice(0, 4);
+    rail.innerHTML = `<div class="label">Recent runs</div>` + (recent.length
+      ? recent.map(r => {
+          const stopped = (r.decisions || []).length > 0;
+          const held = (r.proposals || []).length;
+          const bits = [];
+          if (held) bits.push(`${held} awaiting approval`);
+          if (r.note) bits.push(r.note);
+          return `<div class="rail-run">
+            <div class="hd"><b>${esc(whenShort(r.ran_at))}</b>
+              <span class="st ${stopped ? "stop" : "ok"}">${
+                stopped ? "stopped — needs you" : esc(r.status || "clean")}</span></div>
+            ${bits.length ? `<div class="dt">${esc(bits.join(" · "))}</div>` : ""}
+          </div>`;
+        }).join("")
+      : `<p class="sub muted">No runs yet.</p>`);
   }
   // Permissions (21): which apps it can touch, and whether each is held for approval.
   const perms = $("#pPerms");
