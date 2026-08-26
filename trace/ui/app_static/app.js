@@ -784,6 +784,22 @@ function whenShort(ts) {
   return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
 }
 
+
+/* Frame 21 closes the Permissions card with one line about when the agent stops and
+   asks — "Escalation: team rules + 1 override". The frame's phrasing assumes a team
+   tier that does not exist yet, so this states what IS known: how many stop-rules the
+   worker set at the safety step, and the first of them. Silent when none were set,
+   because "Escalation: none" reads as a missing feature rather than a choice. */
+function escalationLine(data) {
+  const raw = ((data && data.agent && data.agent.rules) || "").trim();
+  if (!raw) return "";
+  const rules = raw.split(/\n+/).map(r => r.replace(/^[-•*\s]+/, "").trim()).filter(Boolean);
+  if (!rules.length) return "";
+  const more = rules.length > 1 ? ` + ${rules.length - 1} more` : "";
+  return `<div class="sub muted" style="margin-top:6px;">Escalation: ${
+    esc(rules[0])}${more} — it stops and asks you.</div>`;
+}
+
 function lessonConfirmCard(agentId, c) {
   return `<div class="card lesson-card" style="margin-top:8px;border-left:3px solid var(--accent,#5b8def);">
     <div class="sub muted" style="margin-bottom:4px;">A similar agent learned this — apply it here?</div>
@@ -2144,7 +2160,7 @@ async function renderProfile(agentId) {
               <span class="ov-strong">${esc(cadenceLabel(sched))}</span>
               <select class="sched" id="pSched">${opts}</select>
             </div>
-            <div class="sub muted">${paused
+            <div class="sub muted" id="pNext">${paused
               ? "Paused — it won't run until you resume it."
               : esc(nextRunLine(sched))}</div>
           </div>
@@ -2386,6 +2402,14 @@ async function renderProfile(agentId) {
       ${pct === null ? "" : `<div class="prof-stat"><b>${pct}%</b><span>approved as-is</span></div>`}
       ${mins === null ? "" : `<div class="prof-stat"><b>${mins}m</b><span>typical run</span></div>`}`;
   }
+  // "Next run tomorrow 6:00 AM · takes ~9 min" — the frame puts expected duration on the
+  // schedule line, which is where it is actually useful: it tells you what window the
+  // agent occupies, not merely when it starts. Appended rather than rendered inline
+  // because it needs the run log, which arrives after first paint.
+  const nextLine = $("#pNext");
+  if (nextLine && mins !== null && !paused) {
+    nextLine.textContent = `${nextLine.textContent} · takes ~${mins} min`;
+  }
   // Recent runs — the rail's third card in frame 21.
   const rail = $("#pRail");
   if (rail) {
@@ -2415,7 +2439,8 @@ async function renderProfile(agentId) {
             <span class="pill ${ap.staged ? "pill-warn" : "pill-on"}">${
               ap.staged ? "ALWAYS STAGED" : "RUNS AUTOMATICALLY"}</span></div>`).join("")}</div>
          <div class="sub muted" style="margin-top:8px;">Staged means it prepares the
-           action and waits for you. Change these under Rules.</div>`
+           action and waits for you. Change these under Rules.</div>
+         ${escalationLine(data)}`
       : `<p class="sub muted" style="margin-top:4px;">No connected apps yet.</p>`);
   }
   const logRow = (s) => {
@@ -3283,11 +3308,18 @@ function renderSafetyNet(sid, ids, saved, prior) {
 // {state, generated, errors} — a count, with no phase and no current bundle — so those
 // ticks would be invented. The phases are shown as what the build is doing, unticked,
 // which is the same information without claiming progress we cannot see.
+// Frame 11 writes a finished phase in the PAST tense ("Learned the weekly steps") and
+// the one in flight in the present. Both forms are kept so a row can change as it
+// completes rather than staying hopeful about work already done.
 const BUILD_PHASES = [
-  "Learning the steps from your recorded day",
-  "Writing its judgment rules from your answers",
-  "Testing against what you actually did",
-  "Safety pass — staging everything outbound",
+  { doing: "Learning the steps from your recorded day",
+    done: "Learned the steps from your recorded day" },
+  { doing: "Writing its judgment rules from your answers",
+    done: "Wrote its judgment rules from your answers" },
+  { doing: "Testing against your recorded day",
+    done: "Tested against your recorded day" },
+  { doing: "Safety pass — staging all outbound",
+    done: "Safety pass — all outbound staged" },
 ];
 
 function stepBuild() {
@@ -3312,7 +3344,7 @@ async function runBuild(sid) {
   if (S.session.build_at) { b.innerHTML = builtSummary(); wireBuiltContinue(); return; }
   b.innerHTML = `
     <div class="bd-phases">${BUILD_PHASES.map(p =>
-      `<div class="bd-phase"><span class="bd-dot"></span>${esc(p)}</div>`).join("")}</div>
+      `<div class="bd-phase"><span class="bd-dot"></span>${esc(p.doing)}</div>`).join("")}</div>
     <div id="buildErr" class="msg err"></div>`;
   try {
     const r = await upost(sid, "/build", {});
@@ -3329,7 +3361,7 @@ function builtSummary() {
   if (head) head.textContent = "Your agents are built";
   return `
     <div class="bd-phases done">${BUILD_PHASES.map(p =>
-      `<div class="bd-phase"><span class="bd-dot on">✓</span>${esc(p)}</div>`).join("")}</div>
+      `<div class="bd-phase"><span class="bd-dot on">✓</span>${esc(p.done)}</div>`).join("")}</div>
     <button id="buildGo" class="btn-primary full bd-go">Connect your apps</button>`;
 }
 function wireBuiltContinue() { $("#buildGo").onclick = () => goStep(5); }
