@@ -287,6 +287,65 @@ def _upload_to_storage(root, sid, filename, owner_id):
             admin.table("sessions").update({col: storage_path}).eq("id", db_id).execute()
 
 
+def purge_cloud_artifacts(root, sid):
+    """Delete a session's uploaded artifacts from Storage and blank the derived
+    content on its row. Returns a small report; never raises.
+
+    _upload_to_storage has had no counterpart since it was written: the whole
+    codebase contained exactly one storage.from_("artifacts") call, an upload. So a
+    recording pushed to the cloud could not be removed from it by any code path,
+    while the privacy screen said deletion covered "your device and the cloud". The
+    on-disk half was true and the cloud half was not.
+
+    The row itself is kept. The user asked to delete the recording, not the record
+    that they once recorded — and agents reference the session id. What goes is the
+    content: the Storage objects and the derived blobs held inline on the row.
+    """
+    report = {"storage_removed": 0, "row_cleared": False, "errors": []}
+    if not supa.is_configured():
+        return report
+    admin = supa.get_admin()
+    db_id = _get_db_id(root, sid)
+    row = {}
+    if db_id:
+        try:
+            r = admin.table("sessions").select(
+                "owner_id,raw_events_path,event_log_path").eq("id", db_id) \
+                .maybe_single().execute()
+            row = (getattr(r, "data", None) or {})
+        except Exception as e:                             # noqa: BLE001
+            report["errors"].append(f"read row: {type(e).__name__}")
+
+    # Remove by listing the session's prefix, not by deleting the two paths we happen
+    # to have recorded — anything else ever uploaded under it must go too.
+    owner = row.get("owner_id")
+    paths = [p for p in (row.get("raw_events_path"), row.get("event_log_path")) if p]
+    if owner:
+        try:
+            listed = admin.storage.from_("artifacts").list(f"{owner}/{sid}") or []
+            paths += [f"{owner}/{sid}/{o.get('name')}" for o in listed if o.get("name")]
+        except Exception as e:                             # noqa: BLE001
+            report["errors"].append(f"list: {type(e).__name__}")
+    paths = list(dict.fromkeys(paths))
+    if paths:
+        try:
+            admin.storage.from_("artifacts").remove(paths)
+            report["storage_removed"] = len(paths)
+        except Exception as e:                             # noqa: BLE001
+            report["errors"].append(f"remove: {type(e).__name__}: {e}")
+
+    if db_id:
+        try:
+            admin.table("sessions").update({
+                "raw_events_path": None, "event_log_path": None,
+                "discovery": None, "validation_report": None,
+            }).eq("id", db_id).execute()
+            report["row_cleared"] = True
+        except Exception as e:                             # noqa: BLE001
+            report["errors"].append(f"clear row: {type(e).__name__}")
+    return report
+
+
 # ---------------------------------------------------------------------------
 # Artifact inspection (unchanged — filesystem is the source of truth during pipeline)
 # ---------------------------------------------------------------------------

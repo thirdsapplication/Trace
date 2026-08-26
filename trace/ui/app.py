@@ -1220,8 +1220,12 @@ class AppState:
                 platform = self.cleanup_fn(test_sessions, file_ids, [], agent_names=[])
             except Exception as e:                        # noqa: BLE001
                 platform = {"error": f"{type(e).__name__}: {e}"}
+        # The cloud copy. Uploaded since Storage landed and, until now, unreachable by
+        # any delete path — the privacy screen promised "your device and the cloud" and
+        # only the first half was true.
+        cloud = sessions.purge_cloud_artifacts(root, sid)
         shutil.rmtree(sessions.session_dir(root, sid), ignore_errors=True)
-        return {"session_id": sid, "deleted": True, "platform": platform}
+        return {"session_id": sid, "deleted": True, "platform": platform, "cloud": cloud}
 
     # --- Phase 4: connection layer (Pipedream Connect + MA vault) ---------
     def _external_user_id(self, sid):
