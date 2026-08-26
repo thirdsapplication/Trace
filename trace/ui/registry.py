@@ -25,6 +25,15 @@ _LOCK = threading.Lock()
 
 # --- column mapping (caller shape ↔ Supabase shape) ------------------------
 
+# Columns on `agents` that are deliberately NOT sent to callers. Each is a large
+# server-side payload with no client consumer — live_yaml is the compiled agent
+# definition, interview the worker's answers, grounding the compiler's context — and
+# including them would put kilobytes into every home_data response for nobody. Listed
+# so a future sweep reads this as a decision rather than the oversight it looks like,
+# and so test_mapping_completeness can tell the two apart.
+AGENT_COLUMNS_NOT_EXPOSED = ("live_yaml", "interview", "grounding")
+
+
 def _agent_to_caller(row):
     """Convert a Supabase agents row to the dict shape callers expect."""
     d = {
@@ -47,6 +56,12 @@ def _agent_to_caller(row):
         # no effect anywhere in Supabase mode. File-mode returns the raw stored dict, so
         # it kept working and the tests never caught it.
         "color": row.get("color"),
+        # status was added to the WRITE map earlier today so a deploy finally records
+        # that it deployed — and this read map dropped it, which would have left that
+        # fix inert: written on every deploy, invisible to every caller. Both halves of
+        # a round trip have to name a column or it may as well not exist.
+        "status": row.get("status"),
+        "team_id": row.get("team_id"),
         # Same omission as color above, with worse consequences: agent_set_consent WRITES
         # these (008 added the columns, NULL = inherit) and nothing read them back, so
         # agent_lesson_scopes always fell through to the account default. A per-agent
@@ -91,6 +106,17 @@ def _run_to_caller(row):
         "started_at": row.get("started_at"),
         "ended_at": row.get("ended_at"),
         "status": row.get("status"),
+        # A failed run knew why and never said: `error` was recorded and dropped, so
+        # the UI could only ever show "failed" with no reason. The three counts are
+        # what a run DID — frame 21's recent-runs line ("14 SKUs · 1 promo confirmed ·
+        # sheet update approved") is exactly this data, which is why that line has
+        # never had anything behind it. trigger_type separates a scheduled run from one
+        # somebody pressed, which is the first question asked about any surprising run.
+        "error": row.get("error"),
+        "actions_taken": row.get("actions_taken"),
+        "actions_held": row.get("actions_held"),
+        "approvals": row.get("approvals"),
+        "trigger_type": row.get("trigger_type"),
         "summary": row.get("summary"),
         "details": row.get("details") or [],
         "run_session_id": row.get("run_session_id"),
