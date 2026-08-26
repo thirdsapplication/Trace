@@ -1447,7 +1447,13 @@ class AppState:
                                     "owner_email": rec.get("owner_email"),
                                     # the worker's review-step correction is the truer bio
                                     "description": b.get("user_description")
-                                                   or b.get("description") or ""})
+                                                   or b.get("description") or "",
+                                    # deploy.py has computed both of these all along and
+                                    # nothing carried them across, so the agents table
+                                    # recorded that a deployment existed but never that
+                                    # it went live.
+                                    "status": rec.get("status"),
+                                    "deployed_at": rec.get("deployed_at")})
                                 try:                  # Phase B: agent-kind gate. Best-effort
                                     self._embed_agent_kind({   # — an embedding hiccup must
                                         "agent_id": rec["agent_id"],   # never fail a deploy

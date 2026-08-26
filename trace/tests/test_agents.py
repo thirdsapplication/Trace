@@ -653,5 +653,41 @@ class RunMappingTest(unittest.TestCase):
         self.assertIsNone(out["ended_at"])
 
 
+class AgentWriteMapTest(unittest.TestCase):
+    """_agent_to_sb is an allow-list, so a field it does not name is dropped in
+    silence — the write-side twin of the _agent_to_caller bugs.
+
+    Deploy state was the casualty: Supabase agents recorded a deployment_id and
+    never that they had gone live, so all 13 production agents read back as
+    status='draft' with a null deployed_at. File mode stamps deployed_at on its own
+    line, so the suite was green throughout. These assert on the map directly,
+    because behaviour is precisely what hides this.
+    """
+
+    def test_deploy_state_survives_the_write_map(self):
+        sb = registry._agent_to_sb({
+            "agent_id": "a1", "owner_user_id": "u1", "name": "Shipping",
+            "status": "live", "deployed_at": "2026-08-26T10:00:00Z"})
+        self.assertEqual(sb["status"], "live",
+                         "status dropped — every agent reads back as draft")
+        self.assertEqual(sb["deployed_at"], "2026-08-26T10:00:00Z",
+                         "deployed_at dropped — 'which agents are live?' is unanswerable")
+
+    def test_the_identity_columns_still_map(self):
+        sb = registry._agent_to_sb({"agent_id": "a1", "owner_user_id": "u1",
+                                    "owner_email": "x@y.com", "deployment_id": "d1"})
+        self.assertEqual(sb["id"], "a1")
+        self.assertEqual(sb["owner_id"], "u1")
+        self.assertEqual(sb["owner_email"], "x@y.com")
+        self.assertEqual(sb["deployment_id"], "d1")
+
+    def test_absent_fields_are_omitted_not_nulled(self):
+        """An upsert that nulls a column it wasn't asked to touch is worse than one
+        that drops it — it would erase a name on any partial write."""
+        sb = registry._agent_to_sb({"agent_id": "a1", "status": "live"})
+        self.assertNotIn("name", sb)
+        self.assertNotIn("deployed_at", sb)
+
+
 if __name__ == "__main__":
     unittest.main()

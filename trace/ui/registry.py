@@ -64,9 +64,15 @@ def _agent_to_sb(agent):
         sb["id"] = agent["agent_id"]
     if "owner_user_id" in agent:
         sb["owner_id"] = agent["owner_user_id"]
+    # An allow-list silently drops whatever is not on it, and status/deployed_at were
+    # not — so in Supabase mode a deploy wrote its deployment_id and nothing about
+    # having deployed. Every agent read back as status 'draft' with a null deployed_at
+    # forever, which is why "which of this customer's agents are actually live?" had no
+    # answer. File mode stamps deployed_at on its own line below and so looked fine,
+    # which is exactly how this survived the suite.
     for key in ("external_user_id", "bundle_id", "name", "vault_ref", "trigger",
                 "session_id", "deployment_id", "memory_store_id", "owner_email",
-                "description"):
+                "description", "status", "deployed_at"):
         if key in agent:
             sb[key] = agent[key]
     if "staged_apps" in agent:
