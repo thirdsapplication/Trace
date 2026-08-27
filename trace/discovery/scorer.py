@@ -18,6 +18,7 @@ Answer-key format (a JSON object):
 """
 
 import json
+from trace.agent import model_call
 
 DEFAULT_OVERLAP_THRESHOLD = 0.5
 _SENSITIVITY_THRESHOLDS = [0.3, 0.4, 0.5, 0.6, 0.7]
@@ -64,11 +65,7 @@ def _default_intent_judge(model="claude-sonnet-4-6"):
             "Do they describe the same underlying workflow/intent? "
             "Answer with exactly one word: YES or NO."
         )
-        resp = client.messages.create(
-            model=model, max_tokens=5, temperature=0,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        text = "".join(b.text for b in resp.content if getattr(b, "type", None) == "text")
+        text = model_call.create_text(client, model, None, prompt, max_tokens=5)
         return text.strip().upper().startswith("Y")
 
     return judge

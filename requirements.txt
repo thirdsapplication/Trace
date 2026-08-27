@@ -3,7 +3,16 @@
 # Reconstruction (Engine 1b) — calls claude-haiku-4-5.
 # Stage 4 (Managed Agents) needs the agent surface (client.beta.agents/sessions);
 # if "Compile & test agents" reports no Managed Agents API, run: pip install -U anthropic
-anthropic>=0.40.0
+# PINNED BELOW 1.0 DELIBERATELY. This was `>=0.40.0`, unpinned, so Render's build
+# pulled whatever was newest -- and when the SDK went to 1.x it stopped accepting
+# `temperature` on messages.create. Every agent build failed with
+# "Messages.create() got an unexpected keyword argument 'temperature'", in production,
+# with nothing in this repo having changed. An unpinned major version on the critical
+# path is a deploy that can break itself overnight.
+#
+# Moving to 1.x is a deliberate task, not something to inherit from a rebuild: the
+# Managed Agents surface lives here too, so the migration needs its own testing pass.
+anthropic>=0.40.0,<1.0
 
 # Local capture (Engine 1a, macOS only). Not needed to run reconstruction or
 # the test suite; install on the capture machine.
@@ -32,6 +41,11 @@ keyring>=24.0 ; sys_platform == "darwin"
 # Stage 4 (Agent Compiler) — emit/validate Managed Agents agent-definition YAML.
 PyYAML>=6.0
 
+# Major versions are capped on everything the SERVER depends on. anthropic taught this
+# on 2026-08-27: `>=0.40.0` let a rebuild pull 1.x, which had dropped a keyword every
+# engine passed, and agent builds died in production with nothing in the repo changed.
+# A cap turns that into a dependency resolution you choose rather than one you inherit.
+
 # Phase 1 (cloud backend). Both cross-platform, so unconditional:
 # - python-dotenv: load a git-ignored .env on a local run (no-op in the cloud,
 #   where Render supplies the same names as real environment variables).
@@ -39,7 +53,7 @@ PyYAML>=6.0
 #   users/sessions schema on startup. Imported lazily, so a DB-less local run
 #   never needs it at runtime; pinned here so the container build has it.
 python-dotenv>=1.0
-psycopg[binary]>=3.1
+psycopg[binary]>=3.1,<4
 
 # CA bundle for the stdlib Pipedream Connect HTTPS calls (connect_client.py), so TLS
 # verification doesn't depend on the OS cert store. Also pulled in transitively by anthropic.
@@ -48,4 +62,4 @@ certifi>=2024.0
 # Phase 2 (Supabase backend). The supabase-py client wraps Auth, Postgres (PostgREST),
 # and Storage behind a single client object. Imported lazily so a fully-local run
 # never needs it at runtime.
-supabase>=2.0
+supabase>=2.0,<3

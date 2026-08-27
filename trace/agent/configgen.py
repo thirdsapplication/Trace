@@ -36,11 +36,7 @@ def _default_model_fn(model):
     client = anthropic.Anthropic()
 
     def call(system, user):
-        resp = client.messages.create(
-            model=model, max_tokens=4000, temperature=0,
-            system=system, messages=[{"role": "user", "content": user}],
-        )
-        return "".join(b.text for b in resp.content if getattr(b, "type", None) == "text")
+        return model_call.create_text(client, model, system, user, max_tokens=4000)
 
     return call
 

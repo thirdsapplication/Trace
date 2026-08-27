@@ -22,6 +22,7 @@ import json
 
 from . import validate
 from .prompt import SYSTEM_PROMPT
+from trace.agent import model_call
 
 # Single, one-line default model tier (Open decision §11: trivially swappable).
 DEFAULT_MODEL = "claude-sonnet-4-6"
@@ -77,16 +78,7 @@ def _default_model_fn(model):
     client = anthropic.Anthropic()
 
     def call(system, user):
-        resp = client.messages.create(
-            model=model,
-            max_tokens=16000,
-            temperature=0,
-            system=system,
-            messages=[{"role": "user", "content": user}],
-        )
-        return "".join(
-            block.text for block in resp.content if getattr(block, "type", None) == "text"
-        )
+        return model_call.create_text(client, model, system, user, max_tokens=16000)
 
     return call
 
