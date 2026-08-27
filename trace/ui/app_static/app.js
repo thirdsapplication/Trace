@@ -7,6 +7,11 @@
    ============================================================ */
 const $ = (sel, r = document) => r.querySelector(sel);
 const root = $("#root");
+// Agents you OWN. A teammate's agent arrives with can_edit === false, and every list
+// that drives a mutation -- messaging, grouping, sharing overrides, capture deletion --
+// must be built from this rather than from the whole visible set. Home, the activity
+// list and the profile deliberately show everything; those are reads.
+const owned = (list) => (list || []).filter(a => a.can_edit !== false);
 const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g,
   c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
@@ -1024,7 +1029,7 @@ async function renderSettings() {
       <h2 style="font-size:16px;">Per agent</h2>
       <p class="sub muted" style="margin-top:2px;">Anything set here wins over the dials above.
         Change one on its own page.</p>
-      <div class="sh-rows">${home.agents.map(a => `
+      <div class="sh-rows">${owned(home.agents).map(a => `
         <button class="sh-row" data-agent="${esc(a.agent_id)}">
           <span class="sh-chip" style="background:${esc(agentColor(a))};"></span>
           <span class="sh-name">${esc(a.name)}</span>
@@ -1271,7 +1276,7 @@ async function setNotifications() {
 
 async function setPrivacy() {
   const home = S.igHome || await loadHome();
-  const agents = (home.agents || []).filter(a => a.capture_present);
+  const agents = owned(home.agents).filter(a => a.capture_present);
   $("#setPane").innerHTML = `
     <div class="danger-card">
       <div class="set-name" style="color:var(--danger);">Delete all capture data</div>
@@ -1416,7 +1421,8 @@ async function renderGroups() {
   const home = S.igHome || await loadHome();
   const { data } = await api("GET", "/api/u/groups");
   const groups = (data && data.groups) || [];
-  const agents = home.agents || [];
+  const agents = owned(home.agents);      // a group is yours; a teammate's agent is not
+
   const tb = agentsTopbar(home.unread_total, null, home.needs_you_total, "groups");
 
   // Stacked color tiles (24): the group's members read as one object at a glance. Four
@@ -1510,7 +1516,7 @@ async function wireGroupAdd(group, redraw) {
     box.innerHTML = `<p class="sub muted">Loading…</p>`;
     const home = S.igHome || await loadHome();
     const inGroup = new Set((group.members || []).map(m => m.agent_id));
-    const rest = (home.agents || []).filter(a => !inGroup.has(a.agent_id));
+    const rest = owned(home.agents).filter(a => !inGroup.has(a.agent_id));
     if (!rest.length) {
       box.innerHTML = `<p class="sub muted">Every agent you have is already in this group.</p>`;
       return;
@@ -1874,7 +1880,7 @@ async function renderMessages() {
       <div class="stack" id="dmList"><p class="muted">Loading…</p></div>
     </div>`);
   tb.wire();
-  const agents = d.agents || [];
+  const agents = owned(d.agents);
   const threads = await Promise.all(agents.map(async a => {
     const r = await api("GET", `/api/u/agents/${a.agent_id}/messages`);
     const msgs = (r.data && r.data.messages) || [];
@@ -2246,7 +2252,8 @@ async function renderProfile(agentId) {
         ${avatar(name, 64, a)}
         <div style="flex:1;min-width:0;">
           <div class="row" style="gap:9px;"><h2 id="pTitle" style="margin:0;">${esc(name)}</h2>
-            <button id="pEdit" class="pencil" title="Rename or recolor">✎</button>
+            ${a.can_edit === false ? "" :
+              `<button id="pEdit" class="pencil" title="Rename or recolor">✎</button>`}
             <span class="pill ${paused ? "pill-warn" : "pill-on"}">${paused ? "PAUSED" : "LIVE"}</span></div>
           <p class="ag-bio wrap" style="margin:5px 0 0;">${profileBio(a)}</p>
         </div>
@@ -2371,15 +2378,18 @@ async function renderProfile(agentId) {
       <div id="pLog"><p class="muted">Loading…</p></div>
     </div>`);
   tb.wire();
-  $("#pMsg").onclick = () => renderThread(agentId);
+  const pm = $("#pMsg");
+  if (pm) pm.onclick = () => renderThread(agentId);
   const pr = $("#pReview");
   if (pr) pr.onclick = () => renderReview(agentId);
-  $("#pRun").onclick = async (e) => {
+  const prun = $("#pRun");
+  if (prun) prun.onclick = async (e) => {
     e.target.disabled = true; e.target.textContent = "Running…";
     await api("POST", `/api/u/agents/${agentId}/run-now`, {});
     S._timers.push(setTimeout(() => { S.igHome = null; renderProfile(agentId); }, 4000));
   };
-  $("#pSched").onchange = async (e) => {
+  const psch = $("#pSched");
+  if (psch) psch.onchange = async (e) => {
     await api("POST", `/api/u/agents/${agentId}/schedule`, { cadence: valueToCadence(e.target.value) });
     S.igHome = null; renderProfile(agentId);
   };

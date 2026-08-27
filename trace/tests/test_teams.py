@@ -317,6 +317,64 @@ class TeamVisibilityTest(unittest.TestCase):
         self.assertEqual(len(seen), 2)
 
 
+class SharedMarksReachTheClientTest(unittest.TestCase):
+    """The marks are useless if the payload drops them, which is what happened.
+
+    TeamVisibilityTest above proves agents_visible_to sets can_edit and shared_from.
+    home_data then rebuilt each agent as a fresh literal and listed neither, so every
+    screen saw a teammate's agent as one of the user's own: Run now, Message, the
+    schedule select, rename, and delete-capture-data were all offered on it. The server
+    refused each one -- they resolve through agents_for_user -- so no cross-user write
+    was ever possible, but the buttons could only 404, and the message thread bounced
+    you back to the list about two seconds after you clicked into it.
+
+    This is the same shape as the five bugs in test_mapping_completeness (color,
+    owner_email, both consent scopes, ended_at, status): written upstream, dropped by a
+    hand-built dict on the way out. That test guards registry's mappers and cannot see
+    this one, because the drop is in app.py.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = self._tmp.name
+        self.state = app.AppState(sessions_root=self.root)
+        for owner, name in (("u1", "Mine"), ("u2", "Theirs")):
+            registry.agent_upsert(self.root, {
+                "agent_id": f"a-{owner}", "owner_user_id": owner, "name": name,
+                "bundle_id": "B1", "owner_email": f"{owner}@x.com"})
+        t = teams.create(self.root, "u1", "A")
+        teams.invite(self.root, t["team_id"], "u2@x.com", "member", "u1")
+        teams.accept_for(self.root, "u2@x.com", "u2")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _home(self):
+        out = self.state.home_data({"user_id": "u1", "email": "u1@x.com"})
+        return {a["name"]: a for a in out["agents"]}
+
+    def test_both_agents_are_in_the_payload(self):
+        self.assertEqual(sorted(self._home()), ["Mine", "Theirs"])
+
+    def test_a_teammates_agent_arrives_marked_read_only(self):
+        theirs = self._home()["Theirs"]
+        self.assertIs(theirs["can_edit"], False,
+                      "the client cannot tell this is somebody else's agent, so it "
+                      "offers Run now, Message and the schedule select on it")
+        self.assertEqual(theirs["shared_from"], "u2@x.com")
+
+    def test_your_own_agent_stays_editable(self):
+        mine = self._home()["Mine"]
+        self.assertIs(mine["can_edit"], True)
+        self.assertIsNone(mine["shared_from"])
+
+    def test_every_agent_carries_the_field_at_all(self):
+        """Absent is as bad as wrong: `a.can_edit === false` is false for undefined."""
+        for name, a in self._home().items():
+            self.assertIn("can_edit", a, f"{name} has no can_edit")
+            self.assertIn("shared_from", a, f"{name} has no shared_from")
+
+
 class UseAsTemplateTest(unittest.TestCase):
     """Templating must not become a back door to someone else's agent or recording.
 

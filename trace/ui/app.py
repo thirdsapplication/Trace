@@ -2132,6 +2132,15 @@ class AppState:
                 "active_lessons": active_by_agent.get(aid, []),
                 "needs_you": needs_you, "fyi_reviews": fyi_reviews,
                 "unread": unread.get(aid, 0),
+                # agents_visible_to marks a teammate's agent read-only, and this dict
+                # dropped both fields on the floor -- so every screen saw a shared agent
+                # as one of your own and offered Run now, Message, schedule changes and
+                # capture deletion on it. The server refused all of them (they resolve
+                # through agents_for_user), so nothing cross-user ever happened, but the
+                # UI spent clicks on buttons that could only 404. Same failure as color,
+                # owner_email, ended_at and status: written upstream, never mapped out.
+                "can_edit": a.get("can_edit", True),
+                "shared_from": a.get("shared_from"),
                 "replying": (self.chat_jobs.get(aid) or {}).get("state") == "running"})
         # Frame 14's strip. Two figures, both counted; the frame's third — hours of
         # busywork handled — has nothing behind it, so it is left out rather than guessed.
