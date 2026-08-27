@@ -115,6 +115,21 @@ APP_STATIC_DIR = os.path.join(os.path.dirname(__file__), "app_static")  # end-us
 # global auto-trusted default — it then injects without the per-agent confirm checkpoint.
 FLEET_DEFAULT_CONFIRMATIONS = 5
 
+
+def _why(e):
+    """An exception as something a person can act on.
+
+    Every pipeline job reported `str(e)`, which drops the TYPE — usually the
+    informative half, since AuthenticationError and JSONDecodeError call for
+    completely different responses — and is EMPTY for anything raised without a
+    message, leaving the user a step that failed and a blank reason. This is the same
+    shape `_build_one` already used; the other nine paths did not.
+    """
+    text = str(e).strip()
+    return f"{type(e).__name__}: {text}" if text else type(e).__name__
+
+
+
 # Group-chat guardrails (credit protection). Each group message can trigger model calls
 # (a broadcast = one per member; an @mention = a full agent session), so cap the blast
 # radius and rate-limit per user. Tune via env if needed.
@@ -372,7 +387,7 @@ class AppState:
                 job.update(state="done", flags=len(report.flags),
                            errors=len(report.errors))
             except Exception as e:  # surface real detail (handoff §4.5)
-                job.update(state="error", error=str(e))
+                job.update(state="error", error=_why(e))
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -407,7 +422,7 @@ class AppState:
                 job.update(state="done", bundles=len(discovery["bundles"]),
                            anti_bundles=len(discovery["anti_bundles"]))
             except Exception as e:
-                job.update(state="error", error=str(e))
+                job.update(state="error", error=_why(e))
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -441,7 +456,7 @@ class AppState:
                 job.update(state="done", bundles=len(discovery["bundles"]),
                            anti_bundles=len(discovery["anti_bundles"]))
             except Exception as e:
-                job.update(state="error", error=str(e))
+                job.update(state="error", error=_why(e))
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -484,7 +499,7 @@ class AppState:
                 sessions.update_meta(self.sessions_root, sid, specs_generated_at=sessions._now())
                 job.update(state="done", built=built, notes=str(report))
             except Exception as e:
-                job.update(state="error", error=str(e))
+                job.update(state="error", error=_why(e))
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -1052,18 +1067,24 @@ class AppState:
                     _write_json(sessions.path(root, sid, sessions.interview_filename(b["id"])), rec)
                     return b["id"]
 
-                done = self._fanout([lambda b=b: _questions_for(b) for b in approved])
+                errs = []
+                done = self._fanout([lambda b=b: _questions_for(b) for b in approved],
+                                    errors=errs)
                 job["generated"] = sum(1 for d in done if d)
                 failed = [b["id"] for b, d in zip(approved, done) if d is None]
                 if failed:
                     # Surface which workflows failed instead of aborting the whole step —
-                    # the ones that succeeded keep their questions.
-                    raise RuntimeError("couldn't prepare questions for: " + ", ".join(failed))
+                    # the ones that succeeded keep their questions — and say WHY. The
+                    # reason was being caught in _fanout and dropped, so this line named
+                    # a bundle id and nothing a person could act on.
+                    why = f" ({type(errs[0]).__name__}: {errs[0]})" if errs else ""
+                    raise RuntimeError("couldn't prepare questions for: "
+                                       + ", ".join(failed) + why)
                 sessions.update_meta(root, sid, interview_at=sessions._now())
                 self._sync_interview_complete(sid)   # zero-approved => vacuously complete
                 job.update(state="done")
             except Exception as e:
-                job.update(state="error", error=str(e))
+                job.update(state="error", error=_why(e))
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -1172,7 +1193,7 @@ class AppState:
                 sessions.update_meta(root, sid, build_at=sessions._now())
                 job.update(state="done")
             except Exception as e:
-                job.update(state="error", error=str(e))
+                job.update(state="error", error=_why(e))
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -1331,7 +1352,7 @@ class AppState:
                            reused=bool(tok.get("reused")),
                            identity_email=tok.get("identity_email"))
             except Exception as e:
-                job.update(state="error", error=str(e))
+                job.update(state="error", error=_why(e))
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -1353,7 +1374,7 @@ class AppState:
                            connected=entry.get("connected"),
                            usable=entry.get("usable"), flag=entry.get("flag"))
             except Exception as e:
-                job.update(state="error", error=str(e))
+                job.update(state="error", error=_why(e))
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -1545,7 +1566,7 @@ class AppState:
                 else:
                     job.update(state="done")          # nothing eligible -> nothing to do
             except Exception as e:
-                job.update(state="error", error=str(e))
+                job.update(state="error", error=_why(e))
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -1881,27 +1902,42 @@ class AppState:
         return "\n".join(lines) or "(no runs yet)"
 
     @staticmethod
-    def _fanout(thunks, workers=None):
+    def _fanout(thunks, workers=None, errors=None):
         """Run independent, IO-bound calls concurrently and return results IN ORDER.
 
         Every fan-out here is one network call per agent — model calls for a broadcast,
         platform sessions for @mentions — so they were waiting on the sum of the parts
         for no reason. A thunk that raises yields None rather than losing the whole set;
         callers substitute their own fallback.
+
+        ``errors`` is an optional list the exceptions are appended to. Without it a
+        failure here is completely silent, and the caller can only report THAT
+        something failed: the interview step said "couldn't prepare questions for: B1"
+        for a user with no way to learn why, because the reason was caught and dropped
+        one frame below. A fallback should replace a result, never the explanation.
         """
         thunks = list(thunks or [])
         if not thunks:
             return []
+
+        def _record(e):
+            if errors is not None:
+                errors.append(e)
+            # Render's logs are the only other place anyone can look.
+            print(f"[fanout] {type(e).__name__}: {e}", flush=True)
+
         if len(thunks) == 1:                               # no thread for a single call
             try:
                 return [thunks[0]()]
-            except Exception:                              # noqa: BLE001
+            except Exception as e:                         # noqa: BLE001
+                _record(e)
                 return [None]
 
         def _safe(fn):
             try:
                 return fn()
-            except Exception:                              # noqa: BLE001
+            except Exception as e:                         # noqa: BLE001
+                _record(e)
                 return None
 
         with concurrent.futures.ThreadPoolExecutor(

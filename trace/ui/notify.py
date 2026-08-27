@@ -24,6 +24,8 @@ import urllib.request
 
 _ENDPOINT = "https://api.resend.com/emails"
 _TIMEOUT = 10
+# A real product name, because the default urllib agent is blocked at the edge.
+_USER_AGENT = "palza/1.0 (+https://github.com/thirdsapplication/Trace)"
 
 
 def is_configured():
@@ -53,6 +55,12 @@ def send(to, subject, text):
     req = urllib.request.Request(_ENDPOINT, data=body, method="POST")
     req.add_header("Authorization", "Bearer " + key)
     req.add_header("Content-Type", "application/json")
+    req.add_header("Accept", "application/json")
+    # Identify ourselves. urllib defaults to "Python-urllib/3.x", and Cloudflare —
+    # which fronts the Resend API — refuses that signature with 403 "error code: 1010"
+    # before the request ever reaches Resend. Their dashboard shows nothing, so it reads
+    # as a config problem when the key and from-address are both perfectly correct.
+    req.add_header("User-Agent", _USER_AGENT)
     try:
         with urllib.request.urlopen(req, timeout=_TIMEOUT,
                                     context=ssl.create_default_context()) as r:
