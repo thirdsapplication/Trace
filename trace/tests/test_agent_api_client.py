@@ -212,14 +212,15 @@ class _FakeDeploymentRuns:
 
 
 class MemoryStoreClientTest(unittest.TestCase):
-    def test_fresh_store_created_and_seeded_with_both_docs(self):
+    def test_fresh_store_created_and_seeded_with_every_doc(self):
         stores = _FakeMemoryStores()
         c = _NSClient.build({"memory_stores": stores})
         out = c.create_or_reuse_memory_store("trace-u1-memory", "desc")
         self.assertFalse(out["reused"])
         from trace.agent import config
         self.assertEqual({p for _s, p, _c in stores.memories.created},
-                         {config.MEMORY_STATUS_DOC, config.MEMORY_LESSONS_DOC})
+                         {config.MEMORY_STATUS_DOC, config.MEMORY_LESSONS_DOC,
+                          config.MEMORY_SHARED_DOC})
 
     def test_reused_store_keeps_existing_docs_untouched(self):
         # a redeploy finds the user's store and its documents already there: the
@@ -228,7 +229,8 @@ class MemoryStoreClientTest(unittest.TestCase):
         from trace.agent import config
         stores = _FakeMemoryStores(
             existing=[{"id": "mem_prior", "name": "trace-u1-memory"}],
-            conflict_paths={config.MEMORY_STATUS_DOC, config.MEMORY_LESSONS_DOC})
+            conflict_paths={config.MEMORY_STATUS_DOC, config.MEMORY_LESSONS_DOC,
+                            config.MEMORY_SHARED_DOC})
         c = _NSClient.build({"memory_stores": stores})
         out = c.create_or_reuse_memory_store("trace-u1-memory", "desc")
         self.assertEqual(out, {"id": "mem_prior", "reused": True})
@@ -245,7 +247,8 @@ class MemoryStoreClientTest(unittest.TestCase):
         self.assertEqual(out, {"id": "mem_prior", "reused": True})
         self.assertEqual([(s, p) for s, p, _c in stores.memories.created],
                          [("mem_prior", config.MEMORY_STATUS_DOC),
-                          ("mem_prior", config.MEMORY_LESSONS_DOC)])
+                          ("mem_prior", config.MEMORY_LESSONS_DOC),
+                          ("mem_prior", config.MEMORY_SHARED_DOC)])
 
     def test_seed_tolerates_path_conflict_but_raises_otherwise(self):
         from trace.agent import config
@@ -257,6 +260,71 @@ class MemoryStoreClientTest(unittest.TestCase):
             RuntimeError("permission denied"))
         with self.assertRaises(RuntimeError):
             c.seed_memory("mem_1", "/other.md", "x")
+
+
+class WriteMemoryTest(unittest.TestCase):
+    """Refreshing a memory document, across SDK surfaces that differ by version.
+
+    seed_memory deliberately KEEPS existing content so a redeploy never wipes an
+    agent's memory — which makes it useless for delivering lessons that change between
+    runs. write_memory replaces instead, and must say so when it cannot: a silent miss
+    means the agent runs without its lessons and every downstream table stays empty,
+    looking exactly like "nothing to share". That ambiguity is what hid this whole
+    feature being dead.
+    """
+
+    def _client(self, memories):
+        stores = _FakeMemoryStores()
+        stores.memories = memories
+        return _NSClient.build({"memory_stores": stores}), stores
+
+    def test_update_is_preferred_when_the_sdk_has_it(self):
+        class M:
+            def __init__(self):
+                self.updated = []
+
+            def update(self, store_id, path=None, content=None):
+                self.updated.append((store_id, path, content))
+
+            def create(self, *a, **k):
+                raise AssertionError("create must not be used when update exists")
+
+        m = M()
+        c, _ = self._client(m)
+        self.assertEqual(c.write_memory("mem_1", "/shared_lessons.md", "body"), "update")
+        self.assertEqual(m.updated, [("mem_1", "/shared_lessons.md", "body")])
+
+    def test_falls_back_to_delete_then_create(self):
+        class M:
+            def __init__(self):
+                self.deleted, self.created = [], []
+
+            def delete(self, store_id, path=None):
+                self.deleted.append((store_id, path))
+
+            def create(self, store_id, path=None, content=None):
+                self.created.append((store_id, path, content))
+
+        m = M()
+        c, _ = self._client(m)
+        self.assertEqual(c.write_memory("mem_1", "/shared_lessons.md", "body"), "create")
+        self.assertEqual(m.deleted, [("mem_1", "/shared_lessons.md")])
+        self.assertEqual(m.created, [("mem_1", "/shared_lessons.md", "body")])
+
+    def test_create_only_sdk_still_works(self):
+        m = _FakeMemories()
+        c, _ = self._client(m)
+        self.assertEqual(c.write_memory("mem_1", "/shared_lessons.md", "body"), "create")
+        self.assertEqual(m.created, [("mem_1", "/shared_lessons.md", "body")])
+
+    def test_total_failure_returns_none_rather_than_pretending(self):
+        class M:
+            def create(self, *a, **k):
+                raise RuntimeError("permission denied")
+
+        c, _ = self._client(M())
+        self.assertIsNone(c.write_memory("mem_1", "/shared_lessons.md", "body"),
+                          "a failed write must be reported, not swallowed into success")
 
 
 class DeploymentClientTest(unittest.TestCase):

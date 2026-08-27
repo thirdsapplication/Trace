@@ -2152,7 +2152,7 @@ function openIdentityPopover(agent, agentId) {
   el.className = "pop-back";
   el.innerHTML = `<div class="pop">
       <div class="row" style="gap:12px;">
-        ${avatar(agent.name, 52, agent)}
+        <span id="popAv">${avatar(agent.name, 52, agent)}</span>
         <div class="pop-title">Edit agent</div>
         <button class="pop-x" title="Close">✕</button>
       </div>
@@ -2189,6 +2189,12 @@ function openIdentityPopover(agent, agentId) {
       await api("POST", `/api/u/agents/${agentId}/color`, { color: chosen.color });
       agent.color = chosen.color;
       S.igHome = null;
+      const av = el.querySelector("#popAv");
+      if (av) av.innerHTML = avatar(agent.name, 52, agent);
+      // ...and the profile header behind the dialog, so the recolor reads as applied
+      // everywhere at once, which is what picking it is supposed to mean.
+      const behind = $("#pAvatar");
+      if (behind) behind.innerHTML = avatar(agent.name, 64, agent);
     } catch (e) { /* the Save button retries */ }
   });
   el.querySelector("#popSave").onclick = async () => {
@@ -2249,7 +2255,7 @@ async function renderProfile(agentId) {
   tb.paint(`
     <div class="panel">
       <div class="row" style="gap:16px;align-items:center;">
-        ${avatar(name, 64, a)}
+        <span id="pAvatar">${avatar(name, 64, a)}</span>
         <div style="flex:1;min-width:0;">
           <div class="row" style="gap:9px;"><h2 id="pTitle" style="margin:0;">${esc(name)}</h2>
             ${a.can_edit === false ? "" :

@@ -370,7 +370,8 @@ class ManagedAgentsClient:
         failure raises (fail loud — a half-initialized store is worse than a failed
         deploy). Returns ``{id, reused}``."""
         documents = documents or [(config.MEMORY_STATUS_DOC, config.MEMORY_STATUS_SEED),
-                                  (config.MEMORY_LESSONS_DOC, config.MEMORY_LESSONS_SEED)]
+                                  (config.MEMORY_LESSONS_DOC, config.MEMORY_LESSONS_SEED),
+                                  (config.MEMORY_SHARED_DOC, config.MEMORY_SHARED_SEED)]
         stores = self._agents_ns("memory_stores")
         store_id, reused = None, False
         try:
@@ -399,6 +400,51 @@ class ManagedAgentsClient:
             if "conflict" in msg or "already exists" in msg:
                 return None
             raise
+
+    # Deployed agents run on the platform: run_deployment() takes no per-run input, so
+    # the ONLY way to hand a live agent anything is its memory store, which it already
+    # reads at the start of every session. Retrieved cross-user lessons therefore go
+    # into a document of their own rather than lessons_learned.md, which the agent
+    # rewrites itself and would clobber them.
+    def write_memory(self, store_id, path, content):
+        """Replace a memory document's contents, creating it if absent.
+
+        seed_memory deliberately KEEPS existing content (a redeploy must never wipe an
+        agent's memory), so it cannot be used to refresh anything. This can.
+
+        The Managed Agents surface differs across SDK versions, so each strategy is
+        tried in turn and the one that worked is logged. Returns the strategy name, or
+        None if the document could not be written -- and says so loudly, because a
+        silent no-op here means the agent runs without the lessons and every table
+        downstream stays empty looking exactly like "nothing to share".
+        """
+        memories = self._agents_ns("memory_stores").memories
+        attempts = []
+
+        def _try(name, fn):
+            try:
+                fn()
+                print(f"[memory] wrote {path} via {name}", flush=True)
+                return name
+            except Exception as e:                         # noqa: BLE001
+                attempts.append(f"{name}: {type(e).__name__}: {str(e)[:120]}")
+                return None
+
+        if hasattr(memories, "update"):
+            got = _try("update", lambda: _retry(lambda: memories.update(
+                store_id, path=path, content=content)))
+            if got:
+                return got
+        if hasattr(memories, "delete"):
+            _try("delete", lambda: _retry(lambda: memories.delete(store_id, path=path)))
+        got = _try("create", lambda: _retry(lambda: memories.create(
+            store_id, path=path, content=content)))
+        if got:
+            return got
+        print(f"[memory] COULD NOT write {path} to store {store_id}. Tried: "
+              f"{'; '.join(attempts) or 'nothing'}. Available methods: "
+              f"{[a for a in dir(memories) if not a.startswith('_')]}", flush=True)
+        return None
 
     def delete_memory_store(self, store_id):
         """Best-effort store deletion — used only by explicit cleanup."""

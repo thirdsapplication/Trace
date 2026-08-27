@@ -867,6 +867,12 @@ class AppState:
         query = f"{agent.get('name') or ''}: {agent.get('trigger') or ''}".strip()
         svecs = agent_embeddings.embed(query, input_type="query")
         if not svecs:
+            # Silent until 2026-08-27, which is why eight runs with a WORKING Voyage key
+            # produced no agent embedding and nobody could tell whether the feature was
+            # off, broken, or simply had nothing to say.
+            print(f"[guidance] no query vector for agent "
+                  f"{agent.get('agent_id')} -- lesson retrieval skipped this run",
+                  flush=True)
             return []
         scopes = registry.agent_lesson_scopes(root, agent)
         kind_emb = registry.agent_embedding_get(root, aid)
@@ -1740,11 +1746,59 @@ class AppState:
             except Exception:                              # noqa: BLE001
                 pass                                       # one bad agent never kills the pass
 
+    def _deliver_guidance(self, agent, lessons):
+        """Put retrieved lessons where a DEPLOYED agent can actually see them.
+
+        run_agent passes guidance straight into the session it creates. A deployment
+        run has no such door -- run_deployment(deployment_id) takes no input -- so
+        until now retrieval simply was not called on that path, and since every real
+        agent is deployment-backed, cross-user learning could never happen at all.
+
+        The agent's memory store IS the door: it is mounted at /mnt/memory/ and read at
+        the start of every session. Writing shared_lessons.md before triggering the run
+        is the deployment-path equivalent of the guidance argument.
+
+        Best-effort and loud: a failure here must not stop the run, but it must not be
+        invisible either -- a silent miss looks exactly like "no lessons to share".
+        """
+        store_id = agent.get("memory_store_id")
+        if not store_id:
+            if lessons:
+                print(f"[guidance] agent {agent.get('agent_id')} has {len(lessons)} "
+                      f"lesson(s) but no memory_store_id -- deployed before shared "
+                      f"lessons existed; redeploy to pick them up", flush=True)
+            return False
+        if lessons:
+            body = (f"{agent_config.MEMORY_SHARED_SEED.split('(none yet)')[0].rstrip()}\n\n"
+                    + "\n".join(f"- {l}" for l in lessons) + "\n")
+        else:
+            body = agent_config.MEMORY_SHARED_SEED       # clear stale advice
+        try:
+            wrote = self._live_client().write_memory(
+                store_id, agent_config.MEMORY_SHARED_DOC, body)
+        except Exception as e:                             # noqa: BLE001
+            print(f"[guidance] could not reach the memory store for "
+                  f"{agent.get('agent_id')}: {type(e).__name__}: {e}", flush=True)
+            return False
+        if wrote and lessons:
+            print(f"[guidance] delivered {len(lessons)} lesson(s) to "
+                  f"{agent.get('agent_id')}", flush=True)
+        return bool(wrote)
+
     def run_deployment_now(self, agent):
         """Manual run of a deployment-backed agent: refresh the vault, trigger a
         platform run, and record it. Never raises (a failure becomes a failed run)."""
         self._refresh_agent_binding(agent)
         self._vault_refreshed[agent.get("vault_ref")] = time.time()
+        # Phase B: the deployment path never retrieved lessons, so agent_embeddings,
+        # lesson_promotions and lesson_applications could not leave zero no matter how
+        # many times an agent ran. Retrieval must happen BEFORE the platform run, since
+        # what it produces is delivered through the memory store the run will read.
+        try:
+            self._deliver_guidance(agent, self._retrieve_guidance(agent))
+        except Exception as e:                              # noqa: BLE001 — never block a run
+            print(f"[guidance] retrieval failed for {agent.get('agent_id')}: "
+                  f"{type(e).__name__}: {e}", flush=True)
         try:
             drun = self._live_client().run_deployment(agent.get("deployment_id"))
             if drun.get("error_type"):

@@ -32,9 +32,12 @@ def embed(texts, input_type="document", api_key=None):
         texts = [texts]
     texts = [str(t) for t in (texts or []) if str(t).strip()]
     if not texts:
+        print("[embed] nothing to embed (all inputs blank)", flush=True)
         return None
     key = api_key or (os.environ.get("VOYAGE_API_KEY") or "").strip()
     if not key:
+        print("[embed] VOYAGE_API_KEY is not set in THIS process -- lesson retrieval "
+              "is inert here", flush=True)
         return None
     body = json.dumps({"model": VOYAGE_MODEL, "input": texts,
                        "input_type": input_type, "output_dimension": EMBED_DIM}).encode()
@@ -43,10 +46,23 @@ def embed(texts, input_type="document", api_key=None):
     try:
         with urllib.request.urlopen(req, timeout=_TIMEOUT) as r:
             data = json.loads(r.read())
-    except (urllib.error.URLError, ValueError, TimeoutError, OSError):
+    except urllib.error.HTTPError as e:
+        try:
+            detail = e.read().decode("utf-8", "replace")[:300]
+        except Exception:                                  # noqa: BLE001
+            detail = ""
+        print(f"[embed] voyage refused ({e.code}) for input_type={input_type!r}: "
+              f"{detail}", flush=True)
+        return None
+    except (urllib.error.URLError, ValueError, TimeoutError, OSError) as e:
+        print(f"[embed] voyage unreachable ({type(e).__name__}: {e}) for "
+              f"input_type={input_type!r}", flush=True)
         return None
     rows = data.get("data") or []
     out = [row.get("embedding") for row in rows]
     if len(out) != len(texts) or any(v is None for v in out):
+        # Never log the text itself -- lessons are user content. Counts only.
+        print(f"[embed] voyage returned {len(out)} vector(s) for {len(texts)} input(s), "
+              f"input_type={input_type!r} -- treating as unusable", flush=True)
         return None
     return out
