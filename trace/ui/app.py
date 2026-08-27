@@ -584,9 +584,13 @@ class AppState:
         one is created by the first invite."""
         root, uid = self.sessions_root, user["user_id"]
         t = teams.team_for_user(root, uid)
+        # Invites addressed to THIS user, as opposed to the ones their team has sent.
+        # Without these the pane can only ever show a team you already belong to, and
+        # being invited somewhere is invisible.
+        mine = teams.invites_for(root, user.get("email"))
         if not t:
             return {"team": None, "members": [], "invites": [],
-                    "email_configured": notify.is_configured()}
+                    "my_invites": mine, "email_configured": notify.is_configured()}
         rows = []
         for m in teams.members(root, t["team_id"]):
             who = users.get(m["user_id"]) or {}
@@ -599,6 +603,7 @@ class AppState:
                          "is_you": m["user_id"] == uid})
         return {"team": t, "members": rows,
                 "invites": teams.pending_invites(root, t["team_id"]),
+                "my_invites": [i for i in mine if i["team_id"] != str(t["team_id"])],
                 "email_configured": notify.is_configured()}
 
     def _team_admin(self, user):
@@ -2583,6 +2588,13 @@ def make_handler(state):
             u, token = users.verify((body or {}).get("email"), (body or {}).get("password"))
             if not u:
                 return self._json(401, {"error": "invalid_credentials"})
+            # Signup accepts pending invites too, but an invite usually lands on somebody
+            # who ALREADY has an account: they log in, never sign up again, and the invite
+            # is created, delivered, clicked and still puts nobody in a team.
+            try:
+                teams.accept_for(root, u.get("email"), u["user_id"])
+            except Exception:                              # noqa: BLE001
+                traceback.print_exc()
             return self._json_auth(200, {"user": u}, set_token=users.start_session(u["user_id"], token))
 
         def _auth_logout(self):
@@ -2688,6 +2700,16 @@ def make_handler(state):
                                    self._app_url())
             except Exception:                              # noqa: BLE001
                 pass
+            return self._json(200, state.team_view(user))
+
+        def _team_invite_accept(self, invite_id, user):
+            """Take up an invite addressed to you. Deliberately not admin-gated: the
+            person accepting is by definition not in the team yet."""
+            t, why = teams.accept_invite(root, invite_id, user["user_id"],
+                                         user.get("email"))
+            if not t:
+                return self._json(400 if why == "already_in_a_team" else 404,
+                                  {"error": why})
             return self._json(200, state.team_view(user))
 
         def _team_invite_action(self, invite_id, what, body, user):
@@ -3170,9 +3192,13 @@ def make_handler(state):
                 registry.user_flags_set(root, user["user_id"],
                                         first_run_completed_at=sessions._now())
                 return self._json(200, registry.user_flags_get(root, user["user_id"]))
-            # --- team (30). Every mutation is admin-only; that check IS the model. ---
+            # --- team (30). Every mutation is admin-only EXCEPT accept: the person
+            # taking up an invite is not in the team yet, so admin is the wrong gate.
             if rest == "/team/invite":
                 return self._team_invite(body, user)
+            mta = re.match(r"^/team/invites/([^/]+)/accept$", rest)
+            if mta:
+                return self._team_invite_accept(mta.group(1), user)
             mtr = re.match(r"^/team/invites/([^/]+)/(resend|cancel)$", rest)
             if mtr:
                 return self._team_invite_action(mtr.group(1), mtr.group(2), body, user)

@@ -181,8 +181,117 @@ def cancel_invite(root, invite_id):
         reg._save(root, "team_invites.json", inv)
 
 
+def invites_for(root, email):
+    """Pending invites addressed to ``email``, with the inviting team's name.
+
+    accept_for silently declines when the person is already in a team, and a team is
+    created by the first invite — so anybody who ever pressed Invite can never be
+    joined implicitly, and had no way to even SEE that they had been invited. This is
+    what the team pane shows them.
+    """
+    email = str(email or "").strip().lower()
+    if not email:
+        return []
+    if supa.is_configured():
+        try:
+            r = supa.get_admin().table("team_invites") \
+                .select("id, team_id, role, invited_at") \
+                .eq("email", email).is_("accepted_at", "null") \
+                .order("invited_at", desc=True).execute()
+            rows = r.data or []
+        except Exception:                                  # noqa: BLE001 — pre-migration
+            return []
+    else:
+        rows = sorted((i for i in reg._load(root, "team_invites.json").values()
+                       if i.get("email") == email and not i.get("accepted_at")),
+                      key=lambda i: i.get("invited_at") or "", reverse=True)
+    out = []
+    for row in rows:
+        out.append({"id": str(row.get("id")), "team_id": str(row.get("team_id")),
+                    "team_name": _team_name(root, row.get("team_id")),
+                    "role": row.get("role") or "member",
+                    "invited_at": row.get("invited_at")})
+    return out
+
+
+def _team_name(root, team_id):
+    if supa.is_configured():
+        try:
+            t = supa.get_admin().table("teams").select("name") \
+                .eq("id", team_id).maybe_single().execute() or supa.NO_ROW
+            return (t.data or {}).get("name") or "Your team"
+        except Exception:                                  # noqa: BLE001
+            return "Your team"
+    return (reg._load(root, "teams.json").get(str(team_id)) or {}).get("name") or "Your team"
+
+
+def accept_invite(root, invite_id, uid, email):
+    """Accept ONE named invite, because the person asked to.
+
+    accept_for is the implicit path and deliberately never moves anybody. This is the
+    explicit one, so leaving behind a team that exists only because they once pressed
+    Invite — no other member, no pending invite of its own — is their decision rather
+    than something that happened to them. A team with anybody else in it, or with
+    invites out, is still refused: that is a real team and leaving it is a different
+    action with different consequences.
+
+    Returns ``(team, None)`` or ``(None, reason)``.
+    """
+    email = str(email or "").strip().lower()
+    hit = next((i for i in invites_for(root, email) if i["id"] == str(invite_id)), None)
+    if not hit:
+        return None, "not_found"                           # never another address's
+    current = team_for_user(root, uid)
+    if current:
+        if str(current["team_id"]) == hit["team_id"]:
+            return current, None                           # already there; idempotent
+        tid = current["team_id"]
+        if len(members(root, tid)) > 1 or pending_invites(root, tid):
+            return None, "already_in_a_team"
+        if not _leave(root, tid, uid):
+            return None, "leave_failed"
+    if supa.is_configured():
+        try:
+            supa.get_admin().table("team_members").insert({
+                "team_id": hit["team_id"], "user_id": uid,
+                "role": hit["role"]}).execute()
+            supa.get_admin().table("team_invites").update({"accepted_at": _now()}) \
+                .eq("id", hit["id"]).execute()
+        except Exception:                                  # noqa: BLE001
+            return None, "join_failed"
+        return team_for_user(root, uid), None
+    with reg._LOCK:
+        mem = reg._load(root, "team_members.json")
+        mem[f"{hit['team_id']}:{uid}"] = {
+            "team_id": hit["team_id"], "user_id": uid, "role": hit["role"],
+            "joined_at": _now()}
+        reg._save(root, "team_members.json", mem)
+        inv = reg._load(root, "team_invites.json")
+        row = inv.get(str(invite_id))
+        if row:
+            row["accepted_at"] = _now()
+            reg._save(root, "team_invites.json", inv)
+    return team_for_user(root, uid), None
+
+
+def _leave(root, team_id, uid):
+    """Remove one membership row. Used only by accept_invite, on a vacant team."""
+    if supa.is_configured():
+        try:
+            supa.get_admin().table("team_members").delete() \
+                .eq("team_id", team_id).eq("user_id", uid).execute()
+        except Exception:                                  # noqa: BLE001
+            return False
+        return True
+    with reg._LOCK:
+        mem = reg._load(root, "team_members.json")
+        mem.pop(f"{team_id}:{uid}", None)
+        reg._save(root, "team_members.json", mem)
+    return True
+
+
 def accept_for(root, email, uid):
-    """Join whichever team invited this address. Called at SIGNUP.
+    """Join whichever team invited this address. Called at signup AND at login.
 
     Without this an invite is decorative — a row created, listed, resent and cancelled,
     that never once put anybody in a team. Returns the team joined, or None.

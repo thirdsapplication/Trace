@@ -104,6 +104,7 @@ def team_invite(email, team_name, inviter, link):
     who = inviter or "A teammate"
     return send(email, f"{who} invited you to {team_name} on palza",
                 f"{who} has invited you to join {team_name} on palza.\n\n"
-                f"Accept the invitation:\n  {link}\n\n"
+                f"Open palza and sign in as {email} — the invitation is waiting in\n"
+                f"Settings > Team.\n  {link}\n\n"
                 "palza watches one workday, finds the work that repeats, and builds an "
                 "agent for each. Nothing leaves without your approval.")

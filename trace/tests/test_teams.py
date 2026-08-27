@@ -74,6 +74,98 @@ class TeamMembershipTest(unittest.TestCase):
         self.assertEqual(teams.owner_ids(self.root, "u1"), ["u1"])
 
 
+class ExplicitInviteAcceptTest(unittest.TestCase):
+    """The dead end this closes, found live on 2026-08-27:
+
+    hello@tester.com invited po2288@columbia.edu, who already owned a team — created
+    for them the first time THEY pressed Invite. accept_for declines when you are
+    already in a team (deliberately: it must never move anybody), and it only ran at
+    signup anyway, while the invitee had had an account for weeks. So the invite row
+    was written, the mail sent, and there was no button anywhere that could ever act
+    on it. Nothing errored at any point.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = self._tmp.name
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _invited(self):
+        """u1's team invites u2, who already owns an accidental team of their own."""
+        a = teams.create(self.root, "u1", "Thirds")
+        teams.create(self.root, "u2", "Your team")
+        teams.invite(self.root, a["team_id"], "u2@x.com", "admin", "u1")
+        return a
+
+    def test_the_invitee_can_see_an_invite_addressed_to_them(self):
+        a = self._invited()
+        mine = teams.invites_for(self.root, "U2@X.com")    # normalised
+        self.assertEqual([i["team_id"] for i in mine], [a["team_id"]])
+        self.assertEqual(mine[0]["team_name"], "Thirds")
+        self.assertEqual(mine[0]["role"], "admin")
+
+    def test_implicit_accept_still_refuses_to_move_them(self):
+        """The invariant the explicit path exists precisely because we keep."""
+        self._invited()
+        self.assertIsNone(teams.accept_for(self.root, "u2@x.com", "u2"))
+        self.assertEqual(teams.team_for_user(self.root, "u2")["name"], "Your team")
+
+    def test_accepting_on_purpose_leaves_the_accidental_team_and_joins(self):
+        a = self._invited()
+        inv = teams.invites_for(self.root, "u2@x.com")[0]
+        t, why = teams.accept_invite(self.root, inv["id"], "u2", "u2@x.com")
+        self.assertIsNone(why)
+        self.assertEqual(t["team_id"], a["team_id"])
+        self.assertEqual(t["role"], "admin")
+        self.assertEqual(teams.pending_invites(self.root, a["team_id"]), [])
+        self.assertEqual(sorted(teams.owner_ids(self.root, "u1")), ["u1", "u2"])
+
+    def test_a_team_with_other_people_in_it_is_not_abandoned(self):
+        a = teams.create(self.root, "u1", "Thirds")
+        b = teams.create(self.root, "u2", "Real")
+        teams.invite(self.root, b["team_id"], "u3@x.com", "member", "u2")
+        teams.accept_for(self.root, "u3@x.com", "u3")      # u2's team is now real
+        teams.invite(self.root, a["team_id"], "u2@x.com", "member", "u1")
+        inv = teams.invites_for(self.root, "u2@x.com")[0]
+        t, why = teams.accept_invite(self.root, inv["id"], "u2", "u2@x.com")
+        self.assertIsNone(t)
+        self.assertEqual(why, "already_in_a_team")
+        self.assertEqual(teams.team_for_user(self.root, "u2")["name"], "Real")
+
+    def test_a_team_with_invites_out_is_not_abandoned_either(self):
+        """Pending invites make a team real too — abandoning it strands them."""
+        a = teams.create(self.root, "u1", "Thirds")
+        b = teams.create(self.root, "u2", "Mine")
+        teams.invite(self.root, b["team_id"], "someone@x.com", "member", "u2")
+        teams.invite(self.root, a["team_id"], "u2@x.com", "member", "u1")
+        inv = teams.invites_for(self.root, "u2@x.com")[0]
+        _, why = teams.accept_invite(self.root, inv["id"], "u2", "u2@x.com")
+        self.assertEqual(why, "already_in_a_team")
+
+    def test_you_cannot_accept_somebody_elses_invite(self):
+        a = self._invited()
+        inv = teams.invites_for(self.root, "u2@x.com")[0]
+        t, why = teams.accept_invite(self.root, inv["id"], "u7", "u7@x.com")
+        self.assertIsNone(t)
+        self.assertEqual(why, "not_found")
+        self.assertEqual(len(teams.pending_invites(self.root, a["team_id"])), 1)
+
+    def test_accepting_twice_is_harmless(self):
+        a = self._invited()
+        inv = teams.invites_for(self.root, "u2@x.com")[0]
+        teams.accept_invite(self.root, inv["id"], "u2", "u2@x.com")
+        t, why = teams.accept_invite(self.root, inv["id"], "u2", "u2@x.com")
+        self.assertEqual(why, "not_found")                 # consumed, not an error state
+        self.assertEqual(teams.team_for_user(self.root, "u2")["team_id"], a["team_id"])
+
+    def test_no_invite_means_nothing_to_show(self):
+        teams.create(self.root, "u1", "Thirds")
+        self.assertEqual(teams.invites_for(self.root, "nobody@x.com"), [])
+        self.assertEqual(teams.invites_for(self.root, ""), [])
+
+
 class TeamLessonTierTest(unittest.TestCase):
     """The tier that migration 018 added and nothing was passing arguments to."""
 

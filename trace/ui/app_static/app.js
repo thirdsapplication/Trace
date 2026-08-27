@@ -1170,7 +1170,22 @@ async function setTeam() {
       ${admin ? `<button class="btn-secondary btn-sm tm-resend" data-id="${esc(i.id)}">Resend</button>
       <button class="btn-link tm-cancel" data-id="${esc(i.id)}" style="color:var(--ink-2);">Cancel</button>` : ""}
     </div>`;
+  // An invite addressed to YOU. Joining is never implicit — you may already own a team
+  // (one is created the moment you press Invite), and being moved out of it silently is
+  // not something that should happen to somebody.
+  const myInviteRow = (i) => `
+    <div class="set-card">
+      <span class="set-av set-av-sm tm-pending">${esc((i.team_name || "?").charAt(0).toUpperCase())}</span>
+      <div class="grow">
+        <div class="set-row-t">${esc(i.team_name)} invited you</div>
+        <div class="set-sub">As ${esc(i.role || "member")} · ${esc(threadStamp(i.invited_at))}</div>
+      </div>
+      <button class="btn-primary btn-sm tm-accept" data-id="${esc(i.id)}">Join</button>
+    </div>`;
   $("#setPane").innerHTML = `
+    ${(d.my_invites || []).length ? `<div class="stack" style="margin-bottom:16px;">
+      ${d.my_invites.map(myInviteRow).join("")}
+      <p id="tmInvMsg" class="msg err"></p></div>` : ""}
     ${d.team ? `<p class="set-sub" style="margin:-8px 0 14px;">${esc(d.team.name)} ·
       ${d.members.length} member${d.members.length === 1 ? "" : "s"} — lesson sharing set
       to "my team" runs inside this group.</p>` : `
@@ -1194,10 +1209,11 @@ async function setTeam() {
   const post = async (path, body) => {
     const r = await api("POST", path, body || {});
     if (!r.ok) {
-      const m = $("#tmMsg");
+      const m = $("#tmMsg") || $("#tmInvMsg");
       if (m) m.textContent = { bad_email: "that doesn't look like an email address",
         thats_you: "that's your own address", not_admin: "only an admin can do that",
         last_admin: "there'd be no admin left — promote someone first",
+        already_in_a_team: "you're already in a team with other people in it — leave that one first",
       }[r.data && r.data.error] || friendly(r.data && r.data.error);
       return false;
     }
@@ -1207,6 +1223,8 @@ async function setTeam() {
   const go = $("#tmGo");
   if (go) go.onclick = () => post("/api/u/team/invite", {
     email: $("#tmEmail").value, role: $("#tmRole").value });
+  root.querySelectorAll(".tm-accept").forEach(b => b.onclick = () =>
+    post(`/api/u/team/invites/${b.dataset.id}/accept`));
   root.querySelectorAll(".tm-resend").forEach(b => b.onclick = () =>
     post(`/api/u/team/invites/${b.dataset.id}/resend`));
   root.querySelectorAll(".tm-cancel").forEach(b => b.onclick = () =>
