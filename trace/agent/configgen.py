@@ -21,7 +21,7 @@ import json
 import os
 import re
 
-from . import compiler, config
+from . import compiler, config, model_call
 from .config_prompt import SYSTEM_PROMPT
 from ..artifact import review
 
