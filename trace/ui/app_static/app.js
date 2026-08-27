@@ -1143,7 +1143,12 @@ function editAccount(p) {
 async function setTeam() {
   const { data } = await api("GET", "/api/u/team");
   const d = data || {};
-  const admin = !d.team || (d.team.role === "admin");
+  // "owner" is what the database trigger writes for whoever created the team, and it
+  // outranks admin. Checking for exactly "admin" hid the invite UI from the one person
+  // guaranteed to be entitled to it — the server-side check learned this and this one
+  // did not, which is the same rule living in two places disagreeing.
+  const ADMIN_ROLES = ["admin", "owner"];
+  const admin = !d.team || ADMIN_ROLES.includes(d.team.role);
   const memberRow = (m) => `
     <div class="set-card">
       <span class="set-av set-av-sm">${esc((m.email || "?").charAt(0).toUpperCase())}</span>
@@ -1151,7 +1156,7 @@ async function setTeam() {
         <div class="set-row-t">${esc(m.email)}${m.is_you ? " · you" : ""}</div>
         <div class="set-sub">${m.agents_live} agent${m.agents_live === 1 ? "" : "s"} live</div>
       </div>
-      <span class="pill ${m.role === "admin" ? "pill-on" : "pill-off"}">${esc((m.role || "member").toUpperCase())}</span>
+      <span class="pill ${ADMIN_ROLES.includes(m.role) ? "pill-on" : "pill-off"}">${esc((m.role || "member").toUpperCase())}</span>
       ${admin && !m.is_you ? `<button class="btn-link tm-del" data-id="${esc(m.user_id)}"
         style="color:var(--danger);">Remove</button>` : ""}
     </div>`;
@@ -2179,6 +2184,33 @@ function openIdentityPopover(agent, agentId) {
 }
 
 
+
+/* Frame 21's subtitle is one readable sentence — "Checks retailer portals for price +
+   casepack drift · live since May 12". The old version welded fragments together and
+   an agent with no description got "Runs when: on a new matching task · live since
+   Aug 12": a sentence stem, a trigger phrase and a date, none of which agree.
+
+   A description is a sentence, so it stands alone. A trigger is a clause, so it needs
+   framing — and a vague one ("on a new matching task") says less than nothing, so it
+   is dropped rather than dressed up. Parts that are absent leave no separator behind. */
+const VAGUE_TRIGGERS = ["on a new matching task", "when you say so", "manual", ""];
+
+function profileBio(a) {
+  const bits = [];
+  const desc = (a.description || "").trim();
+  const trigger = (a.trigger || "").trim();
+  if (desc) {
+    bits.push(esc(desc));
+  } else if (trigger && !VAGUE_TRIGGERS.includes(trigger.toLowerCase())) {
+    bits.push(`Runs ${esc(trigger)}`);
+  } else {
+    bits.push("Runs when you ask it to");
+  }
+  if (a.deployed_at) bits.push(`live since ${esc(onDate(a.deployed_at))}`);
+  if (a.shared_from) bits.push(`${esc(a.shared_from)}'s agent`);
+  return bits.join(" · ");
+}
+
 async function renderProfile(agentId) {
   clearTimers();
   busy();
@@ -2198,10 +2230,7 @@ async function renderProfile(agentId) {
           <div class="row" style="gap:9px;"><h2 id="pTitle" style="margin:0;">${esc(name)}</h2>
             <button id="pEdit" class="pencil" title="Rename or recolor">✎</button>
             <span class="pill ${paused ? "pill-warn" : "pill-on"}">${paused ? "PAUSED" : "LIVE"}</span></div>
-          <p class="ag-bio wrap" style="margin:5px 0 0;">${esc(
-            a.description || ("Runs when: " + (a.trigger || "you say so")))}${
-            a.deployed_at ? ` · live since ${esc(onDate(a.deployed_at))}` : ""}${
-            a.shared_from ? ` · ${esc(a.shared_from)}'s agent` : ""}</p>
+          <p class="ag-bio wrap" style="margin:5px 0 0;">${profileBio(a)}</p>
         </div>
         <div class="row" style="gap:9px;flex:none;">
           ${a.can_edit === false ? `

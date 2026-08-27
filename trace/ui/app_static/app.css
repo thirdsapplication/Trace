@@ -101,8 +101,15 @@ a:hover { color: #2447C4; }
   display: inline-flex; align-items: center; justify-content: center; }
 .tabs { display: flex; gap: 22px; border-bottom: 1px solid var(--line-2);
   font-size: 13.5px; margin-top: 18px; }
-.tab { background: none; border: none; color: var(--ink-2); padding: 8px 2px;
-  cursor: pointer; font-weight: 500; font-size: 13.5px; border-bottom: 2.5px solid transparent; }
+/* A tab is a button, so it inherits the global button rule — including
+   border-radius: 11px, which curved the ends of the underline, and a padding the tab
+   then fights. And without pulling the row down over the container's hairline the
+   active underline sits BELOW it, reading as two lines instead of one. Frame 21 is a
+   flat 2.5px rule flush with the divider. */
+.tab { background: none; border: none; border-radius: 0; color: var(--ink-2);
+  padding: 8px 2px; margin-bottom: -1px; cursor: pointer; font-weight: 500;
+  font-size: 13.5px; border-bottom: 2.5px solid transparent; }
+.tab:hover { color: var(--ink); }
 .tab.on { font-weight: 700; color: var(--accent); border-bottom-color: var(--accent); }
 
 .pop-back { position: fixed; inset: 0; z-index: 90; background: rgba(18,26,47,.45);
