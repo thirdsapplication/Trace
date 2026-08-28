@@ -63,6 +63,10 @@ services:
       # admin portal disabled (it fails closed).
       - key: TRACE_ADMIN_TOKEN
         sync: false
+      # Learning cycles: on by default. Set to 0 to stop them without a redeploy of
+      # new code (the kill switch for ruling them out of a latency problem).
+      - key: TRACE_LEARNING_ENABLED
+        sync: false
       # Email notifications (frame 18) and team invites. Both must be set for anything
       # to send; with either missing the app runs and notifications stay in-app only.
       # EMAIL_FROM must use a domain verified in Resend or every send is refused.

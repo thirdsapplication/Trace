@@ -246,6 +246,45 @@ class LearningCycleTest(unittest.TestCase):
             gate.set()
             t.join(timeout=10)
 
+    def test_only_one_cycle_runs_at_a_time_fleet_wide(self):
+        """N agents used to mean N concurrent cycles, each a long analysis call plus a
+        fan-out of platform reads — competing for the same API headroom as the
+        synchronous activity view, which is what pushed that page over its budget."""
+        gate = threading.Event()
+
+        def slow(system, user):
+            gate.wait(10)
+            return '{"analysis": "x", "docs": {}}'
+        self.state.learn_fn = slow
+        self._seed_runs(self.N)
+        registry.agent_upsert(self.root, {"agent_id": "a2", "owner_user_id": "u1",
+                                          "name": "Other", "memory_store_id": "mem_2"})
+        for i in range(self.N):
+            registry.run_add(self.root, {
+                "agent_id": "a2", "owner_user_id": "u1", "status": "ran",
+                "summary": "", "details": [], "run_session_id": f"b{i}"})
+            self.client.events[f"b{i}"] = _terminal_events()
+        t = self.state.maybe_run_learning_cycle(self.agent)
+        self.assertIsNotNone(t)
+        try:
+            second = self.state.maybe_run_learning_cycle(
+                {"agent_id": "a2", "owner_user_id": "u1", "name": "Other",
+                 "memory_store_id": "mem_2"})
+            self.assertIsNone(second, "a second agent must wait its turn")
+        finally:
+            gate.set()
+            t.join(timeout=10)
+
+    def test_the_kill_switch_stops_cycles(self):
+        self._seed_runs(self.N)
+        original = agent_config.LEARNING_ENABLED
+        agent_config.LEARNING_ENABLED = False              # TRACE_LEARNING_ENABLED=0
+        try:
+            self.assertIsNone(self.state.maybe_run_learning_cycle(self.agent))
+        finally:
+            agent_config.LEARNING_ENABLED = original
+        self.assertEqual(self.learn_calls, [])
+
     def test_an_agent_without_a_memory_store_is_skipped(self):
         self._seed_runs(self.N)
         agent = dict(self.agent, memory_store_id=None)

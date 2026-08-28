@@ -21,17 +21,28 @@ from . import config
 BETA_VERSION = config.BETA_VERSION
 
 
-_RETRYABLE_STATUS = {408, 409, 429, 500, 502, 503, 529}
+# 409 is deliberately NOT here: a path conflict is the EXPECTED answer when seeding a
+# reused memory store on redeploy, and retrying it 5x with backoff spent minutes per
+# deploy re-asking a question already answered.
+_RETRYABLE_STATUS = {408, 429, 500, 502, 503, 529}
 _RETRYABLE_TEXT = ("overloaded", "temporarily unavailable", "please retry", "try again",
                    "rate limit", "timeout", "timed out", "connection")
 
 
 def _is_retryable(exc):
     """True for transient platform errors worth retrying (503 overloaded / file
-    storage temporarily unavailable, 429, 5xx, connection blips)."""
-    sc = getattr(exc, "status_code", None) or getattr(exc, "status", None)
-    if sc in _RETRYABLE_STATUS:
-        return True
+    storage temporarily unavailable, 429, 5xx, connection blips).
+
+    The text match applies ONLY to errors carrying no status code — i.e. transport
+    failures. An HTTP error states its own retryability in its status: scanning its
+    body for words meant that a permanent 4xx got 5 retries whenever the platform's
+    prose happened to say "connection" or "try again" — and in this product every
+    other noun is a connection (Pipedream Connect, MCP server connections, vaults)."""
+    sc = getattr(exc, "status_code", None)
+    if sc is None:
+        sc = getattr(exc, "status", None)
+    if sc is not None:
+        return sc in _RETRYABLE_STATUS
     msg = str(exc).lower()
     return any(k in msg for k in _RETRYABLE_TEXT)
 
@@ -193,10 +204,12 @@ def _event_dict(event):
 class ManagedAgentsClient:
     def __init__(self, api_key=None, beta=BETA_VERSION):
         import anthropic
-        # per-request read timeout so a dead connection raises instead of blocking;
-        # the SDK's own retry budget plus our _retry handle transient 503/overloaded.
+        # per-request read timeout so a dead connection raises instead of blocking.
+        # max_retries is deliberately SMALL: _retry below is the real retry budget, and
+        # the two MULTIPLY (they do not add) — RETRY_ATTEMPTS on both layers meant 5x6 =
+        # 30 HTTP attempts, ~60 minutes of wall clock, for one failing call.
         self._client = anthropic.Anthropic(api_key=api_key, timeout=config.REQUEST_TIMEOUT,
-                                           max_retries=config.RETRY_ATTEMPTS)
+                                           max_retries=config.SDK_MAX_RETRIES)
         self._beta_version = beta
 
     # --- namespace probes (clear, localized errors on SDK drift) ---

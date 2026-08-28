@@ -43,6 +43,12 @@ async function api(method, path, body) {
     let data = null;
     try { data = await r.json(); } catch (e) { /* empty */ }
     return { ok: r.ok, status: r.status, data: data || {} };
+  } catch (e) {
+    // NEVER re-throw. A rejected api() unwinds its caller mid-render and leaves every
+    // "Loading…" placeholder the caller had painted on screen permanently — which is
+    // exactly how Session history came to hang forever on a slow response. Callers
+    // already branch on `ok`, so an aborted or dead request is just another !ok.
+    return { ok: false, status: 0, data: {}, error: e && e.name === "AbortError" ? "timeout" : "network" };
   } finally {
     clearTimeout(timer);
   }
@@ -2466,7 +2472,27 @@ async function renderProfile(agentId) {
     S.igHome = null; renderProfile(agentId);
   };
   // the log: real per-session activity (summaries + proposals), newest first
-  const { data } = await api("GET", `/api/u/agents/${agentId}/activity`);
+  const act = await api("GET", `/api/u/agents/${agentId}/activity`);
+  const { data } = act;
+  if (!act.ok) {
+    // Say so instead of leaving the panes on "Loading…". The log pane is filled LAST
+    // in this function, so a failure here used to strand it plus every pane after it.
+    const msg = act.error === "timeout"
+      ? "Session history is taking too long to load."
+      : "Couldn't load session history.";
+    ["#pRules", "#pPerms", "#pRail"].forEach(sel => {
+      const el = $(sel);
+      if (el) el.innerHTML = `<p class="muted">${esc(msg)}</p>`;
+    });
+    const logBox = $("#pLog");
+    if (logBox) {
+      logBox.innerHTML = `<p class="muted">${esc(msg)}</p>
+        <button class="btn" id="pLogRetry">Try again</button>`;
+      const rb = $("#pLogRetry");
+      if (rb) rb.onclick = () => renderProfile(agentId);
+    }
+    return;
+  }
   const sessionsList = (data && data.activity) || [];
   // Approvals: per-app staged/autonomous toggles (post-deploy, no redeploy). All
   // interpolated values are escaped via esc() (the file's XSS-safe rendering idiom).

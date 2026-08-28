@@ -115,6 +115,15 @@ APP_STATIC_DIR = os.path.join(os.path.dirname(__file__), "app_static")  # end-us
 # Phase B (B5d): a cross-user lesson confirmed by this many DISTINCT users graduates to a
 # global auto-trusted default — it then injects without the per-agent confirm checkpoint.
 FLEET_DEFAULT_CONFIRMATIONS = 5
+# Activity view bounds. This screen is the only user-facing GET that makes platform
+# AND model calls, and it used to make up to `limit` of each with no ceiling: the
+# summaries ran one after another inside the run loop, so a healthy page was already
+# 30-80s and the browser gives up at 65. Now they fan out, at most this many run per
+# request, and once the deadline passes we return what we have — an un-summarized run
+# still renders (with its stored run summary) and picks up its line on a later load,
+# because summary_set caches every one that succeeds.
+ACTIVITY_SUMMARY_BUDGET = 4          # summaries computed per request
+ACTIVITY_DEADLINE_SECONDS = 20       # after this, stop summarizing and answer
 
 
 def _why(e):
@@ -586,8 +595,13 @@ class AppState:
         if not key:
             raise RuntimeError("no_api_key")
         os.environ["ANTHROPIC_API_KEY"] = key
+        # Bounded: this runs inside a user-facing GET, so a stuck call must fail fast
+        # rather than hold the page (the default client waits ~10 min per attempt).
         return self._tap("activity", None, agent_config.SUMMARY_MODEL,
-                         lambda: agent_configgen._default_model_fn(agent_config.SUMMARY_MODEL))
+                         lambda: agent_configgen._default_model_fn(
+                             agent_config.SUMMARY_MODEL,
+                             timeout=agent_config.SUMMARY_REQUEST_TIMEOUT,
+                             max_retries=agent_config.SUMMARY_RETRIES))
 
     def _learning_model_fn(self):
         """The injected learner if present (tests), else a lazy Fable caller from the
@@ -713,10 +727,36 @@ class AppState:
             if sid and sid not in seen and client is not None:
                 seen.add(sid)
                 want.append(sid)
+        deadline = time.monotonic() + ACTIVITY_DEADLINE_SECONDS
         fetched = dict(zip(want, self._fanout(
             [lambda s=s: client.list_session_events(s) for s in want]))) if want else {}
         # …and every summary in one query rather than one per run (see summaries_many).
         cached_summaries = registry.summaries_many(root, want)
+
+        # The staged proposals and open questions below used to be read PER RUN, and
+        # each read pulls the user's whole pending/decision history and filters in
+        # Python — up to `limit` full-history queries for one page. Read once here.
+        pending_rows = decision_rows = None
+        try:
+            if staged:
+                pending_rows = list(registry.pending_for_user(root, owner, status=None))
+            decision_rows = list(registry.decisions_for_user(root, owner, status="pending"))
+        except Exception:                                  # noqa: BLE001 — fall back to
+            pending_rows = decision_rows = None            # per-run reads rather than fail
+
+        # Summaries are the expensive half: fan them out (as the fetch above already
+        # does) instead of running them one after another, cap how many one page load
+        # may compute, and skip entirely once the deadline has passed.
+        need = [sid for sid in want
+                if not (cached_summaries.get(sid) or {}).get("summary")
+                and fetched.get(sid) and agent_activity.is_terminal(fetched[sid])]
+        fresh = {}
+        if model_fn is not None and need and time.monotonic() < deadline:
+            todo = need[:ACTIVITY_SUMMARY_BUDGET]
+            done = self._fanout([
+                lambda s=s: agent_activity.summarize_session(
+                    fetched[s], agent.get("name"), model_fn) for s in todo])
+            fresh = {s: t for s, t in zip(todo, done) if t}
 
         out = []
         seen = set()
@@ -737,23 +777,26 @@ class AppState:
             cached = cached_summaries.get(sid)
             if cached and cached.get("summary"):
                 entry["summary"] = cached["summary"]
-            elif model_fn is not None and agent_activity.is_terminal(events):
-                summ = agent_activity.summarize_session(events, agent.get("name"), model_fn)
-                if summ:
-                    entry["summary"] = summ
-                    registry.summary_set(root, sid, summ, entry["status"])
+            elif fresh.get(sid):
+                entry["summary"] = fresh[sid]
+                try:
+                    registry.summary_set(root, sid, fresh[sid], entry["status"])
+                except Exception:                          # noqa: BLE001 — a cache write
+                    pass                                   # must never cost the response
             # Surface proposals as approvable items — but never from an approval-
             # execution run: that session was told to act, not propose, and re-reading
             # its completion report as a fresh proposal is how an approved action's
             # buttons came back after every reload.
             if staged and run.get("kind") != "approval":
-                entry["proposals"] = self._session_proposals(agent, sid, events, owner)
+                entry["proposals"] = self._session_proposals(agent, sid, events, owner,
+                                                             rows=pending_rows)
             if entry["status"] == "needs_input":           # Gap #3: surface open questions
-                entry["decisions"] = self._session_decisions(agent, sid, events, owner)
+                entry["decisions"] = self._session_decisions(agent, sid, events, owner,
+                                                             rows=decision_rows)
             out.append(entry)
         return out
 
-    def _session_proposals(self, agent, run_session_id, events, owner):
+    def _session_proposals(self, agent, run_session_id, events, owner, rows=None):
         """Persist this session's proposed actions as pending items (deduped) and return
         them — every status, not just pending, so a decided card renders its outcome on
         reload instead of vanishing. Falls back to the final message text when the agent
@@ -767,15 +810,28 @@ class AppState:
                 proposals = [{"app": "", "action": "review",
                               "summary": agent_runner._first_line(final) or "Review the proposal",
                               "details": {"description": final}}]
+        added = False
         for it in agent_runner._proposals_to_pending(agent_id, proposals, run_session_id):
-            registry.pending_add(root, {
+            # pending_add returns True only on a real INSERT (it dedupes on
+            # content_hash), so a re-read of the session's already-staged proposals
+            # costs nothing — which is the steady state on every reload.
+            added = registry.pending_add(root, {
                 "agent_id": agent_id, "owner_user_id": owner,
                 "run_session_id": run_session_id, "app": it.get("app"),
                 "kind": it.get("kind"), "summary": it.get("summary"),
                 "rationale": it.get("rationale"),
-                "payload": it.get("payload"), "content_hash": it.get("content_hash")})
+                "payload": it.get("payload"), "content_hash": it.get("content_hash")}) or added
         out = []
-        for p in registry.pending_for_user(root, owner, status=None):
+        # ``rows`` is the caller's one-per-request read (the activity view); without it
+        # this pulls the user's whole pending history once per run. It must be REFRESHED
+        # when this session just inserted proposals, or they read back as none — and
+        # refreshing in place lets the caller's later runs share the newer list.
+        if rows is None or added:
+            fresh = list(registry.pending_for_user(root, owner, status=None))
+            if isinstance(rows, list):
+                rows[:] = fresh
+            rows = fresh
+        for p in rows:
             if p.get("run_session_id") != run_session_id:
                 continue
             # Self-heal a claim orphaned by a crash mid-execution: without this the
@@ -818,18 +874,20 @@ class AppState:
                 "options": [str(o) for o in (ctx.get("options") or [])],
                 "rule": ctx.get("rule") or ""}
 
-    def _persist_decisions(self, agent, run_session_id, questions, owner):
+    def _persist_decisions(self, agent, run_session_id, questions, owner, rows=None):
         """Gap #3: persist a run's needs_input questions as answerable decision records
         (deduped), returning the still-open ones for this session for the UI."""
         root = self.sessions_root
         tags = {"bundle_id": agent.get("bundle_id") or "",
                 "workflow": agent.get("name") or agent.get("bundle_id") or ""}
+        added = False
         for q in questions or []:
             if not isinstance(q, dict):
                 continue
             qt = str(q.get("question") or "").strip()
             if not qt:
                 continue
+            added = True
             registry.decision_add(root, {
                 "agent_id": agent.get("agent_id"), "owner_user_id": owner,
                 "run_session_id": run_session_id, "question": qt,
@@ -841,14 +899,19 @@ class AppState:
                             "options": [str(o) for o in (q.get("options") or [])],
                             "rule": str(q.get("rule") or "").strip()},
                 "tags": tags})
-        return [self._decision_for_ui(d)
-                for d in registry.decisions_for_user(root, owner, status="pending")
+        if rows is None or added:                          # see _session_proposals
+            fresh = list(registry.decisions_for_user(root, owner, status="pending"))
+            if isinstance(rows, list):
+                rows[:] = fresh
+            rows = fresh
+        return [self._decision_for_ui(d) for d in rows
                 if d.get("run_session_id") == run_session_id]
 
-    def _session_decisions(self, agent, run_session_id, events, owner):
+    def _session_decisions(self, agent, run_session_id, events, owner, rows=None):
         """Persist + return this session's needs_input questions (activity-view path)."""
         return self._persist_decisions(
-            agent, run_session_id, agent_activity.extract_questions(events), owner)
+            agent, run_session_id, agent_activity.extract_questions(events), owner,
+            rows=rows)
 
     def resume_after_answer(self, agent, decision, answer):
         """Gap #3 auto-immediate resume: re-run the agent seeded with the paused question
@@ -1842,6 +1905,8 @@ class AppState:
             aid = agent.get("agent_id")
             if not aid:
                 return None
+            if not agent_config.LEARNING_ENABLED:           # TRACE_LEARNING_ENABLED=0
+                return None
             if not agent.get("memory_store_id"):
                 # pre-memory agents keep working, as in _deliver_guidance
                 if verbose:
@@ -1865,6 +1930,16 @@ class AppState:
                 return None
             with self.lock:
                 if aid in self._learning_inflight:
+                    return None
+                # ONE cycle at a time fleet-wide. The per-agent guard alone allowed N
+                # concurrent cycles for N agents — each a long analysis call plus a
+                # fan-out of platform reads — which competed for the same API headroom
+                # as the (synchronous) activity view and helped push it past the
+                # browser's budget. A deferred agent simply cycles on the next check.
+                if len(self._learning_inflight) >= agent_config.LEARNING_MAX_CONCURRENT:
+                    if verbose:
+                        print(f"[learning] {aid}: another cycle is running — will pick "
+                              f"this batch up on the next check", flush=True)
                     return None
                 self._learning_inflight.add(aid)
             try:
@@ -3360,19 +3435,27 @@ def make_handler(state):
                               if a.get("agent_id") == maa.group(1)), None)
                 if not agent:
                     return self._json(404, {"error": "not_found"})
-                return self._json(200, {"agent": {"agent_id": agent.get("agent_id"),
-                                                  "name": agent.get("name") or agent.get("bundle_id"),
-                                                  "staged_apps": agent.get("staged_apps") or [],
-                                                  "available_apps": state.agent_available_apps(agent),
-                                                  # frame 21's Rules tab: the escalation
-                                                  # rules set at frame 10, read back
-                                                  "rules": state.agent_safety_rules(agent),
-                                                  "consent": {
-                                                      "effective": registry.agent_lesson_scopes(root, agent),
-                                                      "override": {
-                                                          "contribute_scope": agent.get("lesson_contribute_scope"),
-                                                          "consume_scope": agent.get("lesson_consume_scope")}}},
-                                        "activity": state.agent_activity(agent)})
+                # An exception escaping here reaches socketserver, which closes the
+                # socket having written NOTHING — indistinguishable from a hang to the
+                # browser, and the reason Session history sat on "Loading…" forever.
+                # A JSON error is something the page can render.
+                try:
+                    return self._json(200, {"agent": {"agent_id": agent.get("agent_id"),
+                                                      "name": agent.get("name") or agent.get("bundle_id"),
+                                                      "staged_apps": agent.get("staged_apps") or [],
+                                                      "available_apps": state.agent_available_apps(agent),
+                                                      # frame 21's Rules tab: the escalation
+                                                      # rules set at frame 10, read back
+                                                      "rules": state.agent_safety_rules(agent),
+                                                      "consent": {
+                                                          "effective": registry.agent_lesson_scopes(root, agent),
+                                                          "override": {
+                                                              "contribute_scope": agent.get("lesson_contribute_scope"),
+                                                              "consume_scope": agent.get("lesson_consume_scope")}}},
+                                            "activity": state.agent_activity(agent)})
+                except Exception as e:                       # noqa: BLE001
+                    print(f"[activity] failed for {maa.group(1)}: {_why(e)}", flush=True)
+                    return self._json(500, {"error": "activity_failed"})
             m = re.match(r"^/sessions/([^/]+)(/.*)?$", rest)
             if m:
                 if not self._owns(m.group(1), user):

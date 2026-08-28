@@ -29,7 +29,11 @@ EDITABLE_DOCS = (config.MEMORY_LESSONS_DOC,)
 
 def _default_model_fn(model):
     import anthropic
-    client = anthropic.Anthropic()
+    # Bounded: a bare client defaults to ~10 minutes per attempt WITH retries, so one
+    # stuck analysis could pin a worker thread (and its share of the account's API
+    # headroom) for the better part of an hour.
+    client = anthropic.Anthropic(timeout=config.LEARNING_REQUEST_TIMEOUT,
+                                 max_retries=config.LEARNING_RETRIES)
 
     def call(system, user):
         # temperature=None: Fable 5 removed sampling parameters and 400s any

@@ -19,15 +19,17 @@ class FakeHTTPError(Exception):
 
 class IsRetryableTest(unittest.TestCase):
     def test_retryable_status_codes(self):
-        for sc in (408, 409, 429, 500, 502, 503, 529):
+        # 409 was here and is deliberately gone: see RetryScopeTest — a memory path
+        # conflict is the EXPECTED answer on a redeploy, not a transient failure.
+        for sc in (408, 429, 500, 502, 503, 529):
             self.assertTrue(api_client._is_retryable(FakeHTTPError(sc)), sc)
 
     def test_non_retryable_status_codes(self):
-        for sc in (400, 401, 403, 404, 422):
+        for sc in (400, 401, 403, 404, 409, 422):
             self.assertFalse(api_client._is_retryable(FakeHTTPError(sc)), sc)
 
     def test_retryable_by_message_when_no_status(self):
-        # the exact 503 the user hit, surfaced as a plain message
+        # the exact 503 the user hit, surfaced as a plain message (no status attribute)
         self.assertTrue(api_client._is_retryable(
             Exception("File storage is temporarily unavailable. Please retry.")))
         self.assertTrue(api_client._is_retryable(Exception("overloaded_error")))
@@ -35,6 +37,41 @@ class IsRetryableTest(unittest.TestCase):
 
     def test_plain_unrelated_error_not_retryable(self):
         self.assertFalse(api_client._is_retryable(ValueError("bad envelope shape")))
+
+
+class RetryScopeTest(unittest.TestCase):
+    """What is retryable, and what only LOOKED retryable.
+
+    _retry and the SDK client's own max_retries MULTIPLY (5 x 6 = 30 HTTP attempts,
+    ~60 minutes for one failing call), and the text match was applied to errors that
+    already carried a status — so a permanent 4xx got the full treatment whenever the
+    platform's prose happened to say "connection" or "try again". In this product
+    almost every error message says connection.
+    """
+
+    def test_a_404_is_not_retryable_even_when_it_mentions_a_connection(self):
+        self.assertFalse(api_client._is_retryable(
+            FakeHTTPError(404, "Error code: 404 - MCP server connection not found")))
+        self.assertFalse(api_client._is_retryable(
+            FakeHTTPError(404, "Error code: 404 - expired. Please try again with a "
+                               "valid session id.")))
+
+    def test_409_is_not_retryable(self):
+        """A memory path conflict is the EXPECTED answer when re-seeding a reused
+        store on redeploy; retrying it spent minutes per deploy."""
+        self.assertFalse(api_client._is_retryable(FakeHTTPError(409, "conflict")))
+
+    def test_transport_errors_with_no_status_are_still_retryable(self):
+        self.assertTrue(api_client._is_retryable(RuntimeError("Connection error.")))
+        self.assertTrue(api_client._is_retryable(RuntimeError("Request timed out.")))
+
+    def test_genuine_transient_statuses_are_still_retryable(self):
+        for sc in (408, 429, 500, 502, 503, 529):
+            self.assertTrue(api_client._is_retryable(FakeHTTPError(sc)), sc)
+
+    def test_the_sdk_retry_budget_stays_small_so_the_two_do_not_multiply(self):
+        from trace.agent import config
+        self.assertLess(config.SDK_MAX_RETRIES, config.RETRY_ATTEMPTS)
 
 
 class RetryTest(unittest.TestCase):

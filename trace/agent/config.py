@@ -33,6 +33,23 @@ LEARNING_MAX_TOKENS = 16000              # the reply carries a full replacement 
 LEARNING_CHECK_SECONDS = 600             # per-agent trigger-check throttle (sync path)
 LEARNING_TRANSCRIPT_CLIP = 12000         # chars of compacted transcript per session
 LEARNING_DOC_CLIP = 90_000               # max chars per written doc ("well under 100KB")
+# Only ONE learning cycle runs at a time across the whole fleet. Per-agent guarding
+# was not enough: N agents meant N concurrent cycles, each a long Fable call plus a
+# fan-out of platform reads, which starved the (synchronous) activity view of API
+# headroom and pushed it past the browser's 65s budget.
+LEARNING_MAX_CONCURRENT = 1
+# Kill switch: set TRACE_LEARNING_ENABLED=0 to stop cycles from the host's env
+# without a code change, if they ever need to be ruled out of a latency problem.
+LEARNING_ENABLED = (os.environ.get("TRACE_LEARNING_ENABLED") or "1").strip() != "0"
+# Model-call bounds. Every _default_model_fn used to build a bare anthropic.Anthropic(),
+# whose default timeout is 10 minutes PER ATTEMPT with automatic retries — one stuck
+# call could hold a request thread for the better part of an hour. The summarizer runs
+# inside a user-facing GET, so it gets a hard, short bound; the learning call is
+# backgrounded and returns a whole document, so it gets a long one.
+SUMMARY_REQUEST_TIMEOUT = 25             # seconds per summarize call (user-facing)
+SUMMARY_RETRIES = 1
+LEARNING_REQUEST_TIMEOUT = 900           # seconds for the (backgrounded) analysis call
+LEARNING_RETRIES = 1
 # Manual-evaluation mode (current): evaluation is done by the user in the Console,
 # so we keep each run cheap — one session per bundle, a single session's tokens —
 # and never fan out. Recent rounds burned credits running many sessions.
@@ -48,6 +65,10 @@ REQUEST_TIMEOUT = 120                    # per-HTTP-request read timeout (second
 # 429, 5xx) are retried with exponential backoff before giving up.
 RETRY_ATTEMPTS = 5
 RETRY_BASE_DELAY = 1.5                   # seconds; doubles each attempt
+# What the SDK client itself retries UNDER _retry. The two budgets multiply, so this
+# stays small: at RETRY_ATTEMPTS on both layers a single failing call took 30 HTTP
+# attempts and ~60 minutes, which is how one bad session id could hang a page load.
+SDK_MAX_RETRIES = 1
 MOUNT_PATH = "/workspace/files"          # where the Test Deployer mounts artifacts
 # Mounted files are READ-ONLY copies; the agent must write outputs to a new path.
 # The framing makes this contractual and the Deployer retrieves session-scoped files.

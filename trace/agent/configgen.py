@@ -31,9 +31,18 @@ DEFAULT_MODEL = config.DEFAULT_MODEL
 # --------------------------------------------------------------------------
 # Model seam + defensive JSON parse (same pattern as the other engines)
 # --------------------------------------------------------------------------
-def _default_model_fn(model):
+def _default_model_fn(model, timeout=None, max_retries=None):
+    """A caller for ``model``. ``timeout``/``max_retries`` bound the client: a bare
+    anthropic.Anthropic() defaults to a 10-minute-per-attempt timeout with automatic
+    retries, which is fine for a background build but not for the activity view's
+    summarizer, which runs inside a user-facing GET (see AppState._summarize_model_fn)."""
     import anthropic
-    client = anthropic.Anthropic()
+    kw = {}
+    if timeout is not None:
+        kw["timeout"] = timeout
+    if max_retries is not None:
+        kw["max_retries"] = max_retries
+    client = anthropic.Anthropic(**kw)
 
     def call(system, user):
         return model_call.create_text(client, model, system, user, max_tokens=4000)
