@@ -40,10 +40,12 @@ class FakeLearnClient:
     def __init__(self):
         self.events = {}                       # session_id -> events
         self.dead = set()                      # session_ids deleted from the platform
+        self.fetches = 0                       # list_session_events call count
         self.docs = {agent_config.MEMORY_LESSONS_DOC: "# Lessons learned\n- old lesson\n"}
         self.written = []                      # {store_id, path, content}
 
     def list_session_events(self, session_id):
+        self.fetches += 1
         if session_id in self.dead:
             raise RuntimeError(f"Error code: 404 - Session not found: {session_id}")
         return list(self.events.get(session_id, []))
@@ -168,6 +170,19 @@ class LearningCycleTest(unittest.TestCase):
         t.join(timeout=10)
         self.assertEqual(self.learn_calls, [])
         self.assertEqual(self._cycles(), [])
+
+    def test_gone_sessions_are_discovered_once_not_refetched_forever(self):
+        """The throttle re-checks every few minutes; without the memo, an agent
+        whose history was cleaned up 404-stormed the platform on every pass."""
+        self._seed_runs(self.N)
+        self.client.dead = {f"s{i}" for i in range(self.N)}
+        t = self.state.maybe_run_learning_cycle(self.agent)
+        t.join(timeout=10)
+        fetched = self.client.fetches
+        self.assertEqual(fetched, self.N)                  # discovered once
+        self.assertIsNone(self.state.maybe_run_learning_cycle(self.agent),
+                          "gone sessions must no longer count as eligible runs")
+        self.assertEqual(self.client.fetches, fetched, "no re-fetch of dead sessions")
 
     def test_a_still_running_latest_session_defers_the_cycle(self):
         self._seed_runs(self.N, events_fn=_running_events)

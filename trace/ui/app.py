@@ -279,6 +279,11 @@ class AppState:
         self._vault_refreshed = {}   # vault_ref -> epoch of last rolling refresh (deployment sync)
         self._learning_inflight = set()   # agent_ids with a learning cycle running
         self._learning_checked = {}  # agent_id -> epoch of last learning trigger check
+        # Session ids that 404'd (deleted/expired on the platform). A gone session
+        # never comes back, so each is discovered once and then excluded from
+        # eligibility — without this, an agent whose history was cleaned up
+        # re-fetched the same dead sessions every throttle window, forever.
+        self._learning_gone = set()
         self.chat_jobs = {}          # agent_id -> {state, error} (a DM reply in flight)
         self._approval_queues = {}   # agent_id -> queue.Queue of tasks (FIFO per agent)
         self._approval_workers = {}  # agent_id -> live drain thread
@@ -1838,6 +1843,7 @@ class AppState:
             runs = registry.runs_for_agent(root, aid, limit=max(50, 4 * n))
             batch = [r for r in runs
                      if r.get("run_session_id") and r.get("kind") != "approval"
+                     and r.get("run_session_id") not in self._learning_gone
                      and str(r.get("ran_at") or r.get("started_at") or "") > since]
             if len(batch) < n:
                 return None
@@ -1883,12 +1889,24 @@ class AppState:
         aid = agent.get("agent_id")
         store_id = agent.get("memory_store_id")
         client = self._live_client()
+        def fetch(sid):
+            """One session's events, or None when unfetchable. A 404 means the
+            session was deleted/expired — permanent, so memoize it and never fetch
+            it again; a transient error is None for this pass only."""
+            try:
+                return client.list_session_events(sid)
+            except Exception as e:                         # noqa: BLE001
+                if getattr(e, "status_code", None) == 404 \
+                        or "not found" in str(e).lower():
+                    self._learning_gone.add(sid)
+                return None
+
         events_by_run = self._fanout(
-            [lambda s=r["run_session_id"]: client.list_session_events(s) for r in batch])
-        # A None slot means the fetch RAISED — the session was deleted/expired on the
-        # platform (404) and will never become fetchable, so it must not gate the
-        # cycle. An existing session with no terminal event ([] included) genuinely
-        # is still running and does defer.
+            [lambda s=r["run_session_id"]: fetch(s) for r in batch])
+        # A None slot means the fetch failed — usually a session deleted/expired on
+        # the platform (404), which will never become fetchable, so it must not gate
+        # the cycle. An existing session with no terminal event ([] included)
+        # genuinely is still running and does defer.
         pairs = [(r, ev) for r, ev in zip(batch, events_by_run) if ev is not None]
         gone = len(batch) - len(pairs)
         if not pairs:
