@@ -12,6 +12,15 @@ const root = $("#root");
 // must be built from this rather than from the whole visible set. Home, the activity
 // list and the profile deliberately show everything; those are reads.
 const owned = (list) => (list || []).filter(a => a.can_edit !== false);
+// Every renderX() call in this file is fire-and-forget on an async function, so a
+// throw inside one becomes a rejected promise nobody awaits. Without this listener it
+// is completely silent — which is how a hard ReferenceError in renderProfile passed
+// for "the server is slow" through two rounds of debugging.
+if (typeof window !== "undefined") {
+  window.addEventListener("unhandledrejection", (ev) => {
+    console.error("unhandled rejection:", (ev && ev.reason) || ev);
+  });
+}
 const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g,
   c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
@@ -2248,6 +2257,7 @@ function profileBio(a) {
 }
 
 async function renderProfile(agentId) {
+  if (S._activityRepainted !== agentId) S._activityRepainted = null;
   clearTimers();
   busy();
   const home = S.igHome || await loadHome();
@@ -2493,230 +2503,260 @@ async function renderProfile(agentId) {
     }
     return;
   }
-  const sessionsList = (data && data.activity) || [];
-  // Enrichment (reading each session's events, summarizing them, staging proposals)
-  // runs on the server in the background now, so rows can arrive un-summarized on a
-  // first load — the log already says "No summary yet" for those. Poll the (cheap,
-  // DB-only) endpoint until the refresh lands, then re-render the profile once so
-  // every pane and all of its wiring comes from the enriched data.
-  if (data && data.refreshing) {
-    let tries = 0;
-    const repoll = async () => {
-      if (++tries > 8) return;                            // ~20s, then leave it be
-      if (!$("#pLog")) return;                            // navigated away
-      const again = await api("GET", `/api/u/agents/${agentId}/activity`);
-      if (!again.ok) return;
-      if (again.data && again.data.refreshing) {
-        S._timers.push(setTimeout(repoll, 2500));
-        return;
-      }
-      renderProfile(agentId);
+  // Everything below renders the fetched data. A throw in here used to leave every
+  // pane on its "Loading…" placeholder for good — the failure showed up only as an
+  // unhandled rejection in the console, because every caller of this function is
+  // fire-and-forget. A render bug should cost a visible error, not a dead page.
+  try {
+    const sessionsList = (data && data.activity) || [];
+    // Enrichment (reading each session's events, summarizing them, staging proposals)
+    // runs on the server in the background now, so rows can arrive un-summarized on a
+    // first load — the log already says "No summary yet" for those. Poll the (cheap,
+    // DB-only) endpoint until the refresh lands, then re-render the profile once so
+    // every pane and all of its wiring comes from the enriched data.
+    if (data && data.refreshing) {
+      let tries = 0;
+      const repoll = async () => {
+        if (++tries > 8) return;                            // ~20s, then leave it be
+        if (!$("#pLog")) return;                            // navigated away
+        const again = await api("GET", `/api/u/agents/${agentId}/activity`);
+        if (!again.ok) return;
+        if (again.data && again.data.refreshing) {
+          S._timers.push(setTimeout(repoll, 2500));
+          return;
+        }
+        // Re-render ONCE. renderProfile starts a fresh closure with tries=0, so without
+        // this a server that flipped `refreshing` back on would re-paint forever.
+        if (S._activityRepainted === agentId) return;
+        S._activityRepainted = agentId;
+        renderProfile(agentId);
+      };
+      S._timers.push(setTimeout(repoll, 2500));
+    }
+    // Approvals: per-app staged/autonomous toggles (post-deploy, no redeploy). All
+    // interpolated values are escaped via esc() (the file's XSS-safe rendering idiom).
+    // Rules (21): the escalation rules from frame 10, read back. Stored as one sentence
+    // per agent — "Stop and ask me when any of these is true:" then a line per rule — so
+    // it renders as the list it was written as rather than as a paragraph.
+    const rulesBox = $("#pRules");
+    if (rulesBox) {
+      const raw = (data && data.agent && data.agent.rules) || "";
+      const lines = raw.split("\n").map(s => s.trim())
+        .filter(s => s.startsWith("-")).map(s => s.replace(/^-\s*/, ""));
+      rulesBox.innerHTML = lines.length
+        ? `<div class="sn-list">${lines.map(l => {
+            const [head, ...rest] = l.split(":");
+            const tail = rest.join(":").trim();
+            return `<div class="sn-row">
+              <div class="sn-mid"><div class="sn-title">${esc(head.trim())}</div>
+                ${tail ? `<div class="sn-sub">${esc(tail)}</div>` : ""}</div>
+              ${/outbound/i.test(head) ? `<span class="sn-built">BUILT IN</span>` : ""}
+            </div>`;
+          }).join("")}</div>
+          <p class="sub muted" style="margin-top:10px;">Changing these per agent isn't built
+            yet — they come from what you set when the agents were created.</p>`
+        : `<p class="muted">No rules recorded for this agent. Agents built before the safety
+            step still stage everything outbound — that part is always on.</p>`;
+    }
+    const availApps = (data && data.agent && data.agent.available_apps) || [];
+    const apPanel = $("#pApprovalsPanel");
+    if (apPanel && !availApps.length) apPanel.classList.add("pane-empty");
+    if (apPanel && availApps.length) {
+      apPanel.classList.remove("pane-empty");
+      const apMarkup = availApps.map(ap => `
+        <label class="row" style="gap:8px;margin-top:6px;cursor:pointer;">
+          <input type="checkbox" class="stage-toggle" data-slug="${esc(ap.slug)}" ${ap.staged ? "checked" : ""}>
+          <span class="title" style="font-size:14px;">${esc(ap.label)}</span>
+          <span class="sub muted">${ap.staged ? "needs approval" : "runs automatically"}</span>
+        </label>`).join("")
+        + `<button class="btn-primary btn-sm" id="pStageSave" style="margin-top:12px;">Save approval settings</button>`;
+      $("#pApprovals").insertAdjacentHTML("beforeend", apMarkup);
+      $("#pStageSave").onclick = async (e) => {
+        const staged = Array.from(root.querySelectorAll(".stage-toggle"))
+          .filter(c => c.checked).map(c => c.dataset.slug);
+        if (!staged.length && !await confirmDestructive({
+          title: "Let this agent act without review?",
+          body: "No app will need your approval — everything it does, including anything outbound, happens without showing you first.",
+          verb: "Turn off approvals", word: null, tone: "primary",
+        })) return;
+        e.target.disabled = true; e.target.textContent = "Saving…";
+        await api("POST", `/api/u/agents/${agentId}/staging`, { staged_apps: staged });
+        S.igHome = null; renderProfile(agentId);
+      };
+    }
+    // Per-agent lesson-sharing override (Phase B). Empty override = inherit account default.
+    const consent = data && data.agent && data.agent.consent;
+    const shPanel = $("#pSharingPanel");
+    if (shPanel && !consent) shPanel.classList.add("pane-empty");
+    if (shPanel && consent) {
+      shPanel.classList.remove("pane-empty");
+      const ov = consent.override || {};
+      $("#pSharing").insertAdjacentHTML("beforeend", `
+        <div class="row" style="gap:10px;align-items:center;">
+          <span class="label" style="min-width:170px;">Contribute my lessons</span>${scopeSelect("ag-contrib", ov.contribute_scope, "contribute", true)}</div>
+        <div class="row" style="gap:10px;margin-top:8px;align-items:center;">
+          <span class="label" style="min-width:170px;">Use others' lessons</span>${scopeSelect("ag-consume", ov.consume_scope, "consume", true)}</div>
+        <button class="btn-primary btn-sm" id="pShareSave" style="margin-top:12px;">Save</button>`);
+      $("#pShareSave").onclick = async (e) => {
+        await api("POST", `/api/u/agents/${agentId}/consent`, {
+          contribute_scope: $(".ag-contrib").value || "inherit",
+          consume_scope: $(".ag-consume").value || "inherit" });
+        e.target.textContent = "Saved ✓";
+      };
+    }
+    // Declared HERE, not inside the block below: the schedule line further down reads it
+    // too, and when it lived inside `if (statRow)` that read was a ReferenceError thrown
+    // on every successful render — after the stat tiles were painted and before the log,
+    // Recent runs and Permissions were, so those three sat on "Loading…" forever. Every
+    // renderProfile call is unawaited, so it surfaced only as an unhandled rejection in
+    // the console and looked exactly like a server that never answered.
+    const mins = runMinutes(sessionsList);
+    const statRow = $("#pStatRow");
+    if (statRow) {
+      const props = sessionsList.flatMap(s => s.proposals || []);
+      const decided = props.filter(p =>
+        p.status && p.status !== "pending" && p.status !== "queued"
+        && p.status !== "executing");
+      const asIs = decided.filter(p => p.status === "executed" || p.status === "approved");
+      const pct = decided.length ? Math.round((asIs.length / decided.length) * 100) : null;
+      // Frame 21 shows three figures as cards. The third is "saved", which nothing
+      // measures — hours a human DIDN'T spend is not observable from a run log, and
+      // guessing it would put an invented number on the one screen a customer uses to
+      // judge whether the agent is worth keeping. agent_runs does carry started_at and
+      // ended_at, so typical run length is real, and it answers the question the schedule
+      // card actually needs ("takes ~9 min" in the frame).
+      statRow.innerHTML = `
+        <div class="prof-stat"><b>${sessionsList.length}</b><span>run${
+          sessionsList.length === 1 ? "" : "s"}</span></div>
+        ${pct === null ? "" : `<div class="prof-stat"><b>${pct}%</b><span>approved as-is</span></div>`}
+        ${mins === null ? "" : `<div class="prof-stat"><b>${mins}m</b><span>typical run</span></div>`}`;
+    }
+    // "Next run tomorrow 6:00 AM · takes ~9 min" — the frame puts expected duration on the
+    // schedule line, which is where it is actually useful: it tells you what window the
+    // agent occupies, not merely when it starts. Appended rather than rendered inline
+    // because it needs the run log, which arrives after first paint.
+    const nextLine = $("#pNext");
+    if (nextLine && mins !== null && !paused) {
+      nextLine.textContent = `${nextLine.textContent} · takes ~${mins} min`;
+    }
+    // Recent runs — the rail's third card in frame 21.
+    const rail = $("#pRail");
+    if (rail) {
+      const recent = sessionsList.slice(0, 4);
+      rail.innerHTML = `<div class="label">Recent runs</div>` + (recent.length
+        ? recent.map(r => {
+            const stopped = (r.decisions || []).length > 0;
+            const held = (r.proposals || []).length;
+            const bits = [];
+            if (held) bits.push(`${held} awaiting approval`);
+            if (r.note) bits.push(r.note);
+            return `<div class="rail-run">
+              <div class="hd"><b>${esc(whenShort(r.ran_at))}</b>
+                <span class="st ${stopped ? "stop" : "ok"}">${
+                  stopped ? "stopped — needs you" : esc(r.status || "clean")}</span></div>
+              ${bits.length ? `<div class="dt">${esc(bits.join(" · "))}</div>` : ""}
+            </div>`;
+          }).join("")
+        : `<p class="sub muted">No runs yet.</p>`);
+    }
+    // Permissions (21): which apps it can touch, and whether each is held for approval.
+    const perms = $("#pPerms");
+    if (perms) {
+      perms.innerHTML = `<div class="label">Permissions</div>` + (availApps.length
+        ? `<div class="ov-perms">${availApps.map(ap => `
+            <div class="ov-perm"><span class="ov-perm-n">${esc(ap.label || ap.slug)}</span>
+              <span class="pill ${ap.staged ? "pill-warn" : "pill-on"}">${
+                ap.staged ? "ALWAYS STAGED" : "RUNS AUTOMATICALLY"}</span></div>`).join("")}</div>
+           <div class="sub muted" style="margin-top:8px;">Staged means it prepares the
+             action and waits for you. Change these under Rules.</div>
+           ${escalationLine(data)}`
+        : `<p class="sub muted" style="margin-top:4px;">No connected apps yet.</p>`);
+    }
+    const logRow = (s) => {
+      const props = s.proposals || [];
+      const decs = s.decisions || [];
+      const approvable = props.filter(p => !p.status || p.status === "pending");
+      return `<div class="log-row" data-sess="${esc(s.run_session_id || "")}">
+        <div class="row" style="gap:10px;">
+          <span class="mono muted" style="font-size:12px;white-space:nowrap;">${esc(s.ran_at || "")}</span>
+          ${runBadge(s.status)}
+        </div>
+        <div class="log-note">${esc(s.summary || "No summary yet — the run may still be in progress.")}</div>
+        ${decs.length ? `<div style="margin-top:8px;"><div class="label">Needs your input</div>
+          ${decs.map(decisionCard).join("")}
+        </div>` : ""}
+        ${props.length ? `<div style="margin-top:8px;"><div class="label">Proposed actions</div>
+          ${props.map(proposalRow).join("")}
+          ${approvable.length ? `<button class="btn-primary btn-sm approve-sel" style="margin-top:10px;">Approve &amp; run selected</button>` : ""}
+        </div>` : ""}
+      </div>`;
     };
-    S._timers.push(setTimeout(repoll, 2500));
-  }
-  // Approvals: per-app staged/autonomous toggles (post-deploy, no redeploy). All
-  // interpolated values are escaped via esc() (the file's XSS-safe rendering idiom).
-  // Rules (21): the escalation rules from frame 10, read back. Stored as one sentence
-  // per agent — "Stop and ask me when any of these is true:" then a line per rule — so
-  // it renders as the list it was written as rather than as a paragraph.
-  const rulesBox = $("#pRules");
-  if (rulesBox) {
-    const raw = (data && data.agent && data.agent.rules) || "";
-    const lines = raw.split("\n").map(s => s.trim())
-      .filter(s => s.startsWith("-")).map(s => s.replace(/^-\s*/, ""));
-    rulesBox.innerHTML = lines.length
-      ? `<div class="sn-list">${lines.map(l => {
-          const [head, ...rest] = l.split(":");
-          const tail = rest.join(":").trim();
-          return `<div class="sn-row">
-            <div class="sn-mid"><div class="sn-title">${esc(head.trim())}</div>
-              ${tail ? `<div class="sn-sub">${esc(tail)}</div>` : ""}</div>
-            ${/outbound/i.test(head) ? `<span class="sn-built">BUILT IN</span>` : ""}
-          </div>`;
-        }).join("")}</div>
-        <p class="sub muted" style="margin-top:10px;">Changing these per agent isn't built
-          yet — they come from what you set when the agents were created.</p>`
-      : `<p class="muted">No rules recorded for this agent. Agents built before the safety
-          step still stage everything outbound — that part is always on.</p>`;
-  }
-  const availApps = (data && data.agent && data.agent.available_apps) || [];
-  const apPanel = $("#pApprovalsPanel");
-  if (apPanel && !availApps.length) apPanel.classList.add("pane-empty");
-  if (apPanel && availApps.length) {
-    apPanel.classList.remove("pane-empty");
-    const apMarkup = availApps.map(ap => `
-      <label class="row" style="gap:8px;margin-top:6px;cursor:pointer;">
-        <input type="checkbox" class="stage-toggle" data-slug="${esc(ap.slug)}" ${ap.staged ? "checked" : ""}>
-        <span class="title" style="font-size:14px;">${esc(ap.label)}</span>
-        <span class="sub muted">${ap.staged ? "needs approval" : "runs automatically"}</span>
-      </label>`).join("")
-      + `<button class="btn-primary btn-sm" id="pStageSave" style="margin-top:12px;">Save approval settings</button>`;
-    $("#pApprovals").insertAdjacentHTML("beforeend", apMarkup);
-    $("#pStageSave").onclick = async (e) => {
-      const staged = Array.from(root.querySelectorAll(".stage-toggle"))
-        .filter(c => c.checked).map(c => c.dataset.slug);
-      if (!staged.length && !await confirmDestructive({
-        title: "Let this agent act without review?",
-        body: "No app will need your approval — everything it does, including anything outbound, happens without showing you first.",
-        verb: "Turn off approvals", word: null, tone: "primary",
-      })) return;
-      e.target.disabled = true; e.target.textContent = "Saving…";
-      await api("POST", `/api/u/agents/${agentId}/staging`, { staged_apps: staged });
+    const log = $("#pLog");
+    if (log) log.innerHTML = sessionsList.length
+      ? sessionsList.map(logRow).join("")
+      : `<p class="muted">No sessions yet — hit Run now or set a schedule.</p>`;
+    root.querySelectorAll(".approve-sel").forEach(b => b.onclick = async () => {
+      const panel = b.closest("[data-sess]");
+      const ids = Array.from(panel.querySelectorAll(".prop")).filter(c => c.checked).map(c => c.dataset.id);
+      if (!ids.length) { b.textContent = "Select at least one"; return; }
+      b.disabled = true; b.textContent = "Running…";
+      await api("POST", `/api/u/agents/${agentId}/approve-actions`, { pending_ids: ids });
+      S._timers.push(setTimeout(() => { S.igHome = null; renderProfile(agentId); }, 4000));
+    });
+    // Approve & send / Edit first / Reject in Session history. These were never wired
+    // here — only in the story overlay — so all three did nothing on this screen.
+    wireProposalActions(root, agentId, () =>
+      S._timers.push(setTimeout(() => { S.igHome = null; renderProfile(agentId); }, 4000)));
+    root.querySelectorAll(".prop-edit").forEach(b => b.onclick = () => {
+      // Same as the overlay: opens the payload. Editing the content itself is still to
+      // build — the button at least does the visible half now instead of nothing.
+      const box = root.querySelector(`.pp-payload[data-for="${b.dataset.id}"]`);
+      if (box) box.hidden = false;
+    });
+    root.querySelectorAll(".prop-autoapprove").forEach(b => b.onclick = async () => {
+      if (await autoApproveApp(agentId, b.dataset.app)) { S.igHome = null; renderProfile(agentId); }
+    });
+    const refreshAfterAnswer = () =>
+      S._timers.push(setTimeout(() => { S.igHome = null; renderProfile(agentId); }, 4000));
+    wireDecisionCards(root);
+    root.querySelectorAll(".dec-opt").forEach(b => b.onclick = async () => {
+      if (await answerDecision(b.dataset.id, b.dataset.val)) refreshAfterAnswer();
+    });
+    root.querySelectorAll(".dec-submit").forEach(b => b.onclick = async () => {
+      const inp = root.querySelector(`.dec-answer[data-id="${b.dataset.id}"]`);
+      if (!inp || !inp.value.trim()) { if (inp) inp.focus(); return; }
+      b.disabled = true; b.textContent = "Sending…";
+      if (await answerDecision(b.dataset.id, inp.value)) refreshAfterAnswer();
+    });
+    const confirmLesson = async (agent, id, action) => {
+      await api("POST", "/api/u/lessons/confirm", { agent_id: agent, decision_id: id, action });
       S.igHome = null; renderProfile(agentId);
     };
-  }
-  // Per-agent lesson-sharing override (Phase B). Empty override = inherit account default.
-  const consent = data && data.agent && data.agent.consent;
-  const shPanel = $("#pSharingPanel");
-  if (shPanel && !consent) shPanel.classList.add("pane-empty");
-  if (shPanel && consent) {
-    shPanel.classList.remove("pane-empty");
-    const ov = consent.override || {};
-    $("#pSharing").insertAdjacentHTML("beforeend", `
-      <div class="row" style="gap:10px;align-items:center;">
-        <span class="label" style="min-width:170px;">Contribute my lessons</span>${scopeSelect("ag-contrib", ov.contribute_scope, "contribute", true)}</div>
-      <div class="row" style="gap:10px;margin-top:8px;align-items:center;">
-        <span class="label" style="min-width:170px;">Use others' lessons</span>${scopeSelect("ag-consume", ov.consume_scope, "consume", true)}</div>
-      <button class="btn-primary btn-sm" id="pShareSave" style="margin-top:12px;">Save</button>`);
-    $("#pShareSave").onclick = async (e) => {
-      await api("POST", `/api/u/agents/${agentId}/consent`, {
-        contribute_scope: $(".ag-contrib").value || "inherit",
-        consume_scope: $(".ag-consume").value || "inherit" });
-      e.target.textContent = "Saved ✓";
-    };
-  }
-  const statRow = $("#pStatRow");
-  if (statRow) {
-    const props = sessionsList.flatMap(s => s.proposals || []);
-    const decided = props.filter(p =>
-      p.status && p.status !== "pending" && p.status !== "queued"
-      && p.status !== "executing");
-    const asIs = decided.filter(p => p.status === "executed" || p.status === "approved");
-    const pct = decided.length ? Math.round((asIs.length / decided.length) * 100) : null;
-    // Frame 21 shows three figures as cards. The third is "saved", which nothing
-    // measures — hours a human DIDN'T spend is not observable from a run log, and
-    // guessing it would put an invented number on the one screen a customer uses to
-    // judge whether the agent is worth keeping. agent_runs does carry started_at and
-    // ended_at, so typical run length is real, and it answers the question the schedule
-    // card actually needs ("takes ~9 min" in the frame).
-    const mins = runMinutes(sessionsList);
-    statRow.innerHTML = `
-      <div class="prof-stat"><b>${sessionsList.length}</b><span>run${
-        sessionsList.length === 1 ? "" : "s"}</span></div>
-      ${pct === null ? "" : `<div class="prof-stat"><b>${pct}%</b><span>approved as-is</span></div>`}
-      ${mins === null ? "" : `<div class="prof-stat"><b>${mins}m</b><span>typical run</span></div>`}`;
-  }
-  // "Next run tomorrow 6:00 AM · takes ~9 min" — the frame puts expected duration on the
-  // schedule line, which is where it is actually useful: it tells you what window the
-  // agent occupies, not merely when it starts. Appended rather than rendered inline
-  // because it needs the run log, which arrives after first paint.
-  const nextLine = $("#pNext");
-  if (nextLine && mins !== null && !paused) {
-    nextLine.textContent = `${nextLine.textContent} · takes ~${mins} min`;
-  }
-  // Recent runs — the rail's third card in frame 21.
-  const rail = $("#pRail");
-  if (rail) {
-    const recent = sessionsList.slice(0, 4);
-    rail.innerHTML = `<div class="label">Recent runs</div>` + (recent.length
-      ? recent.map(r => {
-          const stopped = (r.decisions || []).length > 0;
-          const held = (r.proposals || []).length;
-          const bits = [];
-          if (held) bits.push(`${held} awaiting approval`);
-          if (r.note) bits.push(r.note);
-          return `<div class="rail-run">
-            <div class="hd"><b>${esc(whenShort(r.ran_at))}</b>
-              <span class="st ${stopped ? "stop" : "ok"}">${
-                stopped ? "stopped — needs you" : esc(r.status || "clean")}</span></div>
-            ${bits.length ? `<div class="dt">${esc(bits.join(" · "))}</div>` : ""}
-          </div>`;
-        }).join("")
-      : `<p class="sub muted">No runs yet.</p>`);
-  }
-  // Permissions (21): which apps it can touch, and whether each is held for approval.
-  const perms = $("#pPerms");
-  if (perms) {
-    perms.innerHTML = `<div class="label">Permissions</div>` + (availApps.length
-      ? `<div class="ov-perms">${availApps.map(ap => `
-          <div class="ov-perm"><span class="ov-perm-n">${esc(ap.label || ap.slug)}</span>
-            <span class="pill ${ap.staged ? "pill-warn" : "pill-on"}">${
-              ap.staged ? "ALWAYS STAGED" : "RUNS AUTOMATICALLY"}</span></div>`).join("")}</div>
-         <div class="sub muted" style="margin-top:8px;">Staged means it prepares the
-           action and waits for you. Change these under Rules.</div>
-         ${escalationLine(data)}`
-      : `<p class="sub muted" style="margin-top:4px;">No connected apps yet.</p>`);
-  }
-  const logRow = (s) => {
-    const props = s.proposals || [];
-    const decs = s.decisions || [];
-    const approvable = props.filter(p => !p.status || p.status === "pending");
-    return `<div class="log-row" data-sess="${esc(s.run_session_id || "")}">
-      <div class="row" style="gap:10px;">
-        <span class="mono muted" style="font-size:12px;white-space:nowrap;">${esc(s.ran_at || "")}</span>
-        ${runBadge(s.status)}
-      </div>
-      <div class="log-note">${esc(s.summary || "No summary yet — the run may still be in progress.")}</div>
-      ${decs.length ? `<div style="margin-top:8px;"><div class="label">Needs your input</div>
-        ${decs.map(decisionCard).join("")}
-      </div>` : ""}
-      ${props.length ? `<div style="margin-top:8px;"><div class="label">Proposed actions</div>
-        ${props.map(proposalRow).join("")}
-        ${approvable.length ? `<button class="btn-primary btn-sm approve-sel" style="margin-top:10px;">Approve &amp; run selected</button>` : ""}
-      </div>` : ""}
-    </div>`;
-  };
-  const log = $("#pLog");
-  if (log) log.innerHTML = sessionsList.length
-    ? sessionsList.map(logRow).join("")
-    : `<p class="muted">No sessions yet — hit Run now or set a schedule.</p>`;
-  root.querySelectorAll(".approve-sel").forEach(b => b.onclick = async () => {
-    const panel = b.closest("[data-sess]");
-    const ids = Array.from(panel.querySelectorAll(".prop")).filter(c => c.checked).map(c => c.dataset.id);
-    if (!ids.length) { b.textContent = "Select at least one"; return; }
-    b.disabled = true; b.textContent = "Running…";
-    await api("POST", `/api/u/agents/${agentId}/approve-actions`, { pending_ids: ids });
-    S._timers.push(setTimeout(() => { S.igHome = null; renderProfile(agentId); }, 4000));
-  });
-  // Approve & send / Edit first / Reject in Session history. These were never wired
-  // here — only in the story overlay — so all three did nothing on this screen.
-  wireProposalActions(root, agentId, () =>
-    S._timers.push(setTimeout(() => { S.igHome = null; renderProfile(agentId); }, 4000)));
-  root.querySelectorAll(".prop-edit").forEach(b => b.onclick = () => {
-    // Same as the overlay: opens the payload. Editing the content itself is still to
-    // build — the button at least does the visible half now instead of nothing.
-    const box = root.querySelector(`.pp-payload[data-for="${b.dataset.id}"]`);
-    if (box) box.hidden = false;
-  });
-  root.querySelectorAll(".prop-autoapprove").forEach(b => b.onclick = async () => {
-    if (await autoApproveApp(agentId, b.dataset.app)) { S.igHome = null; renderProfile(agentId); }
-  });
-  const refreshAfterAnswer = () =>
-    S._timers.push(setTimeout(() => { S.igHome = null; renderProfile(agentId); }, 4000));
-  wireDecisionCards(root);
-  root.querySelectorAll(".dec-opt").forEach(b => b.onclick = async () => {
-    if (await answerDecision(b.dataset.id, b.dataset.val)) refreshAfterAnswer();
-  });
-  root.querySelectorAll(".dec-submit").forEach(b => b.onclick = async () => {
-    const inp = root.querySelector(`.dec-answer[data-id="${b.dataset.id}"]`);
-    if (!inp || !inp.value.trim()) { if (inp) inp.focus(); return; }
-    b.disabled = true; b.textContent = "Sending…";
-    if (await answerDecision(b.dataset.id, inp.value)) refreshAfterAnswer();
-  });
-  const confirmLesson = async (agent, id, action) => {
-    await api("POST", "/api/u/lessons/confirm", { agent_id: agent, decision_id: id, action });
-    S.igHome = null; renderProfile(agentId);
-  };
-  root.querySelectorAll(".lesson-yes").forEach(b => b.onclick = () => confirmLesson(b.dataset.agent, b.dataset.id, "confirm"));
-  root.querySelectorAll(".lesson-no").forEach(b => b.onclick = () => confirmLesson(b.dataset.agent, b.dataset.id, "dismiss"));
-  root.querySelectorAll(".lesson-retire").forEach(b => b.onclick = async () => {
-    const ok = await confirmDestructive({
-      title: "Retire this lesson?",
-      body: "The agent stops applying it from its next run. What it already did stays as it is.",
-      verb: "Retire it", word: null, tone: "primary",
+    root.querySelectorAll(".lesson-yes").forEach(b => b.onclick = () => confirmLesson(b.dataset.agent, b.dataset.id, "confirm"));
+    root.querySelectorAll(".lesson-no").forEach(b => b.onclick = () => confirmLesson(b.dataset.agent, b.dataset.id, "dismiss"));
+    root.querySelectorAll(".lesson-retire").forEach(b => b.onclick = async () => {
+      const ok = await confirmDestructive({
+        title: "Retire this lesson?",
+        body: "The agent stops applying it from its next run. What it already did stays as it is.",
+        verb: "Retire it", word: null, tone: "primary",
+      });
+      if (ok) confirmLesson(b.dataset.agent, b.dataset.id, "retire");
     });
-    if (ok) confirmLesson(b.dataset.agent, b.dataset.id, "retire");
-  });
+  } catch (e) {
+    console.error("renderProfile failed", e);
+    const msg = "Something went wrong showing this page.";
+    ["#pRules", "#pPerms", "#pRail"].forEach(sel => {
+      const el = $(sel);
+      if (el && /Loading…/.test(el.textContent)) el.innerHTML = `<p class="muted">${esc(msg)}</p>`;
+    });
+    const logBox = $("#pLog");
+    if (logBox && /Loading…/.test(logBox.textContent)) {
+      logBox.innerHTML = `<p class="muted">${esc(msg)}</p>
+        <button class="btn" id="pLogRetry2">Try again</button>`;
+      const rb = $("#pLogRetry2");
+      if (rb) rb.onclick = () => renderProfile(agentId);
+    }
+  }
 }
 const renderActivity = renderProfile;                        // legacy entry point
 
