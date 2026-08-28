@@ -262,68 +262,119 @@ class MemoryStoreClientTest(unittest.TestCase):
             c.seed_memory("mem_1", "/other.md", "x")
 
 
+class RealShapeMemories:
+    """The DOCUMENTED Managed Agents memories surface, pinned so a regression back
+    to the guessed shapes fails the suite: create is PATH-addressed (409 when the
+    path is occupied); update/delete/retrieve take the mem_ id first with
+    memory_store_id as a required KEYWORD; list returns Memory entries whose
+    content is included only under view="full". The guessed update(store_id,
+    path=...) / delete(store_id, path=path) shapes failed in production with
+    exactly the TypeErrors these keyword-only signatures reproduce."""
+
+    def __init__(self, docs=None, content_on_list=True):
+        self.docs = dict(docs or {})               # path -> content
+        self.ids = {p: f"mem_{i}" for i, p in enumerate(self.docs)}
+        self.content_on_list = content_on_list
+        self.created, self.updated, self.deleted, self.retrieved = [], [], [], []
+
+    def _path_of(self, mem_id):
+        for p, i in self.ids.items():
+            if i == mem_id:
+                return p
+        raise RuntimeError(f"Error code: 404 - memory not found: {mem_id}")
+
+    def list(self, store_id, **kw):
+        include = self.content_on_list and kw.get("view") == "full"
+        return [dict({"type": "memory", "id": self.ids[p], "path": p},
+                     **({"content": self.docs[p]} if include else {}))
+                for p in self.docs]
+
+    def create(self, store_id, path=None, content=None):
+        if path in self.docs:
+            raise RuntimeError(
+                "Error code: 409 - memory_path_conflict_error: path already occupied")
+        self.docs[path] = content
+        self.ids[path] = f"mem_{len(self.ids)}"
+        self.created.append((store_id, path, content))
+        return {"id": self.ids[path]}
+
+    def update(self, mem_id, *, memory_store_id, content=None, path=None):
+        p = self._path_of(mem_id)
+        self.docs[p] = content
+        self.updated.append((mem_id, memory_store_id, content))
+        return {"id": mem_id}
+
+    def delete(self, mem_id, *, memory_store_id):
+        p = self._path_of(mem_id)
+        del self.docs[p], self.ids[p]
+        self.deleted.append((mem_id, memory_store_id))
+
+    def retrieve(self, mem_id, *, memory_store_id):
+        p = self._path_of(mem_id)
+        self.retrieved.append((mem_id, memory_store_id))
+        return {"id": mem_id, "path": p, "content": self.docs[p]}
+
+
+def _memories_client(memories):
+    stores = _FakeMemoryStores()
+    stores.memories = memories
+    return _NSClient.build({"memory_stores": stores})
+
+
 class WriteMemoryTest(unittest.TestCase):
-    """Refreshing a memory document, across SDK surfaces that differ by version.
+    """Refreshing a memory document against the real memories surface.
 
     seed_memory deliberately KEEPS existing content so a redeploy never wipes an
     agent's memory — which makes it useless for delivering lessons that change between
     runs. write_memory replaces instead, and must say so when it cannot: a silent miss
     means the agent runs without its lessons and every downstream table stays empty,
     looking exactly like "nothing to share". That ambiguity is what hid this whole
-    feature being dead.
+    feature being dead — twice: first the guidance path, then the learning cycle's
+    lessons rewrite, which 409'd on create because the wrong-shaped update/delete
+    could never clear the existing document.
     """
 
-    def _client(self, memories):
-        stores = _FakeMemoryStores()
-        stores.memories = memories
-        return _NSClient.build({"memory_stores": stores}), stores
+    def test_an_existing_document_is_updated_by_memory_id(self):
+        m = RealShapeMemories(docs={"/lessons_learned.md": "old"})
+        c = _memories_client(m)
+        self.assertEqual(c.write_memory("memstore_1", "/lessons_learned.md", "new"),
+                         "update")
+        self.assertEqual(m.updated, [("mem_0", "memstore_1", "new")])
+        self.assertEqual(m.docs["/lessons_learned.md"], "new")
+        self.assertEqual(m.created, [], "create on an occupied path would 409")
 
-    def test_update_is_preferred_when_the_sdk_has_it(self):
-        class M:
-            def __init__(self):
-                self.updated = []
+    def test_a_fresh_path_is_created(self):
+        m = RealShapeMemories()
+        c = _memories_client(m)
+        self.assertEqual(c.write_memory("memstore_1", "/shared_lessons.md", "body"),
+                         "create")
+        self.assertEqual(m.created, [("memstore_1", "/shared_lessons.md", "body")])
 
-            def update(self, store_id, path=None, content=None):
-                self.updated.append((store_id, path, content))
+    def test_update_failure_falls_back_to_delete_then_create(self):
+        class NoUpdate(RealShapeMemories):
+            def update(self, *a, **k):
+                raise RuntimeError("permission denied")
 
-            def create(self, *a, **k):
-                raise AssertionError("create must not be used when update exists")
-
-        m = M()
-        c, _ = self._client(m)
-        self.assertEqual(c.write_memory("mem_1", "/shared_lessons.md", "body"), "update")
-        self.assertEqual(m.updated, [("mem_1", "/shared_lessons.md", "body")])
-
-    def test_falls_back_to_delete_then_create(self):
-        class M:
-            def __init__(self):
-                self.deleted, self.created = [], []
-
-            def delete(self, store_id, path=None):
-                self.deleted.append((store_id, path))
-
-            def create(self, store_id, path=None, content=None):
-                self.created.append((store_id, path, content))
-
-        m = M()
-        c, _ = self._client(m)
-        self.assertEqual(c.write_memory("mem_1", "/shared_lessons.md", "body"), "create")
-        self.assertEqual(m.deleted, [("mem_1", "/shared_lessons.md")])
-        self.assertEqual(m.created, [("mem_1", "/shared_lessons.md", "body")])
-
-    def test_create_only_sdk_still_works(self):
-        m = _FakeMemories()
-        c, _ = self._client(m)
-        self.assertEqual(c.write_memory("mem_1", "/shared_lessons.md", "body"), "create")
-        self.assertEqual(m.created, [("mem_1", "/shared_lessons.md", "body")])
+        m = NoUpdate(docs={"/lessons_learned.md": "old"})
+        c = _memories_client(m)
+        self.assertEqual(c.write_memory("memstore_1", "/lessons_learned.md", "new"),
+                         "create")
+        self.assertEqual(m.deleted, [("mem_0", "memstore_1")])
+        self.assertEqual(m.docs["/lessons_learned.md"], "new")
 
     def test_total_failure_returns_none_rather_than_pretending(self):
-        class M:
+        class Broken(RealShapeMemories):
+            def update(self, *a, **k):
+                raise RuntimeError("permission denied")
+
+            def delete(self, *a, **k):
+                raise RuntimeError("permission denied")
+
             def create(self, *a, **k):
                 raise RuntimeError("permission denied")
 
-        c, _ = self._client(M())
-        self.assertIsNone(c.write_memory("mem_1", "/shared_lessons.md", "body"),
+        c = _memories_client(Broken(docs={"/lessons_learned.md": "old"}))
+        self.assertIsNone(c.write_memory("memstore_1", "/lessons_learned.md", "new"),
                           "a failed write must be reported, not swallowed into success")
 
 
@@ -424,68 +475,51 @@ class EventUsageTest(unittest.TestCase):
 
 
 class ReadMemoryTest(unittest.TestCase):
-    """Reading a memory document back, across SDK surfaces that differ by version.
+    """Reading a memory document back through the real memories surface.
 
     write_memory has existed since the shared-lessons work; the learning cycle is
-    the first thing that must READ what an agent wrote. Same posture: try the
-    likely SDK shapes in turn, and a total failure is None, never a raise — the
-    caller marks the doc unavailable rather than analyzing a fabricated one.
+    the first thing that must READ what an agent wrote. The first version guessed
+    retrieve(store_id, path=...) — wrong on the real SDK, so every read silently
+    returned None and Fable analyzed with each doc "(unavailable)". A total
+    failure is still None, never a raise — the caller marks the doc unavailable
+    rather than analyzing a fabricated one.
     """
 
-    def _client(self, memories):
-        stores = _FakeMemoryStores()
-        stores.memories = memories
-        return _NSClient.build({"memory_stores": stores})
-
-    def test_retrieve_is_preferred_when_the_sdk_has_it(self):
-        class M:
-            def retrieve(self, store_id, path=None):
-                return {"path": path, "content": "the lessons"}
-
-            def get(self, *a, **k):
-                raise AssertionError("get must not be used when retrieve works")
-
-        self.assertEqual(self._client(M()).read_memory("mem_1", "/lessons_learned.md"),
+    def test_reads_content_straight_from_the_full_view_listing(self):
+        m = RealShapeMemories(docs={"/other.md": "no",
+                                    "/lessons_learned.md": "the lessons"})
+        c = _memories_client(m)
+        self.assertEqual(c.read_memory("memstore_1", "/lessons_learned.md"),
                          "the lessons")
+        self.assertEqual(m.retrieved, [], "one listing suffices when it has content")
 
-    def test_falls_back_to_get(self):
-        class M:
-            def retrieve(self, store_id, path=None):
-                raise RuntimeError("permission denied")
-
-            def get(self, store_id, path=None):
-                return {"path": path, "content": "via get"}
-
-        self.assertEqual(self._client(M()).read_memory("mem_1", "/lessons_learned.md"),
-                         "via get")
-
-    def test_falls_back_to_list_and_match(self):
-        class M:
-            def list(self, store_id):
-                return [{"path": "/other.md", "content": "no"},
-                        {"path": "/lessons_learned.md", "content": "via list"}]
-
-        self.assertEqual(self._client(M()).read_memory("mem_1", "/lessons_learned.md"),
-                         "via list")
+    def test_falls_back_to_retrieve_by_id_when_the_listing_has_no_content(self):
+        m = RealShapeMemories(docs={"/lessons_learned.md": "the lessons"},
+                              content_on_list=False)
+        c = _memories_client(m)
+        self.assertEqual(c.read_memory("memstore_1", "/lessons_learned.md"),
+                         "the lessons")
+        self.assertEqual(m.retrieved, [("mem_0", "memstore_1")])
 
     def test_block_list_content_is_joined(self):
-        class M:
-            def retrieve(self, store_id, path=None):
-                return {"path": path, "content": [{"type": "text", "text": "part one "},
-                                                  {"type": "text", "text": "part two"}]}
-
-        self.assertEqual(self._client(M()).read_memory("mem_1", "/lessons_learned.md"),
+        m = RealShapeMemories(docs={"/lessons_learned.md":
+                                    [{"type": "text", "text": "part one "},
+                                     {"type": "text", "text": "part two"}]})
+        c = _memories_client(m)
+        self.assertEqual(c.read_memory("memstore_1", "/lessons_learned.md"),
                          "part one part two")
 
-    def test_total_failure_returns_none_rather_than_raising(self):
-        class M:
-            def retrieve(self, *a, **k):
-                raise RuntimeError("permission denied")
+    def test_a_missing_document_is_none(self):
+        c = _memories_client(RealShapeMemories(docs={"/other.md": "x"}))
+        self.assertIsNone(c.read_memory("memstore_1", "/lessons_learned.md"))
 
+    def test_total_failure_returns_none_rather_than_raising(self):
+        class Broken(RealShapeMemories):
             def list(self, *a, **k):
                 raise RuntimeError("permission denied")
 
-        self.assertIsNone(self._client(M()).read_memory("mem_1", "/lessons_learned.md"))
+        c = _memories_client(Broken())
+        self.assertIsNone(c.read_memory("memstore_1", "/lessons_learned.md"))
 
 
 class SessionMemoryResourceTest(unittest.TestCase):

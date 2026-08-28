@@ -445,39 +445,59 @@ class ManagedAgentsClient:
                 return None
             raise
 
+    def _find_memory_id(self, store_id, path):
+        """The ``mem_...`` id of the memory document at ``path``, or None.
+        Memories are PATH-addressed only on create; update/delete/retrieve are
+        addressed by memory id, so writes and reads both start here. Skips
+        ``memory_prefix`` (directory) nodes; best-effort — never raises."""
+        try:
+            res = _retry(lambda: self._agents_ns("memory_stores").memories.list(store_id))
+        except Exception:                                  # noqa: BLE001
+            return None
+        for m in _data(res) or []:
+            if _attr(m, "type") == "memory_prefix":
+                continue
+            if _attr(m, "path") == path:
+                return _idof(m)
+        return None
+
     def read_memory(self, store_id, path):
         """The text content of the memory document at ``path``, or None when it
-        cannot be read. Defensive across SDK shapes like write_memory: try
-        memories.retrieve / memories.get with (store_id, path=...), then fall back
-        to list-and-match. Best-effort — never raises; the caller decides what a
-        missing document means (the learning cycle marks it unavailable rather
-        than substituting a seed that could look like wiped memory)."""
+        cannot be read. Documented shape: ``memories.list(store_id, view="full")``
+        includes content per entry; ``memories.retrieve(mem_id,
+        memory_store_id=...)`` is the by-id read. Best-effort — never raises; the
+        caller decides what a missing document means (the learning cycle marks it
+        unavailable rather than substituting a seed that could look like wiped
+        memory)."""
         try:
             memories = self._agents_ns("memory_stores").memories
         except Exception:                                  # noqa: BLE001
             return None
-        for name in ("retrieve", "get"):
-            fn = getattr(memories, name, None)
-            if not callable(fn):
-                continue
-            try:
-                doc = _retry(lambda fn=fn: fn(store_id, path=path))
-            except Exception:                              # noqa: BLE001
-                continue
-            text = _memory_text(doc)
-            if text is not None:
-                return text
         try:
-            res = _retry(lambda: memories.list(store_id))
+            res = _retry(lambda: memories.list(store_id, view="full"))
+        except TypeError:                                  # SDK without the view kwarg
+            try:
+                res = _retry(lambda: memories.list(store_id))
+            except Exception:                              # noqa: BLE001
+                return None
         except Exception:                                  # noqa: BLE001
             return None
+        mem_id = None
         for m in _data(res) or []:
-            if _attr(m, "path") != path:
+            if _attr(m, "type") == "memory_prefix" or _attr(m, "path") != path:
                 continue
             text = _memory_text(m)
             if text is not None:
                 return text
-        return None
+            mem_id = _idof(m)
+            break
+        if not mem_id:
+            return None
+        try:
+            doc = _retry(lambda: memories.retrieve(mem_id, memory_store_id=store_id))
+        except Exception:                                  # noqa: BLE001
+            return None
+        return _memory_text(doc)
 
     # Deployed agents run on the platform: run_deployment() takes no per-run input, so
     # the ONLY way to hand a live agent anything is its memory store, which it already
@@ -490,11 +510,15 @@ class ManagedAgentsClient:
         seed_memory deliberately KEEPS existing content (a redeploy must never wipe an
         agent's memory), so it cannot be used to refresh anything. This can.
 
-        The Managed Agents surface differs across SDK versions, so each strategy is
-        tried in turn and the one that worked is logged. Returns the strategy name, or
-        None if the document could not be written -- and says so loudly, because a
-        silent no-op here means the agent runs without the lessons and every table
-        downstream stays empty looking exactly like "nothing to share".
+        Documented shape: only ``create`` is path-addressed (409 when the path is
+        occupied); ``update``/``delete`` take the ``mem_...`` id first with
+        ``memory_store_id`` as a keyword — the earlier guess of update(store_id,
+        path=...) failed on exactly that in production, which is why the id lookup
+        comes first. Each strategy is still tried in turn and the one that worked
+        is logged. Returns the strategy name, or None if the document could not be
+        written -- and says so loudly, because a silent no-op here means the agent
+        runs without the lessons and every table downstream stays empty looking
+        exactly like "nothing to share".
         """
         memories = self._agents_ns("memory_stores").memories
         attempts = []
@@ -508,13 +532,14 @@ class ManagedAgentsClient:
                 attempts.append(f"{name}: {type(e).__name__}: {str(e)[:120]}")
                 return None
 
-        if hasattr(memories, "update"):
+        mem_id = self._find_memory_id(store_id, path)
+        if mem_id:
             got = _try("update", lambda: _retry(lambda: memories.update(
-                store_id, path=path, content=content)))
+                mem_id, memory_store_id=store_id, content=content)))
             if got:
                 return got
-        if hasattr(memories, "delete"):
-            _try("delete", lambda: _retry(lambda: memories.delete(store_id, path=path)))
+            _try("delete", lambda: _retry(lambda: memories.delete(
+                mem_id, memory_store_id=store_id)))
         got = _try("create", lambda: _retry(lambda: memories.create(
             store_id, path=path, content=content)))
         if got:
