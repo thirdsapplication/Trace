@@ -677,7 +677,12 @@ class AgentWriteMapTest(unittest.TestCase):
         sb = registry._agent_to_sb({
             "agent_id": "a1", "owner_user_id": "u1", "name": "Shipping",
             "status": "live", "deployed_at": "2026-08-26T10:00:00Z"})
-        self.assertEqual(sb["status"], "live",
+        # "deployed", not "live": the column's CHECK constraint allows
+        # draft|built|deployed|archived, and sending the deploy record's word for the
+        # same state is what refused every go-live for two days. The state still
+        # survives the map, which is what this test is for — it just arrives in the
+        # vocabulary the column actually has.
+        self.assertEqual(sb["status"], "deployed",
                          "status dropped — every agent reads back as draft")
         self.assertEqual(sb["deployed_at"], "2026-08-26T10:00:00Z",
                          "deployed_at dropped — 'which agents are live?' is unanswerable")
@@ -768,3 +773,27 @@ class AgentUpsertResilienceTest(unittest.TestCase):
         admin, _ = self._fake_admin(lambda row: True)      # rejects even without them
         with self.assertRaises(Exception):
             self._run(admin)
+
+
+class AgentStatusVocabularyTest(unittest.TestCase):
+    """agents.status is constrained to draft | built | deployed | archived. The deploy
+    record calls the live state "live", and sending that word is what refused every
+    go-live from 2026-08-26 — after the platform agent had already been created."""
+
+    def test_live_is_written_as_the_value_the_column_allows(self):
+        sb = registry._agent_to_sb({"agent_id": "a1", "status": "live"})
+        self.assertEqual(sb["status"], "deployed")
+
+    def test_the_columns_own_vocabulary_passes_through(self):
+        for word in ("draft", "built", "deployed", "archived"):
+            self.assertEqual(registry._agent_to_sb({"status": word})["status"], word)
+
+    def test_an_unknown_status_is_dropped_rather_than_refused(self):
+        sb = registry._agent_to_sb({"agent_id": "a1", "name": "A", "status": "wat"})
+        self.assertNotIn("status", sb)
+        self.assertEqual(sb["name"], "A", "the rest of the row still goes")
+
+    def test_the_constraints_vocabulary_is_covered(self):
+        """If the column ever gains a state, this is where the mapping must learn it."""
+        self.assertEqual(set(registry.AGENT_STATUS_DB.values()),
+                         {"draft", "built", "deployed", "archived"})

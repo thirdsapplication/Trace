@@ -69,7 +69,9 @@ class MappingCompletenessTest(unittest.TestCase):
         live — all 13 production agents read 'draft' forever."""
         sb = registry._agent_to_sb({"agent_id": "a", "owner_user_id": "u",
                                     "status": "live", "deployed_at": "2026-08-26T00:00:00Z"})
-        self.assertEqual(sb.get("status"), "live")
+        # Translated to the column's own vocabulary (draft|built|deployed|archived);
+        # the raw "live" the deploy record uses is what the CHECK constraint refused.
+        self.assertEqual(sb.get("status"), "deployed")
         self.assertEqual(sb.get("deployed_at"), "2026-08-26T00:00:00Z")
 
     def test_unexposed_columns_are_real_columns(self):

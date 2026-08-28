@@ -72,6 +72,18 @@ def _agent_to_caller(row):
     return d
 
 
+# The agents.status column carries a CHECK constraint with its own vocabulary:
+#     status IN ('draft', 'built', 'deployed', 'archived')
+# deploy.py's record calls that last state "live" and app.py checks for that word, so
+# the two vocabularies have to meet somewhere. Here, at the one boundary that maps
+# caller shape to columns — not by inventing a fifth value the constraint would have
+# to be widened for, and above all not by sending a word the database will refuse:
+# from 2026-08-26 that refusal failed every go-live AFTER the platform agent existed,
+# leaving it live in the console and invisible in the app.
+AGENT_STATUS_DB = {"live": "deployed", "deployed": "deployed",
+                   "built": "built", "draft": "draft", "archived": "archived"}
+
+
 def _agent_to_sb(agent):
     """Convert a caller-shape agent dict to Supabase column names for upsert."""
     sb = {}
@@ -87,9 +99,16 @@ def _agent_to_sb(agent):
     # which is exactly how this survived the suite.
     for key in ("external_user_id", "bundle_id", "name", "vault_ref", "trigger",
                 "session_id", "deployment_id", "memory_store_id", "owner_email",
-                "description", "status", "deployed_at"):
+                "description", "deployed_at"):
         if key in agent:
             sb[key] = agent[key]
+    if "status" in agent:
+        mapped = AGENT_STATUS_DB.get(str(agent["status"] or "").strip().lower())
+        if mapped:                                 # an unrecognized status is DROPPED,
+            sb["status"] = mapped                  # never sent for the CHECK to refuse
+        else:
+            print(f"[registry] unknown agent status {agent['status']!r} for "
+                  f"{agent.get('agent_id')} — not recorded", flush=True)
     if "staged_apps" in agent:
         sb["staged_apps"] = list(agent.get("staged_apps") or [])
     return sb
