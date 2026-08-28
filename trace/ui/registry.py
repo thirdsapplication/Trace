@@ -230,20 +230,15 @@ def agents_visible_to(root, owner_user_id, team_owner_ids=None):
     return out
 
 
-# The columns _agent_to_caller actually exposes. Selecting "*" also pulled live_yaml,
-# interview and grounding — the three large server-side payloads listed in
-# AGENT_COLUMNS_NOT_EXPOSED, which every caller then discards. They crossed the wire
-# on every agent list, once per owner.
-AGENT_SELECT = ("id, owner_id, external_user_id, bundle_id, name, vault_ref, trigger, "
-                "session_id, staged_apps, deployment_id, memory_store_id, owner_email, "
-                "description, deployed_at, created_at, color, status, team_id, "
-                "lesson_contribute_scope, lesson_consume_scope")
-
-
 def agents_for_user(root, owner_user_id):
+    # select("*") on purpose. Naming the columns saves pulling live_yaml/interview/
+    # grounding, but several columns on this table (description, status, deployed_at)
+    # come from migrations that predate this repo, so an explicit list turns a
+    # database that is merely older into a hard PostgREST error on the query behind
+    # every agent list. Not a trade worth making for a few kilobytes.
     if supa.is_configured():
         admin = supa.get_admin()
-        r = admin.table("agents").select(AGENT_SELECT) \
+        r = admin.table("agents").select("*") \
             .eq("owner_id", owner_user_id) \
             .order("created_at", desc=True).execute()
         return [_agent_to_caller(row) for row in (r.data or [])]

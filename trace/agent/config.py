@@ -68,7 +68,11 @@ RETRY_BASE_DELAY = 1.5                   # seconds; doubles each attempt
 # What the SDK client itself retries UNDER _retry. The two budgets multiply, so this
 # stays small: at RETRY_ATTEMPTS on both layers a single failing call took 30 HTTP
 # attempts and ~60 minutes, which is how one bad session id could hang a page load.
-SDK_MAX_RETRIES = 1
+# Not 1, though: create_deployment and run_deployment deliberately bypass _retry
+# (a retry there could create a second live deployment), so the SDK's budget is the
+# ONLY resilience they have against a transient 429/503 — and a deploy that fails
+# leaves a live platform agent the app never records.
+SDK_MAX_RETRIES = 3
 MOUNT_PATH = "/workspace/files"          # where the Test Deployer mounts artifacts
 # Mounted files are READ-ONLY copies; the agent must write outputs to a new path.
 # The framing makes this contractual and the Deployer retrieves session-scoped files.
