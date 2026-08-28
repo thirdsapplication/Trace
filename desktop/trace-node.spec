@@ -23,8 +23,9 @@ a = Analysis(
     [os.path.join(ROOT, "desktop", "trace_node_entry.py")],
     pathex=[ROOT],
     binaries=[],
-    # Static UI is proxied from the cloud in desktop mode, but bundle it anyway so
-    # nothing breaks if a local static route is ever hit; both dirs are tiny.
+    # The desktop node prefers the CLOUD copy of the UI so a deployed front-end fix
+    # reaches an already-installed app; this bundled copy is the fallback it serves
+    # when the cloud is slow, cold or unreachable. Both dirs are tiny.
     datas=[
         (os.path.join(ROOT, "trace", "ui", "app_static"), "trace/ui/app_static"),
         (os.path.join(ROOT, "trace", "ui", "static"), "trace/ui/static"),

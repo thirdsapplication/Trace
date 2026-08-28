@@ -112,6 +112,10 @@ def _interview_record(bid, questions, answers):
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")          # founder Test UI
 APP_STATIC_DIR = os.path.join(os.path.dirname(__file__), "app_static")  # end-user UI (WS2)
+# Desktop: how long one UI asset may wait on the cloud before falling back to the
+# bundled copy. Short on purpose — a cold backend must cost a beat, never the app.
+DESKTOP_UI_TIMEOUT = 4
+DESKTOP_UI_CACHE_TTL = 60        # seconds a fetched asset is reused in-process
 # Phase B (B5d): a cross-user lesson confirmed by this many DISTINCT users graduates to a
 # global auto-trusted default — it then injects without the per-agent confirm checkpoint.
 FLEET_DEFAULT_CONFIRMATIONS = 5
@@ -289,6 +293,7 @@ class AppState:
         # never comes back, so each is discovered once and then skipped by BOTH the
         # learning cycle and the activity refresh — without this, an agent whose
         # history was cleaned up re-fetched the same dead sessions forever.
+        self._ui_cache = {}          # desktop: rel -> (ctype, bytes, expires_epoch)
         self._sessions_gone = set()
         self._activity_refreshing = set()  # agent_ids with a background refresh running
         self.chat_jobs = {}          # agent_id -> {state, error} (a DM reply in flight)
@@ -304,6 +309,16 @@ class AppState:
         self.started_at = time.time()
         self.lock = threading.Lock()
         os.makedirs(sessions_root, exist_ok=True)
+
+    def ui_cache_get(self, rel):
+        """A recently fetched cloud UI asset, or None. Desktop only."""
+        hit = self._ui_cache.get(rel)
+        if not hit or hit[2] <= time.time():
+            return None
+        return hit[0], hit[1]
+
+    def ui_cache_put(self, rel, ctype, data):
+        self._ui_cache[rel] = (ctype, data, time.time() + DESKTOP_UI_CACHE_TTL)
 
     def _default_cleanup(self, session_ids, file_ids, agent_ids, agent_names=None,
                          deployment_ids=None, memory_store_ids=None):
@@ -2886,14 +2901,15 @@ def make_handler(state):
             # already granted.
             if p.startswith("/api/u/permissions") or p.startswith("/api/permissions"):
                 return True
-            # The end-user UI shell is bundled into the desktop node, so serve it
-            # locally: first paint stops depending on a cloud round-trip (60s
-            # timeout per request, cold starts included). The page is public and
-            # every data call it makes is still proxied/authed as before.
-            # TRACE_DESKTOP_LOCAL_UI=0 restores proxying, e.g. to pick up a cloud
-            # UI deploy without shipping a new app build.
-            if ((p == "/app" or p.startswith("/app/"))
-                    and os.environ.get("TRACE_DESKTOP_LOCAL_UI", "1") != "0"):
+            # UI assets are handled by _serve_app_desktop rather than the generic
+            # proxy, so they are claimed here in every case. That handler fetches
+            # the CLOUD copy first — so a UI deploy reaches an already-installed
+            # app, which is what the bundle was always documented to be a fallback
+            # for — bounded by a short timeout, dropping to the bundled copy when
+            # the cloud is slow, cold or unreachable. Serving the bundle
+            # unconditionally, as this did, meant no UI fix could reach a desktop
+            # user again without shipping a whole new app build.
+            if p == "/app" or p.startswith("/app/"):
                 return True
             return p.startswith("/api/u/capture/") or p.startswith("/api/capture/")
 
@@ -3810,9 +3826,9 @@ def make_handler(state):
                     return self._json(404, {"error": "not_found"})
                 return self._serve_static(p[len("/static/"):])
             if p == "/app" or p == "/app/":                 # end-user UI (WS2)
-                return self._serve_app("index.html")
+                return self._serve_app_desktop("index.html")
             if p.startswith("/app/"):
-                return self._serve_app(p[len("/app/"):])
+                return self._serve_app_desktop(p[len("/app/"):])
             if p == "/admin" or p == "/admin/":             # admin portal (data is token-gated)
                 return self._serve_admin("index.html")
             if p.startswith("/admin/"):
@@ -3977,6 +3993,45 @@ def make_handler(state):
             with open(full, "rb") as f:
                 self._text(200, f.read(), _CONTENT_TYPES.get(ext, "application/octet-stream"),
                            no_cache=True)
+
+        def _serve_app_desktop(self, rel):
+            """Serve one UI asset. On the desktop node, prefer the CLOUD copy so a
+            deployed UI fix reaches an already-installed app — the bundled copy is
+            the fallback it was always documented to be (see desktop/trace-node.spec).
+
+            The reason it became local-only was real: proxying every asset meant a
+            60s-timeout round trip each, cold starts included, which hung the splash.
+            So the cloud attempt is bounded by DESKTOP_UI_TIMEOUT and a failure falls
+            straight through to the bundle — a slow or unreachable cloud costs a few
+            seconds once, not a broken app. Successful fetches are cached in memory
+            briefly so one page load doesn't pay the round trip per file.
+            """
+            if not state.cloud_backend or os.environ.get("TRACE_DESKTOP_LOCAL_UI") == "1":
+                return self._serve_app(rel)
+            rel = (rel or "").lstrip("/") or "index.html"
+            hit = state.ui_cache_get(rel)
+            if hit is not None:
+                ctype, data = hit
+                return self._text(200, data, ctype, no_cache=True)
+            try:
+                status, headers, data = state.proxy_fn(
+                    state.cloud_backend, "GET", "/app/" + rel, {}, None,
+                    timeout=DESKTOP_UI_TIMEOUT)
+            except TypeError:                              # proxy_fn without a timeout arg
+                try:
+                    status, headers, data = state.proxy_fn(
+                        state.cloud_backend, "GET", "/app/" + rel, {}, None)
+                except Exception:                          # noqa: BLE001
+                    return self._serve_app(rel)
+            except Exception:                              # noqa: BLE001 — cold/unreachable
+                return self._serve_app(rel)
+            if status != 200 or not data:
+                return self._serve_app(rel)
+            ctype = next((v for k, v in headers if k.lower() == "content-type"),
+                         _CONTENT_TYPES.get(os.path.splitext(rel)[1],
+                                            "application/octet-stream"))
+            state.ui_cache_put(rel, ctype, data)
+            return self._text(200, data, ctype, no_cache=True)
 
         def _serve_app(self, rel):
             """Serve the end-user UI (WS2) from app_static/. Unknown sub-paths fall back to

@@ -281,15 +281,65 @@ class DesktopStartupTest(unittest.TestCase):
             finally:
                 httpd.shutdown(); httpd.server_close()
 
-    def test_local_ui_escape_hatch_restores_proxying(self):
-        os.environ["TRACE_DESKTOP_LOCAL_UI"] = "0"
+    def test_a_deployed_ui_reaches_an_installed_app(self):
+        """The whole point of preferring the cloud copy: a UI fix must reach a
+        desktop user without shipping a new app build. Serving the bundled copy
+        unconditionally meant no front-end fix could ever arrive — a fixed app.js
+        sat on the server for days while the installed app kept running the old
+        one and looked, from the outside, exactly like an unfixed server."""
+        calls = []
+
+        def cloud_ui(base, method, path, headers=None, body=None, timeout=None):
+            calls.append((path, timeout))
+            return 200, [("Content-Type", "application/javascript")], b"// NEW FROM CLOUD"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state = self._desktop_state(tmp)
+            state.proxy_fn = cloud_ui
+            httpd, port = _serve(state)
+            try:
+                status, body = self._get(port, "/app/app.js")
+                self.assertEqual(status, 200)
+                self.assertEqual(body, b"// NEW FROM CLOUD")
+                self.assertEqual(calls[0][0], "/app/app.js")
+                self.assertIsNotNone(calls[0][1], "the cloud attempt must be bounded")
+                self.assertLessEqual(calls[0][1], app.DESKTOP_UI_TIMEOUT)
+                # …and one page load must not pay that round trip per file.
+                self._get(port, "/app/app.js")
+                self.assertEqual(len(calls), 1)
+            finally:
+                httpd.shutdown(); httpd.server_close()
+
+    def test_a_cloud_error_status_falls_back_to_the_bundle(self):
+        def five_hundred(*a, **k):
+            return 500, [("Content-Type", "text/html")], b"boom"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state = self._desktop_state(tmp)
+            state.proxy_fn = five_hundred
+            httpd, port = _serve(state)
+            try:
+                status, body = self._get(port, "/app/app.js")
+                self.assertEqual(status, 200)
+                self.assertIn(b"function boot", body)      # the bundled copy
+            finally:
+                httpd.shutdown(); httpd.server_close()
+
+    def test_the_local_only_override_never_touches_the_cloud(self):
+        """TRACE_DESKTOP_LOCAL_UI=1 pins the app to its bundled UI (offline dev)."""
+        os.environ["TRACE_DESKTOP_LOCAL_UI"] = "1"
         try:
             with tempfile.TemporaryDirectory() as tmp:
-                httpd, port = _serve(self._desktop_state(tmp))
+                state = self._desktop_state(tmp)
+
+                def forbidden(*a, **k):
+                    raise AssertionError("must not reach for the cloud")
+                state.proxy_fn = forbidden
+                httpd, port = _serve(state)
                 try:
-                    status, body = self._get(port, "/app")   # proxied → raising stub → 502
-                    self.assertEqual(status, 502)
-                    self.assertEqual(json.loads(body)["error"], "cloud_unreachable")
+                    status, body = self._get(port, "/app/app.js")
+                    self.assertEqual(status, 200)
+                    self.assertIn(b"function boot", body)
                 finally:
                     httpd.shutdown(); httpd.server_close()
         finally:
