@@ -252,6 +252,25 @@ class LearningCycleTest(unittest.TestCase):
         self.assertIsNone(self.state.maybe_run_learning_cycle(agent))
         self.assertEqual(self.learn_calls, [])
 
+    def test_verbose_says_why_an_agent_was_skipped(self):
+        """A silently skipped agent is indistinguishable from an unchecked one —
+        'why is nothing learning?' must have an answer in the log."""
+        import contextlib
+        import io
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.state.maybe_run_learning_cycle(
+                dict(self.agent, memory_store_id=None), verbose=True)
+        self.assertIn("no memory store", out.getvalue())
+        self.assertIn("redeploy", out.getvalue())
+
+        self._seed_runs(self.N - 2)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.state.maybe_run_learning_cycle(self.agent, verbose=True)
+        self.assertIn(f"{self.N - 2} eligible session(s)", out.getvalue())
+
     def test_prior_cycles_feed_the_next_analysis(self):
         registry.learning_cycle_add(self.root, {
             "agent_id": "a1", "owner_user_id": "u1",
@@ -279,7 +298,7 @@ class TriggerWiringTest(unittest.TestCase):
         self.state = app.AppState(sessions_root=self.root)
         self.asked = []
         self.state.maybe_run_learning_cycle = \
-            lambda a: self.asked.append(a.get("agent_id")) or None
+            lambda a, **kw: self.asked.append(a.get("agent_id")) or None
 
     def tearDown(self):
         self.state.scheduler_stop.set()

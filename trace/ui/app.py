@@ -1776,7 +1776,7 @@ class AppState:
                 last_check = self._learning_checked.get(agent_id, 0)
                 if fresh or now - last_check >= agent_config.LEARNING_CHECK_SECONDS:
                     self._learning_checked[agent_id] = now
-                    self.maybe_run_learning_cycle(agent)
+                    self.maybe_run_learning_cycle(agent, verbose=fresh)
             except Exception:                              # noqa: BLE001
                 pass                                       # one bad agent never kills the pass
 
@@ -1820,7 +1820,7 @@ class AppState:
         return bool(wrote)
 
     # --- learning cycles: Fable-driven periodic self-improvement ---------
-    def maybe_run_learning_cycle(self, agent):
+    def maybe_run_learning_cycle(self, agent, verbose=False):
         """Best-effort trigger: when >= LEARNING_CYCLE_SESSIONS eligible runs have
         accrued since the last learning cycle, spawn one on a daemon thread (a
         Fable call producing a full replacement doc takes far longer than an HTTP
@@ -1831,11 +1831,24 @@ class AppState:
         Statuses are deliberately NOT filtered: deployment rows are recorded at
         session start and stay "ran" forever, so real terminality is checked
         against live events in the worker. Returns the started Thread (tests
-        join it) or None. Never raises."""
+        join it) or None. Never raises.
+
+        ``verbose`` prints the skip reason — passed by the call sites when a run
+        just happened, so every scheduled run leaves one line of learning progress
+        in the log, while the throttled re-checks stay silent. Without this, a
+        skipped agent was indistinguishable from an unchecked one and "why is
+        nothing learning?" had no answer in the log."""
         try:
             aid = agent.get("agent_id")
-            if not aid or not agent.get("memory_store_id"):
-                return None                  # pre-memory agents keep working, as in _deliver_guidance
+            if not aid:
+                return None
+            if not agent.get("memory_store_id"):
+                # pre-memory agents keep working, as in _deliver_guidance
+                if verbose:
+                    print(f"[learning] {aid} has no memory store — deployed before "
+                          f"memory stores existed; redeploy it to enable learning",
+                          flush=True)
+                return None
             root = self.sessions_root
             cycles = registry.learning_cycles_for_agent(root, aid, limit=1)
             since = str(cycles[0].get("created_at") or "") if cycles else ""
@@ -1846,6 +1859,9 @@ class AppState:
                      and r.get("run_session_id") not in self._learning_gone
                      and str(r.get("ran_at") or r.get("started_at") or "") > since]
             if len(batch) < n:
+                if verbose:
+                    print(f"[learning] {aid}: {len(batch)} eligible session(s) "
+                          f"since the last cycle — a cycle runs at {n}", flush=True)
                 return None
             with self.lock:
                 if aid in self._learning_inflight:
@@ -2529,7 +2545,7 @@ class AppState:
         registry.schedule_mark_run(self.sessions_root, agent.get("agent_id"))
         # Trace-side runs are terminal by this point, so the learning-cycle gate
         # usually passes immediately — the freshest moment to learn from the batch.
-        self.maybe_run_learning_cycle(agent)
+        self.maybe_run_learning_cycle(agent, verbose=True)
         # Actionable outcomes arrive as a DM from the agent (routine completions
         # surface as stories instead, so the inbox stays signal-only).
         if rec["status"] == "failed":
