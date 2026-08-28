@@ -125,6 +125,23 @@ def _run_to_caller(row):
     }
 
 
+def _cycle_to_caller(row):
+    """Convert a Supabase learning_cycles row to the dict shape callers expect.
+    Both halves of the round trip name every column (see the color/status lessons
+    on _agent_to_caller above)."""
+    return {
+        "agent_id": str(row.get("agent_id")) if row.get("agent_id") else None,
+        "owner_user_id": str(row.get("owner_id")) if row.get("owner_id") else None,
+        "session_stats": row.get("session_stats") or [],
+        "total_input_tokens": row.get("total_input_tokens"),
+        "total_output_tokens": row.get("total_output_tokens"),
+        "tokens_estimated": bool(row.get("tokens_estimated")),
+        "analysis": row.get("analysis"),
+        "docs_written": row.get("docs_written") or [],
+        "created_at": row.get("created_at"),
+    }
+
+
 def _pending_to_caller(row):
     """Convert a Supabase pending_actions row to the dict shape callers expect."""
     return {
@@ -437,6 +454,53 @@ def run_seen_drun_ids(root, agent_id):
             return {json.loads(line).get("drun_id") for line in f if line.strip()} - {None}
     except FileNotFoundError:
         return set()
+
+
+# --- learning cycles (Fable-driven periodic self-improvement) ----------------
+def learning_cycle_add(root, rec):
+    """rec: {agent_id, owner_user_id, session_stats, total_input_tokens,
+    total_output_tokens, tokens_estimated, analysis, docs_written}.
+    session_stats: [{session_id, status, total_tokens, estimated}] — the per-run
+    token record lives HERE rather than as agent_runs columns: file-mode runs are
+    append-only JSONL with no update path, and tokens are only known when the
+    cycle fetches the session events, hours after run_add (see 021's header)."""
+    if supa.is_configured():
+        admin = supa.get_admin()
+        admin.table("learning_cycles").insert({
+            "agent_id": rec.get("agent_id"),
+            "owner_id": rec.get("owner_user_id"),
+            "session_stats": rec.get("session_stats") or [],
+            "total_input_tokens": rec.get("total_input_tokens"),
+            "total_output_tokens": rec.get("total_output_tokens"),
+            "tokens_estimated": bool(rec.get("tokens_estimated")),
+            "analysis": rec.get("analysis"),
+            "docs_written": rec.get("docs_written") or [],
+        }).execute()
+        return
+    with _LOCK:
+        p = os.path.join(_dir(root), f"learning_cycles_{_safe(rec['agent_id'])}.jsonl")
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(json.dumps({**rec, "created_at": _now_iso()}, default=str) + "\n")
+
+
+def learning_cycles_for_agent(root, agent_id, limit=5):
+    """Newest-first learning-cycle rows for one agent, in caller shape. The newest
+    row's created_at is the sessions-since-last-cycle watermark; the next few feed
+    the prompt's efficiency feedback loop."""
+    if supa.is_configured():
+        admin = supa.get_admin()
+        r = admin.table("learning_cycles").select("*") \
+            .eq("agent_id", agent_id) \
+            .order("created_at", desc=True) \
+            .limit(limit).execute()
+        return [_cycle_to_caller(row) for row in (r.data or [])]
+    p = os.path.join(_dir(root), f"learning_cycles_{_safe(agent_id)}.jsonl")
+    try:
+        with open(p, encoding="utf-8") as f:
+            rows = [json.loads(line) for line in f if line.strip()]
+    except FileNotFoundError:
+        return []
+    return list(reversed(rows))[:limit]
 
 
 # --- pending (staged) actions — Spec 8 -------------------------------------

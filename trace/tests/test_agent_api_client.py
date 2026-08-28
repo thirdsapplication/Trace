@@ -390,6 +390,104 @@ class DeploymentClientTest(unittest.TestCase):
         self.assertEqual(out["errors"], [])
 
 
+class EventUsageTest(unittest.TestCase):
+    """Token usage must survive event normalization — the learning cycle's cost
+    accounting reads it, and _full_event_dict used to discard it silently."""
+
+    def test_usage_on_the_event_itself_is_preserved(self):
+        d = api_client._full_event_dict({"type": "agent.message", "content": "hi",
+                                         "usage": {"input_tokens": 120, "output_tokens": 30}})
+        self.assertEqual(d["usage"], {"input_tokens": 120, "output_tokens": 30})
+
+    def test_usage_nested_under_message_is_found(self):
+        d = api_client._full_event_dict(
+            {"type": "agent.message", "content": "hi",
+             "message": {"usage": {"input_tokens": 7, "output_tokens": 2,
+                                   "cache_read_input_tokens": 500}}})
+        self.assertEqual(d["usage"], {"input_tokens": 7, "output_tokens": 2,
+                                      "cache_read_input_tokens": 500})
+
+    def test_usage_nested_under_span_is_found(self):
+        d = api_client._full_event_dict(
+            {"type": "span.turn", "span": {"usage": {"input_tokens": 9, "output_tokens": 1}}})
+        self.assertEqual(d["usage"], {"input_tokens": 9, "output_tokens": 1})
+
+    def test_no_usage_normalizes_to_none(self):
+        d = api_client._full_event_dict({"type": "agent.message", "content": "hi"})
+        self.assertIsNone(d["usage"])
+
+    def test_junk_usage_values_are_dropped(self):
+        d = api_client._full_event_dict(
+            {"type": "agent.message", "content": "hi",
+             "usage": {"input_tokens": "lots", "output_tokens": None}})
+        self.assertIsNone(d["usage"])
+
+
+class ReadMemoryTest(unittest.TestCase):
+    """Reading a memory document back, across SDK surfaces that differ by version.
+
+    write_memory has existed since the shared-lessons work; the learning cycle is
+    the first thing that must READ what an agent wrote. Same posture: try the
+    likely SDK shapes in turn, and a total failure is None, never a raise — the
+    caller marks the doc unavailable rather than analyzing a fabricated one.
+    """
+
+    def _client(self, memories):
+        stores = _FakeMemoryStores()
+        stores.memories = memories
+        return _NSClient.build({"memory_stores": stores})
+
+    def test_retrieve_is_preferred_when_the_sdk_has_it(self):
+        class M:
+            def retrieve(self, store_id, path=None):
+                return {"path": path, "content": "the lessons"}
+
+            def get(self, *a, **k):
+                raise AssertionError("get must not be used when retrieve works")
+
+        self.assertEqual(self._client(M()).read_memory("mem_1", "/lessons_learned.md"),
+                         "the lessons")
+
+    def test_falls_back_to_get(self):
+        class M:
+            def retrieve(self, store_id, path=None):
+                raise RuntimeError("permission denied")
+
+            def get(self, store_id, path=None):
+                return {"path": path, "content": "via get"}
+
+        self.assertEqual(self._client(M()).read_memory("mem_1", "/lessons_learned.md"),
+                         "via get")
+
+    def test_falls_back_to_list_and_match(self):
+        class M:
+            def list(self, store_id):
+                return [{"path": "/other.md", "content": "no"},
+                        {"path": "/lessons_learned.md", "content": "via list"}]
+
+        self.assertEqual(self._client(M()).read_memory("mem_1", "/lessons_learned.md"),
+                         "via list")
+
+    def test_block_list_content_is_joined(self):
+        class M:
+            def retrieve(self, store_id, path=None):
+                return {"path": path, "content": [{"type": "text", "text": "part one "},
+                                                  {"type": "text", "text": "part two"}]}
+
+        self.assertEqual(self._client(M()).read_memory("mem_1", "/lessons_learned.md"),
+                         "part one part two")
+
+    def test_total_failure_returns_none_rather_than_raising(self):
+        class M:
+            def retrieve(self, *a, **k):
+                raise RuntimeError("permission denied")
+
+            def list(self, *a, **k):
+                raise RuntimeError("permission denied")
+
+        self.assertIsNone(self._client(M()).read_memory("mem_1", "/lessons_learned.md"))
+
+
 class SessionMemoryResourceTest(unittest.TestCase):
     def test_create_session_passes_memory_resource_through(self):
         captured = {}

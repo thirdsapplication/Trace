@@ -22,6 +22,17 @@ DEFAULT_MODEL = "claude-sonnet-4-6"
 # Lightweight model for summarizing an agent's session logs into plain language for
 # the activity view (cheap; cached per session).
 SUMMARY_MODEL = "claude-haiku-4-5"
+# Fable-driven periodic learning: every N completed sessions, ONE analysis call
+# reviews the batch (transcripts + per-session token cost) plus the agent's memory
+# docs and rewrites lessons_learned.md so future sessions get more accurate and
+# more token-efficient. See trace/agent/learn.py.
+LEARNING_MODEL = "claude-fable-5"
+LEARNING_CYCLE_SESSIONS = 5              # N: eligible sessions per learning cycle
+LEARNING_CYCLE_MAX_SESSIONS = 10         # payload bound when a backlog accrued
+LEARNING_MAX_TOKENS = 16000              # the reply carries a full replacement doc
+LEARNING_CHECK_SECONDS = 600             # per-agent trigger-check throttle (sync path)
+LEARNING_TRANSCRIPT_CLIP = 12000         # chars of compacted transcript per session
+LEARNING_DOC_CLIP = 90_000               # max chars per written doc ("well under 100KB")
 # Manual-evaluation mode (current): evaluation is done by the user in the Console,
 # so we keep each run cheap — one session per bundle, a single session's tokens —
 # and never fan out. Recent rounds burned credits running many sessions.

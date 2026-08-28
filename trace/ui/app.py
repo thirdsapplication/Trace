@@ -63,6 +63,7 @@ from ..agent import runner as agent_runner
 from ..agent import activity as agent_activity
 from ..agent import embeddings as agent_embeddings
 from ..agent import generalize as agent_generalize
+from ..agent import learn as agent_learn
 from . import (cloud, keystore, notify, permissions, registry, sessions,
                supabase_client, teams, users)
 
@@ -204,7 +205,7 @@ class AppState:
                  discovery_fn=None, describe_fn=None, score_fn=None, artifact_fn=None,
                  interview_fn=None, config_fn=None, cleanup_fn=None,
                  connect_fn=None, deploy_fn=None, cloud_backend=None, proxy_fn=None,
-                 summarize_fn=None):
+                 summarize_fn=None, learn_fn=None):
         self.sessions_root = sessions_root
         self.collector_port = collector_port
         # The founder Test UI (`/`, `/static/`, the unauthenticated `/api/*` routes)
@@ -242,6 +243,10 @@ class AppState:
         # Activity view: a model_fn(system, user)->str that summarizes session logs into
         # plain language (Haiku). Injected as a stub in tests; built lazily from the key.
         self.summarize_fn = summarize_fn
+        # Learning cycles: a model_fn(system, user)->str that analyzes a batch of
+        # sessions and rewrites lessons_learned.md (Fable). Stub in tests; built
+        # lazily from the key.
+        self.learn_fn = learn_fn
         self.controller_factory = controller_factory or (
             lambda out: CaptureController(out, collector_port=collector_port))
         self.keystore = key_store or keystore
@@ -272,6 +277,8 @@ class AppState:
         self.scheduler_stop = threading.Event()   # Spec 4: Trace-side scheduler
         self._scheduler_thread = None
         self._vault_refreshed = {}   # vault_ref -> epoch of last rolling refresh (deployment sync)
+        self._learning_inflight = set()   # agent_ids with a learning cycle running
+        self._learning_checked = {}  # agent_id -> epoch of last learning trigger check
         self.chat_jobs = {}          # agent_id -> {state, error} (a DM reply in flight)
         self._approval_queues = {}   # agent_id -> queue.Queue of tasks (FIFO per agent)
         self._approval_workers = {}  # agent_id -> live drain thread
@@ -576,6 +583,20 @@ class AppState:
         os.environ["ANTHROPIC_API_KEY"] = key
         return self._tap("activity", None, agent_config.SUMMARY_MODEL,
                          lambda: agent_configgen._default_model_fn(agent_config.SUMMARY_MODEL))
+
+    def _learning_model_fn(self):
+        """The injected learner if present (tests), else a lazy Fable caller from the
+        saved key. Raises ``no_api_key`` only if it actually needs to call the model.
+        Every call lands in the admin prompt log under engine "learning"."""
+        if self.learn_fn:
+            return self._tap("learning", None, agent_config.LEARNING_MODEL,
+                             lambda: self.learn_fn)
+        key = self.keystore.get_key()
+        if not key:
+            raise RuntimeError("no_api_key")
+        os.environ["ANTHROPIC_API_KEY"] = key
+        return self._tap("learning", None, agent_config.LEARNING_MODEL,
+                         lambda: agent_learn._default_model_fn(agent_config.LEARNING_MODEL))
 
     # --- teams (frame 30) -------------------------------------------------
     def team_view(self, user):
@@ -1743,6 +1764,14 @@ class AppState:
                             self._agent_dm(agent, f"My last run hit a problem: {summary}")
                 if fresh:
                     registry.schedule_mark_run(self.sessions_root, agent_id)
+                # Learning-cycle trigger. Deployment rows are recorded at session
+                # START, so the fresh-row check almost always defers on the
+                # terminality gate — the throttled periodic re-check is what
+                # actually completes a cycle once the session has ended.
+                last_check = self._learning_checked.get(agent_id, 0)
+                if fresh or now - last_check >= agent_config.LEARNING_CHECK_SECONDS:
+                    self._learning_checked[agent_id] = now
+                    self.maybe_run_learning_cycle(agent)
             except Exception:                              # noqa: BLE001
                 pass                                       # one bad agent never kills the pass
 
@@ -1784,6 +1813,141 @@ class AppState:
             print(f"[guidance] delivered {len(lessons)} lesson(s) to "
                   f"{agent.get('agent_id')}", flush=True)
         return bool(wrote)
+
+    # --- learning cycles: Fable-driven periodic self-improvement ---------
+    def maybe_run_learning_cycle(self, agent):
+        """Best-effort trigger: when >= LEARNING_CYCLE_SESSIONS eligible runs have
+        accrued since the last learning cycle, spawn one on a daemon thread (a
+        Fable call producing a full replacement doc takes far longer than an HTTP
+        handler or a scheduler pass can afford). Eligible = has a run_session_id
+        and kind != "approval" — approval sessions run under a different directive
+        ("act, don't propose"), are tiny, and would skew the workflow analysis,
+        the same reasoning that keeps the activity view from mining them (019).
+        Statuses are deliberately NOT filtered: deployment rows are recorded at
+        session start and stay "ran" forever, so real terminality is checked
+        against live events in the worker. Returns the started Thread (tests
+        join it) or None. Never raises."""
+        try:
+            aid = agent.get("agent_id")
+            if not aid or not agent.get("memory_store_id"):
+                return None                  # pre-memory agents keep working, as in _deliver_guidance
+            root = self.sessions_root
+            cycles = registry.learning_cycles_for_agent(root, aid, limit=1)
+            since = str(cycles[0].get("created_at") or "") if cycles else ""
+            n = agent_config.LEARNING_CYCLE_SESSIONS
+            runs = registry.runs_for_agent(root, aid, limit=max(50, 4 * n))
+            batch = [r for r in runs
+                     if r.get("run_session_id") and r.get("kind") != "approval"
+                     and str(r.get("ran_at") or r.get("started_at") or "") > since]
+            if len(batch) < n:
+                return None
+            with self.lock:
+                if aid in self._learning_inflight:
+                    return None
+                self._learning_inflight.add(aid)
+            try:
+                batch = batch[:agent_config.LEARNING_CYCLE_MAX_SESSIONS]
+                t = threading.Thread(target=self._learning_cycle_worker,
+                                     args=(agent, batch), daemon=True)
+                t.start()
+                return t
+            except Exception:                              # noqa: BLE001 — a failed spawn must
+                with self.lock:                            # release the flag, or this agent
+                    self._learning_inflight.discard(aid)   # could never learn again
+                raise
+        except Exception:                                  # noqa: BLE001 — never block a run
+            return None
+
+    def _learning_cycle_worker(self, agent, batch):
+        try:
+            self._run_learning_cycle(agent, batch)
+        except Exception as e:                             # noqa: BLE001
+            print(f"[learning] cycle failed for {agent.get('agent_id')}: {_why(e)}",
+                  flush=True)
+        finally:
+            with self.lock:
+                self._learning_inflight.discard(agent.get("agent_id"))
+
+    def _run_learning_cycle(self, agent, batch):
+        """Execute one learning cycle: fetch the batch's session events, verify
+        terminality, read the memory docs, make ONE Fable analysis call, write the
+        sanitized replacement doc, and record the cycle. Returns the cycle record,
+        or None when deferred (a session still running) or the model call failed —
+        no cycle row is recorded then, so the same batch is retried later; a clean
+        "nothing to change" IS recorded, so the counter still resets.
+
+        Firing right after new terminal runs were recorded is the race mitigation:
+        the next platform-cron session is typically hours away. The residual race
+        with a concurrently-starting session is accepted — the same acceptance
+        shared_lessons.md was built on."""
+        aid = agent.get("agent_id")
+        store_id = agent.get("memory_store_id")
+        client = self._live_client()
+        events_by_run = self._fanout(
+            [lambda s=r["run_session_id"]: client.list_session_events(s) for r in batch])
+        newest = events_by_run[0] if events_by_run else None
+        if not newest or not agent_activity.is_terminal(newest):
+            print(f"[learning] deferring for {aid} — latest session still running",
+                  flush=True)
+            return None
+        kept = [(r, ev) for r, ev in zip(batch, events_by_run)
+                if ev and agent_activity.is_terminal(ev)]
+        if len(kept) < agent_config.LEARNING_CYCLE_SESSIONS:
+            print(f"[learning] deferring for {aid} — only {len(kept)} terminal "
+                  f"session(s) in the batch", flush=True)
+            return None
+        # Oldest first, so the model reads the batch in the order it happened.
+        records = [agent_learn.session_record(r, ev) for r, ev in reversed(kept)]
+        # All three docs go in as context (status + shared read-only; only lessons
+        # may come back edited, enforced by learn._sanitize_docs). A doc that
+        # cannot be read stays None -> "(unavailable)" in the payload — never
+        # substitute a seed, which could read as wiped memory.
+        docs = {p: client.read_memory(store_id, p)
+                for p in (agent_config.MEMORY_STATUS_DOC, agent_config.MEMORY_LESSONS_DOC,
+                          agent_config.MEMORY_SHARED_DOC)}
+        prior = []
+        for c in registry.learning_cycles_for_agent(self.sessions_root, aid, limit=3):
+            stats = c.get("session_stats") or []
+            tokens = [s.get("total_tokens") or 0 for s in stats if isinstance(s, dict)]
+            prior.append({
+                "created_at": c.get("created_at"),
+                "analysis": str(c.get("analysis") or "")[:600],
+                "avg_tokens_per_session": (sum(tokens) // len(tokens)) if tokens else None,
+                "estimated": bool(c.get("tokens_estimated"))})
+        agent_info = {"name": agent.get("name"), "description": agent.get("description"),
+                      "trigger": agent.get("trigger")}
+        result = agent_learn.analyze_batch(agent_info, records, docs, prior,
+                                           self._learning_model_fn())
+        if result is None:
+            print(f"[learning] analysis failed for {aid} — will retry the batch "
+                  f"on a later pass", flush=True)
+            return None
+        docs_written = []
+        for path, content in (result.get("docs") or {}).items():
+            try:
+                if client.write_memory(store_id, path, content):
+                    docs_written.append(path)
+            except Exception as e:                         # noqa: BLE001 — write_memory is already loud
+                print(f"[learning] could not write {path} for {aid}: {_why(e)}",
+                      flush=True)
+        stats = [{"session_id": rec["session_id"], "status": rec["status"],
+                  "total_tokens": rec["tokens"]["total_tokens"],
+                  "estimated": rec["tokens"]["estimated"]} for rec in records]
+        cycle = {
+            "agent_id": aid, "owner_user_id": agent.get("owner_user_id"),
+            "session_stats": stats,
+            "total_input_tokens": sum(r["tokens"]["input_tokens"] for r in records),
+            "total_output_tokens": sum(r["tokens"]["output_tokens"] for r in records),
+            "tokens_estimated": any(r["tokens"]["estimated"] for r in records),
+            "analysis": result.get("analysis") or "",
+            "docs_written": docs_written,
+        }
+        registry.learning_cycle_add(self.sessions_root, cycle)
+        total = sum(s["total_tokens"] for s in stats)
+        est = " (est)" if cycle["tokens_estimated"] else ""
+        print(f"[learning] cycle for {aid}: {len(stats)} sessions, {total} tokens{est}, "
+              f"wrote {', '.join(docs_written) or 'nothing'}", flush=True)
+        return cycle
 
     def run_deployment_now(self, agent):
         """Manual run of a deployment-backed agent: refresh the vault, trigger a
@@ -2337,6 +2501,9 @@ class AppState:
             except Exception:
                 pass
         registry.schedule_mark_run(self.sessions_root, agent.get("agent_id"))
+        # Trace-side runs are terminal by this point, so the learning-cycle gate
+        # usually passes immediately — the freshest moment to learn from the batch.
+        self.maybe_run_learning_cycle(agent)
         # Actionable outcomes arrive as a DM from the agent (routine completions
         # surface as stories instead, so the inbox stays signal-only).
         if rec["status"] == "failed":

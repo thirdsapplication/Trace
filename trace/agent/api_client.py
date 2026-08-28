@@ -66,6 +66,25 @@ def _attr(obj, name):
     return v
 
 
+_USAGE_KEYS = ("input_tokens", "output_tokens",
+               "cache_read_input_tokens", "cache_creation_input_tokens")
+
+
+def _usage_dict(u):
+    """Normalize a usage payload (SDK object or dict) to plain ints, or None when
+    it carries nothing numeric — so token accounting survives SDK shape drift."""
+    if u is None:
+        return None
+    out = {}
+    for k in _USAGE_KEYS:
+        v = _attr(u, k)
+        if isinstance(v, bool):                            # bools are ints; not tokens
+            continue
+        if isinstance(v, (int, float)):
+            out[k] = int(v)
+    return out or None
+
+
 def _select_downloadable(file_objs, exclude_ids, outputs_path):
     """Pick which session-scoped files to download as ``[(file_id, name)]``.
 
@@ -110,7 +129,32 @@ def _full_event_dict(event):
     for k in ("input", "mcp_server_name", "is_error", "processed_at",
               "tool_use_id", "mcp_tool_use_id", "agent_name"):
         d[k] = _attr(event, k)
+    # Token usage may sit on the event itself or nested under message/span depending
+    # on the event kind; preserve it (learning-cycle cost accounting reads it).
+    u = _attr(event, "usage")
+    if u is None:
+        nested = _attr(event, "message") or _attr(event, "span")
+        u = _attr(nested, "usage") if nested is not None else None
+    d["usage"] = _usage_dict(u)
     return d
+
+
+def _memory_text(doc):
+    """Normalize a memory document (SDK object or dict) to its text content, or
+    None when the shape carries none. Content may be a plain string or a list of
+    text blocks, same as event content."""
+    if doc is None:
+        return None
+    content = _attr(doc, "content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            (getattr(b, "text", None) or (b.get("text") if isinstance(b, dict) else "") or "")
+            for b in content)
+    if isinstance(doc, str):
+        return doc
+    return None
 
 
 def _has_terminal(events):
@@ -400,6 +444,40 @@ class ManagedAgentsClient:
             if "conflict" in msg or "already exists" in msg:
                 return None
             raise
+
+    def read_memory(self, store_id, path):
+        """The text content of the memory document at ``path``, or None when it
+        cannot be read. Defensive across SDK shapes like write_memory: try
+        memories.retrieve / memories.get with (store_id, path=...), then fall back
+        to list-and-match. Best-effort — never raises; the caller decides what a
+        missing document means (the learning cycle marks it unavailable rather
+        than substituting a seed that could look like wiped memory)."""
+        try:
+            memories = self._agents_ns("memory_stores").memories
+        except Exception:                                  # noqa: BLE001
+            return None
+        for name in ("retrieve", "get"):
+            fn = getattr(memories, name, None)
+            if not callable(fn):
+                continue
+            try:
+                doc = _retry(lambda fn=fn: fn(store_id, path=path))
+            except Exception:                              # noqa: BLE001
+                continue
+            text = _memory_text(doc)
+            if text is not None:
+                return text
+        try:
+            res = _retry(lambda: memories.list(store_id))
+        except Exception:                                  # noqa: BLE001
+            return None
+        for m in _data(res) or []:
+            if _attr(m, "path") != path:
+                continue
+            text = _memory_text(m)
+            if text is not None:
+                return text
+        return None
 
     # Deployed agents run on the platform: run_deployment() takes no per-run input, so
     # the ONLY way to hand a live agent anything is its memory store, which it already

@@ -20,6 +20,7 @@ import unittest
 # module path -> names its _default_model_fn (or equivalent) depends on at call time
 ENGINES = {
     "trace.agent.configgen": ["model_call"],
+    "trace.agent.learn": ["model_call"],
     "trace.discovery.discover": ["model_call"],
     "trace.discovery.scorer": ["model_call"],
     "trace.reconstruct.reconstruct": ["model_call"],

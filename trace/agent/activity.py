@@ -97,3 +97,29 @@ def session_status(events):
     if extract_proposals(events):
         return "staged"
     return "completed"
+
+
+def session_token_usage(events):
+    """Total token cost of one session: ``{input_tokens, output_tokens,
+    total_tokens, estimated}``. Sums the ``usage`` payloads the api_client
+    preserved on each event (cache reads/creation count as input). When the
+    platform reported no usage at all, falls back to a chars/4 estimate over the
+    events' text and says so (``estimated=True``) — the learning payload always
+    carries a cost figure per session."""
+    inp = out = 0
+    found = False
+    for e in events:
+        u = e.get("usage") if isinstance(e, dict) else None
+        if not isinstance(u, dict):
+            continue
+        found = True
+        inp += int(u.get("input_tokens") or 0) \
+            + int(u.get("cache_read_input_tokens") or 0) \
+            + int(u.get("cache_creation_input_tokens") or 0)
+        out += int(u.get("output_tokens") or 0)
+    if not found:
+        total = max(1, sum(len(e.get("text") or "") for e in events if isinstance(e, dict)) // 4)
+        return {"input_tokens": 0, "output_tokens": 0,
+                "total_tokens": total, "estimated": True}
+    return {"input_tokens": inp, "output_tokens": out,
+            "total_tokens": inp + out, "estimated": False}
