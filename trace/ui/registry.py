@@ -161,6 +161,29 @@ def _cycle_to_caller(row):
     }
 
 
+def _bundle_to_caller(row):
+    """Convert a Supabase peer_bundles row to the dict shape callers expect.
+    Both halves of the round trip name every column (see the color/status lessons
+    on _agent_to_caller above).
+
+    Two of these columns are not decoration: peers.select_peers gates on ``verified``
+    and ages a bundle out by ``created_at``. Dropping either here would not look like
+    a bug — selection would keep returning peers — it would silently share unverified
+    material and let years-old snapshots teach current agents, which is the exact
+    failure the color omission had (written, stored, never read, no error anywhere)
+    with a privacy edge on it."""
+    return {
+        "agent_id": str(row.get("agent_id")) if row.get("agent_id") else None,
+        "owner_user_id": str(row.get("owner_id")) if row.get("owner_id") else None,
+        "sessions": row.get("sessions") or [],
+        "memory": row.get("memory") or {},
+        "fingerprint": row.get("fingerprint") or {},
+        "embedding": row.get("embedding"),
+        "verified": bool(row.get("verified")),
+        "created_at": row.get("created_at"),
+    }
+
+
 def _pending_to_caller(row):
     """Convert a Supabase pending_actions row to the dict shape callers expect."""
     return {
@@ -576,6 +599,122 @@ def learning_cycles_for_agent(root, agent_id, limit=5):
     except FileNotFoundError:
         return []
     return list(reversed(rows))[:limit]
+
+
+# --- peer bundles (cross-agent learning material, schema 022) ---------------
+def peer_bundle_add(root, bundle):
+    """bundle: {agent_id, owner_user_id, sessions, memory, fingerprint, embedding,
+    verified}. Published at the END of a learning cycle, after scrub + verify cleared
+    the material — this row is the one thing that crosses an agent (and account)
+    boundary, so ``verified`` must carry that pass's real answer. It is stored as a
+    plain bool and defaults False: a caller that forgets it publishes something
+    selection ignores, which is the safe direction.
+
+    File mode keeps ONE file per agent, overwritten on every publish, where runs and
+    cycles use append-only JSONL. Only the newest bundle is ever read back (see
+    peer_bundles_latest), so a log would accumulate snapshots nothing can reach.
+    """
+    if supa.is_configured():
+        admin = supa.get_admin()
+        admin.table("peer_bundles").insert({
+            "agent_id": bundle.get("agent_id"),
+            "owner_id": bundle.get("owner_user_id"),
+            "sessions": bundle.get("sessions") or [],
+            "memory": bundle.get("memory") or {},
+            "fingerprint": bundle.get("fingerprint") or {},
+            "embedding": bundle.get("embedding"),
+            "verified": bool(bundle.get("verified")),
+        }).execute()
+        return
+    with _LOCK:
+        _save(root, f"peer_bundle_{_safe(bundle['agent_id'])}.json",
+              {**bundle, "verified": bool(bundle.get("verified")),
+               "created_at": _now_iso()})
+
+
+def peer_bundles_latest(root, limit=200):
+    """The newest VERIFIED bundle per agent, newest first, in caller shape.
+
+    Only the latest is kept per agent because a bundle is a snapshot of that agent's
+    CURRENT practice. An older snapshot describes behaviour the agent has already
+    moved past, and offered alongside the new one it does not merely add noise — it
+    competes: a peer reading both weighs a habit the source has since abandoned as a
+    second, independent observation. Predecessors stay in the table for audit (022);
+    selection never sees them.
+
+    ``limit`` bounds the rows SCANNED, not the agents returned. PostgREST cannot
+    express DISTINCT ON, so the newest-first rows are collapsed per agent_id here in
+    Python — an agent that publishes very often can therefore push a quieter agent's
+    latest bundle past the window, which is acceptable for peer material (it is
+    advisory, never required) and is why the window is generous rather than page-sized.
+    """
+    if supa.is_configured():
+        try:
+            # Deliberately NOT select("*"). Selection reads only the fingerprint, the
+            # embedding and the two gate columns; sessions and memory are the bundle's
+            # bulk (up to ~100KB each) and are needed for at most PEER_MAX of these rows.
+            # select("*") over a 200-row window pulls tens of megabytes through PostgREST
+            # into the web process to choose three — the same "fetch everything, use a
+            # sliver" shape that made the activity view unusable. The chosen few are
+            # fetched by peer_bundle_material below.
+            r = supa.get_admin().table("peer_bundles") \
+                .select("agent_id, owner_id, fingerprint, embedding, verified, created_at") \
+                .eq("verified", True) \
+                .order("created_at", desc=True) \
+                .limit(limit).execute()
+            rows = r.data or []
+        except Exception:                                  # noqa: BLE001 — pre-migration
+            # 022 may not be applied. Peer material is an enhancement to a learning
+            # cycle, so an absent table means "no peers", never a failed cycle.
+            return []
+        out, seen = [], set()
+        for row in rows:
+            aid = str(row.get("agent_id") or "")
+            if aid in seen:
+                continue
+            seen.add(aid)
+            out.append(_bundle_to_caller(row))
+        return out
+    out = []
+    for name in sorted(os.listdir(_dir(root))):
+        if not (name.startswith("peer_bundle_") and name.endswith(".json")):
+            continue
+        row = _load(root, name)                            # {} for a half-written file
+        if not row or not row.get("verified"):
+            continue
+        out.append(row)
+    out.sort(key=lambda b: str(b.get("created_at") or ""), reverse=True)
+    return out[:limit]
+
+
+def peer_bundle_material(root, agent_id):
+    """``{"sessions": [...], "memory": {...}}`` for one agent's newest verified bundle,
+    or None. The second half of the two-stage read peer_bundles_latest describes: that
+    call carries only what selection gates on, and this fetches the bulk for the handful
+    of bundles that actually won. File mode already holds the whole row in memory, so
+    this is a projection there and a real query only against Supabase.
+
+    Returns None rather than raising on a missing table or row: peer material is an
+    enhancement to a cycle, so an unfetchable bundle means one fewer peer, never a lost
+    cycle."""
+    if supa.is_configured():
+        try:
+            r = supa.get_admin().table("peer_bundles") \
+                .select("sessions, memory") \
+                .eq("agent_id", agent_id).eq("verified", True) \
+                .order("created_at", desc=True).limit(1).execute()
+            rows = r.data or []
+        except Exception:                                  # noqa: BLE001 — pre-migration
+            return None
+        if not rows:
+            return None
+        return {"sessions": rows[0].get("sessions") or [],
+                "memory": rows[0].get("memory") or {}}
+    row = _load(root, f"peer_bundle_{_safe(agent_id)}.json")
+    if not row or not row.get("verified"):
+        return None
+    return {"sessions": row.get("sessions") or [],
+            "memory": row.get("memory") or {}}
 
 
 # --- pending (staged) actions — Spec 8 -------------------------------------

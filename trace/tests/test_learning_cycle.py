@@ -8,7 +8,15 @@ the terminality gate, the retry-vs-reset distinction (a failed call records no
 cycle; "nothing to change" records one), the code-side edit whitelist, and that
 both choke points invoke the trigger at all.
 
-Offline: tempdir file-mode registry, fake platform client, injected learn_fn.
+The collective path rides on that same cycle and is off by default
+(TRACE_COLLECTIVE_ENABLED): peer material goes IN to the analysis payload, a scrubbed
+bundle goes OUT after the memory write. Both directions are pinned here rather than in
+the peers/scrub unit tests because both failure modes are failures of the WIRING, not of
+either engine — a peer's owner identifiable inside the payload handed to a DIFFERENT
+customer's model, or an agent losing the lessons it earned because the publish behind
+them failed.
+
+Offline: tempdir file-mode registry, fake platform client, injected learn_fn/scrub_fn.
 """
 
 import json
@@ -34,6 +42,18 @@ def _running_events():
             {"type": "agent.message", "text": "still working"}]
 
 
+def _tool_events(tools=("gmail-search", "sheets-read")):
+    """A completed session that actually CALLED tools. Peer matching runs on tool names
+    and nothing else, so a batch of tool-free sessions fingerprints to {} and matches
+    nobody — which is a real property of the design, and would make every collective
+    assertion below pass for the wrong reason."""
+    return ([{"type": "user.message", "text": "Task: go"}]
+            + [{"type": "mcp_tool_use", "name": t, "input": {}} for t in tools]
+            + [{"type": "agent.message", "text": "did the work",
+                "usage": {"input_tokens": 100, "output_tokens": 20}},
+               {"type": "session.status_idle", "text": "", "stop_reason": "end_turn"}])
+
+
 class FakeLearnClient:
     """The platform surface a learning cycle touches."""
 
@@ -43,6 +63,11 @@ class FakeLearnClient:
         self.fetches = 0                       # list_session_events call count
         self.docs = {agent_config.MEMORY_LESSONS_DOC: "# Lessons learned\n- old lesson\n"}
         self.written = []                      # {store_id, path, content}
+        # One interleaved order of the calls a cycle makes to anything outside itself.
+        # `written` says WHAT was written, this says WHEN relative to everything else —
+        # which is the only way to assert that publishing a peer bundle happens after
+        # the agent's own memory write and never instead of it.
+        self.timeline = []
 
     def list_session_events(self, session_id):
         self.fetches += 1
@@ -55,10 +80,16 @@ class FakeLearnClient:
 
     def write_memory(self, store_id, path, content):
         self.written.append({"store_id": store_id, "path": path, "content": content})
+        self.timeline.append(f"write_memory {path}")
         return "update"
 
 
-class LearningCycleTest(unittest.TestCase):
+class _CycleHarness(unittest.TestCase):
+    """Shared fixture: a file-mode registry in a tempdir, the fake platform client, and
+    an AppState whose learning call is a stub. No tests of its own — the collective and
+    forced-cycle cases below run the same cycle through the same seams, and a second
+    copy of this setup is a second thing to keep in step with app.py."""
+
     N = agent_config.LEARNING_CYCLE_SESSIONS
 
     def setUp(self):
@@ -94,6 +125,8 @@ class LearningCycleTest(unittest.TestCase):
     def _cycles(self):
         return registry.learning_cycles_for_agent(self.root, "a1")
 
+
+class LearningCycleTest(_CycleHarness):
     def test_no_cycle_before_n_eligible_runs(self):
         self._seed_runs(self.N - 1)
         self.assertIsNone(self.state.maybe_run_learning_cycle(self.agent))
@@ -326,6 +359,291 @@ class LearningCycleTest(unittest.TestCase):
         payload = json.loads(self.learn_calls[0]["user"])
         self.assertEqual(payload["prior_cycles"][0]["analysis"], "earlier advice")
         self.assertEqual(payload["prior_cycles"][0]["avg_tokens_per_session"], 900)
+
+
+class CollectiveLearningCycleTest(_CycleHarness):
+    """The collective path end to end: a peer's scrubbed material reaching the analysis
+    call, and this agent's batch leaving as a bundle after the cycle is safely done.
+
+    The switch is off by default, so the first test is the one describing production
+    today; every other test here turns it on explicitly. The scrub is stubbed as an
+    IDENTITY rewrite — same session ids, same line counts, no identifier shapes — so the
+    gate's own deterministic checks pass and what is left under test is the wiring.
+    scrub.py's tests are where a bad scrub is caught.
+    """
+
+    PEER_ID = "peer_agent_7"
+    PEER_OWNER = "u-peer-owner"
+    PEER_NAME = "Bakery Concierge"
+    PEER_EMAIL = "chef@bakery.example"
+    PEER_LESSON = "read the sheet once per run, not once per row"
+
+    def setUp(self):
+        super().setUp()
+        self.scrub_calls, self.verify_calls = [], []
+
+        def scrub_fn(system, user):
+            self.scrub_calls.append(user)
+            payload = json.loads(user)
+            return json.dumps({"sessions": payload["sessions"],
+                               "memory": payload["memory"], "redactions": []})
+
+        def verify_fn(system, user):
+            self.verify_calls.append(user)
+            return '{"safe": true}'
+
+        self.state.scrub_fn = scrub_fn
+        self.state.scrub_verify_fn = verify_fn
+
+    def _enable_collective(self):
+        original = agent_config.COLLECTIVE_ENABLED
+        agent_config.COLLECTIVE_ENABLED = True             # TRACE_COLLECTIVE_ENABLED=1
+        self.addCleanup(setattr, agent_config, "COLLECTIVE_ENABLED", original)
+        # _peer_vector embeds the agent's profile. With no VOYAGE key that is already a
+        # local no-op returning None, but a developer machine that HAS one would make
+        # this suite call Voyage over the network — so the absence is pinned rather than
+        # assumed. None is the ordinary answer, and peers then match on tool overlap.
+        original_embed = app.agent_embeddings.embed
+        app.agent_embeddings.embed = lambda *a, **k: None
+        self.addCleanup(setattr, app.agent_embeddings, "embed", original_embed)
+
+    def _seed_peer_bundle(self, tools=("gmail-search", "sheets-read"), verified=True):
+        """A publishable bundle from ANOTHER customer's agent, alongside that agent's
+        real registry row — the identity the analysis payload must not carry."""
+        registry.agent_upsert(self.root, {
+            "agent_id": self.PEER_ID, "owner_user_id": self.PEER_OWNER,
+            "name": self.PEER_NAME, "owner_email": self.PEER_EMAIL,
+            "memory_store_id": "mem_peer"})
+        registry.peer_bundle_add(self.root, {
+            "agent_id": self.PEER_ID, "owner_user_id": self.PEER_OWNER,
+            "sessions": [{"session_id": "p1", "status": "completed",
+                          "transcript": "[agent] chased restaurant client A"}],
+            "memory": {agent_config.MEMORY_LESSONS_DOC: self.PEER_LESSON},
+            "fingerprint": {"tools": {t: 3 for t in tools}, "sessions": 5,
+                            "avg_tokens": 900},
+            "embedding": None, "verified": verified})
+
+    def _run_cycle(self):
+        self._seed_runs(self.N, events_fn=_tool_events)
+        t = self.state.maybe_run_learning_cycle(self.agent)
+        self.assertIsNotNone(t)
+        t.join(timeout=10)
+        self.assertEqual(len(self.learn_calls), 1)
+        return json.loads(self.learn_calls[0]["user"])
+
+    def _published(self):
+        return [b for b in registry.peer_bundles_latest(self.root)
+                if b.get("agent_id") == "a1"]
+
+    def test_switched_off_no_peer_goes_in_and_no_bundle_comes_out(self):
+        """The default. A bundle that would match is present and must still be ignored
+        in BOTH directions: an install that never set TRACE_COLLECTIVE_ENABLED has not
+        agreed to read other customers' material or to publish its own."""
+        self._seed_peer_bundle()
+        payload = self._run_cycle()
+        self.assertNotIn("peers", payload,
+                         "with the collective path off the payload must be byte-identical "
+                         "to the solo one — an empty 'peers' key is still a claim")
+        self.assertEqual(self.scrub_calls, [], "nothing may be scrubbed for publication")
+        self.assertEqual(self._published(), [])
+        self.assertEqual([w["path"] for w in self.client.written],
+                         [agent_config.MEMORY_LESSONS_DOC])   # the cycle itself is normal
+
+    def test_a_matching_bundle_reaches_the_analysis_payload(self):
+        self._enable_collective()
+        self._seed_peer_bundle()
+        payload = self._run_cycle()
+        self.assertEqual(len(payload["peers"]), 1)
+        peer = payload["peers"][0]
+        self.assertEqual(peer["peer_ref"], "peer agent 1")
+        self.assertEqual(peer["tier"], "same_tooling")       # no embeddings -> no cosine
+        self.assertEqual(sorted(peer["shared_tools"]), ["gmail-search", "sheets-read"])
+        self.assertEqual(peer["tool_overlap"], 1.0)
+        self.assertIn(self.PEER_LESSON, json.dumps(peer["memory"]))
+        self.assertEqual(peer["sessions"][0]["session_id"], "p1")
+
+    def test_a_bundle_sharing_no_tooling_is_not_offered(self):
+        """Tool overlap is the gate, not a preference — a peer that drives different
+        integrations has nothing mechanical to teach this agent."""
+        self._enable_collective()
+        self._seed_peer_bundle(tools=("calendar-list", "slack-post"))
+        payload = self._run_cycle()
+        self.assertNotIn("peers", payload)
+
+    def test_no_peer_identity_reaches_the_analysis_model(self):
+        """THE privacy assertion for this direction. The peer belongs to a different
+        customer, and the model receiving this payload works for ours: nothing in it may
+        name the source agent, the source agent's owner, or that owner's address —
+        directly or in passing. peer_payloads gives a positional label and nothing else,
+        and this is the test that fails if a future field carries identity along with it.
+        """
+        self._enable_collective()
+        self._seed_peer_bundle()
+        payload = self._run_cycle()
+        blob = self.learn_calls[0]["user"].lower()
+        for secret in (self.PEER_ID, self.PEER_OWNER, self.PEER_NAME, self.PEER_EMAIL):
+            self.assertNotIn(secret.lower(), blob,
+                             f"{secret!r} identifies another customer's agent and is in "
+                             f"the payload handed to this one's model")
+        # Not passing by sharing nothing: the peer's material is genuinely in there.
+        self.assertIn(self.PEER_LESSON, blob)
+        # The contract's keys exactly — a new key added to peer_payloads has to be
+        # weighed against the paragraph above before it can land.
+        self.assertEqual(set(payload["peers"][0]),
+                         {"peer_ref", "tier", "tool_overlap", "shared_tools",
+                          "sessions", "memory"})
+
+    def test_a_failed_scrub_still_completes_the_agents_own_cycle(self):
+        """Publication is best-effort and must never cost the agent its own learning:
+        the lessons doc and the cycle row are already durable when the publish runs, and
+        a scrub that throws is a lost bundle and nothing else."""
+        self._enable_collective()
+
+        def boom(system, user):
+            raise RuntimeError("scrub model down")
+        self.state.scrub_fn = boom
+        self._run_cycle()
+        self.assertEqual([w["path"] for w in self.client.written],
+                         [agent_config.MEMORY_LESSONS_DOC])
+        self.assertIn("check the ledger first", self.client.written[0]["content"])
+        self.assertEqual(len(self._cycles()), 1, "the counter must still reset")
+        self.assertEqual(self._published(), [], "a failed scrub publishes nothing")
+
+    def test_a_rejected_scrub_costs_the_bundle_and_nothing_else(self):
+        """The gate failing closed is a routine outcome, not an error — same result for
+        the agent as a scrub that raised."""
+        self._enable_collective()
+        self.state.scrub_verify_fn = lambda system, user: '{"safe": false}'
+        self._run_cycle()
+        self.assertEqual([w["path"] for w in self.client.written],
+                         [agent_config.MEMORY_LESSONS_DOC])
+        self.assertEqual(len(self._cycles()), 1)
+        self.assertEqual(self._published(), [])
+
+    def test_the_bundle_is_published_after_the_memory_write(self):
+        """Ordering, not just presence. Publishing is a second long model call behind a
+        gate that fails closed — the step most likely to fail — so it goes last, once
+        everything the cycle owed its own agent is durable."""
+        self._enable_collective()
+        real_add = registry.peer_bundle_add
+
+        def recording_add(root, bundle):
+            self.client.timeline.append("peer_bundle_add")
+            return real_add(root, bundle)
+        registry.peer_bundle_add = recording_add
+        self.addCleanup(setattr, registry, "peer_bundle_add", real_add)
+        self._run_cycle()
+        self.assertEqual(self.client.timeline,
+                         [f"write_memory {agent_config.MEMORY_LESSONS_DOC}",
+                          "peer_bundle_add"],
+                         "a bundle published before the memory write would advertise "
+                         "practice this agent had not adopted yet — and would be lost "
+                         "work if the write then failed")
+
+    def test_what_is_published_is_the_batch_the_agent_now_runs_on(self):
+        self._enable_collective()
+        self._run_cycle()
+        published = self._published()
+        self.assertEqual(len(published), 1)
+        bundle = published[0]
+        self.assertTrue(bundle["verified"])
+        self.assertEqual(bundle["owner_user_id"], "u1")
+        self.assertEqual(len(bundle["sessions"]), self.N)
+        self.assertEqual(bundle["fingerprint"]["tools"],
+                         {"gmail-search": self.N, "sheets-read": self.N})
+        lessons = bundle["memory"][agent_config.MEMORY_LESSONS_DOC]
+        self.assertIn("check the ledger first", lessons)
+        self.assertNotIn("old lesson", lessons,
+                         "the doc just written is what this agent runs on; the pre-cycle "
+                         "text describes practice it has already left behind")
+
+
+class PublishConcurrencyTest(CollectiveLearningCycleTest):
+    """Publishing must not hold the fleet-wide learning slot.
+
+    LEARNING_MAX_CONCURRENT is 1, so whatever holds a place in _learning_inflight
+    serialises every other agent's cycle behind it. The scrub is the longest call in the
+    whole path — a verbatim rewrite streams as many tokens as it reads — with the privacy
+    gate behind it. Holding the slot across both would roughly double the window in which
+    no other agent can learn, to publish a bundle nobody is waiting on. This is the same
+    shape as the lock that was held across network I/O and stalled the app in August.
+    """
+
+    def test_the_fleet_slot_is_released_before_the_scrub_runs(self):
+        self._enable_collective()
+        seen = {}
+        real = self.state._publish_peer_bundle
+
+        def watch(agent, records, docs, fp):
+            seen["inflight"] = set(self.state._learning_inflight)
+            seen["publishing"] = set(self.state._publish_inflight)
+            return real(agent, records, docs, fp)
+
+        self.state._publish_peer_bundle = watch
+        aid = self.agent["agent_id"]
+        # The real path claims the slot in maybe_run_learning_cycle and holds it in the
+        # worker's finally, so the claim under test is the one the cycle itself took.
+        self._run_cycle()
+        self.assertIn("inflight", seen, "publish never ran")
+        self.assertNotIn(aid, seen["inflight"],
+                         "the fleet-wide learning slot was still held during the scrub")
+        self.assertIn(aid, seen["publishing"],
+                      "nothing guards this agent against publishing twice at once")
+
+
+class ForcedLearningCycleTest(_CycleHarness):
+    """"Learn now" (force=True): the same cycle the scheduler runs, minus the session
+    COUNT gate. It exists because five sessions at a daily cadence made every change to
+    the learning path a week-long round trip to check. Everything else still applies —
+    which is the half worth testing, since a force that also skipped terminality would
+    drop a still-running session from this batch AND from every later one."""
+
+    def setUp(self):
+        super().setUp()
+        if self.N < 2:
+            self.skipTest("TRACE_LEARNING_CYCLE_SESSIONS=1 leaves no room below "
+                          "the threshold to force past")
+
+    def test_learn_now_forces_a_cycle_below_the_session_threshold(self):
+        self._seed_runs(self.N - 1)
+        self.assertIsNone(self.state.maybe_run_learning_cycle(self.agent),
+                          "unforced, this batch is still short of a cycle")
+        t = self.state.maybe_run_learning_cycle(self.agent, force=True)
+        self.assertIsNotNone(t)
+        t.join(timeout=10)
+        payload = json.loads(self.learn_calls[0]["user"])
+        self.assertEqual(len(payload["sessions"]), self.N - 1)
+        self.assertEqual([w["path"] for w in self.client.written],
+                         [agent_config.MEMORY_LESSONS_DOC])
+        self.assertEqual(len(self._cycles()), 1)
+
+    def test_forcing_with_nothing_new_analyzes_nothing(self):
+        """Forcing cannot conjure material — an empty batch would surface downstream as
+        a confusing "analysis failed"."""
+        self.assertIsNone(self.state.maybe_run_learning_cycle(self.agent, force=True))
+        self.assertEqual(self.learn_calls, [])
+        self.assertEqual(self._cycles(), [])
+
+    def test_forcing_does_not_reach_terminality(self):
+        self._seed_runs(self.N - 1, events_fn=_running_events)
+        t = self.state.maybe_run_learning_cycle(self.agent, force=True)
+        self.assertIsNotNone(t)
+        t.join(timeout=10)
+        self.assertEqual(self.learn_calls, [], "a session still running has nothing to "
+                                               "analyze, and forcing past it would drop "
+                                               "it from every later batch too")
+        self.assertEqual(self._cycles(), [])
+
+    def test_forcing_does_not_reach_the_kill_switch(self):
+        self._seed_runs(self.N - 1)
+        original = agent_config.LEARNING_ENABLED
+        agent_config.LEARNING_ENABLED = False              # TRACE_LEARNING_ENABLED=0
+        try:
+            self.assertIsNone(
+                self.state.maybe_run_learning_cycle(self.agent, force=True))
+        finally:
+            agent_config.LEARNING_ENABLED = original
+        self.assertEqual(self.learn_calls, [])
 
 
 class TriggerWiringTest(unittest.TestCase):

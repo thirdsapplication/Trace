@@ -1,0 +1,358 @@
+"""Privacy pre-call — de-identify one agent's batch BEFORE any other agent can read it.
+
+Collective learning only works if an agent can read what other agents actually did, and
+what agents actually do is full of their owners' customers: names, addresses, invoice
+amounts, order ids. This engine runs on the PRODUCING agent's own learning cycle, so the
+raw material never leaves the cycle that owns it — what leaves is a rewrite in which every
+customer-identifying detail has become a generic description ("Mario's Pizzeria" ->
+"restaurant client A") and the mechanics a peer needs (tool names, errors, retries,
+ordering) are untouched.
+
+Trust is placed in the checks, not in the model. A scrub is accepted only after a
+deterministic structural check (a model that summarised instead of substituting is the
+likeliest failure, and it is free to detect), a deterministic leak sweep that ignores what
+the model claimed and simply hunts for identifier SHAPES, and finally a second, independent
+model that judges the scrubbed text on its own. Cheap checks run first; the paid one last.
+
+Everything here is best-effort and fails closed: the return value on any doubt is None, and
+None costs the fleet one publish. The sweep is deliberately trigger-happy for the same
+reason — a rejected batch is a non-event, a leaked one is a customer's data sitting in
+another customer's payload.
+"""
+
+import json
+import re
+
+from . import config, model_call
+from .configgen import _parse_json_object
+from .scrub_prompt import SCRUB_SYSTEM, VERIFY_SYSTEM
+
+DEFAULT_MODEL = config.SCRUB_MODEL
+VERIFY_MODEL = config.SCRUB_VERIFY_MODEL
+
+# The only documents that may be scrubbed and travel. /shared_lessons.md is deliberately
+# NOT here: it is Trace-owned and is already distilled from OTHER agents' material, so
+# publishing it as peer material would let a lesson re-enter the fleet as fresh peer
+# evidence and be counted a second time — one agent's opinion coming back as independent
+# corroboration of itself.
+#
+# /lessons_learned.md is a WEAKER version of that same objection, accepted knowingly.
+# Once collective learning is on it is itself peer-influenced, so publishing it does let
+# a technique propagate agent to agent and, over enough cycles, return to where it
+# started looking like corroboration. That is not a leak and it is largely the point —
+# a good technique spreading is the feature — but it means a BAD one can amplify rather
+# than die out, which the per-agent token measurement in prior_cycles cannot currently
+# attribute back to a peer. Excluding it instead would gut the feature: a peer's curated
+# lessons are the most useful thing in a bundle, far more so than its raw transcripts.
+# If amplification ever shows up in practice, the fix is to mark peer-derived lessons in
+# the file so the next cycle can drop them first — not to stop publishing the document.
+SCRUBBED_DOCS = (config.MEMORY_LESSONS_DOC, config.MEMORY_STATUS_DOC)
+
+
+def _default_model_fn(model=DEFAULT_MODEL):
+    import anthropic
+    # Bounded: a bare client defaults to ~10 minutes per attempt WITH retries, so one
+    # stuck scrub could pin a worker thread for the better part of an hour.
+    client = anthropic.Anthropic(timeout=config.SCRUB_REQUEST_TIMEOUT,
+                                 max_retries=config.SCRUB_RETRIES)
+
+    def call(system, user):
+        # Streaming, not create_text: the reply restates every session AND every document
+        # in full, and above ~16K max_tokens a non-streaming request does not fail — it
+        # hangs until the HTTP timeout, with no error to read (see model_call's docstring).
+        return model_call.create_text_streaming(client, model, system, user,
+                                                max_tokens=config.SCRUB_MAX_TOKENS)
+
+    return call
+
+
+def _default_verify_model_fn(model=VERIFY_MODEL):
+    import anthropic
+    client = anthropic.Anthropic(timeout=config.SCRUB_REQUEST_TIMEOUT,
+                                 max_retries=config.SCRUB_RETRIES)
+
+    def call(system, user):
+        # The ordinary non-streaming call: the gate answers one boolean, so max_tokens is
+        # tiny on purpose — a gate that starts explaining itself has stopped answering.
+        # temperature=None: Opus 5 rejects sampling parameters with a 400.
+        return model_call.create_text(client, model, system, user,
+                                      max_tokens=100, temperature=None)
+
+    return call
+
+
+def _norm_path(path):
+    """Doc paths are compared against a whitelist, so a missing leading slash must not
+    silently turn an allowed doc into a rejected one (or vice versa)."""
+    p = str(path or "")
+    return p if p.startswith("/") else "/" + p
+
+
+def _clip_transcript(text):
+    return str(text or "")[:config.SCRUB_SESSION_CLIP]
+
+
+def _sanitize_memory(docs):
+    """Keep only SCRUBBED_DOCS, with non-empty string content, clipped. Applied on the way
+    IN and again on the way OUT: the model echoes back what it was handed, but its answer
+    is what gets published, so the whitelist is enforced in code both times."""
+    out = {}
+    if not isinstance(docs, dict):
+        return out
+    for path, text in docs.items():
+        p = _norm_path(path)
+        if p not in SCRUBBED_DOCS:
+            continue
+        if not isinstance(text, str) or not text.strip():
+            continue
+        out[p] = text[:config.SCRUB_DOC_CLIP]
+    return out
+
+
+def build_payload(session_records, memory_docs):
+    """The dict json.dumps'd into the scrub call's user message: the batch as the learning
+    call would see it, clipped so a VERBATIM rewrite of it still fits inside
+    SCRUB_MAX_TOKENS. Unreadable docs (None) are dropped rather than sent as
+    "(unavailable)" the way learn.build_payload does — there is nothing to scrub in a
+    document nobody could read, and nothing to publish either."""
+    sessions = [{"session_id": rec.get("session_id"),
+                 "ran_at": rec.get("ran_at"),
+                 "status": rec.get("status"),
+                 "tokens": rec.get("tokens"),
+                 "transcript": _clip_transcript(rec.get("transcript"))}
+                for rec in (session_records or [])]
+    return {"sessions": sessions, "memory": _sanitize_memory(memory_docs)}
+
+
+def scrub_batch(session_records, memory_docs, model_fn):
+    """ONE scrub call over the batch. Returns the parsed answer — ``{"sessions", "memory",
+    "redactions"}`` — or None when the call or the parse failed. Never raises: this runs
+    inside a learning cycle, and a failed scrub must cost the fleet one publish, not the
+    agent its cycle."""
+    if not session_records:
+        return None
+    user = json.dumps(build_payload(session_records, memory_docs),
+                      ensure_ascii=False, default=str)
+    try:
+        obj = _parse_json_object(model_fn(SCRUB_SYSTEM, user))
+    except Exception as e:                                 # noqa: BLE001 — best-effort, but
+        # say WHY: a reason-less "scrub failed" line cost a debugging round in learn.py.
+        print(f"[scrub] scrub call failed: {type(e).__name__}: {str(e)[:200]}", flush=True)
+        return None
+    return obj or None
+
+
+def structural_check(session_records, scrubbed):
+    """(ok, reason) — did the model SUBSTITUTE, or did it summarise? Same session ids, same
+    count, and the same number of lines in every transcript.
+
+    Summarising is the likeliest way a scrub goes wrong, and it is silent: the answer still
+    parses, still reads plausibly, and has quietly thrown away the retry patterns and
+    orderings that are the whole reason this material travels. Line counts catch it for
+    free, before either model is paid again.
+    """
+    originals = {}
+    for rec in (session_records or []):
+        sid = str(rec.get("session_id") or "")
+        if sid:
+            originals[sid] = _clip_transcript(rec.get("transcript"))
+    got = (scrubbed or {}).get("sessions")
+    if not isinstance(got, list):
+        return False, "no sessions in the scrubbed payload"
+    if len(got) != len(originals):
+        return False, f"session count changed: {len(originals)} in, {len(got)} out"
+    seen = set()
+    for entry in got:
+        if not isinstance(entry, dict):
+            return False, "session entry is not an object"
+        sid = str(entry.get("session_id") or "")
+        if sid not in originals:
+            return False, f"unknown session id {sid!r}"
+        if sid in seen:
+            return False, f"duplicate session id {sid!r}"
+        seen.add(sid)
+        # Compare against the CLIPPED original: the model only ever saw the clipped copy,
+        # so counting lines in the full record would fail every over-long session.
+        want = len(originals[sid].splitlines())
+        have = len(str(entry.get("transcript") or "").splitlines())
+        if have != want:
+            return False, (f"session {sid} transcript {want} lines in, {have} out "
+                           f"(summarised?)")
+    return True, ""
+
+
+# Identifier SHAPES. This sweep is unconditional — it does not care what the model declared
+# in redactions, because the dangerous case is the identifier it never declared at all. A
+# hit fails the whole batch even when the redactions list is empty.
+_SWEEP = (
+    # someone@somewhere.tld — the most direct re-identifier there is.
+    ("email address", re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")),
+    # 13-19 digits with optional separators (payment card), or IBAN's country + check
+    # digits + account body. Checked before the generic digit rule so the reason names it.
+    ("card/IBAN-shaped string",
+     re.compile(r"\b(?:\d[ \-]?){13,19}\b|\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b")),
+    # +1 (555) 123-4567 and friends: a digit run broken by spaces, dots, dashes, parens.
+    ("phone-shaped number", re.compile(r"\+?\d[\d ().\-]{7,}\d")),
+    # A URL with a query string: ?id=, ?email=, share tokens — the parameters carry the
+    # identity even when the host does not.
+    ("url with a query string", re.compile(r"https?://\S+\?\S")),
+    # Any run of four or more digits: order numbers, invoice ids, account numbers, zip+4.
+    ("digit run of 4 or more", re.compile(r"\d{4,}")),
+)
+
+
+def _sweep_text(scrubbed):
+    """The free text of a scrubbed payload — every transcript and every document — as one
+    string.
+
+    Deliberately NOT the whole serialised object: session_id, ran_at and tokens are
+    structural fields the scrub is REQUIRED to copy through untouched, and an ISO
+    timestamp or a five-figure token total trips the four-digit rule on literally every
+    payload that will ever be produced. They carry no identity. The text does.
+    """
+    parts = []
+    for entry in ((scrubbed or {}).get("sessions") or []):
+        if isinstance(entry, dict):
+            parts.append(str(entry.get("transcript") or ""))
+    memory = (scrubbed or {}).get("memory")
+    if isinstance(memory, dict):
+        parts.extend(str(text or "") for text in memory.values())
+    return "\n".join(parts)
+
+
+def _strings(value):
+    """Every string anywhere in a nested structure, as a flat list. Keys as well as
+    values: a model that answered {"Mario's Pizzeria": "..."} put the literal in a key."""
+    out = []
+    if isinstance(value, str):
+        out.append(value)
+    elif isinstance(value, dict):
+        for k, v in value.items():
+            out.append(str(k))
+            out.extend(_strings(v))
+    elif isinstance(value, (list, tuple)):
+        for v in value:
+            out.extend(_strings(v))
+    return out
+
+
+def leak_sweep(scrubbed, redactions):
+    """(ok, reason) — did anything identifying survive? Three checks over the scrubbed
+    payload: every declared literal is gone, every declared pseudonym is actually there
+    (a declaration the model never carried out), and no identifier shape appears in the
+    free text at all. Reasons never quote what was found: this line gets printed."""
+    # Everything the model returned EXCEPT its own redactions list: that list quotes every
+    # original literal by design, so searching it for those literals would fail every
+    # scrub ever written. Any other key the model invented is still searched.
+    content = {k: v for k, v in (scrubbed or {}).items() if k != "redactions"}
+    # Walked, not json.dumps'd. Serialising first would compare against ESCAPED text, so a
+    # literal holding a quote, a backslash, a newline or a tab — O'Brien's Bar, a Windows
+    # path, a pasted signature block — could survive verbatim in the published string and
+    # still never match here. That would silently disarm the one check in this file that
+    # does not take the model's word for anything.
+    low = "\n".join(_strings(content)).lower()
+    for item in (redactions or []):
+        if not isinstance(item, dict):
+            return False, "redaction entry is not an object"
+        literal = str(item.get("literal") or "")
+        pseudonym = str(item.get("pseudonym") or "")
+        if not literal.strip():
+            continue                     # an empty literal declares nothing to look for
+        if not pseudonym.strip():
+            return False, "redaction declares a literal but no pseudonym"
+        # Case-insensitive: "MARIO'S PIZZERIA" in a subject line is the same leak.
+        if literal.lower() in low:
+            return False, f"declared literal still present (pseudonym {pseudonym!r})"
+        if pseudonym.lower() not in low:
+            return False, f"pseudonym {pseudonym!r} declared but never used"
+    text = _sweep_text(scrubbed)
+    for label, pattern in _SWEEP:
+        if pattern.search(text):
+            return False, f"{label} survived in the scrubbed text"
+    return True, ""
+
+
+def verify_scrub(scrubbed, model_fn):
+    """True iff an independent model, seeing ONLY the scrubbed payload, says no real
+    person, company, or account can be identified from it. It exists for the leak the
+    regexes cannot see: a description that names nobody and still points at one real
+    business.
+
+    FAILS CLOSED — empty input, an exception, an unparseable answer, or anything other than
+    a literal true returns False (same posture as generalize.verify_lesson_scrub), because
+    a wrong True puts one customer's material in another customer's payload.
+    """
+    if not isinstance(scrubbed, dict):
+        return False
+    payload = {"sessions": scrubbed.get("sessions") or [],
+               "memory": scrubbed.get("memory") or {}}
+    if not payload["sessions"] and not payload["memory"]:
+        return False
+    # The gate never sees "redactions": that list holds the ORIGINAL literals, so sending
+    # it would hand the verifier the very identities it is being asked to hunt for.
+    user = json.dumps(payload, ensure_ascii=False, default=str)
+    try:
+        obj = _parse_json_object(model_fn(VERIFY_SYSTEM, user)) or {}
+    except Exception as e:                                 # noqa: BLE001 — fail closed
+        print(f"[scrub] verify call failed: {type(e).__name__}: {str(e)[:200]}", flush=True)
+        return False
+    return obj.get("safe") is True
+
+
+def _publishable_sessions(session_records, scrubbed):
+    """The sessions actually published: scrubbed TEXT, with the metadata taken from the
+    records we already hold rather than from the answer. Two reasons for the projection —
+    a field the model invented would ride out of here having never been swept (nothing
+    downstream knows to look at a key that is not in the contract), and a status or a
+    token count the model "tidied" would misreport what the batch really cost.
+
+    session_id and ran_at are dropped here, and this is the last point at which they
+    could be. Both are required INPUTS — structural_check matches sessions by id, and
+    without that a model could quietly drop or rename one — but neither may be published:
+    a platform session id identifies the producing customer's run to anyone who can see
+    the platform, and a run timestamp discloses when that customer's business operates.
+    Neither carries any signal a reader needs, because order is the list's order. What
+    replaces the id is an ordinal, so a reader can still say "in session 2 it retried".
+    """
+    by_id = {str(rec.get("session_id") or ""): rec for rec in (session_records or [])}
+    out = []
+    for entry in ((scrubbed or {}).get("sessions") or []):
+        if not isinstance(entry, dict):
+            continue
+        rec = by_id.get(str(entry.get("session_id") or "")) or {}
+        out.append({"index": len(out) + 1,
+                    "status": rec.get("status"),
+                    "tokens": rec.get("tokens"),
+                    "transcript": str(entry.get("transcript") or "")})
+    return out
+
+
+def _reject(reason):
+    print(f"[scrub] rejected — {reason}", flush=True)
+    return None
+
+
+def scrub_and_verify(session_records, memory_docs, model_fn, verify_model_fn):
+    """The whole gate: scrub, then structural check, then leak sweep, then the independent
+    privacy model — deterministic checks first so a summarised or leaky answer is thrown
+    out before a second model is paid to read it.
+
+    Returns ``{"sessions": [...], "memory": {path: text}}`` ready to publish, or None.
+    Never raises; prints one reason line on rejection.
+    """
+    scrubbed = scrub_batch(session_records, memory_docs, model_fn)
+    if not scrubbed:
+        return _reject("scrub call produced nothing")
+    ok, reason = structural_check(session_records, scrubbed)
+    if not ok:
+        return _reject(reason)
+    ok, reason = leak_sweep(scrubbed, scrubbed.get("redactions") or [])
+    if not ok:
+        return _reject(reason)
+    if not verify_scrub(scrubbed, verify_model_fn):
+        return _reject("privacy gate did not answer safe")
+    # "redactions" is a literal -> pseudonym map: the one artifact that can UNDO this
+    # scrub. It is used by the checks above and dropped here — it must never be persisted,
+    # logged, or passed onward to any caller.
+    return {"sessions": _publishable_sessions(session_records, scrubbed),
+            "memory": _sanitize_memory(scrubbed.get("memory"))}

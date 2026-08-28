@@ -2,10 +2,19 @@
 
 Every ``config.LEARNING_CYCLE_SESSIONS`` completed sessions, ONE ``model_fn(system,
 user) -> str`` call reviews the batch — each session's compacted transcript, outcome
-status, and token cost — together with the agent's memory documents and the outcomes
-of prior cycles, then returns a full replacement ``lessons_learned.md`` aimed at
-making future sessions more accurate and more token-efficient. Deterministic
-parsing; best-effort — any failure returns None so a bad call never blocks a run.
+status, and token cost — together with the agent's memory documents, the outcomes of
+prior cycles, and (when a similar agent was found) privacy-scrubbed material from
+that peer, then returns a full replacement ``lessons_learned.md`` aimed at making
+future sessions more accurate and more token-efficient. Deterministic parsing;
+best-effort — any failure returns None so a bad call never blocks a run.
+
+Peers are here because an agent reading only its own history can do no better than
+relearn its own waste, one customer at a time: the re-read another agent already
+worked out it could drop is a saving this one should not have to pay for twice. What
+peers do NOT do is widen anything. The material arrives already scrubbed and
+de-identified, it is read for technique rather than for fact (the prompt's hard
+rules), and ``_sanitize_docs`` still admits exactly one document, whoever the
+lesson came from.
 
 Only ``lessons_learned.md`` may be rewritten: ``current_workflow_status.md`` is
 agent-owned (rewritten at end of every session) and ``shared_lessons.md`` is owned by
@@ -57,13 +66,14 @@ def session_record(run, events):
     }
 
 
-def build_payload(agent, session_records, memory_docs, prior_cycles):
+def build_payload(agent, session_records, memory_docs, prior_cycles, peers=None):
     """The dict json.dumps'd into the user message. ``memory_docs`` maps doc path
     -> text or None (None becomes "(unavailable)" so the model reasons without it
     rather than treating an unreadable file as empty); ``prior_cycles`` is the
     efficiency feedback loop — earlier analyses with their batches' average
-    tokens per session."""
-    return {
+    tokens per session; ``peers`` is the scrubbed material from similar agents
+    (``peers.peer_payloads``), and having none is the ordinary case."""
+    payload = {
         "agent": {"name": agent.get("name"),
                   "description": agent.get("description"),
                   "trigger": agent.get("trigger")},
@@ -72,6 +82,14 @@ def build_payload(agent, session_records, memory_docs, prior_cycles):
                    for path, text in (memory_docs or {}).items()},
         "prior_cycles": list(prior_cycles or []),
     }
+    # Added only when there is something to add: with no peer — the common case, and
+    # what every existing payload test asserts against — the object stays byte for
+    # byte what it was before the collective path existed. An empty "peers": [] would
+    # also read to the model as "we looked and everyone is unlike you", which is a
+    # different claim from "we did not look".
+    if peers:
+        payload["peers"] = list(peers)
+    return payload
 
 
 def _sanitize_docs(docs):
@@ -93,7 +111,8 @@ def _sanitize_docs(docs):
     return out
 
 
-def analyze_batch(agent, session_records, memory_docs, prior_cycles, model_fn):
+def analyze_batch(agent, session_records, memory_docs, prior_cycles, model_fn,
+                  peers=None):
     """ONE analysis call over the batch. Returns ``{"analysis": str, "docs":
     {path: content}}`` with docs already sanitized (possibly empty — a valid
     "nothing to change"), or None when the call/parse failed. Never raises.
@@ -101,10 +120,14 @@ def analyze_batch(agent, session_records, memory_docs, prior_cycles, model_fn):
     The distinction matters to the caller: None records NO cycle, so the same
     batch is retried later; an empty-docs result IS recorded, so a clean
     "nothing to change" still resets the sessions-since-last-cycle counter.
+
+    ``peers`` is optional throughout: peer selection is best-effort upstream, so a
+    cycle that found nobody must run exactly as it always did rather than wait.
     """
     if not session_records:
         return None
-    user = json.dumps(build_payload(agent, session_records, memory_docs, prior_cycles),
+    user = json.dumps(build_payload(agent, session_records, memory_docs, prior_cycles,
+                                    peers=peers),
                       ensure_ascii=False, default=str)
     try:
         obj = _parse_json_object(model_fn(SYSTEM_PROMPT, user))

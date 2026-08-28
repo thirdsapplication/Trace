@@ -8,6 +8,13 @@ five engines pass `temperature=0` for determinism. Every agent build failed with
 The pin in requirements.txt is the real fix. This is so the next signature change
 degrades rather than failing: determinism is preferred, never required, because a run
 without temperature is worth more than no run at all.
+
+The module later absorbed a failure that is not a signature at all: above roughly 16K
+max_tokens the SDK requires streaming, and an oversized non-streaming request does not
+raise — it hangs to the HTTP timeout, so there is no error to read and nothing to fall
+back to. ``create_text_streaming`` is that path, covered here because it has to stay
+the SAME call underneath — text blocks only, system omitted rather than nulled — while
+never sending the one parameter ``create_text`` still tries.
 """
 
 import unittest
@@ -81,6 +88,43 @@ class Client:
         self.messages = messages
 
 
+class Stream:
+    """What ``.stream()`` hands back: a context manager, not a message. Leaving the
+    with-block is the only thing that releases the HTTP connection, so the fake
+    records whether it was ever closed."""
+
+    def __init__(self, resp):
+        self.resp, self.closed = resp, False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.closed = True
+        return False
+
+    def get_final_message(self):
+        return self.resp
+
+
+class StreamingMessages:
+    """An SDK with a working streaming transport. ``blocks`` stands in for what the
+    stream accumulated before ``get_final_message`` assembled it."""
+
+    blocks = ("streamed ", "ok")
+
+    def __init__(self):
+        self.calls, self.streams = [], []
+
+    def stream(self, **kw):
+        self.calls.append(kw)
+        resp = Resp(self.blocks[0])
+        for text in self.blocks[1:]:
+            resp.content.append(Block(text))
+        self.streams.append(Stream(resp))
+        return self.streams[-1]
+
+
 class ModelCallTest(unittest.TestCase):
     def test_temperature_is_sent_when_the_sdk_takes_it(self):
         m = Messages()
@@ -140,6 +184,70 @@ class ModelCallTest(unittest.TestCase):
                 return r
         self.assertEqual(
             model_call.create_text(Client(Mixed()), "m", "s", "u"), "kept")
+
+
+class StreamingCallTest(unittest.TestCase):
+    """The scrub engine returns a verbatim rewrite as large as its input, which is
+    what this transport exists for; a caller that quietly got create_text's behaviour
+    instead would hang rather than fail."""
+
+    def _client(self, messages=None):
+        m = messages if messages is not None else StreamingMessages()
+        return Client(m), m
+
+    def test_the_accumulated_message_comes_back_as_one_string(self):
+        c, m = self._client()
+        self.assertEqual(model_call.create_text_streaming(c, "m", "sys", "hi"),
+                         "streamed ok")
+        # Same request shape as create_text: only the transport differs.
+        self.assertEqual(m.calls[0]["model"], "m")
+        self.assertEqual(m.calls[0]["messages"], [{"role": "user", "content": "hi"}])
+
+    def test_the_stream_is_closed(self):
+        """get_final_message() outside the with-block returns the same text and leaks
+        the connection — the leak is invisible until a worker runs out of them."""
+        c, m = self._client()
+        model_call.create_text_streaming(c, "m", "sys", "hi")
+        self.assertTrue(m.streams[0].closed)
+
+    def test_no_temperature_is_sent_at_all(self):
+        """Every model that needs this path (Fable 5, Sonnet 5, Opus 5) answers 400 to
+        any sampling parameter, so unlike create_text there is nothing to send and no
+        rejection worth a second round trip."""
+        c, m = self._client()
+        model_call.create_text_streaming(c, "m", "sys", "hi")
+        self.assertNotIn("temperature", m.calls[0])
+        self.assertEqual(len(m.calls), 1)
+
+    def test_an_absent_system_prompt_is_omitted_not_nulled(self):
+        c, m = self._client()
+        model_call.create_text_streaming(c, "m", None, "hi")
+        self.assertNotIn("system", m.calls[0])
+        c, m = self._client()
+        model_call.create_text_streaming(c, "m", "sys", "hi")
+        self.assertEqual(m.calls[0]["system"], "sys")
+
+    def test_max_tokens_is_passed_through(self):
+        c, m = self._client()
+        model_call.create_text_streaming(c, "m", "s", "u", max_tokens=64_000)
+        self.assertEqual(m.calls[0]["max_tokens"], 64_000)
+
+    def test_the_default_ceiling_is_the_one_create_text_could_not_pass(self):
+        c, m = self._client()
+        model_call.create_text_streaming(c, "m", "s", "u")
+        self.assertEqual(m.calls[0]["max_tokens"], 16000)
+
+    def test_only_text_blocks_are_returned(self):
+        class Mixed(StreamingMessages):
+            def stream(self, **kw):
+                s = super().stream(**kw)
+                other = Block("dropped")
+                other.type = "thinking"
+                s.resp.content.append(other)
+                return s
+        c, _ = self._client(Mixed())
+        self.assertEqual(model_call.create_text_streaming(c, "m", "s", "u"),
+                         "streamed ok")
 
 
 if __name__ == "__main__":

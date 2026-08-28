@@ -14,6 +14,7 @@ import unittest
 import urllib.error
 import urllib.request
 
+from trace.agent import config as agent_config
 from trace.ui import app, registry, sessions, users
 from trace.tests.test_scheduler import FakeMA
 from trace.tests.test_ui import FakeController, FakeKeystore, fake_reconstruct
@@ -797,3 +798,133 @@ class AgentStatusVocabularyTest(unittest.TestCase):
         """If the column ever gains a state, this is where the mapping must learn it."""
         self.assertEqual(set(registry.AGENT_STATUS_DB.values()),
                          {"draft", "built", "deployed", "archived"})
+
+
+class PeerBundleRegistryTest(unittest.TestCase):
+    """A peer bundle is the one row in this system that crosses a CUSTOMER boundary, and
+    what may cross is decided entirely by two of its fields: ``verified`` (the scrub
+    gate's real answer) and ``created_at`` (how far the source has moved on since).
+
+    A field dropped between the write and the read does not present as a bug here — peers
+    keep being selected and the material still reads fine — it just quietly shares
+    something nothing cleared, or lets a year-old snapshot teach a current agent. That is
+    the color/owner_email omission again with a privacy edge on it, so both halves of the
+    round trip are asserted rather than assumed. File mode, the path this suite runs.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = self._tmp.name
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _bundle(self, agent_id="a1", verified=True, lesson="batch the searches"):
+        return {"agent_id": agent_id, "owner_user_id": "u1",
+                "sessions": [{"session_id": "s1", "status": "completed",
+                              "tokens": {"total_tokens": 4510},
+                              "transcript": "[agent] chased restaurant client A"}],
+                "memory": {agent_config.MEMORY_LESSONS_DOC: lesson},
+                "fingerprint": {"tools": {"gmail-search": 4}, "sessions": 5,
+                                "avg_tokens": 900},
+                "embedding": [0.25] * 8, "verified": verified}
+
+    def test_every_field_survives_the_round_trip(self):
+        registry.peer_bundle_add(self.root, self._bundle())
+        rows = registry.peer_bundles_latest(self.root)
+        self.assertEqual(len(rows), 1)
+        for key in ("agent_id", "owner_user_id", "sessions", "memory", "fingerprint",
+                    "embedding", "verified"):
+            self.assertEqual(rows[0][key], self._bundle()[key],
+                             f"{key} did not survive the round trip")
+        self.assertTrue(rows[0].get("created_at"),
+                        "without it every bundle is ageless and stale practice never "
+                        "drops out of selection")
+
+    def test_only_the_newest_bundle_per_agent_comes_back(self):
+        registry.peer_bundle_add(self.root, self._bundle(lesson="the abandoned habit"))
+        registry.peer_bundle_add(self.root, self._bundle(lesson="the current habit"))
+        rows = registry.peer_bundles_latest(self.root)
+        self.assertEqual(len(rows), 1,
+                         "offered alongside the new one, an older snapshot does not add "
+                         "noise — it corroborates a habit the source has already dropped")
+        self.assertEqual(rows[0]["memory"][agent_config.MEMORY_LESSONS_DOC],
+                         "the current habit")
+
+    def test_each_agent_keeps_its_own_latest(self):
+        registry.peer_bundle_add(self.root, self._bundle("a1"))
+        registry.peer_bundle_add(self.root, self._bundle("a2"))
+        self.assertEqual({b["agent_id"] for b in registry.peer_bundles_latest(self.root)},
+                         {"a1", "a2"}, "newest PER AGENT, not newest overall")
+
+
+    def test_material_is_fetched_separately_from_selection(self):
+        # peer_bundles_latest carries only what selection gates on; the bulk comes back
+        # for the handful that won. Both halves have to work or peers arrive empty.
+        registry.peer_bundle_add(self.root, self._bundle("a1", lesson="read once"))
+        material = registry.peer_bundle_material(self.root, "a1")
+        self.assertIsNotNone(material)
+        self.assertTrue(material["sessions"])
+        self.assertIn("read once", json.dumps(material["memory"]))
+
+    def test_material_for_an_unknown_agent_is_none_not_an_error(self):
+        self.assertIsNone(registry.peer_bundle_material(self.root, "nobody"))
+    def test_an_unverified_bundle_is_never_returned(self):
+        registry.peer_bundle_add(self.root, self._bundle("a1", verified=False))
+        registry.peer_bundle_add(self.root, self._bundle("a2"))
+        self.assertEqual([b["agent_id"] for b in registry.peer_bundles_latest(self.root)],
+                         ["a2"], "only material the scrub pass AND its independent "
+                                 "verifier cleared may cross a customer boundary")
+
+    def test_a_bundle_that_forgot_the_flag_is_not_returned(self):
+        """``verified`` defaults False on the way in, so a caller that omits it publishes
+        something selection ignores — the safe direction to be wrong in."""
+        bundle = self._bundle()
+        bundle.pop("verified")
+        registry.peer_bundle_add(self.root, bundle)
+        self.assertEqual(registry.peer_bundles_latest(self.root), [])
+
+    def test_limit_bounds_the_rows_returned(self):
+        for i in range(4):
+            registry.peer_bundle_add(self.root, self._bundle(f"a{i}"))
+        self.assertEqual(len(registry.peer_bundles_latest(self.root, limit=2)), 2)
+
+
+class PeerBundleMappingTest(unittest.TestCase):
+    """The Supabase half of that round trip. File mode returns the stored dict, so the
+    tests above pass whatever _bundle_to_caller does — and Supabase is the path that runs
+    in production, which is the exact shape of the five mapping bugs this month."""
+
+    ROW = {"agent_id": "a1", "owner_id": "u1",
+           "sessions": [{"session_id": "s1", "transcript": "[agent] did the work"}],
+           "memory": {"/lessons_learned.md": "batch the searches"},
+           "fingerprint": {"tools": {"gmail-search": 2}}, "embedding": [0.5, 0.5],
+           "verified": True, "created_at": "2026-08-26T06:00:00Z"}
+
+    def test_the_two_gating_columns_survive(self):
+        out = registry._bundle_to_caller(dict(self.ROW))
+        self.assertTrue(out["verified"],
+                        "dropped, selection can no longer tell material the scrub "
+                        "gate cleared from material it never saw")
+        self.assertEqual(out["created_at"], "2026-08-26T06:00:00Z",
+                         "dropped, select_peers can no longer age anything out")
+
+    def test_the_material_and_the_match_keys_survive(self):
+        out = registry._bundle_to_caller(dict(self.ROW))
+        self.assertEqual(out["agent_id"], "a1")
+        self.assertEqual(out["owner_user_id"], "u1")
+        self.assertEqual(out["sessions"], self.ROW["sessions"])
+        self.assertEqual(out["memory"], self.ROW["memory"])
+        self.assertEqual(out["fingerprint"]["tools"], {"gmail-search": 2})
+        self.assertEqual(out["embedding"], [0.5, 0.5],
+                         "without it a bundle can only ever match on tool overlap")
+
+    def test_a_sparse_row_maps_to_the_empty_shapes_callers_expect(self):
+        """A pre-022 or half-written row must map to something selection can read
+        without type-checking every field — and must not read as verified."""
+        out = registry._bundle_to_caller({})
+        self.assertFalse(out["verified"])
+        self.assertEqual(out["sessions"], [])
+        self.assertEqual(out["memory"], {})
+        self.assertEqual(out["fingerprint"], {})
+        self.assertIsNone(out["agent_id"])

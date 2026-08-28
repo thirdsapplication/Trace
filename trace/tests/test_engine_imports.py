@@ -21,6 +21,7 @@ import unittest
 ENGINES = {
     "trace.agent.configgen": ["model_call"],
     "trace.agent.learn": ["model_call"],
+    "trace.agent.scrub": ["model_call"],          # two builders: scrub and verify
     "trace.discovery.discover": ["model_call"],
     "trace.discovery.scorer": ["model_call"],
     "trace.reconstruct.reconstruct": ["model_call"],

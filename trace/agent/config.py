@@ -9,6 +9,18 @@ import os
 import re
 import urllib.parse
 
+
+def _env_int(name, default, minimum=1):
+    """A positive-int knob read from the host's environment, falling back to ``default``
+    on anything unusable. Deliberately total: these are read at IMPORT time, so a typo in
+    a deployment's env var must degrade to the default, never crash the app at startup."""
+    try:
+        value = int((os.environ.get(name) or "").strip())
+    except (TypeError, ValueError):
+        return default
+    return value if value >= minimum else default
+
+
 # --- platform pins (also mirrored in api_client; keep in sync) -------------
 # All doc-confirmed against the Verified Platform Reference (June 2026 public beta).
 BETA_VERSION = "managed-agents-2026-04-01"
@@ -27,7 +39,11 @@ SUMMARY_MODEL = "claude-haiku-4-5"
 # docs and rewrites lessons_learned.md so future sessions get more accurate and
 # more token-efficient. See trace/agent/learn.py.
 LEARNING_MODEL = "claude-fable-5"
-LEARNING_CYCLE_SESSIONS = 5              # N: eligible sessions per learning cycle
+# N: eligible sessions per learning cycle. Overridable because a cycle only fires after N
+# REAL sessions — at a daily cadence that is five days, so testing collective learning
+# end-to-end was a week-long round trip. TRACE_LEARNING_CYCLE_SESSIONS=1 on a test
+# deployment collapses that to a single run; a non-integer or < 1 value falls back to 5.
+LEARNING_CYCLE_SESSIONS = _env_int("TRACE_LEARNING_CYCLE_SESSIONS", 5)
 LEARNING_CYCLE_MAX_SESSIONS = 10         # payload bound when a backlog accrued
 LEARNING_MAX_TOKENS = 16000              # the reply carries a full replacement doc
 LEARNING_CHECK_SECONDS = 600             # per-agent trigger-check throttle (sync path)
@@ -50,6 +66,34 @@ SUMMARY_REQUEST_TIMEOUT = 25             # seconds per summarize call (user-faci
 SUMMARY_RETRIES = 1
 LEARNING_REQUEST_TIMEOUT = 900           # seconds for the (backgrounded) analysis call
 LEARNING_RETRIES = 1
+# Collective learning (scrub -> publish -> peer bundles). COLLECTIVE_ENABLED is the one
+# switch here that defaults OFF, the opposite of LEARNING_ENABLED above: a learning cycle
+# only ever rewrites an agent's OWN lessons doc, while this path moves material BETWEEN
+# agents, and therefore between customers. It stays dark until a human explicitly sets
+# TRACE_COLLECTIVE_ENABLED=1 on the host — off is the safe default; on is a decision.
+COLLECTIVE_ENABLED = (os.environ.get("TRACE_COLLECTIVE_ENABLED") or "0").strip() != "0"
+# De-identification pass run before a batch may leave its agent. TWO models on purpose:
+# a cheaper one writes the scrub, a stronger and independent one verifies it — a writer
+# grading its own redactions is not a second opinion (same posture as the per-lesson
+# gate in generalize.verify_lesson_scrub).
+SCRUB_MODEL = "claude-sonnet-5"
+SCRUB_VERIFY_MODEL = "claude-opus-5"
+SCRUB_MAX_TOKENS = 64_000                # the reply restates every session AND doc in full
+SCRUB_REQUEST_TIMEOUT = 900              # seconds; backgrounded, like the analysis call
+SCRUB_RETRIES = 1
+SCRUB_SESSION_CLIP = 12_000              # chars of transcript per session (matches learning)
+# Far tighter than LEARNING_DOC_CLIP (90_000): the learning call READS the docs, this one
+# has to echo every scrubbed one back inside SCRUB_MAX_TOKENS alongside the sessions.
+SCRUB_DOC_CLIP = 20_000
+# Peer selection. Two tiers: agents reaching for the SAME TOOLS (Jaccard overlap of tool
+# names) and agents doing the SAME JOB (embedding cosine). Both floors are deliberately
+# strict — an unrelated agent's lessons are worse than no lessons, because whatever lands
+# in the payload reads as authoritative to the model that receives it.
+PEER_MIN_TOOL_OVERLAP = 0.4              # Jaccard floor for "works with the same tools"
+PEER_SAME_JOB_COSINE = 0.8               # cosine floor for "does the same job"
+PEER_MAX = 3                             # more peers crowd out the agent's OWN sessions
+PEER_BUNDLE_MAX_AGE_DAYS = 30            # older bundles describe a workflow that has moved on
+LEARNING_PEER_BUDGET_CHARS = 120_000     # hard cap on peer material in one learning payload
 # Manual-evaluation mode (current): evaluation is done by the user in the Console,
 # so we keep each run cheap — one session per bundle, a single session's tokens —
 # and never fan out. Recent rounds burned credits running many sessions.

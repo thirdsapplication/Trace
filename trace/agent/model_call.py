@@ -15,6 +15,14 @@ must never see the parameter.
 
 Determinism is preferred, never required: a run without temperature is worth more
 than no run at all, and the alternative is an agent build that dies on a keyword.
+
+The third failure this module absorbs is size, not signature. Above roughly 16K
+``max_tokens`` the SDK requires streaming, and a non-streaming request that large does
+not fail loudly -- it hangs until the HTTP timeout, so there is no error to read and
+nothing to fall back to. That ceiling is the only reason ``LEARNING_MAX_TOKENS`` is
+pinned at 16000: ``create_text`` was all there was. The scrub engine cannot live under
+it -- it returns a verbatim rewrite as large as its input (~25K tokens, up to 64K) --
+so ``create_text_streaming`` is the same call with the streaming transport underneath.
 """
 
 
@@ -46,6 +54,28 @@ def create_text(client, model, system, user, max_tokens=4000, temperature=0):
         if "temperature" not in msg and "sampling" not in msg:
             raise
         resp = client.messages.create(**kwargs)
+    return _text(resp)
+
+
+def create_text_streaming(client, model, system, user, max_tokens=16000):
+    """Call Messages over a stream and return the concatenated text.
+
+    Same result as ``create_text`` -- one string, text blocks only -- for callers whose
+    reply is too big to survive a non-streaming request (see the module docstring).
+
+    Sends NO temperature at all -- not even the send-then-retry ``create_text`` does,
+    because every model that needs this path (Fable 5, Sonnet 5, Opus 5) answers 400 to
+    any sampling parameter: there is no determinism left to trade for, and no rejection
+    worth a second round trip.
+    """
+    kwargs = dict(model=model, max_tokens=max_tokens,
+                  messages=[{"role": "user", "content": user}])
+    if system:                       # same rule as create_text: sending system=None
+        kwargs["system"] = system    # is not the same as omitting it
+    # .stream() hands back a manager, not a message: the with-block is what closes the
+    # HTTP connection once get_final_message() has assembled the accumulated deltas.
+    with client.messages.stream(**kwargs) as stream:
+        resp = stream.get_final_message()
     return _text(resp)
 
 

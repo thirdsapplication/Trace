@@ -64,6 +64,8 @@ from ..agent import activity as agent_activity
 from ..agent import embeddings as agent_embeddings
 from ..agent import generalize as agent_generalize
 from ..agent import learn as agent_learn
+from ..agent import peers as agent_peers
+from ..agent import scrub as agent_scrub
 from . import (cloud, keystore, notify, permissions, registry, sessions,
                supabase_client, teams, users)
 
@@ -227,7 +229,8 @@ class AppState:
                  discovery_fn=None, describe_fn=None, score_fn=None, artifact_fn=None,
                  interview_fn=None, config_fn=None, cleanup_fn=None,
                  connect_fn=None, deploy_fn=None, cloud_backend=None, proxy_fn=None,
-                 summarize_fn=None, learn_fn=None):
+                 summarize_fn=None, learn_fn=None,
+                 scrub_fn=None, scrub_verify_fn=None):
         self.sessions_root = sessions_root
         self.collector_port = collector_port
         # The founder Test UI (`/`, `/static/`, the unauthenticated `/api/*` routes)
@@ -269,6 +272,12 @@ class AppState:
         # sessions and rewrites lessons_learned.md (Fable). Stub in tests; built
         # lazily from the key.
         self.learn_fn = learn_fn
+        # Collective learning: the scrub pass and its independent privacy gate. Two
+        # seams, not one, because the whole point of the gate is that it is a SECOND
+        # opinion — a test that stubs both with the same callable is testing plumbing,
+        # and should have to say so.
+        self.scrub_fn = scrub_fn
+        self.scrub_verify_fn = scrub_verify_fn
         self.controller_factory = controller_factory or (
             lambda out: CaptureController(out, collector_port=collector_port))
         self.keystore = key_store or keystore
@@ -300,6 +309,7 @@ class AppState:
         self._scheduler_thread = None
         self._vault_refreshed = {}   # vault_ref -> epoch of last rolling refresh (deployment sync)
         self._learning_inflight = set()   # agent_ids with a learning cycle running
+        self._publish_inflight = set()    # agent_ids publishing a peer bundle
         self._learning_checked = {}  # agent_id -> epoch of last learning trigger check
         # Session ids that 404'd (deleted/expired on the platform). A gone session
         # never comes back, so each is discovered once and then skipped by BOTH the
@@ -649,6 +659,39 @@ class AppState:
         os.environ["ANTHROPIC_API_KEY"] = key
         return self._tap("learning", None, agent_config.LEARNING_MODEL,
                          lambda: agent_learn._default_model_fn(agent_config.LEARNING_MODEL))
+
+    def _scrub_model_fn(self):
+        """The injected scrubber if present (tests), else a lazy Sonnet caller from the
+        saved key. Raises ``no_api_key`` only if it actually needs to call the model.
+        Every call lands in the admin prompt log under engine "scrub" — the tap carries
+        the same transcripts the learning tap already carries, and being able to read
+        back exactly what the scrub was asked to rewrite is the only way a bundle that
+        came out wrong can be diagnosed after the fact."""
+        if self.scrub_fn:
+            return self._tap("scrub", None, agent_scrub.DEFAULT_MODEL,
+                             lambda: self.scrub_fn)
+        key = self.keystore.get_key()
+        if not key:
+            raise RuntimeError("no_api_key")
+        os.environ["ANTHROPIC_API_KEY"] = key
+        return self._tap("scrub", None, agent_scrub.DEFAULT_MODEL,
+                         lambda: agent_scrub._default_model_fn(agent_scrub.DEFAULT_MODEL))
+
+    def _scrub_verify_model_fn(self):
+        """The independent privacy gate on a scrubbed bundle — a DIFFERENT (stronger)
+        model than the one that did the scrubbing, because a model checking its own work
+        is one opinion counted twice, and this is the last check before material crosses
+        an account boundary. Logged under engine "scrub-verify"."""
+        if self.scrub_verify_fn:
+            return self._tap("scrub-verify", None, agent_scrub.VERIFY_MODEL,
+                             lambda: self.scrub_verify_fn)
+        key = self.keystore.get_key()
+        if not key:
+            raise RuntimeError("no_api_key")
+        os.environ["ANTHROPIC_API_KEY"] = key
+        return self._tap("scrub-verify", None, agent_scrub.VERIFY_MODEL,
+                         lambda: agent_scrub._default_verify_model_fn(
+                             agent_scrub.VERIFY_MODEL))
 
     # --- teams (frame 30) -------------------------------------------------
     def team_view(self, user):
@@ -2041,7 +2084,7 @@ class AppState:
         return bool(wrote)
 
     # --- learning cycles: Fable-driven periodic self-improvement ---------
-    def maybe_run_learning_cycle(self, agent, verbose=False):
+    def maybe_run_learning_cycle(self, agent, verbose=False, force=False):
         """Best-effort trigger: when >= LEARNING_CYCLE_SESSIONS eligible runs have
         accrued since the last learning cycle, spawn one on a daemon thread (a
         Fable call producing a full replacement doc takes far longer than an HTTP
@@ -2058,7 +2101,14 @@ class AppState:
         just happened, so every scheduled run leaves one line of learning progress
         in the log, while the throttled re-checks stay silent. Without this, a
         skipped agent was indistinguishable from an unchecked one and "why is
-        nothing learning?" had no answer in the log."""
+        nothing learning?" had no answer in the log.
+
+        ``force`` (the manual "learn now") drops the session-COUNT gate only —
+        everything else still applies, including the kill switch, the memory-store
+        requirement, the one-cycle-at-a-time bound and terminality. It exists so a
+        change to the learning path can be exercised on demand: at the default of
+        five sessions and a daily cadence, the alternative was a five-day wait per
+        attempt."""
         try:
             aid = agent.get("agent_id")
             if not aid:
@@ -2082,10 +2132,20 @@ class AppState:
                      and r.get("run_session_id") not in self._sessions_gone
                      and str(r.get("ran_at") or r.get("started_at") or "") > since]
             if len(batch) < n:
-                if verbose:
-                    print(f"[learning] {aid}: {len(batch)} eligible session(s) "
-                          f"since the last cycle — a cycle runs at {n}", flush=True)
-                return None
+                if not force:
+                    if verbose:
+                        print(f"[learning] {aid}: {len(batch)} eligible session(s) "
+                              f"since the last cycle — a cycle runs at {n}", flush=True)
+                    return None
+                if not batch:
+                    # Forcing cannot conjure material: with nothing since the last
+                    # cycle there is literally nothing to analyze, and an empty batch
+                    # would surface downstream as a confusing "analysis failed".
+                    print(f"[learning] {aid}: nothing to learn from — no eligible "
+                          f"session since the last cycle", flush=True)
+                    return None
+                print(f"[learning] {aid}: forced cycle on {len(batch)} session(s), "
+                      f"below the usual {n}", flush=True)
             with self._bg_lock:
                 if aid in self._learning_inflight:
                     return None
@@ -2103,7 +2163,7 @@ class AppState:
             try:
                 batch = batch[:agent_config.LEARNING_CYCLE_MAX_SESSIONS]
                 t = threading.Thread(target=self._learning_cycle_worker,
-                                     args=(agent, batch), daemon=True)
+                                     args=(agent, batch, force), daemon=True)
                 t.start()
                 return t
             except Exception:                              # noqa: BLE001 — a failed spawn must
@@ -2113,9 +2173,9 @@ class AppState:
         except Exception:                                  # noqa: BLE001 — never block a run
             return None
 
-    def _learning_cycle_worker(self, agent, batch):
+    def _learning_cycle_worker(self, agent, batch, force=False):
         try:
-            self._run_learning_cycle(agent, batch)
+            self._run_learning_cycle(agent, batch, force=force)
         except Exception as e:                             # noqa: BLE001
             print(f"[learning] cycle failed for {agent.get('agent_id')}: {_why(e)}",
                   flush=True)
@@ -2123,7 +2183,7 @@ class AppState:
             with self._bg_lock:
                 self._learning_inflight.discard(agent.get("agent_id"))
 
-    def _run_learning_cycle(self, agent, batch):
+    def _run_learning_cycle(self, agent, batch, force=False):
         """Execute one learning cycle: fetch the batch's session events, verify
         terminality, read the memory docs, make ONE Fable analysis call, write the
         sanitized replacement doc, and record the cycle. Returns the cycle record,
@@ -2134,7 +2194,10 @@ class AppState:
         Firing right after new terminal runs were recorded is the race mitigation:
         the next platform-cron session is typically hours away. The residual race
         with a concurrently-starting session is accepted — the same acceptance
-        shared_lessons.md was built on."""
+        shared_lessons.md was built on.
+
+        ``force`` lowers the batch-size floor to one session (see
+        maybe_run_learning_cycle) and changes nothing else."""
         aid = agent.get("agent_id")
         store_id = agent.get("memory_store_id")
         client = self._live_client()
@@ -2167,12 +2230,24 @@ class AppState:
                   flush=True)
             return None
         kept = [(r, ev) for r, ev in pairs if agent_activity.is_terminal(ev)]
-        if len(kept) < agent_config.LEARNING_CYCLE_SESSIONS:
+        # force lowers the FLOOR; it deliberately does not reach the terminality checks
+        # above. A session still running has nothing to analyze yet, and pulling it into
+        # a cycle now would also drop it from every later batch (batches are filtered on
+        # the last cycle's timestamp), so forcing past it would lose the session outright.
+        floor = 1 if force else agent_config.LEARNING_CYCLE_SESSIONS
+        if len(kept) < floor:
             print(f"[learning] deferring for {aid} — only {len(kept)} fetchable "
                   f"terminal session(s) in the batch ({gone} gone)", flush=True)
             return None
         # Oldest first, so the model reads the batch in the order it happened.
         records = [agent_learn.session_record(r, ev) for r, ev in reversed(kept)]
+        # What this agent actually DOES, taken from the events this batch already
+        # fetched. Both halves of the collective path read it — who this agent may learn
+        # from, and what it publishes at the end — and it is computed here because these
+        # event lists are the only ones in hand; deriving it later would mean a second
+        # fan-out of platform reads for material we already paid for once.
+        fp = agent_peers.fingerprint([ev for _, ev in kept])
+        vec = self._peer_vector(agent, fp)
         # All three docs go in as context (status + shared read-only; only lessons
         # may come back edited, enforced by learn._sanitize_docs). A doc that
         # cannot be read stays None -> "(unavailable)" in the payload — never
@@ -2191,8 +2266,13 @@ class AppState:
                 "estimated": bool(c.get("tokens_estimated"))})
         agent_info = {"name": agent.get("name"), "description": agent.get("description"),
                       "trigger": agent.get("trigger")}
+        # No lock is held across any of this, and none may be: peer selection, the
+        # analysis call and the publish below are minutes of network I/O. Holding
+        # self.lock across network I/O is exactly what once left a database-only page
+        # waiting behind a scheduler pass, and is why the background locks were split.
+        peers = self._collect_peers(agent, fp, vec)
         result = agent_learn.analyze_batch(agent_info, records, docs, prior,
-                                           self._learning_model_fn())
+                                           self._learning_model_fn(), peers=peers)
         if result is None:
             print(f"[learning] analysis failed for {aid} — will retry the batch "
                   f"on a later pass", flush=True)
@@ -2222,7 +2302,168 @@ class AppState:
         est = " (est)" if cycle["tokens_estimated"] else ""
         print(f"[learning] cycle for {aid}: {len(stats)} sessions, {total} tokens{est}, "
               f"wrote {', '.join(docs_written) or 'nothing'}", flush=True)
+        # Publishing is deliberately the LAST thing the cycle does. It is a second long
+        # model call behind a gate that fails closed, so it is the step most likely to
+        # fail — and by now everything this cycle owed its own agent (the rewritten
+        # lessons doc, the recorded cycle row) is already durable. A rejected or failed
+        # publish therefore costs the fleet one bundle and this agent nothing.
+        # The docs published are the ones the agent is ACTUALLY running on: the freshly
+        # written content for anything that reached the memory store, the pre-cycle text
+        # for the rest. Publishing a doc whose write failed would advertise practice this
+        # agent never adopted.
+        fresh = {p: c for p, c in (result.get("docs") or {}).items() if p in docs_written}
+        # Hand the fleet-wide slot back BEFORE publishing. LEARNING_MAX_CONCURRENT is 1, so
+        # whatever holds that slot serialises every other agent's cycle behind it — and the
+        # scrub is the longest call in this whole path (a verbatim rewrite streams as many
+        # tokens as it reads), with the privacy gate behind it. Holding the slot across both
+        # would roughly double the window in which no other agent can learn, to publish a
+        # bundle nobody is waiting on. The worker's finally still discards; discard is
+        # idempotent. _publish_inflight keeps this agent from publishing twice at once,
+        # which is the only race the early release opens.
+        aid_ = agent.get("agent_id")
+        with self._bg_lock:
+            self._learning_inflight.discard(aid_)
+            if aid_ in self._publish_inflight:
+                return cycle
+            self._publish_inflight.add(aid_)
+        try:
+            self._publish_peer_bundle(agent, records, {**docs, **fresh}, fp)
+        finally:
+            with self._bg_lock:
+                self._publish_inflight.discard(aid_)
         return cycle
+
+    # --- collective learning: peers in, a scrubbed bundle out --------------
+    def _peer_vector(self, agent, fp):
+        """This agent's profile embedding for peer matching, or None.
+
+        None is an ordinary answer rather than a failure: peers.classify still matches on
+        tool overlap without a vector, so an install with no embeddings key gets the
+        coarser tier instead of no peers at all. Never raises.
+        """
+        if not agent_config.COLLECTIVE_ENABLED:
+            return None
+        try:
+            vecs = agent_embeddings.embed(agent_peers.profile_text(agent, fp),
+                                          input_type="document")
+        except Exception as e:                             # noqa: BLE001 — advisory input
+            print(f"[learning] could not embed the peer profile for "
+                  f"{agent.get('agent_id')}: {_why(e)}", flush=True)
+            return None
+        return vecs[0] if vecs else None
+
+    def _collect_peers(self, agent, fp, vec):
+        """The scrubbed material from similar agents to put in front of this cycle, or []
+        when the collective path is off, nobody matched, or the lookup failed.
+
+        Never raises and never blocks the cycle. A peer is an enhancement to a learning
+        cycle; the agent's own sessions are the point of it. Losing a cycle to a failed
+        peer lookup would trade the lessons this agent is guaranteed for material it
+        merely might have benefited from — so every failure here degrades to solo
+        learning, out loud.
+        """
+        if not agent_config.COLLECTIVE_ENABLED:
+            return []
+        aid = agent.get("agent_id")
+
+        def note(peer):
+            # Tier and overlap only. A peer belongs to a DIFFERENT customer, and the log
+            # is the one place its identity could leak back out of a payload that was
+            # built (peers.peer_payloads) to carry nothing but a positional label.
+            try:
+                return f"{peer.get('tier')}, overlap {float(peer.get('tool_overlap')):.2f}"
+            except (TypeError, ValueError):                # a bundle from an older build
+                return str(peer.get("tier"))
+
+        try:
+            bundles = registry.peer_bundles_latest(self.sessions_root)
+            selected = agent_peers.select_peers(aid, fp, vec, bundles)
+            # Selection ran on fingerprints alone; the material comes back only for the
+            # few that won (see registry.peer_bundles_latest on why that read is narrow).
+            # A bundle whose material has since gone is dropped rather than sent empty:
+            # an empty peer teaches nothing and still spends payload budget.
+            filled = []
+            for peer in selected:
+                bundle = peer.get("bundle") or {}
+                material = registry.peer_bundle_material(self.sessions_root,
+                                                         bundle.get("agent_id"))
+                if not material or not material.get("sessions"):
+                    continue
+                filled.append({**peer, "bundle": {**bundle, **material}})
+            selected = filled
+            peers = agent_peers.peer_payloads(selected)
+            if not peers:
+                # The empty case is logged too. Silence here is what made "why is nothing
+                # learning?" unanswerable in this codebase once already: a cycle that
+                # found nobody read exactly like a cycle that never looked.
+                print(f"[learning] no peer matched {aid} ({len(bundles)} bundle(s) "
+                      f"considered) — learning from its own sessions only", flush=True)
+                return []
+            print(f"[learning] {len(peers)} peer{'' if len(peers) == 1 else 's'} included "
+                  f"({'; '.join(note(x) for x in peers)})", flush=True)
+            if len(peers) < len(selected):
+                print(f"[learning] {len(selected) - len(peers)} further peer(s) matched "
+                      f"{aid} but did not fit the payload budget", flush=True)
+            return peers
+        except Exception as e:                             # noqa: BLE001 — solo, never lost
+            print(f"[learning] peer lookup failed for {aid}: {_why(e)} — learning from "
+                  f"its own sessions only", flush=True)
+            return []
+
+    def _publish_peer_bundle(self, agent, records, docs, fp):
+        """Offer this cycle's batch to the fleet: scrub it, have a second model verify the
+        scrub, and store the result as this agent's peer bundle. True only when a bundle
+        was actually written.
+
+        Rejection is a routine outcome — the gate fails closed on anything it cannot
+        clear — so every exit says why: a bundle that silently never appears is
+        indistinguishable from a collective path that was switched off. Never raises; the
+        caller has already written this agent's own lessons by the time it runs.
+        """
+        if not agent_config.COLLECTIVE_ENABLED:
+            return False
+        aid = agent.get("agent_id")
+        try:
+            # _sanitize_memory drops everything outside scrub.SCRUBBED_DOCS, so all three
+            # cycle docs (unreadable ones included) can go in as they are — the whitelist
+            # is enforced there, in code, rather than restated at each call site.
+            scrubbed = agent_scrub.scrub_and_verify(records, docs,
+                                                    self._scrub_model_fn(),
+                                                    self._scrub_verify_model_fn())
+        except Exception as e:                             # noqa: BLE001 — costs one bundle
+            print(f"[learning] scrub failed for {aid}: {_why(e)} — nothing published",
+                  flush=True)
+            return False
+        if not scrubbed:
+            # scrub_and_verify already printed the specific "[scrub] rejected — ..." line;
+            # this one ties that rejection back to the agent and the cycle it came from.
+            print(f"[learning] no peer bundle for {aid} — the scrub gate rejected this "
+                  f"batch", flush=True)
+            return False
+        vec = self._peer_vector(agent, fp)
+        try:
+            registry.peer_bundle_add(self.sessions_root, {
+                "agent_id": aid,
+                "owner_user_id": agent.get("owner_user_id"),
+                "sessions": scrubbed.get("sessions") or [],
+                "memory": scrubbed.get("memory") or {},
+                "fingerprint": fp,
+                "embedding": vec,
+                # scrub_and_verify returns a dict ONLY after the structural check, the
+                # leak sweep and the independent privacy model have all passed, so this
+                # flag is that pass's real answer and not an optimistic default.
+                "verified": True,
+            })
+        except Exception as e:                             # noqa: BLE001
+            print(f"[learning] could not store the peer bundle for {aid}: {_why(e)}",
+                  flush=True)
+            return False
+        print(f"[learning] published a peer bundle for {aid}: "
+              f"{len(scrubbed.get('sessions') or [])} scrubbed session(s), "
+              f"{len((fp or {}).get('tools') or {})} tool(s)"
+              + ("" if vec else " (no profile vector — peers will match it on tool "
+                                "overlap alone)"), flush=True)
+        return True
 
     def run_deployment_now(self, agent):
         """Manual run of a deployment-backed agent: refresh the vault, trigger a
@@ -3132,9 +3373,10 @@ def make_handler(state):
             return out
 
         def _agent_action(self, agent_id, action, body, user):
-            """Spec 4: set/clear/pause an agent's schedule, or run it now. Scoped to
-            the logged-in user (only their own agents). Run-now is async (a real run
-            can take minutes) — the dashboard polls /api/u/agents for the outcome."""
+            """Spec 4: set/clear/pause an agent's schedule, run it now, or run a
+            learning cycle now. Scoped to the logged-in user (only their own agents).
+            Run-now and learn-now are async (both take minutes) — the dashboard polls
+            /api/u/agents for the outcome."""
             agent = next((a for a in registry.agents_for_user(root, user["user_id"])
                           if a.get("agent_id") == agent_id), None)
             if not agent:
@@ -3180,6 +3422,21 @@ def make_handler(state):
                 else:                                     # legacy (pre-deployment) agent
                     threading.Thread(target=lambda: state.run_agent(agent), daemon=True).start()
                 return self._json(202, {"state": "running"})
+            if action == "learn-now":
+                # A cycle needs LEARNING_CYCLE_SESSIONS real sessions, and at a daily
+                # cadence that is five days — so checking any change to the learning
+                # path end to end was a week-long round trip per attempt. force=True
+                # runs the SAME cycle the scheduler runs, minus the count gate; none of
+                # the cycle logic is duplicated here, so what this verifies is the real
+                # path and not a test-only imitation of it.
+                # Threaded like run-now, and for the same reason: the trigger alone
+                # reads runs and cycles from the registry before it defers or spawns,
+                # which is not work an HTTP handler should be holding a socket open for.
+                threading.Thread(
+                    target=lambda: state.maybe_run_learning_cycle(agent, verbose=True,
+                                                                  force=True),
+                    daemon=True).start()
+                return self._json(202, {"state": "learning"})
             return self._json(404, {"error": "not_found"})
 
         def _team_invite(self, body, user):
@@ -3653,8 +3910,9 @@ def make_handler(state):
                 return self._capture_ctl(rest.rsplit("/", 1)[1])
             if rest == "/sessions/raw-upload":           # Phase 2: desktop capture upload
                 return self._raw_upload(user, body)
-            ma = re.match(r"^/agents/([^/]+)/(schedule|schedule/pause|run-now)$", rest)
-            if ma:                                       # Spec 4: schedule / run-now
+            ma = re.match(
+                r"^/agents/([^/]+)/(schedule|schedule/pause|run-now|learn-now)$", rest)
+            if ma:                                       # Spec 4: schedule / run-now / learn-now
                 return self._agent_action(ma.group(1), ma.group(2), body, user)
             mrv = re.match(r"^/agents/([^/]+)/reviews$", rest)
             if mrv:                                      # mark one story (session) reviewed
