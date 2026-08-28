@@ -258,6 +258,13 @@ class ActivityEndpointTest(AgentsEndpointTest):
     def test_activity_returns_summary_and_proposals(self):
         uid, cookie = self._signup("a1@x.com")
         self._setup_staged(uid)
+        # The first load answers from the DB and kicks the enrichment off a thread
+        # (reading session events and summarizing them is what used to make this
+        # request slow); the enriched rows land on the next load.
+        status, data, _ = self._req("GET", "/api/u/agents/agent-1/activity", cookie=cookie)
+        self.assertEqual(status, 200)
+        self.assertTrue(data["refreshing"])
+        self.state.flush_activity_refresh()
         status, data, _ = self._req("GET", "/api/u/agents/agent-1/activity", cookie=cookie)
         self.assertEqual(status, 200)
         act = data["activity"]
@@ -279,6 +286,7 @@ class ActivityEndpointTest(AgentsEndpointTest):
         uid, cookie = self._signup("a3@x.com")
         self._setup_staged(uid)
         self._req("GET", "/api/u/agents/agent-1/activity", cookie=cookie)   # creates pending
+        self.state.flush_activity_refresh()                 # enrichment is backgrounded
         pend = registry.pending_for_user(self.root, uid)
         self.assertTrue(pend)
         status, _, _ = self._req("POST", "/api/u/agents/agent-1/approve-actions",
@@ -596,6 +604,7 @@ class QueuedReaperTest(AgentsEndpointTest):
         self.state.summarize_fn = lambda s, u: "x"
         try:
             self._req("GET", "/api/u/agents/agent-1/activity", cookie=cookie)
+            self.state.flush_activity_refresh()             # staging is backgrounded now
             id1, id2 = sorted((p["id"] for p in registry.pending_for_user(self.root, uid)),
                               key=int)
             self._req("POST", f"/api/u/pending/{id1}/approve", {}, cookie=cookie)

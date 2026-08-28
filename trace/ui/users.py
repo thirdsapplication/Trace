@@ -186,8 +186,35 @@ def verify(email, password):
     return None, None
 
 
+# Same reasoning as the JWT cache below, for the lookup that runs immediately after
+# it: _current_user resolves the profile on EVERY authenticated request, and this was
+# an uncached round trip on the critical path of every page. Only id/email/created_at
+# are cached, and no write path in the app changes those (registry's profiles updates
+# touch display_name, org, notify prefs and consent — none of them here), so the short
+# TTL is the only staleness bound needed; _profile_evict exists for anything that ever
+# does change them.
+_PROFILE_CACHE = {}              # user_id -> (public_user, expires_epoch)
+_PROFILE_CACHE_TTL = 60
+_PROFILE_CACHE_MAX = 1024
+
+
+def _profile_evict(user_id=None):
+    """Drop one cached profile (or all of them) — call after any profile write."""
+    with _LOCK:
+        if user_id is None:
+            _PROFILE_CACHE.clear()
+        else:
+            _PROFILE_CACHE.pop(str(user_id), None)
+
+
 def get(user_id):
-    """The public user for an id, or None."""
+    """The public user for an id, or None. Cached briefly (see _PROFILE_CACHE)."""
+    key = str(user_id or "")
+    now = time.time()
+    with _LOCK:
+        hit = _PROFILE_CACHE.get(key)
+        if hit and hit[1] > now:
+            return hit[0]
     if supa.is_configured():
         admin = supa.get_admin()
         row = admin.table("profiles").select("id, email, created_at") \
@@ -195,10 +222,17 @@ def get(user_id):
         if not row.data:
             return None
         d = row.data
-        return {"user_id": str(d["id"]), "email": d["email"],
-                "created_at": d.get("created_at") or _now()}
-    u = _load().get(user_id or "")
-    return _public(u) if u else None
+        out = {"user_id": str(d["id"]), "email": d["email"],
+               "created_at": d.get("created_at") or _now()}
+    else:
+        u = _load().get(user_id or "")
+        out = _public(u) if u else None
+    if out:
+        with _LOCK:
+            if len(_PROFILE_CACHE) >= _PROFILE_CACHE_MAX:
+                _PROFILE_CACHE.clear()
+            _PROFILE_CACHE[key] = (out, now + _PROFILE_CACHE_TTL)
+    return out
 
 
 def external_user_id(user_id):

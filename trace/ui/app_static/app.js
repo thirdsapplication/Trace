@@ -2494,6 +2494,26 @@ async function renderProfile(agentId) {
     return;
   }
   const sessionsList = (data && data.activity) || [];
+  // Enrichment (reading each session's events, summarizing them, staging proposals)
+  // runs on the server in the background now, so rows can arrive un-summarized on a
+  // first load — the log already says "No summary yet" for those. Poll the (cheap,
+  // DB-only) endpoint until the refresh lands, then re-render the profile once so
+  // every pane and all of its wiring comes from the enriched data.
+  if (data && data.refreshing) {
+    let tries = 0;
+    const repoll = async () => {
+      if (++tries > 8) return;                            // ~20s, then leave it be
+      if (!$("#pLog")) return;                            // navigated away
+      const again = await api("GET", `/api/u/agents/${agentId}/activity`);
+      if (!again.ok) return;
+      if (again.data && again.data.refreshing) {
+        S._timers.push(setTimeout(repoll, 2500));
+        return;
+      }
+      renderProfile(agentId);
+    };
+    S._timers.push(setTimeout(repoll, 2500));
+  }
   // Approvals: per-app staged/autonomous toggles (post-deploy, no redeploy). All
   // interpolated values are escaped via esc() (the file's XSS-safe rendering idiom).
   // Rules (21): the escalation rules from frame 10, read back. Stored as one sentence

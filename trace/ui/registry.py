@@ -230,10 +230,20 @@ def agents_visible_to(root, owner_user_id, team_owner_ids=None):
     return out
 
 
+# The columns _agent_to_caller actually exposes. Selecting "*" also pulled live_yaml,
+# interview and grounding — the three large server-side payloads listed in
+# AGENT_COLUMNS_NOT_EXPOSED, which every caller then discards. They crossed the wire
+# on every agent list, once per owner.
+AGENT_SELECT = ("id, owner_id, external_user_id, bundle_id, name, vault_ref, trigger, "
+                "session_id, staged_apps, deployment_id, memory_store_id, owner_email, "
+                "description, deployed_at, created_at, color, status, team_id, "
+                "lesson_contribute_scope, lesson_consume_scope")
+
+
 def agents_for_user(root, owner_user_id):
     if supa.is_configured():
         admin = supa.get_admin()
-        r = admin.table("agents").select("*") \
+        r = admin.table("agents").select(AGENT_SELECT) \
             .eq("owner_id", owner_user_id) \
             .order("created_at", desc=True).execute()
         return [_agent_to_caller(row) for row in (r.data or [])]
@@ -1199,10 +1209,15 @@ def user_consent_set(root, uid, contribute_scope=None, consume_scope=None):
 
 def agent_lesson_scopes(root, agent):
     """Effective (contribute, consume) scopes for an agent: its own override, else the
-    owner's account default."""
+    owner's account default. The account default costs a query, so it is only read
+    when an override is actually missing (this runs on every agent page load)."""
+    contribute = agent.get("lesson_contribute_scope")
+    consume = agent.get("lesson_consume_scope")
+    if contribute and consume:
+        return {"contribute_scope": contribute, "consume_scope": consume}
     dflt = user_consent_get(root, agent.get("owner_user_id"))
-    return {"contribute_scope": agent.get("lesson_contribute_scope") or dflt["contribute_scope"],
-            "consume_scope": agent.get("lesson_consume_scope") or dflt["consume_scope"]}
+    return {"contribute_scope": contribute or dflt["contribute_scope"],
+            "consume_scope": consume or dflt["consume_scope"]}
 
 
 def agent_set_consent(root, agent_id, contribute_scope=None, consume_scope=None):

@@ -115,15 +115,12 @@ APP_STATIC_DIR = os.path.join(os.path.dirname(__file__), "app_static")  # end-us
 # Phase B (B5d): a cross-user lesson confirmed by this many DISTINCT users graduates to a
 # global auto-trusted default — it then injects without the per-agent confirm checkpoint.
 FLEET_DEFAULT_CONFIRMATIONS = 5
-# Activity view bounds. This screen is the only user-facing GET that makes platform
-# AND model calls, and it used to make up to `limit` of each with no ceiling: the
-# summaries ran one after another inside the run loop, so a healthy page was already
-# 30-80s and the browser gives up at 65. Now they fan out, at most this many run per
-# request, and once the deadline passes we return what we have — an un-summarized run
-# still renders (with its stored run summary) and picks up its line on a later load,
-# because summary_set caches every one that succeeds.
-ACTIVITY_SUMMARY_BUDGET = 4          # summaries computed per request
-ACTIVITY_DEADLINE_SECONDS = 20       # after this, stop summarizing and answer
+# The activity view used to make platform AND model calls inside the page load — up
+# to `limit` of each. Capping and parallelizing them was not enough: a page that does
+# live network I/O has a floor of seconds. That work now runs in refresh_activity on
+# a background thread and the view reads what it persisted, so this bound is a cost
+# ceiling on ONE refresh rather than a deadline a user is waiting behind.
+ACTIVITY_SUMMARY_BUDGET = 10         # summaries computed per background refresh
 
 
 def _why(e):
@@ -289,10 +286,11 @@ class AppState:
         self._learning_inflight = set()   # agent_ids with a learning cycle running
         self._learning_checked = {}  # agent_id -> epoch of last learning trigger check
         # Session ids that 404'd (deleted/expired on the platform). A gone session
-        # never comes back, so each is discovered once and then excluded from
-        # eligibility — without this, an agent whose history was cleaned up
-        # re-fetched the same dead sessions every throttle window, forever.
-        self._learning_gone = set()
+        # never comes back, so each is discovered once and then skipped by BOTH the
+        # learning cycle and the activity refresh — without this, an agent whose
+        # history was cleaned up re-fetched the same dead sessions forever.
+        self._sessions_gone = set()
+        self._activity_refreshing = set()  # agent_ids with a background refresh running
         self.chat_jobs = {}          # agent_id -> {state, error} (a DM reply in flight)
         self._approval_queues = {}   # agent_id -> queue.Queue of tasks (FIFO per agent)
         self._approval_workers = {}  # agent_id -> live drain thread
@@ -697,66 +695,42 @@ class AppState:
                 for s in slugs]
 
     def agent_activity(self, agent, limit=10):
-        """The agent's recent runs as REAL session activity: for each run's session id,
-        read the session's events from the platform, summarize them in plain language
-        (cached per session), classify the outcome, and surface any staged proposals as
-        approvable items. Authoritative (ground truth), unlike the run self-report.
-        Best-effort per session — one bad fetch never breaks the list."""
+        """The agent's recent runs, served ENTIRELY from the registry — no platform
+        calls, no model calls, nothing that can be slow on a page load.
+
+        Everything this screen shows is already persisted: the plain-English summary
+        and the derived per-session status in session_summaries, staged proposals in
+        pending_actions, open questions in agent_decisions. Reading the session events
+        (and summarizing them) is what produces those rows, and that work now happens
+        in refresh_activity on a background thread — because doing it inline meant the
+        response waited on up to ten platform round trips plus model calls, which is
+        why this page could not load inside the browser's budget however tightly the
+        work was capped.
+
+        A session with nothing cached yet renders from its run row (the UI already
+        says "No summary yet") and fills in once the refresh lands.
+        """
         root = self.sessions_root
         owner = agent.get("owner_user_id")
         staged = bool(agent.get("staged_apps"))
-        try:
-            client = self._live_client()
-        except Exception:
-            client = None
-        try:
-            model_fn = self._summarize_model_fn()
-        except Exception:
-            model_fn = None
         runs = list(registry.runs_for_agent(root, agent.get("agent_id"), limit))
-
-        # This screen is where approvals live, and it used to fetch one session's events
-        # from the platform at a time, in a loop — up to `limit` sequential round trips
-        # to Managed Agents before anything could render. That is the wait: it is not the
-        # database, it is a queue of network calls waiting on each other for no reason.
-        # _fanout exists for precisely this and every other caller already uses it.
-        want = []
+        sids = []
         seen = set()
         for run in runs:
             sid = run.get("run_session_id")
-            if sid and sid not in seen and client is not None:
+            if sid and sid not in seen:
                 seen.add(sid)
-                want.append(sid)
-        deadline = time.monotonic() + ACTIVITY_DEADLINE_SECONDS
-        fetched = dict(zip(want, self._fanout(
-            [lambda s=s: client.list_session_events(s) for s in want]))) if want else {}
-        # …and every summary in one query rather than one per run (see summaries_many).
-        cached_summaries = registry.summaries_many(root, want)
-
-        # The staged proposals and open questions below used to be read PER RUN, and
-        # each read pulls the user's whole pending/decision history and filters in
-        # Python — up to `limit` full-history queries for one page. Read once here.
-        pending_rows = decision_rows = None
+                sids.append(sid)
+        cached = registry.summaries_many(root, sids) if sids else {}
+        # One read each, not one per run: both pull the user's whole history and
+        # filter in Python, so per-run reads made a page cost grow with its own length.
+        pending_rows, decision_rows = [], []
         try:
             if staged:
                 pending_rows = list(registry.pending_for_user(root, owner, status=None))
             decision_rows = list(registry.decisions_for_user(root, owner, status="pending"))
-        except Exception:                                  # noqa: BLE001 — fall back to
-            pending_rows = decision_rows = None            # per-run reads rather than fail
-
-        # Summaries are the expensive half: fan them out (as the fetch above already
-        # does) instead of running them one after another, cap how many one page load
-        # may compute, and skip entirely once the deadline has passed.
-        need = [sid for sid in want
-                if not (cached_summaries.get(sid) or {}).get("summary")
-                and fetched.get(sid) and agent_activity.is_terminal(fetched[sid])]
-        fresh = {}
-        if model_fn is not None and need and time.monotonic() < deadline:
-            todo = need[:ACTIVITY_SUMMARY_BUDGET]
-            done = self._fanout([
-                lambda s=s: agent_activity.summarize_session(
-                    fetched[s], agent.get("name"), model_fn) for s in todo])
-            fresh = {s: t for s, t in zip(todo, done) if t}
+        except Exception:                                  # noqa: BLE001 — a history read
+            pending_rows, decision_rows = [], []           # must not cost the page
 
         out = []
         seen = set()
@@ -765,36 +739,193 @@ class AppState:
             entry = {"ran_at": run.get("ran_at"), "run_session_id": sid,
                      "status": run.get("status"), "summary": run.get("summary") or "",
                      "proposals": [], "decisions": []}
-            if not sid or sid in seen or client is None:
+            if not sid or sid in seen:
                 out.append(entry)
                 continue
             seen.add(sid)
-            events = fetched.get(sid)
-            if events is None:                             # a failed fetch, per _fanout
-                out.append(entry)
-                continue
-            entry["status"] = agent_activity.session_status(events)
-            cached = cached_summaries.get(sid)
-            if cached and cached.get("summary"):
-                entry["summary"] = cached["summary"]
-            elif fresh.get(sid):
-                entry["summary"] = fresh[sid]
-                try:
-                    registry.summary_set(root, sid, fresh[sid], entry["status"])
-                except Exception:                          # noqa: BLE001 — a cache write
-                    pass                                   # must never cost the response
-            # Surface proposals as approvable items — but never from an approval-
-            # execution run: that session was told to act, not propose, and re-reading
-            # its completion report as a fresh proposal is how an approved action's
-            # buttons came back after every reload.
+            row = cached.get(sid) or {}
+            # The cached status is ground truth (derived from the real events); the run
+            # row's status is its self-report at insert time and, for deployment runs,
+            # is recorded at session START and never updated.
+            if row.get("status"):
+                entry["status"] = row["status"]
+            if row.get("summary"):
+                entry["summary"] = row["summary"]
             if staged and run.get("kind") != "approval":
-                entry["proposals"] = self._session_proposals(agent, sid, events, owner,
-                                                             rows=pending_rows)
-            if entry["status"] == "needs_input":           # Gap #3: surface open questions
-                entry["decisions"] = self._session_decisions(agent, sid, events, owner,
-                                                             rows=decision_rows)
+                entry["proposals"] = self._proposals_for_session(sid, pending_rows)
+            if entry["status"] == "needs_input":
+                entry["decisions"] = self._decisions_for_session(sid, decision_rows)
             out.append(entry)
         return out
+
+    def activity_needs_refresh(self, agent, limit=10):
+        """True when some session in the window has no cached status yet — i.e. the
+        background refresh has work to do. Cheap: two registry reads."""
+        root = self.sessions_root
+        try:
+            runs = registry.runs_for_agent(root, agent.get("agent_id"), limit)
+            sids = [r.get("run_session_id") for r in runs if r.get("run_session_id")]
+            sids = [s for s in sids if s not in self._sessions_gone]
+            if not sids:
+                return False
+            cached = registry.summaries_many(root, sids)
+            return any(not (cached.get(s) or {}).get("status") for s in sids)
+        except Exception:                                  # noqa: BLE001
+            return False
+
+    def _proposals_for_session(self, run_session_id, rows):
+        """This session's staged actions out of an already-read pending list — every
+        status, not just pending, so a decided card renders its outcome on reload
+        instead of vanishing."""
+        out = []
+        for p in rows or []:
+            if p.get("run_session_id") != run_session_id:
+                continue
+            # Self-heal a claim orphaned by a crash mid-execution: without this the
+            # card would say "Sending…" forever. This screen is where approvals live,
+            # so read time here is the reliable place to notice.
+            if p.get("status") == "executing" and self._executing_went_stale(p):
+                try:
+                    registry.pending_set_status(self.sessions_root, p["id"], "failed")
+                except Exception:                          # noqa: BLE001
+                    pass
+                p = {**p, "status": "failed"}
+            out.append(p)
+        return out
+
+    def _decisions_for_session(self, run_session_id, rows):
+        """This session's still-open questions out of an already-read decision list."""
+        return [self._decision_for_ui(d) for d in (rows or [])
+                if d.get("run_session_id") == run_session_id]
+
+    # --- background enrichment (what used to happen inside the page load) ----
+    def maybe_refresh_activity(self, agent, limit=10):
+        """Spawn ONE background refresh for this agent if one isn't already running.
+        Returns the started Thread (tests join it) or None. Never raises."""
+        try:
+            aid = agent.get("agent_id")
+            if not aid:
+                return None
+            with self.lock:
+                if aid in self._activity_refreshing:
+                    return None
+                self._activity_refreshing.add(aid)
+            try:
+                t = threading.Thread(target=self._activity_refresh_worker,
+                                     args=(agent, limit), daemon=True)
+                t.start()
+                return t
+            except Exception:                              # noqa: BLE001 — a failed spawn
+                with self.lock:                            # must release the claim
+                    self._activity_refreshing.discard(aid)
+                raise
+        except Exception:                                  # noqa: BLE001
+            return None
+
+    def flush_activity_refresh(self, timeout=30):
+        """Block until no background activity refresh is in flight. Test/shutdown
+        helper, mirroring flush_approvals — the enrichment a page used to do inline
+        now happens on a thread, so a caller that wants the enriched rows has to
+        wait for it explicitly."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with self.lock:
+                if not self._activity_refreshing:
+                    return True
+            time.sleep(0.02)
+        with self.lock:
+            return not self._activity_refreshing
+
+    def _activity_refresh_worker(self, agent, limit):
+        try:
+            self.refresh_activity(agent, limit)
+        except Exception as e:                             # noqa: BLE001
+            print(f"[activity] refresh failed for {agent.get('agent_id')}: {_why(e)}",
+                  flush=True)
+        finally:
+            with self.lock:
+                self._activity_refreshing.discard(agent.get("agent_id"))
+
+    def refresh_activity(self, agent, limit=10):
+        """Read the real session events for this agent's recent runs and persist what
+        the activity view reads: the derived status and plain-English summary per
+        session, plus any staged proposals and open questions. Returns the number of
+        sessions whose cache it wrote. Never raises.
+
+        This is the expensive half of the old activity view. Nothing here is on a
+        request path, so it can take the time the platform and the model need.
+        """
+        root = self.sessions_root
+        owner = agent.get("owner_user_id")
+        staged = bool(agent.get("staged_apps"))
+        try:
+            client = self._live_client()
+        except Exception:                                  # noqa: BLE001 — no key: nothing
+            return 0                                       # to refresh from
+        try:
+            model_fn = self._summarize_model_fn()
+        except Exception:                                  # noqa: BLE001
+            model_fn = None
+        runs = list(registry.runs_for_agent(root, agent.get("agent_id"), limit))
+        by_sid, order = {}, []
+        for run in runs:
+            sid = run.get("run_session_id")
+            if sid and sid not in by_sid and sid not in self._sessions_gone:
+                by_sid[sid] = run
+                order.append(sid)
+        if not order:
+            return 0
+
+        def fetch(sid):
+            """Events for one session, or None. A 404 means the session is gone from
+            the platform for good — memoize it so no later pass re-fetches it."""
+            try:
+                return client.list_session_events(sid)
+            except Exception as e:                         # noqa: BLE001
+                if getattr(e, "status_code", None) == 404 or "not found" in str(e).lower():
+                    self._sessions_gone.add(sid)
+                return None
+
+        events_by_sid = dict(zip(order, self._fanout([lambda s=s: fetch(s) for s in order])))
+        cached = registry.summaries_many(root, order)
+        # Summarize every session that still needs one, concurrently, bounded so a long
+        # backlog can't fan out without limit.
+        need = [s for s in order
+                if events_by_sid.get(s)
+                and not (cached.get(s) or {}).get("summary")
+                and agent_activity.is_terminal(events_by_sid[s])]
+        fresh = {}
+        if model_fn is not None and need:
+            todo = need[:ACTIVITY_SUMMARY_BUDGET]
+            done = self._fanout([
+                lambda s=s: agent_activity.summarize_session(
+                    events_by_sid[s], agent.get("name"), model_fn) for s in todo])
+            fresh = {s: t for s, t in zip(todo, done) if t}
+
+        wrote = 0
+        for sid in order:
+            events = events_by_sid.get(sid)
+            if not events:
+                continue
+            status = agent_activity.session_status(events)
+            # Write the STATUS even when there is no summary — carrying any existing
+            # summary through, since summary_set writes both columns. Without this a
+            # deployment run stays at its insert-time "ran" forever on the fast path.
+            summary = fresh.get(sid) or (cached.get(sid) or {}).get("summary") or ""
+            try:
+                registry.summary_set(root, sid, summary, status)
+                wrote += 1
+            except Exception:                              # noqa: BLE001
+                pass
+            run = by_sid.get(sid) or {}
+            try:
+                if staged and run.get("kind") != "approval":
+                    self._session_proposals(agent, sid, events, owner)
+                if status == "needs_input":
+                    self._session_decisions(agent, sid, events, owner)
+            except Exception:                              # noqa: BLE001 — one bad session
+                pass                                       # never stops the rest
+        return wrote
 
     def _session_proposals(self, agent, run_session_id, events, owner, rows=None):
         """Persist this session's proposed actions as pending items (deduped) and return
@@ -821,27 +952,13 @@ class AppState:
                 "kind": it.get("kind"), "summary": it.get("summary"),
                 "rationale": it.get("rationale"),
                 "payload": it.get("payload"), "content_hash": it.get("content_hash")}) or added
-        out = []
-        # ``rows`` is the caller's one-per-request read (the activity view); without it
-        # this pulls the user's whole pending history once per run. It must be REFRESHED
-        # when this session just inserted proposals, or they read back as none — and
-        # refreshing in place lets the caller's later runs share the newer list.
+        # ``rows`` lets a caller supply an already-read pending list; it must be
+        # REFRESHED when this session just inserted proposals, or they read back as
+        # none. The read/shape half lives in _proposals_for_session, which the (DB-only)
+        # activity view uses directly.
         if rows is None or added:
-            fresh = list(registry.pending_for_user(root, owner, status=None))
-            if isinstance(rows, list):
-                rows[:] = fresh
-            rows = fresh
-        for p in rows:
-            if p.get("run_session_id") != run_session_id:
-                continue
-            # Self-heal a claim orphaned by a crash mid-execution: without this the
-            # card would say "Sending…" forever. This screen is where approvals live,
-            # so read time here is the reliable place to notice.
-            if p.get("status") == "executing" and self._executing_went_stale(p):
-                registry.pending_set_status(root, p["id"], "failed")
-                p = {**p, "status": "failed"}
-            out.append(p)
-        return out
+            rows = list(registry.pending_for_user(root, owner, status=None))
+        return self._proposals_for_session(run_session_id, rows)
 
     @staticmethod
     def _executing_went_stale(p, max_minutes=15):
@@ -900,12 +1017,8 @@ class AppState:
                             "rule": str(q.get("rule") or "").strip()},
                 "tags": tags})
         if rows is None or added:                          # see _session_proposals
-            fresh = list(registry.decisions_for_user(root, owner, status="pending"))
-            if isinstance(rows, list):
-                rows[:] = fresh
-            rows = fresh
-        return [self._decision_for_ui(d) for d in rows
-                if d.get("run_session_id") == run_session_id]
+            rows = list(registry.decisions_for_user(root, owner, status="pending"))
+        return self._decisions_for_session(run_session_id, rows)
 
     def _session_decisions(self, agent, run_session_id, events, owner, rows=None):
         """Persist + return this session's needs_input questions (activity-view path)."""
@@ -1921,7 +2034,7 @@ class AppState:
             runs = registry.runs_for_agent(root, aid, limit=max(50, 4 * n))
             batch = [r for r in runs
                      if r.get("run_session_id") and r.get("kind") != "approval"
-                     and r.get("run_session_id") not in self._learning_gone
+                     and r.get("run_session_id") not in self._sessions_gone
                      and str(r.get("ran_at") or r.get("started_at") or "") > since]
             if len(batch) < n:
                 if verbose:
@@ -1989,7 +2102,7 @@ class AppState:
             except Exception as e:                         # noqa: BLE001
                 if getattr(e, "status_code", None) == 404 \
                         or "not found" in str(e).lower():
-                    self._learning_gone.add(sid)
+                    self._sessions_gone.add(sid)
                 return None
 
         events_by_run = self._fanout(
@@ -3440,6 +3553,12 @@ def make_handler(state):
                 # browser, and the reason Session history sat on "Loading…" forever.
                 # A JSON error is something the page can render.
                 try:
+                    # Kick the background refresh BEFORE building the response, so the
+                    # data it writes is ready as soon as possible; the response itself
+                    # never waits on it.
+                    refreshing = False
+                    if state.activity_needs_refresh(agent):
+                        refreshing = bool(state.maybe_refresh_activity(agent))
                     return self._json(200, {"agent": {"agent_id": agent.get("agent_id"),
                                                       "name": agent.get("name") or agent.get("bundle_id"),
                                                       "staged_apps": agent.get("staged_apps") or [],
@@ -3452,7 +3571,11 @@ def make_handler(state):
                                                           "override": {
                                                               "contribute_scope": agent.get("lesson_contribute_scope"),
                                                               "consume_scope": agent.get("lesson_consume_scope")}}},
-                                            "activity": state.agent_activity(agent)})
+                                            "activity": state.agent_activity(agent),
+                                            # Enrichment (events -> status/summary/
+                                            # proposals) runs in the background; the
+                                            # page polls while this is true.
+                                            "refreshing": bool(refreshing)})
                 except Exception as e:                       # noqa: BLE001
                     print(f"[activity] failed for {maa.group(1)}: {_why(e)}", flush=True)
                     return self._json(500, {"error": "activity_failed"})

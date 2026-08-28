@@ -402,6 +402,9 @@ class SchedulerPassTest(unittest.TestCase):
         self.state._live_client = lambda: self._staging_ma()
         self.state.summarize_fn = lambda system, user: "Checked the inbox; proposed actions."
         self.state.run_agent(agent)                           # records a run with a session id
+        # Reading the session's events and summarizing them is backgrounded now (it is
+        # what made this page slow); the view itself renders what that refresh wrote.
+        self.state.refresh_activity(agent)
         act = self.state.agent_activity(agent)
         self.assertTrue(act)
         self.assertEqual(act[0]["status"], "staged")          # status read from real events
@@ -420,9 +423,10 @@ class SchedulerPassTest(unittest.TestCase):
             return "A summary."
         self.state.summarize_fn = summ
         self.state.run_agent(agent)
-        self.state.agent_activity(agent)
-        self.state.agent_activity(agent)
+        self.state.refresh_activity(agent)
+        self.state.refresh_activity(agent)
         self.assertEqual(calls["n"], 1)                       # summarized once, then cached
+        self.assertEqual(self.state.agent_activity(agent)[0]["summary"], "A summary.")
 
     def test_approve_actions_executes_selected_and_marks_processed(self):
         agent = self._staged_agent()
