@@ -197,6 +197,109 @@ class ActivityViewTest(unittest.TestCase):
         self.state.refresh_activity(self.agent)            # must not raise
 
 
+class LockIndependenceTest(unittest.TestCase):
+    """A page load must not wait on anything that does I/O.
+
+    `state.lock` is held ACROSS Supabase calls by the scheduler
+    (_record_deployment_run) and across platform calls — minutes of them — by a
+    schedule change (apply_platform_schedule). When the activity path took that
+    same lock, a database-only endpoint still hung behind a 60-second scheduler
+    pass, and an unchanged front end waiting on the response sat on "Loading…".
+    /api/u/home never took the lock, which is exactly why it kept rendering.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = self._tmp.name
+        self.state = app.AppState(sessions_root=self.root)
+        self.state._live_client = lambda: FakeActivityClient()
+        self.agent = {"agent_id": "a1", "owner_user_id": "u1", "name": "Orders"}
+        registry.agent_upsert(self.root, dict(self.agent))
+        for i in range(3):
+            registry.run_add(self.root, {
+                "agent_id": "a1", "owner_user_id": "u1", "status": "ran",
+                "summary": "", "details": [], "run_session_id": f"s{i}"})
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_the_view_renders_while_the_global_lock_is_held(self):
+        held = threading.Event()
+        release = threading.Event()
+
+        def hog():
+            with self.state.lock:                          # as the scheduler does
+                held.set()
+                release.wait(10)
+
+        t = threading.Thread(target=hog, daemon=True)
+        t.start()
+        held.wait(5)
+        try:
+            t0 = time.monotonic()
+            out = self.state.agent_activity(self.agent)
+            self.assertEqual(len(out), 3)
+            self.assertLess(time.monotonic() - t0, 2.0,
+                            "the activity view waited on the global lock")
+        finally:
+            release.set()
+            t.join(timeout=5)
+
+    def test_the_refresh_trigger_does_not_take_the_global_lock(self):
+        held = threading.Event()
+        release = threading.Event()
+
+        def hog():
+            with self.state.lock:
+                held.set()
+                release.wait(10)
+
+        t = threading.Thread(target=hog, daemon=True)
+        t.start()
+        held.wait(5)
+        try:
+            t0 = time.monotonic()
+            self.state.activity_needs_refresh(self.agent)
+            worker = self.state.maybe_refresh_activity(self.agent)
+            self.assertLess(time.monotonic() - t0, 2.0,
+                            "spawning the refresh waited on the global lock")
+            if worker:
+                worker.join(timeout=10)
+        finally:
+            release.set()
+            t.join(timeout=5)
+
+    def test_refreshes_are_capped_fleet_wide(self):
+        gate = threading.Event()
+
+        def slow(session_id):
+            gate.wait(10)
+            return [{"type": "session.status_idle", "text": ""}]
+        client = FakeActivityClient()
+        client.list_session_events = slow
+        self.state._live_client = lambda: client
+        started = []
+        try:
+            for i in range(app.ACTIVITY_MAX_CONCURRENT + 2):
+                aid = f"cap{i}"
+                registry.agent_upsert(self.root, {"agent_id": aid, "owner_user_id": "u1",
+                                                  "name": aid})
+                registry.run_add(self.root, {
+                    "agent_id": aid, "owner_user_id": "u1", "status": "ran",
+                    "summary": "", "details": [], "run_session_id": f"{aid}-s"})
+                t = self.state.maybe_refresh_activity({"agent_id": aid,
+                                                       "owner_user_id": "u1", "name": aid})
+                if t:
+                    started.append(t)
+            self.assertEqual(len(started), app.ACTIVITY_MAX_CONCURRENT,
+                             "each refresh spawns threads and dozens of queries; the "
+                             "fleet needs a ceiling, not just a per-agent guard")
+        finally:
+            gate.set()
+            for t in started:
+                t.join(timeout=10)
+
+
 class ProfileCacheTest(unittest.TestCase):
     """_current_user resolves the profile on EVERY authenticated request; it was an
     uncached round trip sitting in front of every page in the app."""

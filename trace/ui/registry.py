@@ -450,13 +450,23 @@ def runs_for_agent(root, agent_id, limit=20):
     return list(reversed(rows))[:limit]
 
 
+# How far back the sync-loop dedupe looks. The query runs under a lock, once per
+# deployment_run per scheduler pass, and unbounded it grew with an agent's entire
+# run history forever. The platform only ever lists recent runs, so a recent window
+# dedupes exactly as well at a fixed cost.
+RUN_DEDUPE_WINDOW = 500
+
+
 def run_seen_drun_ids(root, agent_id):
-    """The deployment_run ids already recorded for one agent (sync-loop dedupe)."""
+    """The deployment_run ids already recorded for one agent (sync-loop dedupe),
+    over the most recent RUN_DEDUPE_WINDOW runs."""
     if supa.is_configured():
         admin = supa.get_admin()
         r = admin.table("agent_runs").select("drun_id") \
             .eq("agent_id", agent_id) \
-            .not_.is_("drun_id", "null").execute()
+            .not_.is_("drun_id", "null") \
+            .order("started_at", desc=True) \
+            .limit(RUN_DEDUPE_WINDOW).execute()
         return {row["drun_id"] for row in (r.data or [])}
     p = os.path.join(_dir(root), f"runs_{_safe(agent_id)}.jsonl")
     try:

@@ -68,6 +68,15 @@ from . import (cloud, keystore, notify, permissions, registry, sessions,
                supabase_client, teams, users)
 
 
+class _Server(ThreadingHTTPServer):
+    """The stdlib listen backlog is 5. Once a handful of handlers are blocked, new
+    connections are never accepted — which presents as a request that hangs before
+    any of our code runs, indistinguishable from a slow endpoint."""
+    request_queue_size = 128
+    daemon_threads = True
+    allow_reuse_address = True
+
+
 def _write_json(path, obj):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(obj, f, indent=2, ensure_ascii=False)
@@ -125,6 +134,9 @@ FLEET_DEFAULT_CONFIRMATIONS = 5
 # a background thread and the view reads what it persisted, so this bound is a cost
 # ceiling on ONE refresh rather than a deadline a user is waiting behind.
 ACTIVITY_SUMMARY_BUDGET = 10         # summaries computed per background refresh
+# Fleet-wide ceiling on concurrent refreshes. Each spawns up to ~21 threads and
+# dozens of queries, and the page polls the very endpoint that starts them.
+ACTIVITY_MAX_CONCURRENT = 2
 
 
 def _why(e):
@@ -293,6 +305,14 @@ class AppState:
         # never comes back, so each is discovered once and then skipped by BOTH the
         # learning cycle and the activity refresh — without this, an agent whose
         # history was cleaned up re-fetched the same dead sessions forever.
+        # Purpose-built locks. `self.lock` is held ACROSS network I/O by the
+        # scheduler (_record_deployment_run) and by schedule changes
+        # (apply_platform_schedule), so anything a page load touches must never
+        # wait on it — that is how a database-only endpoint still hung behind a
+        # 60-second scheduler pass.
+        self._bg_lock = threading.Lock()      # background claim sets (set ops only)
+        self._runs_lock = threading.Lock()    # run-row check-then-insert
+        self._deploy_lock = threading.Lock()  # deployment create/archive per agent
         self._ui_cache = {}          # desktop: rel -> (ctype, bytes, expires_epoch)
         self._sessions_gone = set()
         self._activity_refreshing = set()  # agent_ids with a background refresh running
@@ -821,9 +841,11 @@ class AppState:
             aid = agent.get("agent_id")
             if not aid:
                 return None
-            with self.lock:
+            with self._bg_lock:
                 if aid in self._activity_refreshing:
                     return None
+                if len(self._activity_refreshing) >= ACTIVITY_MAX_CONCURRENT:
+                    return None                            # picked up on a later load
                 self._activity_refreshing.add(aid)
             try:
                 t = threading.Thread(target=self._activity_refresh_worker,
@@ -831,7 +853,7 @@ class AppState:
                 t.start()
                 return t
             except Exception:                              # noqa: BLE001 — a failed spawn
-                with self.lock:                            # must release the claim
+                with self._bg_lock:                        # must release the claim
                     self._activity_refreshing.discard(aid)
                 raise
         except Exception:                                  # noqa: BLE001
@@ -844,11 +866,11 @@ class AppState:
         wait for it explicitly."""
         deadline = time.time() + timeout
         while time.time() < deadline:
-            with self.lock:
+            with self._bg_lock:
                 if not self._activity_refreshing:
                     return True
             time.sleep(0.02)
-        with self.lock:
+        with self._bg_lock:
             return not self._activity_refreshing
 
     def _activity_refresh_worker(self, agent, limit):
@@ -858,7 +880,7 @@ class AppState:
             print(f"[activity] refresh failed for {agent.get('agent_id')}: {_why(e)}",
                   flush=True)
         finally:
-            with self.lock:
+            with self._bg_lock:
                 self._activity_refreshing.discard(agent.get("agent_id"))
 
     def refresh_activity(self, agent, limit=10):
@@ -1908,7 +1930,9 @@ class AppState:
         DB uniqueness constraint). A None drun_id (a run that never started) is always
         recorded. Returns True if it wrote a row."""
         aid = agent.get("agent_id")
-        with self.lock:
+        # Its OWN lock: this holds across two Supabase calls, and on the global lock
+        # that stalled every page load for the length of a scheduler pass.
+        with self._runs_lock:
             if drun_id and drun_id in registry.run_seen_drun_ids(self.sessions_root, aid):
                 return False
             registry.run_add(self.sessions_root, {
@@ -2056,7 +2080,7 @@ class AppState:
                     print(f"[learning] {aid}: {len(batch)} eligible session(s) "
                           f"since the last cycle — a cycle runs at {n}", flush=True)
                 return None
-            with self.lock:
+            with self._bg_lock:
                 if aid in self._learning_inflight:
                     return None
                 # ONE cycle at a time fleet-wide. The per-agent guard alone allowed N
@@ -2077,7 +2101,7 @@ class AppState:
                 t.start()
                 return t
             except Exception:                              # noqa: BLE001 — a failed spawn must
-                with self.lock:                            # release the flag, or this agent
+                with self._bg_lock:                        # release the flag, or this agent
                     self._learning_inflight.discard(aid)   # could never learn again
                 raise
         except Exception:                                  # noqa: BLE001 — never block a run
@@ -2090,7 +2114,7 @@ class AppState:
             print(f"[learning] cycle failed for {agent.get('agent_id')}: {_why(e)}",
                   flush=True)
         finally:
-            with self.lock:
+            with self._bg_lock:
                 self._learning_inflight.discard(agent.get("agent_id"))
 
     def _run_learning_cycle(self, agent, batch):
@@ -2625,7 +2649,9 @@ class AppState:
         live and still registered — a failed schedule change never strands the agent
         with an archived deployment. Serialized per-process so two concurrent schedule
         POSTs can't each create a live cron deployment and orphan one."""
-        with self.lock:
+        # Its OWN lock: the platform calls below can take minutes, and holding the
+        # global lock across them froze capture status, approvals and page loads.
+        with self._deploy_lock:
             client = self._live_client()
             old_id = agent.get("deployment_id")
             aid = agent.get("agent_id")
@@ -4809,7 +4835,7 @@ def build_server(host="127.0.0.1", port=8765, sessions_root="captures/sessions",
     # public service.
     state.test_ui_enabled = (host in ("127.0.0.1", "localhost", "::1")
                              or os.environ.get("TRACE_ENABLE_TEST_UI") == "1")
-    httpd = ThreadingHTTPServer((host, port), make_handler(state))
+    httpd = _Server((host, port), make_handler(state))
     return httpd, state
 
 

@@ -48,16 +48,44 @@ def is_configured():
     )
 
 
+# Every query in the app shares one client, hence one HTTP connection pool. Without
+# an explicit deadline a stuck request has none the app controls, and a handler waits
+# on it indefinitely — the failure mode that looks like a hang with no error anywhere.
+REQUEST_TIMEOUT = 20
+
+
+def _options():
+    """ClientOptions carrying our timeout, or None when the installed supabase
+    version does not accept one (the pin is a range; behavior must degrade, not
+    break — the same lesson as the anthropic temperature incident)."""
+    try:
+        from supabase.lib.client_options import ClientOptions
+        return ClientOptions(postgrest_client_timeout=REQUEST_TIMEOUT,
+                             storage_client_timeout=REQUEST_TIMEOUT)
+    except Exception:                                      # noqa: BLE001
+        return None
+
+
+def _create(url, key):
+    from supabase import create_client
+    opts = _options()
+    if opts is not None:
+        try:
+            return create_client(url, key, options=opts)
+        except Exception:                                  # noqa: BLE001 — shape drift
+            pass
+    return create_client(url, key)
+
+
 def get_client():
     """Anon-key client (respects RLS). Cached after first call."""
     global _client
     if _client is None:
-        from supabase import create_client
         url = (os.environ.get("SUPABASE_URL") or "").strip()
         key = (os.environ.get("SUPABASE_ANON_KEY") or "").strip()
         if not url or not key:
             raise RuntimeError("SUPABASE_URL / SUPABASE_ANON_KEY not set")
-        _client = create_client(url, key)
+        _client = _create(url, key)
     return _client
 
 
@@ -65,10 +93,9 @@ def get_admin():
     """Service-role client (bypasses RLS). Cached after first call."""
     global _admin
     if _admin is None:
-        from supabase import create_client
         url = (os.environ.get("SUPABASE_URL") or "").strip()
         key = (os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or "").strip()
         if not url or not key:
             raise RuntimeError("SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY not set")
-        _admin = create_client(url, key)
+        _admin = _create(url, key)
     return _admin
