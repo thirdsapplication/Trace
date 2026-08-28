@@ -32,8 +32,11 @@ def _default_model_fn(model):
     client = anthropic.Anthropic()
 
     def call(system, user):
+        # temperature=None: Fable 5 removed sampling parameters and 400s any
+        # request that carries one, so the learning call must never send it.
         return model_call.create_text(client, model, system, user,
-                                      max_tokens=config.LEARNING_MAX_TOKENS)
+                                      max_tokens=config.LEARNING_MAX_TOKENS,
+                                      temperature=None)
 
     return call
 
@@ -101,7 +104,10 @@ def analyze_batch(agent, session_records, memory_docs, prior_cycles, model_fn):
                       ensure_ascii=False, default=str)
     try:
         obj = _parse_json_object(model_fn(SYSTEM_PROMPT, user))
-    except Exception:                                      # noqa: BLE001 — best-effort
+    except Exception as e:                                 # noqa: BLE001 — best-effort, but
+        # say WHY: a reason-less "analysis failed" line cost a debugging round.
+        print(f"[learn] analysis call failed: {type(e).__name__}: {str(e)[:200]}",
+              flush=True)
         return None
     if not obj:
         return None

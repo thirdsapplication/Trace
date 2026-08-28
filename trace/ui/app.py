@@ -1885,16 +1885,24 @@ class AppState:
         client = self._live_client()
         events_by_run = self._fanout(
             [lambda s=r["run_session_id"]: client.list_session_events(s) for r in batch])
-        newest = events_by_run[0] if events_by_run else None
-        if not newest or not agent_activity.is_terminal(newest):
+        # A None slot means the fetch RAISED — the session was deleted/expired on the
+        # platform (404) and will never become fetchable, so it must not gate the
+        # cycle. An existing session with no terminal event ([] included) genuinely
+        # is still running and does defer.
+        pairs = [(r, ev) for r, ev in zip(batch, events_by_run) if ev is not None]
+        gone = len(batch) - len(pairs)
+        if not pairs:
+            print(f"[learning] deferring for {aid} — all {gone} session(s) in the "
+                  f"batch are gone from the platform", flush=True)
+            return None
+        if not agent_activity.is_terminal(pairs[0][1]):     # newest FETCHABLE session
             print(f"[learning] deferring for {aid} — latest session still running",
                   flush=True)
             return None
-        kept = [(r, ev) for r, ev in zip(batch, events_by_run)
-                if ev and agent_activity.is_terminal(ev)]
+        kept = [(r, ev) for r, ev in pairs if agent_activity.is_terminal(ev)]
         if len(kept) < agent_config.LEARNING_CYCLE_SESSIONS:
-            print(f"[learning] deferring for {aid} — only {len(kept)} terminal "
-                  f"session(s) in the batch", flush=True)
+            print(f"[learning] deferring for {aid} — only {len(kept)} fetchable "
+                  f"terminal session(s) in the batch ({gone} gone)", flush=True)
             return None
         # Oldest first, so the model reads the batch in the order it happened.
         records = [agent_learn.session_record(r, ev) for r, ev in reversed(kept)]

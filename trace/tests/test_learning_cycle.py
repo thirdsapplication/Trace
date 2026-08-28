@@ -39,10 +39,13 @@ class FakeLearnClient:
 
     def __init__(self):
         self.events = {}                       # session_id -> events
+        self.dead = set()                      # session_ids deleted from the platform
         self.docs = {agent_config.MEMORY_LESSONS_DOC: "# Lessons learned\n- old lesson\n"}
         self.written = []                      # {store_id, path, content}
 
     def list_session_events(self, session_id):
+        if session_id in self.dead:
+            raise RuntimeError(f"Error code: 404 - Session not found: {session_id}")
         return list(self.events.get(session_id, []))
 
     def read_memory(self, store_id, path):
@@ -143,6 +146,28 @@ class LearningCycleTest(unittest.TestCase):
         self.assertFalse(any(s.startswith("ap") for s in sids),
                          "approval-execution sessions run a different directive and "
                          "must not shape the workflow analysis")
+
+    def test_deleted_sessions_do_not_block_the_cycle(self):
+        """Old runs whose platform sessions were cleaned up 404 forever; waiting on
+        them stalled real agents in production. Gone is not running — skip them and
+        analyze the sessions that still exist."""
+        self._seed_runs(self.N)
+        self._seed_runs(2, prefix="dead")
+        self.client.dead = {"dead0", "dead1"}          # the two NEWEST runs are gone
+        t = self.state.maybe_run_learning_cycle(self.agent)
+        t.join(timeout=10)
+        payload = json.loads(self.learn_calls[0]["user"])
+        sids = {s["session_id"] for s in payload["sessions"]}
+        self.assertEqual(sids, {f"s{i}" for i in range(self.N)})
+        self.assertEqual(len(self._cycles()), 1)
+
+    def test_an_all_dead_batch_defers_without_a_model_call(self):
+        self._seed_runs(self.N)
+        self.client.dead = {f"s{i}" for i in range(self.N)}
+        t = self.state.maybe_run_learning_cycle(self.agent)
+        t.join(timeout=10)
+        self.assertEqual(self.learn_calls, [])
+        self.assertEqual(self._cycles(), [])
 
     def test_a_still_running_latest_session_defers_the_cycle(self):
         self._seed_runs(self.N, events_fn=_running_events)

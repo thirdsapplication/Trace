@@ -53,6 +53,29 @@ class MessagesBrokenOtherwise(Messages):
         raise TypeError("create() got an unexpected keyword argument 'modle'")
 
 
+class FakeAPIError(Exception):
+    """An API-level rejection (the SDK raises its own classes; only the message
+    matters to the fallback)."""
+
+
+class MessagesRejectingSampling(Messages):
+    """The Fable-5 shape: the SDK takes the keyword, the API answers 400."""
+
+    def create(self, **kw):
+        if "temperature" in kw:
+            raise FakeAPIError(
+                "Error code: 400 - temperature is not supported: sampling "
+                "parameters have been removed on this model")
+        return super().create(**kw)
+
+
+class MessagesRejectingOtherwise(Messages):
+    """A genuine API error, which must NOT be retried into silence."""
+
+    def create(self, **kw):
+        raise FakeAPIError("Error code: 400 - max_tokens exceeds model limit")
+
+
 class Client:
     def __init__(self, messages):
         self.messages = messages
@@ -76,6 +99,28 @@ class ModelCallTest(unittest.TestCase):
         that fails the same way, twice as slowly."""
         with self.assertRaises(TypeError):
             model_call.create_text(Client(MessagesBrokenOtherwise()), "m", "s", "u")
+
+    def test_temperature_none_omits_the_parameter_in_one_call(self):
+        """Fable 5 rejects all sampling parameters with a 400 — a caller that knows
+        its model must be able to never send one, not send-and-retry."""
+        m = Messages()
+        out = model_call.create_text(Client(m), "m", "sys", "hi", temperature=None)
+        self.assertEqual(out, "ok")
+        self.assertEqual(len(m.calls), 1)
+        self.assertNotIn("temperature", m.calls[0])
+
+    def test_it_retries_without_temperature_when_the_api_refuses(self):
+        """The 1.x incident, API-shaped: the SDK takes the keyword, the model 400s.
+        Not a TypeError, so the original fallback never fired and every learning
+        call died with no run."""
+        m = MessagesRejectingSampling()
+        out = model_call.create_text(Client(m), "m", "sys", "hi")
+        self.assertEqual(out, "ok", "the whole learning cycle died here")
+        self.assertNotIn("temperature", m.calls[-1])
+
+    def test_a_real_api_error_still_raises(self):
+        with self.assertRaises(FakeAPIError):
+            model_call.create_text(Client(MessagesRejectingOtherwise()), "m", "s", "u")
 
     def test_an_absent_system_prompt_is_omitted_not_nulled(self):
         """The scorer has no system prompt, and system=None is not the same as
