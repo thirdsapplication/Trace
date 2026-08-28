@@ -189,6 +189,31 @@ class ActivityViewTest(unittest.TestCase):
         self.state.refresh_activity(self.agent)
         self.assertFalse(self.state.activity_needs_refresh(self.agent))
 
+    def test_a_run_cached_as_running_still_refreshes(self):
+        """A status derived while the session was mid-run must not strand the run on
+        "running" after it finishes. The gate has to re-open for a non-terminal cached
+        status, not just a missing one — otherwise the mid-run "running" is cached once
+        and never re-derived, which is exactly how a finished run kept showing "still
+        going" in Session history."""
+        self._runs(1)
+        registry.summary_set(self.root, "s0", "", "running")   # observed mid-run
+        self.assertTrue(self.state.activity_needs_refresh(self.agent))
+        # The session has since gone idle (the fake client returns a terminal stream);
+        # a refresh must re-derive the terminal status and close the gate.
+        self.state.refresh_activity(self.agent)
+        self.assertEqual(registry.summaries_many(self.root, ["s0"])["s0"]["status"],
+                         "completed")
+        self.assertFalse(self.state.activity_needs_refresh(self.agent))
+
+    def test_a_terminal_cached_status_does_not_refresh(self):
+        """The complement: a session cached with a terminal status must NOT re-open the
+        gate, or every settled run would re-fetch the platform on every page load."""
+        self._runs(1)
+        for terminal in ("completed", "failed", "staged", "needs_input"):
+            registry.summary_set(self.root, "s0", "done", terminal)
+            self.assertFalse(self.state.activity_needs_refresh(self.agent),
+                             f"{terminal!r} should not need a refresh")
+
     def test_a_failing_refresh_never_raises(self):
         def boom(session_id):
             raise RuntimeError("platform down")

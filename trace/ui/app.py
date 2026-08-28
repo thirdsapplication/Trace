@@ -794,8 +794,13 @@ class AppState:
         return out
 
     def activity_needs_refresh(self, agent, limit=10):
-        """True when some session in the window has no cached status yet — i.e. the
-        background refresh has work to do. Cheap: two registry reads."""
+        """True when some session in the window still needs the background refresh:
+        either it has no cached status yet, or its cached status is the non-terminal
+        "running". Keying only on a MISSING status stranded finished runs on "running"
+        — a status derived while the session was still mid-run got cached, and this
+        gate then reported "nothing to do", so it was never re-derived after the
+        session went idle. Terminal statuses (completed/failed/staged/needs_input)
+        stay cached and don't re-fetch. Cheap: two registry reads."""
         root = self.sessions_root
         try:
             runs = registry.runs_for_agent(root, agent.get("agent_id"), limit)
@@ -804,7 +809,8 @@ class AppState:
             if not sids:
                 return False
             cached = registry.summaries_many(root, sids)
-            return any(not (cached.get(s) or {}).get("status") for s in sids)
+            return any((cached.get(s) or {}).get("status") in (None, "", "running")
+                       for s in sids)
         except Exception:                                  # noqa: BLE001
             return False
 
