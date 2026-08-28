@@ -700,3 +700,71 @@ class AgentWriteMapTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AgentUpsertResilienceTest(unittest.TestCase):
+    """A deploy that reaches the registry has already created a LIVE platform agent.
+    Losing the row there strands it: present in the Managed Agents console, absent
+    from the app, with the user pressing Go live again to no effect.
+
+    That is not hypothetical. deploy.py writes status="live"; the agents table has
+    carried a CHECK constraint rejecting that value since before this repo, and from
+    2026-08-26 (when status began being written) every single go-live failed this way.
+    """
+
+    class _Boom(Exception):
+        def __init__(self, code="23514"):
+            super().__init__({"message": 'violates check constraint '
+                                         '"agents_status_check"', "code": code})
+            self.code = code
+
+    def _fake_admin(self, reject_when):
+        calls = []
+
+        class Table:
+            def upsert(self, row, on_conflict=None):
+                calls.append(dict(row))
+                if reject_when(row):
+                    raise AgentUpsertResilienceTest._Boom()
+                return self
+
+            def execute(self):
+                return type("R", (), {"data": []})()
+
+        class Admin:
+            def table(self, _name):
+                return Table()
+
+        return Admin(), calls
+
+    def _run(self, admin):
+        real_conf, real_admin = registry.supa.is_configured, registry.supa.get_admin
+        registry.supa.is_configured = lambda: True
+        registry.supa.get_admin = lambda: admin
+        try:
+            registry.agent_upsert("/tmp", {
+                "agent_id": "agent_1", "owner_user_id": "u1", "name": "A",
+                "bundle_id": "B1", "status": "live", "deployed_at": "t"})
+        finally:
+            registry.supa.is_configured, registry.supa.get_admin = real_conf, real_admin
+
+    def test_the_agent_is_registered_even_when_status_is_rejected(self):
+        admin, calls = self._fake_admin(lambda row: "status" in row)
+        self._run(admin)
+        self.assertEqual(len(calls), 2, "it must retry without the optional columns")
+        self.assertNotIn("status", calls[1])
+        self.assertNotIn("deployed_at", calls[1])
+        self.assertEqual(calls[1]["id"], "agent_1", "the agent is still registered")
+        self.assertEqual(calls[1]["name"], "A")
+
+    def test_any_other_error_still_raises(self):
+        class Admin:
+            def table(self, _name):
+                raise RuntimeError("connection refused")
+        with self.assertRaises(RuntimeError):
+            self._run(Admin())
+
+    def test_a_check_violation_unrelated_to_those_columns_still_raises(self):
+        admin, _ = self._fake_admin(lambda row: True)      # rejects even without them
+        with self.assertRaises(Exception):
+            self._run(admin)

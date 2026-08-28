@@ -185,13 +185,54 @@ def _save(root, name, obj):
 
 
 # --- agents ----------------------------------------------------------------
+# Bookkeeping columns: useful, but never worth losing the row over. `status` and
+# `deployed_at` began being written on 2026-08-26 and the agents table carries a
+# CHECK constraint (agents_status_check, from a migration older than this repo) that
+# rejects the value deploy.py writes — "live". Every go-live since then created a
+# real platform agent and was then refused by the database, so the agent existed in
+# the Managed Agents console and never appeared in the app.
+AGENT_OPTIONAL_COLUMNS = ("status", "deployed_at")
+_CHECK_VIOLATION = "23514"
+
+
+def _is_check_violation(exc):
+    """True for a Postgres check-constraint violation (SQLSTATE 23514), whether the
+    client raises it with a .code, in a dict-ish payload, or only in its message."""
+    code = getattr(exc, "code", None)
+    if code is None:
+        details = getattr(exc, "args", None)
+        if details and isinstance(details[0], dict):
+            code = details[0].get("code")
+    if str(code) == _CHECK_VIOLATION:
+        return True
+    return _CHECK_VIOLATION in str(exc) or "check constraint" in str(exc).lower()
+
+
 def agent_upsert(root, agent):
     """agent: {agent_id, owner_user_id, external_user_id, bundle_id, name,
-    vault_ref, trigger, session_id, ...}."""
+    vault_ref, trigger, session_id, ...}.
+
+    Registering the agent is the load-bearing write — a deploy that reaches here has
+    already created a live agent on the platform. If the database refuses the row
+    over one of the OPTIONAL bookkeeping columns, drop those and write the agent
+    anyway, loudly. Any other error still raises: this is a narrow allowance for a
+    metadata column disagreeing with a constraint, not a blanket swallow.
+    """
     if supa.is_configured():
         admin = supa.get_admin()
         sb = _agent_to_sb(agent)
-        admin.table("agents").upsert(sb, on_conflict="id").execute()
+        try:
+            admin.table("agents").upsert(sb, on_conflict="id").execute()
+        except Exception as e:                             # noqa: BLE001
+            dropped = [k for k in AGENT_OPTIONAL_COLUMNS if k in sb]
+            if not dropped or not _is_check_violation(e):
+                raise
+            print(f"[registry] agents rejected {dropped} for "
+                  f"{agent.get('agent_id')} ({str(e)[:200]}) — registering the agent "
+                  f"without them so the deploy is not lost", flush=True)
+            for k in dropped:
+                sb.pop(k, None)
+            admin.table("agents").upsert(sb, on_conflict="id").execute()
         return
     with _LOCK:
         d = _load(root, "agents.json")

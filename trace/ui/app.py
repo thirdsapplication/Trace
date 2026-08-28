@@ -3589,7 +3589,15 @@ def make_handler(state):
                                   teams.owner_ids(root, user["user_id"]))
                               if a.get("agent_id") == maa.group(1)), None)
                 if not agent:
+                    print(f"[activity] request agent={maa.group(1)} — NOT VISIBLE to "
+                          f"{user.get('user_id')}", flush=True)
                     return self._json(404, {"error": "not_found"})
+                # Handler.log_message is a no-op, so no route logs anything by
+                # default — which left three rounds of debugging with nothing to read
+                # and no way to tell a request that failed from one that never
+                # arrived. One line, on the route that has cost the most.
+                print(f"[activity] request agent={agent.get('agent_id')} "
+                      f"user={user.get('user_id')}", flush=True)
                 # An exception escaping here reaches socketserver, which closes the
                 # socket having written NOTHING — indistinguishable from a hang to the
                 # browser, and the reason Session history sat on "Loading…" forever.
@@ -3620,6 +3628,7 @@ def make_handler(state):
                                             "refreshing": bool(refreshing)})
                 except Exception as e:                       # noqa: BLE001
                     print(f"[activity] failed for {maa.group(1)}: {_why(e)}", flush=True)
+                    traceback.print_exc()
                     return self._json(500, {"error": "activity_failed"})
             m = re.match(r"^/sessions/([^/]+)(/.*)?$", rest)
             if m:
