@@ -3861,8 +3861,14 @@ def make_handler(state):
                     return self._json(404, {"error": "not_found"})
                 return self._serve_static(p[len("/static/"):])
             if p == "/app" or p == "/app/":                 # end-user UI (WS2)
+                print("[ui] serving /app/index.html", flush=True)
                 return self._serve_app_desktop("index.html")
             if p.startswith("/app/"):
+                # Logged because "where does the desktop app get its UI?" has been
+                # guesswork for two days. If these lines appear on the CLOUD when the
+                # desktop app starts, it fetches its UI from here and a deploy reaches
+                # it; if they never appear, it is serving its own bundled copy.
+                print(f"[ui] serving /app/{p[len('/app/'):]}", flush=True)
                 return self._serve_app_desktop(p[len("/app/"):])
             if p == "/admin" or p == "/admin/":             # admin portal (data is token-gated)
                 return self._serve_admin("index.html")
