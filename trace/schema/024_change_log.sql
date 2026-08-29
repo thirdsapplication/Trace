@@ -1,4 +1,7 @@
--- 023: the self-improvement engine's change log and document snapshots.
+-- 024: the self-improvement engine's change log and document snapshots.
+--
+-- Authored as 023 on a parallel branch and renumbered on merge; 023 is agent
+-- deployment modes. Apply that one first.
 --
 -- The engine used to rewrite an agent's memory every N sessions and hope. It had one
 -- feedback signal — average tokens per session — and no way to tell which of its edits

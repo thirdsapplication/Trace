@@ -377,6 +377,7 @@ class PromptPinsTest(unittest.TestCase):
         p = learn_prompt.SYSTEM_PROMPT
         self.assertNotIn("LEDGER IS SACRED", p)
         self.assertIn("OUT OF REACH", p)
+        self.assertIn(config.MEMORY_SHARED_DOC, p)
         self.assertIn(config.MEMORY_STATUS_DOC, p)
         # And the guarantee itself lives in code, not in the sentence above.
         self.assertIn(config.MEMORY_STATUS_DOC, config.UNWRITABLE_DOCS)
@@ -397,9 +398,17 @@ class PromptPinsTest(unittest.TestCase):
         self.assertIn("you do not set the standard and you do not apply it", p)
 
     def test_no_pre_determined_structure_is_promised(self):
+        """A store begins with live state alone; what else it holds is the engine's call.
+
+        shared_lessons.md DOES appear — as one of the two documents the engine may not
+        write, since Trace writes it. That is the opposite of promising a structure: it
+        names what is out of reach, and everything else is open."""
         p = " ".join(learn_prompt.SYSTEM_PROMPT.lower().split())
         self.assertIn("there is no fixed structure", p)
-        self.assertNotIn("shared_lessons", p)
+        self.assertIn("two files are out of reach", p)
+        self.assertNotIn("three documents", p)
+        # The lessons file is not promised anywhere: it may not exist.
+        self.assertNotIn("lessons_learned.md — what has been learned", p)
 
     def test_the_output_contract_is_json(self):
         self.assertIn('{"analysis"', learn_prompt.SYSTEM_PROMPT)
