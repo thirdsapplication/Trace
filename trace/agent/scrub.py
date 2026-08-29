@@ -83,11 +83,17 @@ def _default_verify_model_fn(model=VERIFY_MODEL):
                                  max_retries=config.SCRUB_RETRIES)
 
     def call(system, user):
-        # The ordinary non-streaming call: the gate answers one boolean, so max_tokens is
-        # tiny on purpose — a gate that starts explaining itself has stopped answering.
-        # temperature=None: Opus 5 rejects sampling parameters with a 400.
+        # The ordinary non-streaming call. max_tokens is NOT tiny, and the first version's
+        # 100 was a bug that took a production round to find: Opus 5 runs adaptive
+        # thinking by DEFAULT, thinking tokens count against max_tokens, and a ceiling
+        # that low is spent before any text block is emitted. The gate then returned an
+        # empty string, which fails closed — so every batch was refused with "did not
+        # answer safe" and it read exactly like the model judging the content unsafe.
+        # The answer is still one boolean; the headroom is for the reasoning in front of
+        # it. temperature=None: Opus 5 rejects sampling parameters with a 400.
         return model_call.create_text(client, model, system, user,
-                                      max_tokens=100, temperature=None)
+                                      max_tokens=config.SCRUB_VERIFY_MAX_TOKENS,
+                                      temperature=None)
 
     return call
 
@@ -387,11 +393,27 @@ def verify_scrub(scrubbed, model_fn):
     # it would hand the verifier the very identities it is being asked to hunt for.
     user = json.dumps(payload, ensure_ascii=False, default=str)
     try:
-        obj = _parse_json_object(model_fn(VERIFY_SYSTEM, user)) or {}
+        reply = model_fn(VERIFY_SYSTEM, user)
     except Exception as e:                                 # noqa: BLE001 — fail closed
         print(f"[scrub] verify call failed: {type(e).__name__}: {str(e)[:200]}", flush=True)
         return False
-    return obj.get("safe") is True
+    obj = _parse_json_object(reply) or {}
+    if obj.get("safe") is True:
+        return True
+    # "did not answer safe" covers two very different things — the gate judged the text
+    # unsafe, or the gate never answered at all — and conflating them cost a production
+    # round when an empty reply (max_tokens spent on thinking) read as a refusal.
+    text = str(reply or "")
+    if not text.strip():
+        print("[scrub] the privacy gate returned NOTHING — this is a broken call, not a "
+              "judgement (check SCRUB_VERIFY_MAX_TOKENS against the model's thinking)",
+              flush=True)
+    elif not obj:
+        print(f"[scrub] the privacy gate did not answer JSON. Reply: {text[:200]!r}",
+              flush=True)
+    else:
+        print(f"[scrub] the privacy gate judged the batch unsafe: {obj!r}", flush=True)
+    return False
 
 
 def _publishable_sessions(session_records, scrubbed):
@@ -432,20 +454,34 @@ def scrub_and_verify(session_records, memory_docs, model_fn, verify_model_fn):
     privacy model — deterministic checks first so a summarised or leaky answer is thrown
     out before a second model is paid to read it.
 
+    With ``config.SCRUB_CHECKS_ENABLED`` false (TRACE_SCRUB_CHECKS=0) all three are
+    skipped and whatever the scrub model returned is published. That is a debugging
+    switch for telling "nothing qualified" apart from "this is broken", which the logs
+    otherwise render identically — not a mode anything should run in. The scrub itself
+    still happens; nothing verifies it did anything.
+
     Returns ``{"sessions": [...], "memory": {path: text}}`` ready to publish, or None.
     Never raises; prints one reason line on rejection.
     """
     scrubbed = scrub_batch(session_records, memory_docs, model_fn)
     if not scrubbed:
         return _reject("scrub call produced nothing")
-    ok, reason = structural_check(session_records, scrubbed)
-    if not ok:
-        return _reject(reason)
-    ok, reason = leak_sweep(scrubbed, scrubbed.get("redactions") or [])
-    if not ok:
-        return _reject(reason)
-    if not verify_scrub(scrubbed, verify_model_fn):
-        return _reject("privacy gate did not answer safe")
+    if not config.SCRUB_CHECKS_ENABLED:
+        # Loud on EVERY publish, not once at startup: a flag set for one debugging run and
+        # forgotten is exactly how unverified material ends up shared, and the log is the
+        # only place that would show it.
+        print("[scrub] *** CHECKS DISABLED (TRACE_SCRUB_CHECKS=0) *** publishing this "
+              "batch with NOTHING verifying the scrub removed anything. Delete these "
+              "bundles before any real customer data goes near this path.", flush=True)
+    else:
+        ok, reason = structural_check(session_records, scrubbed)
+        if not ok:
+            return _reject(reason)
+        ok, reason = leak_sweep(scrubbed, scrubbed.get("redactions") or [])
+        if not ok:
+            return _reject(reason)
+        if not verify_scrub(scrubbed, verify_model_fn):
+            return _reject("privacy gate did not answer safe")
     # "redactions" is a literal -> pseudonym map: the one artifact that can UNDO this
     # scrub. It is used by the checks above and dropped here — it must never be persisted,
     # logged, or passed onward to any caller.

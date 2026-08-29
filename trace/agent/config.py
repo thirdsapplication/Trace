@@ -79,6 +79,27 @@ COLLECTIVE_ENABLED = (os.environ.get("TRACE_COLLECTIVE_ENABLED") or "0").strip()
 SCRUB_MODEL = "claude-sonnet-5"
 SCRUB_VERIFY_MODEL = "claude-opus-5"
 SCRUB_MAX_TOKENS = 64_000                # the reply restates every session AND doc in full
+# Headroom for the privacy gate's reply. It answers one boolean, but Opus 5 thinks
+# adaptively by default and that reasoning is billed against max_tokens — the first
+# value here was 100, which the model spent before emitting any text, so the gate
+# returned an empty string and every batch failed closed looking like a refusal.
+SCRUB_VERIFY_MAX_TOKENS = 4000
+
+# Bypass switch for the three checks between a scrub and a publish (structural, leak
+# sweep, privacy gate). OFF means the checks run — this is a debugging aid, not a mode.
+#
+# It exists because a check failing and a feature being broken look identical from the
+# outside: every rejection prints a reason and publishes nothing, so a chain of them
+# reads as "working, nothing qualified" while the feature is in fact dead. Being able to
+# take the checks out for one run separates the two in minutes instead of days.
+#
+# What it costs while it is on: material leaves one account for another with NOTHING
+# verifying the scrub actually removed anything. The scrub model is still asked to
+# de-identify and generally does, but a batch it silently summarised, half-scrubbed, or
+# skipped will publish. Every publish under this flag logs a warning naming that, and
+# any bundle written while it was on should be deleted from peer_bundles before real
+# customer data is anywhere near this path.
+SCRUB_CHECKS_ENABLED = (os.environ.get("TRACE_SCRUB_CHECKS") or "1").strip() != "0"
 SCRUB_REQUEST_TIMEOUT = 900              # seconds; backgrounded, like the analysis call
 SCRUB_RETRIES = 1
 SCRUB_SESSION_CLIP = 12_000              # chars of transcript per session (matches learning)

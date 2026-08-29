@@ -279,6 +279,88 @@ class ScrubBatchTest(unittest.TestCase):
         self.assertIsNone(scrub.scrub_batch(_records(), {}, _fn("no json here")))
 
 
+class ChecksDisabledTest(unittest.TestCase):
+    """TRACE_SCRUB_CHECKS=0 — the debugging switch that separates "nothing qualified"
+    from "this is broken", which every rejection log otherwise renders identically."""
+
+    def _run(self, scrub_reply, verify_reply='{"safe": false}'):
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            out = scrub.scrub_and_verify(_records(), {}, _fn(scrub_reply),
+                                         _fn(verify_reply))
+        return out, buf.getvalue()
+
+    def setUp(self):
+        self._orig = config.SCRUB_CHECKS_ENABLED
+        config.SCRUB_CHECKS_ENABLED = False
+        self.addCleanup(setattr, config, "SCRUB_CHECKS_ENABLED", self._orig)
+
+    def test_a_batch_the_privacy_gate_refuses_still_publishes(self):
+        out, _ = self._run(json.dumps(_scrubbed()))
+        self.assertIsNotNone(out)
+
+    def test_a_summarised_scrub_still_publishes(self):
+        payload = _scrubbed()
+        payload["sessions"][0]["transcript"] = "the agent did some things"
+        out, _ = self._run(json.dumps(payload))
+        self.assertIsNotNone(out, "the structural check must be bypassed too")
+
+    def test_a_leaky_scrub_still_publishes(self):
+        payload = _scrubbed("[agent] emailed chef@mariospizzeria.example")
+        out, _ = self._run(json.dumps(payload))
+        self.assertIsNotNone(out, "the leak sweep must be bypassed too")
+
+    def test_every_bypassed_publish_warns(self):
+        # Once at startup would not do: a flag set for one run and forgotten is exactly
+        # how unverified material gets shared, and the log is the only place it shows.
+        _, log = self._run(json.dumps(_scrubbed()))
+        self.assertIn("CHECKS DISABLED", log)
+        self.assertIn("TRACE_SCRUB_CHECKS=0", log)
+
+    def test_a_failed_scrub_call_still_publishes_nothing(self):
+        # The switch bypasses the CHECKS, not the scrub. With no scrubbed text there is
+        # nothing to publish under any flag.
+        out, _ = self._run("not json at all")
+        self.assertIsNone(out)
+
+    def test_redactions_are_still_stripped(self):
+        out, _ = self._run(json.dumps(_scrubbed(
+            redactions=[{"pseudonym": "restaurant client A",
+                         "literal": "Mario's Pizzeria", "category": "company"}])))
+        self.assertNotIn("redactions", out)
+        self.assertNotIn("Mario", json.dumps(out))
+
+
+class VerifyGateDiagnosticsTest(unittest.TestCase):
+    """"did not answer safe" covered two different things: the gate judged the content
+    unsafe, or the gate never answered. Conflating them cost a production round when
+    max_tokens=100 on a model that thinks by default returned an empty string."""
+
+    def _log(self, verify_reply):
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            scrub.verify_scrub(_scrubbed(), _fn(verify_reply))
+        return buf.getvalue()
+
+    def test_an_empty_reply_is_reported_as_a_broken_call(self):
+        log = self._log("")
+        self.assertIn("returned NOTHING", log)
+        self.assertIn("broken call, not a judgement", log)
+
+    def test_a_non_json_reply_is_reported_as_such(self):
+        self.assertIn("did not answer JSON", self._log("I cannot help with that"))
+
+    def test_a_genuine_refusal_is_reported_as_a_judgement(self):
+        self.assertIn("judged the batch unsafe", self._log('{"safe": false}'))
+
+    def test_a_safe_answer_still_passes(self):
+        self.assertTrue(scrub.verify_scrub(_scrubbed(), _fn('{"safe": true}')))
+
+
 class LeakSweepPrecisionTest(unittest.TestCase):
     """The sweep must not fire on ordinary transcript furniture.
 
