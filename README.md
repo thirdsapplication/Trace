@@ -28,7 +28,7 @@ privacy-preserving signal stream and reconstructs it (Haiku) into `event_log.jso
 Stage 2 (`trace/discovery/`) proposes workflows — **bundles** (automatable) and
 **anti-bundles** (judgment-required) — in one Sonnet call over the whole day; the
 operator lightly corrects them in the review surface (`reviewed_bundles.json`). From
-there the in-product chain (`trace/agent/`) asks a few **interview** questions about
+there the in-product chain (`trace/agent/`) asks any **interview** questions it needs about
 what the data couldn't reveal, writes each agent's **configuration** (Managed Agents
 YAML) directly with a **grounding** record, **connects** the worker's apps through
 one Pipedream connection, and **deploys live**
@@ -231,10 +231,12 @@ trace/
     reviewed_bundles.schema.json, environment.schema.json, ARTIFACT_SCHEMA.md
   agent/                   the in-product chain — interview -> config -> connect -> live
     interview_prompt.py, interview.py   Phase 2 — gap detector: what capture couldn't reveal -> questions
+                           (as many as the workflow needs, up to 10 — often none)
     config_prompt.py, configgen.py      Phase 1 — write agent_<id>.{test,live}.yaml + grounding_<id>.json directly
     config.schema.json, CONFIG_SCHEMA.md  the model's content-JSON contract
     connect_client.py, connect.py       Phase 4 — Pipedream Connect + Managed Agents vault (read+bind), offline orchestration
-    deploy.py              Phase 6 — create the LIVE agent over the connection; outbound held for approval
+    deploy.py              Phase 6 — create the LIVE agent over the connection, plus its staging
+                           and execution deployments (one unpaused; approval is a whole-agent setting)
     api_client.py          the ONE beta-pinned Managed Agents / Files API client (+ vault inject, tool_confirmation approval)
     config.py              platform pins, Pipedream + connect tables, defaults (editable)
     interview_cli.py, configgen_cli.py  dry-run-able CLIs for the engines
@@ -490,7 +492,7 @@ visible. The contract is `trace/discovery/DISCOVERY_SCHEMA.md`.
 # render the prompt + whole event log that would be sent (free, no model call)
 python -m trace.discovery.cli trace/discovery/fixtures/marcy_event_log.json --dry-run
 
-# run discovery (needs ANTHROPIC_API_KEY; default model claude-sonnet-4-6)
+# run discovery (needs ANTHROPIC_API_KEY; default model claude-sonnet-5)
 export ANTHROPIC_API_KEY=sk-ant-...
 python -m trace.discovery.cli path/to/event_log.json -o discovery.json
 ```
@@ -541,7 +543,7 @@ frozen `reviewed_bundles.json` (contract in `trace/artifact/ARTIFACT_SCHEMA.md`)
 the only workflow input the Artifact Engine reads.
 
 **Artifact Engine (`trace/artifact/`).** For each item classified as a `bundle`
-with disposition `approve_for_build`, one model call (default `claude-sonnet-4-6`,
+with disposition `approve_for_build`, one model call (default `claude-sonnet-5`,
 injectable) produces the intent prose, example-supported acceptance criteria, and a
 representative/illustrative assessment of each example; deterministic code then
 assembles the three-layer **Artifact C** markdown spec so that the verbatim

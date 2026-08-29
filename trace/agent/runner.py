@@ -171,13 +171,18 @@ def _app_label(slug):
     return str(slug or "").replace("_", " ").title()
 
 
-def _staging_trigger(base_trigger, staged_slugs):
-    """Prepend the staging directive (naming the staged apps) to the run's trigger so
-    the agent reads freely but proposes — not performs — outbound actions in those apps."""
-    apps = ", ".join(_app_label(s) for s in staged_slugs) or "the staged apps"
-    # plain replace (not str.format) — the directive contains literal JSON braces
-    directive = config.STAGING_DIRECTIVE.replace("{apps}", apps)
-    return f"{directive}\nTask: {base_trigger}"
+def agent_mode(agent):
+    """Which mode this agent runs in: staging (propose, wait for a human) or execution.
+
+    Approval used to be a per-app set on the row, applied by prefixing a staging
+    directive to each run's text. It is now a whole-agent mode, selected by which of the
+    agent's two deployments is unpaused, and read here so a directly-created session
+    behaves the same way a platform-fired run does.
+    """
+    if not config.approval_required(agent):
+        return config.MODE_EXECUTION
+    mode = (agent or {}).get("deployment_mode")
+    return mode if mode in (config.MODE_STAGING, config.MODE_EXECUTION) else config.MODE_STAGING
 
 
 def _uncertainty_max_questions():
@@ -185,14 +190,6 @@ def _uncertainty_max_questions():
     interview's limit so both stages behave the same (per product decision)."""
     from .interview import _MAX_QUESTIONS
     return _MAX_QUESTIONS
-
-
-def _uncertainty_trigger(base_trigger):
-    """Append the uncertainty directive so the agent can pause on a genuinely blocking
-    edge case (Gap #3). Applies to every run, staged or autonomous."""
-    directive = config.UNCERTAINTY_DIRECTIVE.replace(
-        "{max_questions}", str(_uncertainty_max_questions()))
-    return f"{base_trigger}\n\n{directive}"
 
 
 def _parse_needs_input(text):
@@ -339,14 +336,19 @@ def _memory_resources(agent):
 
 def _resume_preamble(resume):
     """Prepend the paused question + the human's answer so an auto-resumed run continues
-    where it left off (Gap #3 B2). ``resume`` is ``{question, context, answer}``."""
+    where it left off (Gap #3 B2). ``resume`` is ``{question, context, answer}``.
+
+    It used to end with a dangling "Original task: " that the run's trigger text
+    completed. The run's message is now one line naming the mode, so this block stands
+    on its own and the mode line follows it.
+    """
     q = str(resume.get("question") or "").strip()
     ctx = str(resume.get("context") or "").strip()
     ans = str(resume.get("answer") or "").strip()
     return (f"You previously paused on this task and asked: \"{q}\".\n"
             + (f"What you'd found: {ctx}\n" if ctx else "")
             + f"The human has now answered: \"{ans}\".\n"
-            "Use that answer to proceed and complete the task now.\n\nOriginal task: ")
+            "Use that answer to proceed and complete the task now.\n\n")
 
 
 def _guidance_preamble(lessons):
@@ -357,8 +359,9 @@ def _guidance_preamble(lessons):
             "have to ask again:\n" + body + "\n\n") if body else ""
 
 
-def _rejected_preamble(rejected):
-    """Lead the trigger with actions the human REJECTED, so they aren't proposed again.
+def rejected_block(rejected):
+    """The actions the human REJECTED, rendered for the agent to read so they aren't
+    proposed again. Returns "" when there is nothing to say.
 
     Rejecting only set the row's status, which the agent never sees — so the next run
     re-proposed the identical action and rejecting taught the system nothing. A rejection
@@ -367,6 +370,12 @@ def _rejected_preamble(rejected):
     proposals. The REASON matters more than the fact: "don't propose this" stops one
     action, while "the ship date isn't confirmed yet" tells the agent what to do
     differently — and the card has always promised to ask for it.
+
+    This used to be PREPENDED to the run's text. On a deployment-backed agent that meant
+    tearing the deployment down and rebuilding it every time somebody rejected a card,
+    because a deployment's opening message is immutable. It goes into the agent's memory
+    store now (``ui.app._deliver_guidance``), which is rewritten before every run and
+    costs nothing to change.
     """
     lines = []
     for r in rejected or []:
@@ -379,35 +388,41 @@ def _rejected_preamble(rejected):
                      + (f"\n    they said: {why}" if why else ""))
     if not lines:
         return ""
-    return ("ALREADY REJECTED BY THE HUMAN — do NOT propose these again, and do not "
-            "propose a lightly reworded version of them. If you believe one is now "
-            "genuinely warranted because the situation changed, say why in its "
-            "rationale rather than re-proposing it silently:\n"
+    # Worded for BOTH modes. The same agent object backs the staging and the execution
+    # deployment, and an agent switched to execution still carries the rejections it
+    # collected while staging — "don't propose that again" would read as permission to
+    # just do it.
+    return ("ALREADY TURNED DOWN BY THE HUMAN — do NOT do these, and do not propose or "
+            "do a lightly reworded version of them. If you believe one is now genuinely "
+            "warranted because the situation changed, say why rather than acting on it "
+            "silently:\n"
             + "\n".join(lines[:20]) + "\n\n")
 
 
 def run_once(client, agent, resume=None, guidance=None, rejected=None):
-    """Run one agent once. ``agent`` is a registry row carrying ``agent_id``,
-    ``vault_ref``, and ``trigger``. Returns a run record dict
+    """Run one agent once, in its own mode. ``agent`` is a registry row carrying
+    ``agent_id``, ``vault_ref`` and its approval setting. Returns a run record dict
     ``{agent_id, status, summary, details, run_session_id}`` where ``status`` is
     ``completed`` | ``needs_approval`` | ``needs_input`` | ``failed`` and ``details`` is
     the in-Trace list of actions. Never raises (a platform failure becomes ``failed``).
-    ``resume`` (Gap #3) seeds the trigger with a prior paused question + human answer so
-    the agent continues where it stopped. ``guidance`` (Gap #3 B4) is a list of retrieved
-    reusable lessons injected as leading context. ``rejected`` is a list of
-    ``{summary, app}`` the human turned down, so the same action isn't proposed again."""
+
+    The message sent is the SAME one-line mode message the agent's platform deployment
+    would send (``config.deployment_initial_message``), so "Run now" and a scheduled
+    platform run are the same run. The contracts that used to be stacked onto this text
+    — staging, uncertainty, memory — are in the agent's system prompt now.
+
+    ``resume`` (Gap #3) leads with a prior paused question + the human's answer so the
+    agent continues where it stopped. ``guidance`` (Gap #3 B4) is a list of retrieved
+    reusable lessons injected as leading context. ``rejected`` is accepted for call-site
+    compatibility and no longer used here — rejections reach the agent through its
+    memory store, which is the only channel a platform-fired deployment run also has.
+    """
     agent_id = agent.get("agent_id")
-    base_trigger = agent.get("trigger") or "on a new matching task"
-    if resume:
-        base_trigger = _resume_preamble(resume) + base_trigger
+    trigger = config.deployment_initial_message(agent_mode(agent),
+                                                config.approval_required(agent))
     vault_ref = agent.get("vault_ref")
-    staged = [s for s in (agent.get("staged_apps") or []) if s]
-    trigger = _staging_trigger(base_trigger, staged) if staged else base_trigger
-    trigger = _uncertainty_trigger(trigger)            # Gap #3: agent may pause when stuck
-    if agent.get("memory_store_id"):
-        trigger = trigger + "\n\n" + config.MEMORY_UPDATE_DIRECTIVE
-    if rejected:                                       # don't re-propose what was refused
-        trigger = _rejected_preamble(rejected) + trigger
+    if resume:
+        trigger = _resume_preamble(resume) + trigger
     if guidance:                                       # Gap #3 B4: retrieved lessons up top
         trigger = _guidance_preamble(guidance) + trigger
     owner, agent_name = config.agent_owner(agent), agent.get("name") or agent_id
@@ -471,10 +486,11 @@ def _build_run_record(agent_id, events, run_session_id, client):
 def execute_pending(client, agent, pending):
     """Perform one previously-staged action on the user's approval (Spec 8 "quick fresh
     task"). Runs the deployed agent on a fresh session with an explicit EXECUTE
-    instruction that overrides staging (staging lives only in the scheduled-run trigger,
-    not the agent's system prompt, so a plain execute trigger performs the action under
-    the always_allow toolsets). Returns ``{status: executed|failed, summary,
-    run_session_id}``. Never raises."""
+    instruction. An approval-required agent carries the staging contract in its system
+    prompt, so that contract names this case explicitly ("a run that hands you a
+    specific action a human has already approved") and the instruction below is the
+    override it defers to; the toolsets are ``always_allow``, so the call goes through.
+    Returns ``{status: executed|failed, summary, run_session_id}``. Never raises."""
     agent_id = agent.get("agent_id")
     vault_ref = agent.get("vault_ref")
     summary = pending.get("summary") or pending.get("kind") or "the action"
@@ -483,8 +499,6 @@ def execute_pending(client, agent, pending):
         "You are approved to perform this ONE action now, for real. Do NOT stage, "
         "propose, or describe it — actually carry it out using your tools, then stop. "
         f"Action: {summary}. Details: {json.dumps(payload, ensure_ascii=False, default=str)}")
-    if agent.get("memory_store_id"):
-        instruction = instruction + "\n\n" + config.MEMORY_UPDATE_DIRECTIVE
     owner, agent_name = config.agent_owner(agent), agent.get("name") or agent_id
     try:
         environment_id = client.create_environment(
@@ -508,7 +522,8 @@ def execute_pending(client, agent, pending):
 
 def execute_actions(client, agent, items):
     """Perform several approved staged actions in ONE fresh session (batch approve from
-    the activity screen). Explicit EXECUTE instruction overrides staging. Returns
+    the activity screen). Explicit EXECUTE instruction, overriding the system prompt's
+    staging contract exactly as ``execute_pending`` does. Returns
     ``{status: executed|failed, summary, run_session_id}``. Never raises."""
     agent_id = agent.get("agent_id")
     vault_ref = agent.get("vault_ref")
@@ -521,8 +536,6 @@ def execute_actions(client, agent, items):
         "You are approved to perform these actions now, for real. Do NOT stage, propose, "
         "or describe them — actually carry each one out using your tools, then stop:\n"
         + "\n".join(lines))
-    if agent.get("memory_store_id"):
-        instruction = instruction + "\n\n" + config.MEMORY_UPDATE_DIRECTIVE
     owner, agent_name = config.agent_owner(agent), agent.get("name") or agent_id
     try:
         environment_id = client.create_environment(

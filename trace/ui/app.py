@@ -392,7 +392,7 @@ class AppState:
             connect_client = None                 # preflight is optional, deploy isn't
         return agent_deploy.deploy_live(bundle, live_dict, connection_record, client,
                                         trigger=start.get("trigger"), schedule=start.get("schedule"),
-                                        staged_apps=start.get("staged_apps"),
+                                        approval_required=start.get("approval_required"),
                                         connect_client=connect_client)
 
     def _live_client(self):
@@ -756,21 +756,32 @@ class AppState:
             pass
         return ""
 
-    def agent_available_apps(self, agent):
-        """The agent's usable connected apps, each flagged whether it's currently staged
-        (held for approval). Drives the post-deploy staging toggle. Reads the agent's
-        session connection record; on any failure falls back to the currently-staged set
-        so the toggle can still render what's staged."""
-        staged = set(s for s in (agent.get("staged_apps") or []) if s)
+    def agent_app_slugs(self, agent):
+        """The app slugs this agent actually works in, from its connection record.
+
+        Falls back to the legacy ``staged_apps`` list for agents deployed before
+        approval became a whole-agent setting — that column doubled as the only record
+        of which apps an agent touched, and lesson provenance still needs it.
+        """
+        legacy = [s for s in (agent.get("staged_apps") or []) if s]
         try:
             rec, _ = self._load_connection(agent.get("session_id"))
             usable = agent_deploy._usable_app_slugs(rec)
         except Exception:                                  # noqa: BLE001 — best-effort
-            usable = sorted(staged)
-        # keep any staged slug even if the connection record no longer lists it as usable
-        slugs = list(dict.fromkeys(list(usable) + sorted(staged)))
-        return [{"slug": s, "label": agent_runner._app_label(s), "staged": s in staged}
-                for s in slugs]
+            usable = []
+        return list(dict.fromkeys(list(usable) + legacy))
+
+    def agent_available_apps(self, agent):
+        """The agent's usable connected apps, for the profile's app list.
+
+        Each app used to carry its own ``staged`` flag driving a per-app approval
+        toggle. Approval is one setting for the whole agent now (see
+        ``set_agent_mode``): with two deployments — one that says stage, one that says
+        execute — "hold Gmail but let Sheets run" is not a mode a deployment can be in.
+        """
+        approval = agent_config.approval_required(agent)
+        return [{"slug": s, "label": agent_runner._app_label(s), "staged": approval}
+                for s in self.agent_app_slugs(agent)]
 
     def agent_activity(self, agent, limit=10):
         """The agent's recent runs, served ENTIRELY from the registry — no platform
@@ -790,7 +801,7 @@ class AppState:
         """
         root = self.sessions_root
         owner = agent.get("owner_user_id")
-        staged = bool(agent.get("staged_apps"))
+        staged = agent_config.approval_required(agent)
         runs = list(registry.runs_for_agent(root, agent.get("agent_id"), limit))
         sids = []
         seen = set()
@@ -1202,8 +1213,7 @@ class AppState:
             registry.lesson_application_add(root, aid, owner, h["decision_id"], None)
         return [h["lesson"] for h in inject]
 
-    @staticmethod
-    def _same_context_only(root, agent, hits):
+    def _same_context_only(self, root, agent, hits):
         """Drop cross-owner lessons learned somewhere this agent does not work.
 
         The similarity gate upstream compares two agents' DESCRIPTIONS — prose a model
@@ -1217,8 +1227,8 @@ class AppState:
         fuzzy one, for other people's lessons only.
 
         Deliberately permissive when either side is UNRECORDED. Every decision written
-        before migration 020 has no source_apps, and every agent built before staging
-        existed has none either — treating unknown as "no overlap" would silently
+        before migration 020 has no source_apps, and an agent whose connection record
+        cannot be read has none either — treating unknown as "no overlap" would silently
         switch off cross-user sharing for the whole existing corpus, which is a far
         worse failure than admitting a lesson that turns out not to apply (the human
         still has to confirm it).
@@ -1226,7 +1236,7 @@ class AppState:
         cross = [h for h in hits if h.get("tier") != "own"]
         if not cross:
             return hits
-        mine = {a for a in (agent.get("staged_apps") or []) if a}
+        mine = set(self.agent_app_slugs(agent))
         if not mine:
             return hits                                    # unknown -> do not filter
         by_id = registry.decisions_source_apps(root, [h["decision_id"] for h in cross])
@@ -1269,7 +1279,7 @@ class AppState:
             team = teams.team_for_user(root, agent.get("owner_user_id")) or {}
             registry.decision_set_provenance(
                 root, did,
-                source_apps=[s for s in (agent.get("staged_apps") or []) if s],
+                source_apps=self.agent_app_slugs(agent),
                 source_team_id=team.get("team_id"))
         # T3 gate: only cross-user-shareable if the source consents to global AND it scrubs clean
         contribute = (registry.agent_lesson_scopes(root, agent)["contribute_scope"] if agent
@@ -1433,7 +1443,9 @@ class AppState:
     def _interview_all_complete(self, sid):
         """True when EVERY approved bundle's interview record exists with status
         'complete' (vacuously true with zero approved bundles). The questions phase
-        is mandatory: this is the build gate, always recomputed from disk."""
+        always RUNS before build — this is the build gate, always recomputed from disk —
+        but it may legitimately produce NO questions, which ``_interview_record`` scores
+        as 'complete', so a workflow with no real gaps passes straight through."""
         approved, _ = self._approved_for_stage4(sid)
         for b in approved:
             rec = sessions.read_json_artifact(self.sessions_root, sid,
@@ -1517,6 +1529,9 @@ class AppState:
                 agent_ids.append(d["agent_id"])
             if d.get("deployment_id"):
                 deployment_ids.append(d["deployment_id"])
+            # An agent has up to two deployments (staging + execution); cleanup that only
+            # knew about the active one left the paused sibling behind on the platform.
+            deployment_ids.extend(v for v in (d.get("deployments") or {}).values() if v)
             if d.get("memory_store_id"):
                 memory_store_ids.append(d["memory_store_id"])
         # any manual-eval run records (dormant path)
@@ -1802,8 +1817,12 @@ class AppState:
                                          and a.get("deployment_id") != rec.get("deployment_id")),
                                         None)
                                     if prior:
-                                        self._live_client().archive_deployment(
-                                            prior["deployment_id"])
+                                        client = self._live_client()
+                                        for did in {prior["deployment_id"],
+                                                    *(prior.get("deployments") or {}).values()}:
+                                            if did and did not in (
+                                                    rec.get("deployments") or {}).values():
+                                                client.archive_deployment(did)
                                 except Exception:          # noqa: BLE001 — best-effort
                                     pass
                                 registry.agent_upsert(root, {
@@ -1813,8 +1832,10 @@ class AppState:
                                     "vault_ref": rec.get("vault_ref"),
                                     "trigger": (rec.get("start") or {}).get("value"),
                                     "session_id": sid,
-                                    "staged_apps": rec.get("staged_apps") or [],
+                                    "approval_required": bool(rec.get("approval_required")),
                                     "deployment_id": rec.get("deployment_id"),
+                                    "deployments": rec.get("deployments") or {},
+                                    "deployment_mode": rec.get("deployment_mode"),
                                     "memory_store_id": rec.get("memory_store_id"),
                                     # the owner identity every later session/
                                     # environment/deployment is named with
@@ -2044,8 +2065,9 @@ class AppState:
             except Exception:                              # noqa: BLE001
                 pass                                       # one bad agent never kills the pass
 
-    def _deliver_guidance(self, agent, lessons):
-        """Put retrieved lessons where a DEPLOYED agent can actually see them.
+    def _deliver_guidance(self, agent, lessons, rejected=None):
+        """Put what Trace knows where a DEPLOYED agent can actually see it: retrieved
+        lessons, and the actions this agent's human has recently turned down.
 
         run_agent passes guidance straight into the session it creates. A deployment
         run has no such door -- run_deployment(deployment_id) takes no input -- so
@@ -2056,21 +2078,30 @@ class AppState:
         the start of every session. Writing shared_lessons.md before triggering the run
         is the deployment-path equivalent of the guidance argument.
 
+        Rejections travel the same way, and for the same reason. They used to be
+        prepended to the deployment's opening message, which meant every "no" on an
+        approval card destroyed and rebuilt a live platform deployment to change one
+        paragraph. Same door, no rebuild.
+
         Best-effort and loud: a failure here must not stop the run, but it must not be
         invisible either -- a silent miss looks exactly like "no lessons to share".
         """
         store_id = agent.get("memory_store_id")
         if not store_id:
-            if lessons:
-                print(f"[guidance] agent {agent.get('agent_id')} has {len(lessons)} "
+            if lessons or rejected:
+                print(f"[guidance] agent {agent.get('agent_id')} has {len(lessons or [])} "
                       f"lesson(s) but no memory_store_id -- deployed before shared "
                       f"lessons existed; redeploy to pick them up", flush=True)
             return False
+        head = agent_config.MEMORY_SHARED_SEED.split("(none yet)")[0].rstrip()
+        blocks = []
         if lessons:
-            body = (f"{agent_config.MEMORY_SHARED_SEED.split('(none yet)')[0].rstrip()}\n\n"
-                    + "\n".join(f"- {l}" for l in lessons) + "\n")
-        else:
-            body = agent_config.MEMORY_SHARED_SEED       # clear stale advice
+            blocks.append("\n".join(f"- {l}" for l in lessons))
+        rejected_text = agent_runner.rejected_block(rejected).strip()
+        if rejected_text:
+            blocks.append(rejected_text)
+        body = f"{head}\n\n" + "\n\n".join(blocks) + "\n" if blocks else \
+            agent_config.MEMORY_SHARED_SEED           # clear stale advice
         try:
             wrote = self._live_client().write_memory(
                 store_id, agent_config.MEMORY_SHARED_DOC, body)
@@ -2078,9 +2109,10 @@ class AppState:
             print(f"[guidance] could not reach the memory store for "
                   f"{agent.get('agent_id')}: {type(e).__name__}: {e}", flush=True)
             return False
-        if wrote and lessons:
-            print(f"[guidance] delivered {len(lessons)} lesson(s) to "
-                  f"{agent.get('agent_id')}", flush=True)
+        if wrote and blocks:
+            print(f"[guidance] delivered {len(lessons or [])} lesson(s) and "
+                  f"{len(rejected or [])} rejection(s) to {agent.get('agent_id')}",
+                  flush=True)
         return bool(wrote)
 
     # --- learning cycles: Fable-driven periodic self-improvement ---------
@@ -2508,7 +2540,8 @@ class AppState:
         # many times an agent ran. Retrieval must happen BEFORE the platform run, since
         # what it produces is delivered through the memory store the run will read.
         try:
-            self._deliver_guidance(agent, self._retrieve_guidance(agent))
+            self._deliver_guidance(agent, self._retrieve_guidance(agent),
+                                   rejected=self._rejected_for(agent))
         except Exception as e:                              # noqa: BLE001 — never block a run
             print(f"[guidance] retrieval failed for {agent.get('agent_id')}: "
                   f"{type(e).__name__}: {e}", flush=True)
@@ -2779,9 +2812,12 @@ class AppState:
         base = {"agent_id": aid, "name": agent.get("name") or aid,
                 "color": registry.agent_color(agent), "staged": []}
         self._refresh_agent_binding(agent)
-        staged_apps = [s for s in (agent.get("staged_apps") or []) if s]
+        approval = agent_config.approval_required(agent)
         directive = agent_config.GROUP_DIRECT_DIRECTIVE.replace("{text}", text)
-        trigger = agent_runner._staging_trigger(directive, staged_apps) if staged_apps else directive
+        # The staging contract is in an approval-required agent's system prompt, so a
+        # directed message only has to name the mode; an autonomous agent gets none.
+        trigger = (f"{agent_config.STAGING_INITIAL_MESSAGE}\n\n{directive}"
+                   if approval else directive)
         try:
             client = self._live_client()
             named = self._with_owner(agent)
@@ -2797,7 +2833,7 @@ class AppState:
             return {**base, "reply": "I couldn't respond just now — try again in a moment."}
         human = agent_runner._final_text(events).split("```")[0].strip()   # drop any proposal fence
         reply = agent_runner._first_line(human) or "Done."
-        staged = self._session_proposals(agent, sid, events, owner) if staged_apps else []
+        staged = self._session_proposals(agent, sid, events, owner) if approval else []
         return {**base, "reply": reply, "staged": staged}
 
     @staticmethod
@@ -2917,71 +2953,99 @@ class AppState:
                 "needs_you_total": sum(a["needs_you"] for a in agents_out),
                 "week": week}
 
-    def apply_platform_schedule(self, agent, cadence):
+    def apply_platform_schedule(self, agent, cadence, approval_required=None, mode=None):
         """Re-point a deployment agent at the requested cadence. Deployments are
-        immutable, so this creates a fresh one and archives the old — cron for
-        daily/weekly (config.cadence_to_cron), or a manual deployment when ``cadence``
-        is None/unmappable so Run-now keeps working. Raises on platform rejection (the
+        immutable, so this creates a fresh PAIR (staging + execution, or execution alone
+        for an autonomous agent) and archives the old ones — cron for daily/weekly
+        (config.cadence_to_cron), or manual deployments when ``cadence`` is
+        None/unmappable so Run-now keeps working. Raises on platform rejection (the
         caller surfaces the real error rather than phantom-succeeding).
 
-        Ordering matters: CREATE the new deployment first, PERSIST it, and only THEN
-        archive the old one. If the create fails, the old (working) deployment stays
+        Ordering matters: CREATE the new deployments first, PERSIST them, and only THEN
+        archive the old ones. If the create fails, the old (working) deployments stay
         live and still registered — a failed schedule change never strands the agent
         with an archived deployment. Serialized per-process so two concurrent schedule
-        POSTs can't each create a live cron deployment and orphan one."""
+        POSTs can't each create a live cron deployment and orphan one.
+
+        The agent's current mode is preserved across the rebuild: whichever deployment
+        was unpaused before is the one unpaused after. ``approval_required``/``mode``
+        override that — ``set_agent_mode`` passes the mode it is switching INTO, which
+        the stored row does not know yet (and must not, until the platform agrees).
+        """
         # Its OWN lock: the platform calls below can take minutes, and holding the
         # global lock across them froze capture status, approvals and page loads.
         with self._deploy_lock:
             client = self._live_client()
-            old_id = agent.get("deployment_id")
             aid = agent.get("agent_id")
-            # re-read the row so a racing change's deployment_id is the one we archive
+            # re-read the row so a racing change's deployments are the ones we archive
             current = next((a for a in registry.agents_for_user(
                 root=self.sessions_root, owner_user_id=agent.get("owner_user_id"))
                 if a.get("agent_id") == aid), agent)
-            old_id = current.get("deployment_id") or old_id
-            trigger_text = agent_deploy.build_deployment_trigger(
-                agent.get("trigger"), [s for s in (agent.get("staged_apps") or []) if s],
-                rejected=self._rejected_for(agent))
-            store_id = agent.get("memory_store_id")
+            old = {d for d in [current.get("deployment_id"), agent.get("deployment_id")] if d}
+            old |= {d for d in (current.get("deployments") or {}).values() if d}
+            approval = (agent_config.approval_required(current)
+                        if approval_required is None else bool(approval_required))
+            mode = mode or agent_runner.agent_mode({**current,
+                                                    "approval_required": approval})
             named = self._with_owner(agent)
             who = agent_config.agent_owner(named)
             workflow = named.get("name") or named.get("bundle_id") or aid
-            new_id = client.create_deployment(       # create BEFORE archive
-                name=agent_config.deployment_name(who, workflow),
-                agent_id=aid,
+            store_id = agent.get("memory_store_id")
+            new_deployments = agent_deploy.create_deployments(   # create BEFORE archive
+                client, agent_id=aid,
                 environment_id=client.create_environment(
                     agent_config.environment_defaults(who, workflow)),
-                trigger_text=trigger_text,
+                owner=who, workflow=workflow,
+                approval_required=approval, active_mode=mode,
                 schedule=agent_config.cadence_to_cron(cadence) if cadence else None,
                 resources=[agent_config.memory_resource(store_id)] if store_id else None,
                 vault_ids=[agent.get("vault_ref")] if agent.get("vault_ref") else None,
                 metadata={"trace_bundle_id": str(agent.get("bundle_id") or "")})
-            registry.agent_set_deployment(self.sessions_root, aid, new_id)   # register first
-            if old_id and old_id != new_id:
-                client.archive_deployment(old_id)    # then retire the old one (tolerant)
+            new_id = new_deployments[mode]
+            registry.set_approval_required(self.sessions_root, aid, approval)
+            registry.agent_set_deployment(self.sessions_root, aid, new_id,   # register first
+                                          deployments=new_deployments, mode=mode)
+            for did in old - set(new_deployments.values()):
+                client.archive_deployment(did)               # then retire the old ones
             return new_id
 
-    def refresh_deployment_trigger(self, agent_id, owner_user_id):
-        """Recreate a deployment so its baked-in trigger picks up what has changed since
-        deploy — today, the human's rejections.
+    def set_agent_mode(self, agent, approval_required):
+        """Switch an agent between staging and execution, and persist the choice.
 
-        Deployments are immutable and platform-fired, so a deployment agent keeps running
-        the exact text it was created with. Without this, rejecting a proposal changed
-        nothing for the agent that proposed it and the same action came back next run.
-        Reuses apply_platform_schedule's create-then-archive ordering, keeping the current
-        cadence. Best-effort: a failure leaves the existing deployment live and working.
+        This is the whole point of running two deployments. Approval used to be a set of
+        app slugs on the row: the in-app "Run now" path read it live, but a
+        platform-fired scheduled run replayed the opening message its deployment was
+        created with, so turning approval on or off silently did not apply to the runs
+        that matter. Now both deployments already exist, and the switch is one unpause
+        plus one pause.
+
+        An agent that has no deployment for the mode it is switching INTO — an autonomous
+        agent turning approval on, or one deployed before this change — gets its pair
+        built by ``apply_platform_schedule``, keeping the cadence it already has.
+        Raises on platform rejection; the caller surfaces the real error.
         """
-        try:
-            agent = next((a for a in registry.agents_for_user(self.sessions_root, owner_user_id)
-                          if a.get("agent_id") == agent_id), None)
-            if not agent or not agent.get("deployment_id"):
-                return None                                # nothing deployed to refresh
-            sched = registry.schedule_get(self.sessions_root, agent_id) or {}
-            return self.apply_platform_schedule(agent, sched.get("cadence"))
-        except Exception:                                  # noqa: BLE001 — never surfaced
-            traceback.print_exc()
-            return None
+        aid = agent.get("agent_id")
+        required = bool(approval_required)
+        mode = agent_config.MODE_STAGING if required else agent_config.MODE_EXECUTION
+        if not agent.get("deployment_id"):
+            registry.set_approval_required(self.sessions_root, aid, required)
+            return None                                    # not deployed: the flag is all there is
+        deployments = dict(agent.get("deployments") or {})
+        if mode not in deployments:
+            # No deployment to switch to (or a pre-migration agent with only one). Rebuild
+            # the pair on the current cadence; create_deployments leaves `mode` unpaused.
+            sched = registry.schedule_get(self.sessions_root, aid) or {}
+            return self.apply_platform_schedule(agent, sched.get("cadence"),
+                                                approval_required=required, mode=mode)
+        # PLATFORM FIRST, then the row. A row that says "staging" while the execution
+        # deployment is the unpaused one is worse than a failed toggle: the agent acts,
+        # the screen says it is waiting for you, and nobody finds out until it has.
+        with self.lock:
+            active = agent_deploy.set_active_mode(self._live_client(), deployments, mode)
+        registry.set_approval_required(self.sessions_root, aid, required)
+        registry.agent_set_deployment(self.sessions_root, aid, active,
+                                      deployments=deployments, mode=mode)
+        return active
 
     def _rejected_for(self, agent, limit=20):
         """Recently rejected proposals for this agent, newest first, so the next run can
@@ -3075,7 +3139,7 @@ class AppState:
             # NOW (one session read) so they land in the feed + an approval DM without
             # waiting for the user to open the activity view.
             staged_props = []
-            if agent.get("staged_apps") and rec.get("run_session_id"):
+            if agent_config.approval_required(agent) and rec.get("run_session_id"):
                 try:
                     events = self._live_client().list_session_events(rec["run_session_id"])
                     staged_props = self._session_proposals(
@@ -3566,12 +3630,12 @@ def make_handler(state):
                     return self._json(409, {"error": "already_processed"})
                 registry.pending_set_status(root, pending_id, "rejected",
                                             reason=(body or {}).get("reason"))
-                # A deployment-backed agent runs against text baked in at deploy time, so
-                # the rejection only reaches it by recreating the deployment. Async and
-                # best-effort: the rejection itself is already saved, and a platform
-                # hiccup must not turn a click into an error.
-                threading.Thread(target=lambda: state.refresh_deployment_trigger(
-                    item.get("agent_id"), user["user_id"]), daemon=True).start()
+                # Nothing more to do here. A rejection used to have to be baked into a
+                # freshly-created deployment, because a deployment-backed agent replays
+                # the text it was created with and that text is immutable — so every
+                # rejected card tore down and rebuilt a live deployment. Rejections now
+                # ride in the agent's memory store, which ``_deliver_guidance`` rewrites
+                # immediately before each run.
                 return self._json(200, {"id": pending_id, "status": "rejected"})
             # Claim before dispatch: the atomic pending→queued flip is what makes a
             # double click (or a click from a stale reload) a 409, not a resend. The
@@ -3586,28 +3650,35 @@ def make_handler(state):
                                    lambda it=item: state.approve_pending(it))
             return self._json(202, {"id": pending_id, "state": "running"})
 
-        def _set_staging(self, agent_id, body, user):
-            """Spec 8: edit which of the agent's apps are staged (held for approval).
-            Owner-scoped. Two shapes: ``{staged_apps: [...]}`` replaces the whole set
-            (profile toggle), or ``{unstage: "<slug>"}`` drops one app (the per-proposal
-            "auto-approve this app" quick action) computed server-side so it's race-free.
-            The posted set is validated against the agent's usable apps; an empty result is
-            allowed (fully autonomous — the UI confirms first). Takes effect next run."""
+        def _set_mode(self, agent_id, body, user):
+            """Turn approval on or off for one agent, and switch which deployment runs.
+
+            Approval was a per-app set (``{staged_apps: [...]}`` / ``{unstage: slug}``).
+            It is one setting for the whole agent now: with a staging deployment and an
+            execution deployment, "hold Gmail but let Sheets run automatically" is not a
+            state either deployment can be in. The per-proposal "stop staging this app"
+            quick action turns the agent autonomous outright, which is a bigger step —
+            the UI confirms it.
+
+            Owner-scoped. Takes effect on the NEXT run, and unlike the old toggle it
+            takes effect on scheduled platform runs too, not just in-app ones.
+            """
             agent = next((a for a in registry.agents_for_user(root, user["user_id"])
                           if a.get("agent_id") == agent_id), None)
             if not agent:
                 return self._json(404, {"error": "not_found"})
             b = body or {}
-            if b.get("unstage"):                           # drop one app from the current set
-                current = [s for s in (agent.get("staged_apps") or []) if s]
-                staged = [s for s in current if s != b.get("unstage")]
-            else:                                          # replace the whole set
-                requested = [s for s in (b.get("staged_apps") or []) if s]
-                available = {a["slug"] for a in state.agent_available_apps(agent)}
-                # keep only verifiable slugs; if the app list can't be loaded, trust the request
-                staged = [s for s in requested if s in available] if available else requested
-            registry.set_staged_apps(root, agent_id, staged)
-            return self._json(200, {"agent_id": agent_id, "staged_apps": staged})
+            if "approval_required" not in b:
+                return self._json(400, {"error": "approval_required_missing"})
+            required = bool(b.get("approval_required"))
+            try:
+                state.set_agent_mode(agent, required)
+            except Exception as e:                          # noqa: BLE001
+                traceback.print_exc()
+                return self._json(502, {"error": "platform_error", "detail": _why(e)})
+            return self._json(200, {"agent_id": agent_id, "approval_required": required,
+                                    "mode": (agent_config.MODE_STAGING if required
+                                             else agent_config.MODE_EXECUTION)})
 
         def _answer_decision(self, decision_id, body, user):
             """Gap #3: record the human's answer to a paused question, then auto-immediately
@@ -3907,7 +3978,7 @@ def make_handler(state):
                         refreshing = bool(state.maybe_refresh_activity(agent))
                     return self._json(200, {"agent": {"agent_id": agent.get("agent_id"),
                                                       "name": agent.get("name") or agent.get("bundle_id"),
-                                                      "staged_apps": agent.get("staged_apps") or [],
+                                                      "approval_required": agent_config.approval_required(agent),
                                                       "available_apps": state.agent_available_apps(agent),
                                                       # frame 21's Rules tab: the escalation
                                                       # rules set at frame 10, read back
@@ -4002,9 +4073,9 @@ def make_handler(state):
                         agent["agent_id"],
                         lambda a=agent, its=items: state.execute_claimed_actions(a, its))
                 return self._json(202, {"state": "running"})
-            mst = re.match(r"^/agents/([^/]+)/staging$", rest)
+            mst = re.match(r"^/agents/([^/]+)/(?:mode|staging)$", rest)
             if mst:                                      # Spec 8: edit which apps are staged (no redeploy)
-                return self._set_staging(mst.group(1), body, user)
+                return self._set_mode(mst.group(1), body, user)
             man = re.match(r"^/decisions/([^/]+)/answer$", rest)
             if man:                                      # Gap #3: answer a paused question, auto-resume
                 return self._answer_decision(man.group(1), body, user)
@@ -4456,7 +4527,9 @@ def make_handler(state):
                         "deployed_at": a.get("deployed_at"),
                         "deployment_id": a.get("deployment_id"),
                         "memory_store_id": a.get("memory_store_id"),
-                        "staged_apps": a.get("staged_apps") or [],
+                        "approval_required": agent_config.approval_required(a),
+                        "deployments": a.get("deployments") or {},
+                        "deployment_mode": a.get("deployment_mode"),
                         "schedule": registry.schedule_get(root, aid),
                         "recent_runs": registry.runs_for_agent(root, aid, 5)})
                 out.append({"user": u, "sessions": mine_sessions, "agents": mine_agents,
@@ -4522,7 +4595,7 @@ def make_handler(state):
                      "connects_to": []},
                 ],
                 "pipeline": ["capture", "reconstruct", "discover | describe", "review",
-                             "questions (mandatory)", "build", "connect", "deploy",
+                             "questions (as needed)", "build", "connect", "deploy",
                              "runs + approvals + memory"]})
 
         # --- settings ---
@@ -4956,8 +5029,9 @@ def make_handler(state):
         def _build(self, sid, body=None):
             if not sessions.artifacts(root, sid)["reviewed"]:
                 return self._json(400, {"error": "not_reviewed"})
-            # The questions phase is mandatory: no build until every approved
-            # bundle's interview is complete (recomputed from disk, never the meta flag).
+            # The questions phase must have RUN for every approved bundle before build
+            # (recomputed from disk, never the meta flag). A round that produced no
+            # questions is complete — the gate is "asked and answered", not "asked N".
             if not state._interview_all_complete(sid):
                 return self._json(400, {"error": "interview_incomplete"})
             approved, _ = state._approved_for_stage4(sid)
@@ -5015,8 +5089,13 @@ def make_handler(state):
             if not state.keystore.get_key():
                 return self._json(400, {"error": "no_api_key"})
             b = body or {}
+            # Spec 8, revised: approval is a whole-agent setting. ``staged_apps`` is
+            # still accepted from older clients — a non-empty list means "approve first".
+            approval = b.get("approval_required")
+            if approval is None:
+                approval = bool([x for x in (b.get("staged_apps") or []) if x])
             start = {"trigger": b.get("trigger"), "schedule": b.get("schedule"),
-                     "staged_apps": b.get("staged_apps")}   # Spec 8: apps staged for approval
+                     "approval_required": bool(approval)}
             with state.lock:
                 existing = state.deploy_jobs.get(sid)
                 if existing and existing.get("state") == "running":

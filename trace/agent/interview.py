@@ -5,6 +5,9 @@ capture blind spots (Lens A) and undetermined decisions (Lens B) — and propose
 few short, hard-triaged questions for the worker. The worker's one-line answers
 become the AUTHORITATIVE ``user_answers`` input the Phase-1 config engine consumes.
 
+Questions are generated AS NEEDED: a workflow with no real unknowns yields none, and
+that is a complete interview, not a failure. Nothing pads the list toward a minimum.
+
 The model writes the questions; deterministic code normalizes them (coerces enums,
 drops anything the agent could discover live, drops near-duplicates, ranks by
 cost-if-wrong, caps at 10). ``model_fn(system, user) -> str`` is injectable so the
@@ -33,36 +36,6 @@ _QUESTION_STOPWORDS = frozenset((
     "new", "one", "each", "any", "from", "as", "with", "at", "by", "if", "then", "else",
 ))
 _DUP_THRESHOLD = 0.7        # token-set Jaccard at/above which two questions are duplicates
-
-# Canonical fallback interview. The questions phase is MANDATORY: if the model
-# returns no usable questions (or every one is filtered by normalization), these
-# deterministic, domain-neutral questions are asked instead — the same backstop
-# idiom as the canonical working rules in configgen. Raw-shaped so they pass
-# through the exact same _normalize_questions path (ids, cost ordering). Wordings
-# are deliberately distinct so _dedup_questions never collapses them.
-FALLBACK_QUESTIONS = [
-    {"unknown": "exception handling",
-     "lens": "undetermined_decision",
-     "why_it_matters": "Items that don't fit the pattern are where automation goes wrong.",
-     "question": "When an item doesn't fit the normal pattern, what should the agent do with it?",
-     "suggested_answers": ["Skip it and flag it for me", "Handle it like the normal ones",
-                           "Use your best judgment"],
-     "answer_type": "short_text", "cost_if_wrong": "high", "runtime_discoverable": False},
-    {"unknown": "escalation on uncertainty",
-     "lens": "undetermined_decision",
-     "why_it_matters": "Decides whether uncertain runs pause or proceed.",
-     "question": "If the agent is unsure mid-task, should it pause and ask you, or continue "
-                 "with its best call and leave a note?",
-     "suggested_answers": ["Pause and ask me", "Continue and leave a note"],
-     "answer_type": "short_text", "cost_if_wrong": "high", "runtime_discoverable": False},
-    {"unknown": "definition of done",
-     "lens": "capture_blind_spot",
-     "why_it_matters": "The agent needs a finish-line check to verify its own runs.",
-     "question": "How can the agent tell a run of this workflow finished correctly — what "
-                 "does 'done' look like?",
-     "suggested_answers": [],
-     "answer_type": "short_text", "cost_if_wrong": "medium", "runtime_discoverable": False},
-]
 
 
 def build_prompt_material(workflow_description, observed_events):
@@ -135,15 +108,23 @@ def _normalize_questions(raw):
 
 
 def generate_questions(bundle, event_log, model=DEFAULT_MODEL, model_fn=None):
-    """Detect gaps for one bundle. Returns ``{"questions": [...]}`` — never empty: if the
-    model returns no usable questions, the canonical FALLBACK_QUESTIONS are asked instead
-    (the questions phase is mandatory)."""
+    """Detect gaps for one bundle. Returns ``{"questions": [...]}``, which may legitimately
+    be EMPTY.
+
+    An empty result used to be back-filled with three canned fallback questions, because
+    the interview was treated as mandatory back when capture was weak enough that a
+    workflow with no detected gaps almost certainly had undetected ones. Capture is good
+    enough now that "nothing worth asking" is a real answer, and the padding was actively
+    harmful: the gap-detector prompt tells the model not to pad, and code then padded on
+    its behalf. Three generic questions on a simple workflow cost the worker's attention
+    and teach them the interview is boilerplate to click through.
+
+    Downstream already handles zero questions as a complete interview
+    (``ui.app._interview_record``), so the build gate is not blocked by an empty round.
+    """
     workflow_description, observed_events, _ = make_engine_inputs(bundle, event_log)
     if model_fn is None:
         model_fn = _default_model_fn(model)
     user_msg = build_prompt_material(workflow_description, observed_events)
     model_out = _parse_json_object(model_fn(SYSTEM_PROMPT, user_msg))
-    qs = _normalize_questions(model_out.get("questions"))
-    if not qs:
-        qs = _normalize_questions(FALLBACK_QUESTIONS)
-    return {"questions": qs}
+    return {"questions": _normalize_questions(model_out.get("questions"))}

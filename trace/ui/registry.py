@@ -45,8 +45,16 @@ def _agent_to_caller(row):
         "vault_ref": row.get("vault_ref"),
         "trigger": row.get("trigger"),
         "session_id": str(row.get("session_id")) if row.get("session_id") else None,
+        # Legacy per-app staging, still read so a row written before migration 023 can
+        # be interpreted (non-empty => approval required); nothing writes it any more.
         "staged_apps": row.get("staged_apps") or [],
+        "approval_required": row.get("approval_required"),
+        # ``deployment_id`` is the ACTIVE deployment; ``deployments`` is {mode: id} for
+        # the staging/execution pair. Keeping the singular field authoritative is what
+        # lets every pre-existing reader (run-now, run listing, pause) stay unchanged.
         "deployment_id": row.get("deployment_id"),
+        "deployments": row.get("deployments") or {},
+        "deployment_mode": row.get("deployment_mode"),
         "memory_store_id": row.get("memory_store_id"),
         "owner_email": row.get("owner_email"),
         "description": row.get("description"),
@@ -99,7 +107,7 @@ def _agent_to_sb(agent):
     # which is exactly how this survived the suite.
     for key in ("external_user_id", "bundle_id", "name", "vault_ref", "trigger",
                 "session_id", "deployment_id", "memory_store_id", "owner_email",
-                "description", "deployed_at"):
+                "description", "deployed_at", "deployment_mode"):
         if key in agent:
             sb[key] = agent[key]
     if "status" in agent:
@@ -111,6 +119,10 @@ def _agent_to_sb(agent):
                   f"{agent.get('agent_id')} — not recorded", flush=True)
     if "staged_apps" in agent:
         sb["staged_apps"] = list(agent.get("staged_apps") or [])
+    if "approval_required" in agent:
+        sb["approval_required"] = bool(agent.get("approval_required"))
+    if "deployments" in agent:
+        sb["deployments"] = dict(agent.get("deployments") or {})
     return sb
 
 
@@ -354,36 +366,45 @@ def agents_with_deployments(root):
                   key=lambda a: a.get("deployed_at") or "", reverse=True)
 
 
-def agent_set_deployment(root, agent_id, deployment_id):
-    """Point one agent row at a new platform deployment."""
+def _agent_update(root, agent_id, fields):
+    """Apply a column update to one agent row in whichever backend is configured."""
     if supa.is_configured():
-        admin = supa.get_admin()
-        admin.table("agents").update({"deployment_id": deployment_id}) \
-            .eq("id", agent_id).execute()
+        supa.get_admin().table("agents").update(dict(fields)).eq("id", agent_id).execute()
         return
     with _LOCK:
         d = _load(root, "agents.json")
         if agent_id in d:
-            d[agent_id]["deployment_id"] = deployment_id
+            d[agent_id].update(fields)
             _save(root, "agents.json", d)
 
 
-def set_staged_apps(root, agent_id, staged_apps):
-    """Update which apps are staged (held for approval) for one agent. Staging is
-    prompt-level and read fresh each run (see runner.run_once), so this takes effect on
-    the next run — no redeploy. ``staged_apps`` is a list of app slugs (may be empty =
-    fully autonomous)."""
-    slugs = [s for s in (staged_apps or []) if s]
-    if supa.is_configured():
-        admin = supa.get_admin()
-        admin.table("agents").update({"staged_apps": slugs}) \
-            .eq("id", agent_id).execute()
-        return
-    with _LOCK:
-        d = _load(root, "agents.json")
-        if agent_id in d:
-            d[agent_id]["staged_apps"] = slugs
-            _save(root, "agents.json", d)
+def agent_set_deployment(root, agent_id, deployment_id, deployments=None, mode=None):
+    """Point one agent row at its platform deployments.
+
+    ``deployment_id`` stays the ACTIVE deployment — the field every other reader in the
+    codebase already uses — while ``deployments`` records the whole ``{mode: id}`` pair
+    and ``mode`` records which one is live.
+    """
+    fields = {"deployment_id": deployment_id}
+    if deployments is not None:
+        fields["deployments"] = dict(deployments)
+    if mode is not None:
+        fields["deployment_mode"] = mode
+    _agent_update(root, agent_id, fields)
+
+
+def set_approval_required(root, agent_id, required):
+    """Set whether this agent's human must approve its outbound actions.
+
+    This is a whole-agent setting. It replaced a per-app ``staged_apps`` list, which
+    could not survive the move to one deployment per mode: a deployment's opening
+    message either tells the agent to stage or tells it to act, and "stage, but only in
+    Gmail" is a mode plus a caveat the agent has to hold in its head mid-run.
+
+    Writing the flag is only half of a mode change — ``ui.app`` also has to flip which
+    deployment is unpaused — so callers should go through ``app.set_agent_mode``.
+    """
+    _agent_update(root, agent_id, {"approval_required": bool(required)})
 
 
 # --- schedules -------------------------------------------------------------

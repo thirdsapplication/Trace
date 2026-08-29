@@ -23,13 +23,18 @@ import unittest
 
 from trace.ui import registry
 
-# The real columns, as of 2026-08-26.
+# The real columns, as of migration 023.
 AGENTS = {
     "id", "session_id", "owner_id", "bundle_id", "name", "description", "live_yaml",
     "grounding", "trigger", "vault_ref", "staged_apps", "deployment_id",
     "memory_store_id", "external_user_id", "owner_email", "color", "status",
     "deployed_at", "created_at", "interview", "team_id",
     "lesson_contribute_scope", "lesson_consume_scope",
+    # 023 — approval became a whole-agent setting, and an agent gained a second
+    # deployment (staging + execution, one unpaused). `deployment_id` still names the
+    # ACTIVE one so every pre-existing reader keeps working; `deployments` holds the
+    # pair. `staged_apps` stays above, read-only, so pre-023 rows remain interpretable.
+    "approval_required", "deployments", "deployment_mode",
 }
 AGENT_RUNS = {
     "id", "agent_id", "owner_id", "run_session_id", "drun_id", "started_at",
@@ -62,6 +67,22 @@ class MappingCompletenessTest(unittest.TestCase):
         missing = AGENT_RUNS - named - STRUCTURAL
         self.assertEqual(missing, set(),
                          f"run columns never read back: {sorted(missing)}")
+
+    def test_the_write_map_can_carry_the_deployment_pair(self):
+        """A mode change writes three things; dropping any one desynchronises the row
+        from the platform — an agent that says it stages while its execution
+        deployment is the unpaused one."""
+        sb = registry._agent_to_sb({"agent_id": "a", "owner_user_id": "u",
+                                    "approval_required": True,
+                                    "deployment_id": "dep_stg",
+                                    "deployments": {"staging": "dep_stg",
+                                                    "execution": "dep_exec"},
+                                    "deployment_mode": "staging"})
+        self.assertTrue(sb.get("approval_required"))
+        self.assertEqual(sb.get("deployment_id"), "dep_stg")
+        self.assertEqual(sb.get("deployments"),
+                         {"staging": "dep_stg", "execution": "dep_exec"})
+        self.assertEqual(sb.get("deployment_mode"), "staging")
 
     def test_the_write_map_can_carry_deploy_state(self):
         """The other direction. status and deployed_at were absent from the write

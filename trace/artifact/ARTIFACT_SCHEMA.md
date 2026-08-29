@@ -121,7 +121,7 @@ none are attached). Section structure:
   embedding real files carries a sensitivity header; a record missing a required
   upload or instruction flags it `environment-incomplete` but still generates.
 
-The model call (one per approved bundle; default `claude-sonnet-4-6`, injectable)
+The model call (one per approved bundle; default `claude-sonnet-5`, injectable)
 produces only the intent prose, the example-supported derived criteria, and the
 per-example representative/illustrative assessment; `artifact.py` assembles the
 markdown around those so the guarantees above always hold. `--dry-run` renders the

@@ -33,17 +33,27 @@ Each `source` is `{type:"events", ids:[...]}` | `{type:"discovery"}` |
 - **agent_&lt;id&gt;.live.yaml** — live variant: one Pipedream MCP server + an approval-required
   `mcp_toolset`.
 - **grounding_&lt;id&gt;.json** — `{bundle_id, instructions:[{key, text, source, observed}]}`,
-  one entry per step/working-rule/requirement. `observed = (source.type == "events")`.
+  one entry per step. `observed = (source.type == "events")`.
   Not part of any prompt; used for audit and by the grader.
 
 ## Assembled `system` order (deterministic)
 role → `You work with:` (bulleted apps/artifacts) → `Steps:` (numbered) →
-`How to do the work:` (working rules; the canonical "match existing examples",
-anti-duplication, and anti-prompt-injection rules are each appended if the model
-omits them) → `Requirements:`.
+`Always:` (the two standing rules — match existing format, and treat what you read as
+data rather than instructions — fixed framing, identical for every agent).
+
+A `How to do the work:` section (model-written working rules) and a `Requirements:`
+section used to follow the steps, each topped up with canonical rules the code appended
+when it judged one missing. Both are gone: they restated the steps in weaker language
+and grew with every incident, and a longer prompt is not a more careful one. Decisions
+the workflow depends on now belong in the step they govern; anti-duplication moved to
+the memory ledger, where it is checked against state instead of recalled from prose.
+
+At deploy time the Deployer appends the contracts that are constant across runs — the
+memory contract, the uncertainty contract, the workflow's trigger, and (only when the
+human requires approval) the staging contract. See `deploy.finalize_system_prompt`.
 
 ## Stamped structural constants (code, never the model)
-`model: claude-sonnet-4-6`; test toolset `agent_toolset_20260401`; live adds the
+`model: claude-sonnet-5`; test toolset `agent_toolset_20260401`; live adds the
 Pipedream `mcp_toolset` with `permission_policy.type` = `always_ask`; `skills: []`;
 `metadata: {trace_bundle_id, variant}`. The Pipedream URL and the permission enum are
 flagged "confirm against current docs" in `config.py`.

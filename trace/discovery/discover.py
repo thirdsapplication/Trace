@@ -8,7 +8,7 @@ Design, mirroring the reconstruction engine's conventions:
 - the whole day is reasoned over in ONE model call (no chunking) so workflows
   whose trigger and execution are separated by hours — linked only by an artifact —
   remain visible;
-- a more capable default model than reconstruction (Claude Sonnet 4.6), kept
+- a more capable default model than reconstruction (Claude Sonnet 5), kept
   injectable/configurable via a single default so the tier swaps trivially;
 - the Anthropic call is injected as ``model_fn`` so the engine is testable without
   a key/network;
@@ -25,7 +25,7 @@ from .prompt import SYSTEM_PROMPT
 from trace.agent import model_call
 
 # Single, one-line default model tier (Open decision §11: trivially swappable).
-DEFAULT_MODEL = "claude-sonnet-4-6"
+DEFAULT_MODEL = "claude-sonnet-5"
 
 
 def load_event_log(path):

@@ -253,7 +253,8 @@ function deriveStep() {
   if (!a.event_log) return a.raw ? 1 : 0;
   if (!a.discovery) return 1;
   if (!s.reviewed_at) return 2;
-  // the questions phase is mandatory before build (already-built sessions keep going)
+  // the questions phase must have run before build; it may have asked nothing
+  // (already-built sessions keep going)
   if (!s.build_at) return s.interview_complete_at ? 4 : 3;
   if (!connectionUsable()) return 5;
   return 6;
@@ -721,16 +722,17 @@ function wireProposalCards(root_) {
   });
 }
 
-// Per-proposal quick action: stop staging one app (future actions in it run automatically).
-// Server computes current-minus-app, so it's race-free. Returns true if the user confirmed.
+// Per-proposal quick action: stop asking for approval. This used to drop one app from a
+// staged set; approval is one setting for the whole agent now (it selects which of the
+// agent's two deployments runs), so the confirm says what actually happens.
 async function autoApproveApp(agentId, app) {
   const ok = await confirmDestructive({
-    title: `Stop asking approval for ${app}?`,
-    body: `Future ${app} actions run automatically, without showing you first. You can turn approval back on from this agent's page.`,
+    title: "Stop asking for your approval?",
+    body: `This agent will act on its own from now on — ${app} included — without showing you anything first. You can turn approval back on from its page.`,
     verb: "Stop asking", word: null, tone: "primary",
   });
   if (!ok) return false;
-  await api("POST", `/api/u/agents/${agentId}/staging`, { unstage: app });
+  await api("POST", `/api/u/agents/${agentId}/mode`, { approval_required: false });
   return true;
 }
 
@@ -2558,29 +2560,47 @@ async function renderProfile(agentId) {
         : `<p class="muted">No rules recorded for this agent. Agents built before the safety
             step still stage everything outbound — that part is always on.</p>`;
     }
+    // Approval is ONE switch for the whole agent. It used to be a checkbox per connected
+    // app, but an agent now runs from one of two deployments — one that tells it to stage,
+    // one that tells it to act — and "hold Gmail, let Sheets run" is not a state either of
+    // them can be in. Flipping this switches which deployment is live, so unlike the old
+    // per-app toggle it applies to scheduled runs as well as in-app ones.
     const availApps = (data && data.agent && data.agent.available_apps) || [];
+    const needsApproval = !!(data && data.agent && data.agent.approval_required);
     const apPanel = $("#pApprovalsPanel");
     if (apPanel && !availApps.length) apPanel.classList.add("pane-empty");
     if (apPanel && availApps.length) {
       apPanel.classList.remove("pane-empty");
-      const apMarkup = availApps.map(ap => `
+      $("#pApprovals").insertAdjacentHTML("beforeend", `
         <label class="row" style="gap:8px;margin-top:6px;cursor:pointer;">
-          <input type="checkbox" class="stage-toggle" data-slug="${esc(ap.slug)}" ${ap.staged ? "checked" : ""}>
-          <span class="title" style="font-size:14px;">${esc(ap.label)}</span>
-          <span class="sub muted">${ap.staged ? "needs approval" : "runs automatically"}</span>
-        </label>`).join("")
-        + `<button class="btn-primary btn-sm" id="pStageSave" style="margin-top:12px;">Save approval settings</button>`;
-      $("#pApprovals").insertAdjacentHTML("beforeend", apMarkup);
+          <input type="checkbox" id="pApprovalToggle" ${needsApproval ? "checked" : ""}>
+          <span class="title" style="font-size:14px;">Ask me before it acts</span>
+          <span class="sub muted">${needsApproval
+            ? "it proposes; nothing happens until you say yes"
+            : "it acts on its own, without showing you first"}</span>
+        </label>
+        <p class="sub muted" style="margin-top:6px;">Applies to everything it does in
+          ${availApps.map(ap => esc(ap.label)).join(", ")}.</p>
+        <button class="btn-primary btn-sm" id="pStageSave" style="margin-top:12px;">Save approval setting</button>`);
       $("#pStageSave").onclick = async (e) => {
-        const staged = Array.from(root.querySelectorAll(".stage-toggle"))
-          .filter(c => c.checked).map(c => c.dataset.slug);
-        if (!staged.length && !await confirmDestructive({
+        const required = !!$("#pApprovalToggle").checked;
+        if (!required && !await confirmDestructive({
           title: "Let this agent act without review?",
-          body: "No app will need your approval — everything it does, including anything outbound, happens without showing you first.",
+          body: "Everything it does, including anything outbound, happens without showing you first.",
           verb: "Turn off approvals", word: null, tone: "primary",
         })) return;
         e.target.disabled = true; e.target.textContent = "Saving…";
-        await api("POST", `/api/u/agents/${agentId}/staging`, { staged_apps: staged });
+        const r = await api("POST", `/api/u/agents/${agentId}/mode`, { approval_required: required });
+        if (!r.ok) {
+          // A failed switch must not look like a successful one: the deployment that was
+          // live before is still the live one, and the toggle has to say so.
+          e.target.disabled = false; e.target.textContent = "Save approval setting";
+          $("#pApprovalToggle").checked = needsApproval;
+          e.target.insertAdjacentHTML("afterend",
+            `<p class="sub muted" style="margin-top:8px;">Couldn't change that just now — ${
+              esc(friendly((r.data && r.data.error) || "please try again"))}.</p>`);
+          return;
+        }
         S.igHome = null; renderProfile(agentId);
       };
     }
@@ -2659,16 +2679,19 @@ async function renderProfile(agentId) {
           }).join("")
         : `<p class="sub muted">No runs yet.</p>`);
     }
-    // Permissions (21): which apps it can touch, and whether each is held for approval.
+    // Permissions (21): which apps it can touch. Approval is one setting for the agent,
+    // not one per app, so every app carries the same pill — read from the agent, not the
+    // app row, so the two can never disagree.
     const perms = $("#pPerms");
     if (perms) {
       perms.innerHTML = `<div class="label">Permissions</div>` + (availApps.length
         ? `<div class="ov-perms">${availApps.map(ap => `
             <div class="ov-perm"><span class="ov-perm-n">${esc(ap.label || ap.slug)}</span>
-              <span class="pill ${ap.staged ? "pill-warn" : "pill-on"}">${
-                ap.staged ? "ALWAYS STAGED" : "RUNS AUTOMATICALLY"}</span></div>`).join("")}</div>
-           <div class="sub muted" style="margin-top:8px;">Staged means it prepares the
-             action and waits for you. Change these under Rules.</div>
+              <span class="pill ${needsApproval ? "pill-warn" : "pill-on"}">${
+                needsApproval ? "ALWAYS STAGED" : "RUNS AUTOMATICALLY"}</span></div>`).join("")}</div>
+           <div class="sub muted" style="margin-top:8px;">${needsApproval
+             ? "Staged means it prepares the action and waits for you."
+             : "This agent acts on its own — nothing waits for you."} Change this under Approvals.</div>
            ${escalationLine(data)}`
         : `<p class="sub muted" style="margin-top:4px;">No connected apps yet.</p>`);
     }
@@ -3737,14 +3760,16 @@ async function renderGolive(sid) {
   if (!S.session.deploy_at) {
     if (!S.conn) { try { S.conn = (await uget(sid, "/connection-data")).data; } catch (e) { /* best effort */ } }
     const staging = usableApps();
-    const stageRow = (a) => `<label class="row" style="gap:8px;justify-content:flex-start;margin-top:8px;">
-        <input type="checkbox" class="stage-app" data-slug="${esc(a.slug)}" checked>
-        <span class="title" style="font-size:13.5px;">Stage ${esc(a.label)} actions for my approval</span></label>`;
+    // One choice, for the whole agent: it either shows you everything first or it acts.
+    // This used to be a checkbox per app; an agent now runs from a staging deployment or
+    // an execution deployment, and there is no deployment for "staged, but only Gmail".
     const stagingHtml = staging.length ? `
       <div class="card" style="margin-top:12px;text-align:left;">
         <div class="title" style="font-size:14px;">Before they act</div>
-        <div class="sub" style="margin-top:4px;">For anything you'd rather check first, keep it staged: the agent prepares the action and you approve it here before it actually happens. Unchecked apps run automatically.</div>
-        ${staging.map(stageRow).join("")}
+        <div class="sub" style="margin-top:4px;">Keep this on and nothing happens without you: the agent prepares each action in ${staging.map(a => esc(a.label)).join(", ")} and you approve it here first. Turn it off and it acts on its own.</div>
+        <label class="row" style="gap:8px;justify-content:flex-start;margin-top:8px;">
+          <input type="checkbox" id="stageAll" checked>
+          <span class="title" style="font-size:13.5px;">Show me every action before it happens</span></label>
       </div>` : "";
     // Frame 13 introduces the agent BY NAME — "Meet Retail recap", its avatar in its
     // colour, its schedule, and what happens on the first run. We showed a generic
@@ -3787,9 +3812,10 @@ async function renderGolive(sid) {
       // Which agents existed BEFORE this deploy, so the ones that appear after it are
       // exactly the ones that need a shade picked (29).
       const before = new Set((((await loadHome()) || {}).agents || []).map(a => a.agent_id));
-      const staged_apps = Array.from(document.querySelectorAll(".stage-app"))
-        .filter(c => c.checked).map(c => c.dataset.slug);
-      const r = await upost(sid, "/deploy", { trigger: "on a new matching task", staged_apps });
+      const approval_required = !document.querySelector("#stageAll")
+        || !!document.querySelector("#stageAll").checked;
+      const r = await upost(sid, "/deploy",
+                            { trigger: "on a new matching task", approval_required });
       if (!r.ok && r.status !== 202) {
         $("#liveGo").disabled = false; $("#liveGo").textContent = "Go live";
         if (r.data.error === "not_eligible") {

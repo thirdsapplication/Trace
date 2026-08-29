@@ -47,7 +47,7 @@ def _best_candidate(ak_item, candidates):
     return best, best_ov
 
 
-def _default_intent_judge(model="claude-sonnet-4-6"):
+def _default_intent_judge(model="claude-sonnet-5"):
     """LLM intent judge: confirms a candidate's description matches an intent.
     Lazily imported so the scorer loads without anthropic; injectable for tests."""
     import anthropic

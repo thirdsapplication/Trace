@@ -72,7 +72,9 @@ not read here first:
   LEDGER of items the agent has finished: message ids, order numbers, invoice
   numbers, row keys. The agent is instructed to check that ledger before acting and
   to SKIP anything listed. Read the rule below before you touch this file.
-- /lessons_learned.md — what the agent has learned the hard way. Yours to shape
+- /lessons_learned.md — what has been learned the hard way about this workflow. YOU
+  are its only author: the agent reads it and never writes to it, so nothing here is
+  its opinion of itself — everything in it is yours, from a previous cycle. Shape it
   freely; this is where most of your work belongs.
 - /shared_lessons.md — lessons from other agents, written by Trace BEFORE EVERY RUN.
   Anything you write here is overwritten before the agent next reads it, so editing
