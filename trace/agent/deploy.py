@@ -51,48 +51,102 @@ def finalize_live_envelope(live_envelope_dict, connection_record, staged_apps=No
     return env
 
 
-def build_deployment_trigger(base_trigger, staged_slugs, rejected=None):
-    """The deployment's initial user.message: the (optionally staging-prefixed) task, the
-    uncertainty directive, anything the human has rejected, and the memory-maintenance
-    directive. One composition point, reused whenever the deployment is recreated.
+def finalize_system_prompt(live_envelope_dict, approval_required, trigger=None):
+    """Bake the run-time contracts into the agent's ``system`` prompt at create time.
 
-    The uncertainty directive belongs HERE, not only in ``run_once``. Deployment-backed
-    agents are fired by the platform against this text, so while it was applied only on
-    the run_once path they were never told they could pause and ask — the entire
-    human-in-the-loop pause was inert for every real deployed agent. It showed up as
-    agents staging "here's the problem, please handle it manually" emails: escalating by
-    the only route they knew they had.
-
-    ``rejected`` is what the human has turned down, so a recreated deployment stops
-    proposing it. Deployments are immutable, so this only takes effect on recreation.
+    The generated instructions (``configgen.assemble_system_text``) describe the
+    workflow; the memory contract, the uncertainty contract and — only when the human
+    requires approval — the staging contract are appended here, because this is the
+    first point at which ``approval_required`` is known. Returns a NEW dict.
     """
-    from . import runner                                   # local import: runner imports deploy helpers' siblings
-    base = base_trigger or "on a new matching event"
-    if staged_slugs:
-        text = runner._staging_trigger(base, staged_slugs)
-    else:
-        text = f"Task: {base}"
-    text = runner._uncertainty_trigger(text)
-    if rejected:
-        text = runner._rejected_preamble(rejected) + text
-    return text + "\n\n" + config.MEMORY_UPDATE_DIRECTIVE
+    env = dict(live_envelope_dict)
+    env["system"] = config.agent_system_prompt(env.get("system"), approval_required,
+                                               trigger=trigger)
+    return env
+
+
+def create_deployments(client, *, agent_id, environment_id, owner, workflow,
+                       approval_required, active_mode, schedule=None, resources=None,
+                       vault_ids=None, metadata=None):
+    """Create this agent's deployments and leave exactly ONE unpaused.
+
+    An approval-required agent gets two — staging and execution — against the same
+    agent, environment, memory store and cadence; an autonomous agent gets execution
+    only. ``active_mode`` says which one runs; the other is created and immediately
+    paused, so switching modes later is one pause plus one unpause rather than a
+    rebuild (deployments are immutable, which is why the old single-deployment design
+    could not honour the approval toggle on platform-fired runs at all).
+
+    Returns ``{mode: deployment_id}``. Nothing here is wrapped in a try: a platform
+    rejection must surface as a failed deploy, never as a phantom-live agent.
+    """
+    modes = config.deployment_modes(approval_required)
+    if active_mode not in modes:
+        active_mode = config.MODE_EXECUTION
+    out = {}
+    for mode in modes:
+        did = client.create_deployment(
+            name=config.deployment_name(owner, workflow, mode),
+            agent_id=agent_id, environment_id=environment_id,
+            trigger_text=config.deployment_initial_message(mode, approval_required),
+            schedule=schedule,
+            resources=list(resources) if resources else None,
+            vault_ids=list(vault_ids) if vault_ids else None,
+            metadata=dict(metadata) if metadata else None)
+        out[mode] = did
+        if mode != active_mode:
+            # Best-effort: a deployment that fails to pause is a duplicate run, so say so
+            # loudly, but a paused-state hiccup must not fail an otherwise good deploy.
+            try:
+                client.pause_deployment(did)
+            except Exception as exc:                       # noqa: BLE001
+                print(f"[deploy] could not pause the {mode} deployment {did}: "
+                      f"{type(exc).__name__}: {exc} — it may run alongside "
+                      f"{active_mode}", flush=True)
+    return out
+
+
+def set_active_mode(client, deployments, mode):
+    """Switch which of an agent's deployments runs: unpause ``mode``, pause the rest.
+
+    ``deployments`` is ``{mode: deployment_id}``. Unpause FIRST so a failure leaves the
+    agent running something rather than nothing; then pause the others. Returns the
+    active deployment id.
+    """
+    active = (deployments or {}).get(mode)
+    if not active:
+        raise ValueError(f"agent has no {mode!r} deployment")
+    client.unpause_deployment(active)
+    for m, did in (deployments or {}).items():
+        if m != mode and did:
+            client.pause_deployment(did)
+    return active
 
 
 def deploy_live(bundle, live_envelope_dict, connection_record, client,
-                trigger=None, schedule=None, staged_apps=None, connect_client=None):
+                trigger=None, schedule=None, staged_apps=None, connect_client=None,
+                approval_required=None):
     """Create the LIVE agent for one bundle over the bound connection, plus its own
     dedicated per-agent MEMORY STORE (created-or-reused by a name keyed on user +
-    workflow, so lessons survive redeploys even though the platform agent id rotates)
-    and a platform DEPLOYMENT whose initial message set carries the task + the
-    memory-update directive (+ the staging directive when apps are staged). The
-    deployment, environment, and store are NAMED for the owner + workflow so an
-    administrator can tell whose they are in the Console (runs inherit the name). The
+    workflow, so its memory survives redeploys even though the platform agent id
+    rotates; BOTH deployments attach the same store)
+    and its DEPLOYMENTS — staging + execution when the human requires approval, execution
+    alone when they do not, with exactly one unpaused. Each deployment's initial message
+    is one line naming the mode; everything constant across runs (memory, uncertainty,
+    and the staging contract for approval-required agents) rides in the agent's system
+    prompt instead. The deployments, environment, and store are NAMED for the owner +
+    workflow so an administrator can tell whose they are in the Console (runs inherit
+    the name; the deployment name also carries its mode, so a Console reader can tell a
+    staging run from an executing one). The
     deployment is created MANUAL (no schedule) — the dashboard cadence attaches a
     cron schedule afterwards. Returns a ``live_record``. The customer's vault rides
     on the deployment (injected into every run session). Memory-store and deployment
     creation are NOT wrapped: a platform rejection propagates so the deploy job
     surfaces the real API error instead of a phantom "live" (the always_ask lesson).
-    ``staged_apps`` (Spec 8) marks which app slugs are staged for approval.
+    ``approval_required`` decides both the system prompt (an autonomous agent carries
+    no staging contract) and how many deployments are created: staging + execution when
+    approval is required, execution alone when it is not. Legacy callers may pass
+    ``staged_apps`` instead; a non-empty list means approval is required.
 
     ``connect_client`` (a ConnectClient, optional): when provided, two guards run
     before the agent is created:
@@ -117,7 +171,13 @@ def deploy_live(bundle, live_envelope_dict, connection_record, client,
         except Exception as exc:                     # never block a deploy on preflight
             pf = {"toolsets": {}, "warnings": [], "errors": {"*": str(exc)}}
 
+    if approval_required is None:
+        approval_required = bool([s for s in (staged_apps or []) if s])
+
+    base_trigger = trigger or (bundle.get("trigger") or "on a new matching event")
     live_envelope_dict = finalize_live_envelope(live_envelope_dict, connection_record, staged_apps)
+    live_envelope_dict = finalize_system_prompt(live_envelope_dict, approval_required,
+                                                trigger=base_trigger)
 
     binding_check = {}
     verify = getattr(connect_client, "verify_bindings", None) if connect_client else None
@@ -168,21 +228,26 @@ def deploy_live(bundle, live_envelope_dict, connection_record, client,
         description=config.memory_store_description(owner))
     memory_store_id = store.get("id") if isinstance(store, dict) else store
 
-    base_trigger = trigger or (bundle.get("trigger") or "on a new matching event")
-    trigger_text = build_deployment_trigger(base_trigger, staged_apps)
     # A cron ``schedule`` at deploy (the founder Test UI's "on a schedule" mode) is
     # honored as the deployment's cron; the end-user flow deploys manual (schedule=None)
-    # and attaches a cadence afterwards from the dashboard.
+    # and attaches a cadence afterwards from the dashboard. BOTH deployments carry the
+    # same cadence — only the unpaused one fires.
     cron = ({"expression": schedule, "timezone": config.TRACE_SCHEDULE_TZ}
             if schedule else None)
-    deployment_id = client.create_deployment(
-        name=config.deployment_name(owner, workflow),
-        agent_id=agent_id, environment_id=environment_id,
-        trigger_text=trigger_text,
+    # A new approval-required agent starts in STAGING: the first thing its human sees
+    # should be a proposal to approve, not an action already taken.
+    active_mode = config.MODE_STAGING if approval_required else config.MODE_EXECUTION
+    deployments = create_deployments(
+        client, agent_id=agent_id, environment_id=environment_id,
+        owner=owner, workflow=workflow,
+        approval_required=approval_required, active_mode=active_mode,
         schedule=cron,
         resources=[config.memory_resource(memory_store_id)],
         vault_ids=[vault_ref] if vault_ref else None,
         metadata={"trace_bundle_id": str(bundle.get("id"))})
+    # ``deployment_id`` stays the ACTIVE deployment so every existing reader (run-now,
+    # run listing, the pause toggle, the active-agents query) keeps working unchanged.
+    deployment_id = deployments[active_mode]
 
     start = {"mode": "deployment-schedule" if schedule else "deployment-manual",
              "value": schedule or base_trigger}
@@ -191,6 +256,9 @@ def deploy_live(bundle, live_envelope_dict, connection_record, client,
         "agent_id": agent_id,
         "session_id": None,        # deployment runs create their sessions; kept for record-shape compat
         "deployment_id": deployment_id,
+        "deployments": dict(deployments),
+        "deployment_mode": active_mode,
+        "approval_required": bool(approval_required),
         "memory_store_id": memory_store_id,
         "memory_store_reused": bool(isinstance(store, dict) and store.get("reused")),
         "vault_ref": vault_ref,

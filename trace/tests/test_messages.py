@@ -100,7 +100,7 @@ class ChatAndDMTest(unittest.TestCase):
         from trace.tests.test_scheduler import _PROPOSAL_BLOCK
         self.ma.events = [{"type": "agent.message", "text": _PROPOSAL_BLOCK},
                           {"type": "session.status_idle", "stop_reason": "end_turn", "text": ""}]
-        self.state.run_agent(_agent(staged_apps=["gmail"]))
+        self.state.run_agent(_agent(approval_required=True))
         thread = registry.messages_for_agent(self.root, "usr_1", "agent-1")
         self.assertTrue(any("approval" in m["text"] for m in thread))
 
@@ -464,65 +464,115 @@ class StagingToggleTest(HomeAndMessagesEndpointTest):
         with open(sessions.path(self.root, sid, sessions.CONNECTION), "w", encoding="utf-8") as f:
             json.dump(rec, f)
 
-    def test_set_staged_apps_registry_round_trip(self):
+    def test_approval_flag_registry_round_trip(self):
         uid, _ = self._signup("stage-reg@x.com")
         self._seed_agent(uid)
-        registry.set_staged_apps(self.root, "agent-1", ["gmail", "", "google_sheets"])
-        agent = registry.agents_for_user(self.root, uid)[0]
-        self.assertEqual(agent["staged_apps"], ["gmail", "google_sheets"])   # blanks dropped
-        registry.set_staged_apps(self.root, "agent-1", [])                   # fully autonomous
-        self.assertEqual(registry.agents_for_user(self.root, uid)[0]["staged_apps"], [])
+        registry.set_approval_required(self.root, "agent-1", True)
+        self.assertTrue(registry.agents_for_user(self.root, uid)[0]["approval_required"])
+        registry.set_approval_required(self.root, "agent-1", False)
+        self.assertFalse(registry.agents_for_user(self.root, uid)[0]["approval_required"])
 
-    def test_activity_exposes_available_apps_with_staged_flags(self):
+    def test_available_apps_all_carry_the_agents_one_setting(self):
+        """Every connected app reports the agent's setting, not its own.
+
+        Approval used to be per app. It cannot be any more: an agent runs from a staging
+        deployment or an execution deployment, and there is no deployment for "staged in
+        Gmail, automatic in Sheets".
+        """
         uid, cookie = self._signup("avail@x.com")
         self._seed_agent(uid)
         self._seed_connection()
-        registry.set_staged_apps(self.root, "agent-1", ["gmail"])
+        registry.set_approval_required(self.root, "agent-1", True)
         status, data, _ = self._req("GET", "/api/u/agents/agent-1/activity", cookie=cookie)
         self.assertEqual(status, 200)
         apps = {a["slug"]: a for a in data["agent"]["available_apps"]}
         self.assertEqual(set(apps), {"gmail", "google_sheets"})
-        self.assertTrue(apps["gmail"]["staged"])
-        self.assertFalse(apps["google_sheets"]["staged"])
+        self.assertTrue(all(a["staged"] for a in apps.values()))
         self.assertEqual(apps["google_sheets"]["label"], "Google Sheets")
 
-    def test_staging_replace_validates_subset(self):
-        uid, cookie = self._signup("replace@x.com")
+    def test_turning_approval_off_switches_which_deployment_runs(self):
+        """The whole point of two deployments.
+
+        The old per-app toggle wrote to this row, which the in-app run path read live —
+        but a platform-fired scheduled run replays the opening message its deployment was
+        created with, and deployments are immutable. So turning approval off did not
+        reach the runs that actually happen on a schedule. Now both deployments already
+        exist and the switch is one unpause plus one pause.
+        """
+        uid, cookie = self._signup("mode@x.com")
         self._seed_agent(uid)
         self._seed_connection()
-        # request includes an app the agent isn't connected to -> dropped
-        status, data, _ = self._req("POST", "/api/u/agents/agent-1/staging",
-                                    {"staged_apps": ["gmail", "slack"]}, cookie=cookie)
-        self.assertEqual(status, 200)
-        self.assertEqual(data["staged_apps"], ["gmail"])                     # slack rejected
-        self.assertEqual(registry.agents_for_user(self.root, uid)[0]["staged_apps"], ["gmail"])
+        registry.set_approval_required(self.root, "agent-1", True)
+        registry.agent_set_deployment(
+            self.root, "agent-1", "dep_stg",
+            deployments={"staging": "dep_stg", "execution": "dep_exec"}, mode="staging")
 
-    def test_staging_empty_allowed_fully_autonomous(self):
-        uid, cookie = self._signup("auto@x.com")
+        class FakeClient:
+            def __init__(self):
+                self.paused, self.unpaused = [], []
+
+            def pause_deployment(self, d):
+                self.paused.append(d)
+
+            def unpause_deployment(self, d):
+                self.unpaused.append(d)
+
+        fake = FakeClient()
+        self.state._live_client = lambda: fake
+        status, data, _ = self._req("POST", "/api/u/agents/agent-1/mode",
+                                    {"approval_required": False}, cookie=cookie)
+        self.assertEqual((status, data["mode"]), (200, "execution"))
+        self.assertEqual(fake.unpaused, ["dep_exec"])
+        self.assertEqual(fake.paused, ["dep_stg"])
+        row = registry.agents_for_user(self.root, uid)[0]
+        self.assertFalse(row["approval_required"])
+        self.assertEqual(row["deployment_id"], "dep_exec")   # the ACTIVE one, as before
+        self.assertEqual(row["deployment_mode"], "execution")
+
+    def test_a_failed_platform_switch_leaves_the_row_alone(self):
+        """A row that says "staging" while the execution deployment is unpaused is worse
+        than a failed toggle: the agent acts, the screen says it is waiting for you, and
+        nobody finds out until after it has."""
+        uid, cookie = self._signup("modefail@x.com")
         self._seed_agent(uid)
-        self._seed_connection()
-        registry.set_staged_apps(self.root, "agent-1", ["gmail"])
-        status, data, _ = self._req("POST", "/api/u/agents/agent-1/staging",
-                                    {"staged_apps": []}, cookie=cookie)
-        self.assertEqual((status, data["staged_apps"]), (200, []))
+        registry.set_approval_required(self.root, "agent-1", True)
+        registry.agent_set_deployment(
+            self.root, "agent-1", "dep_stg",
+            deployments={"staging": "dep_stg", "execution": "dep_exec"}, mode="staging")
 
-    def test_staging_unstage_one_app_server_side(self):
-        uid, cookie = self._signup("unstage@x.com")
+        class Boom:
+            def unpause_deployment(self, d):
+                raise RuntimeError("503 overloaded")
+
+        self.state._live_client = lambda: Boom()
+        status, data, _ = self._req("POST", "/api/u/agents/agent-1/mode",
+                                    {"approval_required": False}, cookie=cookie)
+        self.assertEqual((status, data["error"]), (502, "platform_error"))
+        row = registry.agents_for_user(self.root, uid)[0]
+        self.assertTrue(row["approval_required"])            # unchanged
+        self.assertEqual(row["deployment_id"], "dep_stg")
+
+    def test_mode_requires_the_flag(self):
+        uid, cookie = self._signup("modearg@x.com")
         self._seed_agent(uid)
-        self._seed_connection()
-        registry.set_staged_apps(self.root, "agent-1", ["gmail", "google_sheets"])
-        status, data, _ = self._req("POST", "/api/u/agents/agent-1/staging",
-                                    {"unstage": "gmail"}, cookie=cookie)
-        self.assertEqual(status, 200)
-        self.assertEqual(data["staged_apps"], ["google_sheets"])            # only gmail dropped
+        status, data, _ = self._req("POST", "/api/u/agents/agent-1/mode", {}, cookie=cookie)
+        self.assertEqual((status, data["error"]), (400, "approval_required_missing"))
 
-    def test_staging_scoped_to_owner(self):
+    def test_an_undeployed_agent_just_records_the_flag(self):
+        uid, cookie = self._signup("nodep@x.com")
+        self._seed_agent(uid)
+        status, data, _ = self._req("POST", "/api/u/agents/agent-1/mode",
+                                    {"approval_required": True}, cookie=cookie)
+        self.assertEqual((status, data["approval_required"]), (200, True))
+        self.assertTrue(registry.agents_for_user(self.root, uid)[0]["approval_required"])
+
+    def test_mode_scoped_to_owner(self):
         uid, _ = self._signup("me@x.com")
         self._seed_agent(uid)
         other_cookie = self._req("POST", "/api/auth/signup",
                                  {"email": "nosy2@x.com", "password": "password1"})[2]
-        status, _, _ = self._req("POST", "/api/u/agents/agent-1/staging",
-                                 {"staged_apps": ["gmail"]}, cookie=other_cookie)
+        status, _, _ = self._req("POST", "/api/u/agents/agent-1/mode",
+                                 {"approval_required": True}, cookie=other_cookie)
         self.assertEqual(status, 404)
 
 
@@ -930,7 +980,7 @@ class GroupMessageTest(HomeAndMessagesEndpointTest):
         from trace.tests.test_scheduler import _PROPOSAL_BLOCK
         uid, cookie = self._signup("gm3@x.com")
         self._seed_agent(uid, agent_id="agent-1", name="Operations")
-        registry.set_staged_apps(self.root, "agent-1", ["gmail"])
+        registry.set_approval_required(self.root, "agent-1", True)
         self.ma.events = [{"type": "agent.message", "text": "Drafted it.\n" + _PROPOSAL_BLOCK},
                           {"type": "session.status_idle", "stop_reason": "end_turn", "text": ""}]
         gid = self._group_with(cookie, ["agent-1"])
@@ -939,7 +989,8 @@ class GroupMessageTest(HomeAndMessagesEndpointTest):
         r = data["replies"][0]
         self.assertTrue(r["staged"])                            # action PROPOSED, not performed
         self.assertEqual(r["reply"], "Drafted it.")            # fence stripped from human reply
-        self.assertIn("STAGING MODE", self.ma.triggers[-1])    # staging directive was applied
+        # The staging CONTRACT is in the system prompt; the message only names the mode.
+        self.assertTrue(self.ma.triggers[-1].startswith("Stage, don't execute."))
 
     def test_rate_limit_guards_credits(self):
         import trace.ui.app as appmod

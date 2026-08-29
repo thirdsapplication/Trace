@@ -13,6 +13,7 @@ import unittest
 
 from trace.ui import app, registry
 from trace.agent import runner
+from trace.agent import config as agent_config
 from trace.tests.test_ui import FakeKeystore
 
 
@@ -118,10 +119,12 @@ class FakeConnect:
         return {"refreshed": 1, "expires_at": "2026-01-01T00:00:00Z"}
 
 
-def _agent(owner="usr_1", agent_id="agent-1", staged_apps=None):
+def _agent(owner="usr_1", agent_id="agent-1", approval_required=False, mode=None):
     return {"agent_id": agent_id, "owner_user_id": owner, "external_user_id": "x",
             "bundle_id": "wf", "name": "WF", "vault_ref": "vlt-1",
-            "trigger": "on a new task", "session_id": "s", "staged_apps": staged_apps or []}
+            "trigger": "on a new task", "session_id": "s",
+            "approval_required": approval_required,
+            "deployment_mode": mode}
 
 
 # A staged agent's final message carrying the proposed-actions contract block.
@@ -166,23 +169,43 @@ class RunnerTest(unittest.TestCase):
         self.assertIn("approve", rec["summary"].lower())
         self.assertEqual(rec["details"], ["send email to Bob"])
 
-    # --- prompt-level staging: run_once triggers; proposals come from activity ---
-    def test_staged_agent_gets_staging_directive(self):
-        # A staged agent's run prepends the staging directive (naming the app) so it
-        # proposes instead of executing; run_once itself just triggers + records.
+    # --- modes: run_once sends the same one-line message its deployment would --
+    def test_staged_agent_is_told_to_stage_in_one_line(self):
+        # The staging CONTRACT (the proposals block shape) is in the system prompt; the
+        # run's message only selects the mode. It used to carry ~2,000 characters of
+        # contract on every single run.
         ma = FakeMA(events=[{"type": "agent.message", "text": _PROPOSAL_BLOCK},
                             {"type": "session.thread_status_idle", "stop_reason": {"type": "end_turn"}}])
-        rec = runner.run_once(ma, _agent(staged_apps=["gmail"]))
-        self.assertIn("STAGING MODE", ma.triggers[0])
-        self.assertIn("Gmail", ma.triggers[0])
+        rec = runner.run_once(ma, _agent(approval_required=True))
+        self.assertEqual(ma.triggers[0], "Stage, don't execute.\n\nBegin.")
         self.assertEqual(rec["run_session_id"], "run-sess-1")
         self.assertEqual(ma.approved, [])                      # never executes on the staged run
 
-    def test_non_staged_agent_runs_normally(self):
+    def test_autonomous_agent_is_never_told_about_staging(self):
         ma = FakeMA()
-        rec = runner.run_once(ma, _agent())                    # no staged_apps
+        rec = runner.run_once(ma, _agent())                    # approval not required
         self.assertEqual(rec["status"], "completed")
-        self.assertNotIn("STAGING MODE", ma.triggers[0])       # plain trigger, no directive
+        self.assertEqual(ma.triggers[0], "Begin.")
+
+    def test_an_approval_agent_switched_to_execution_gets_the_override(self):
+        """Same agent object, both modes — so the execution message has to be explicit.
+
+        Both deployments point at one platform agent, which means one system prompt;
+        an approval-required agent carries the staging contract in it, and an execution
+        run must say plainly that this run is not that.
+        """
+        ma = FakeMA()
+        runner.run_once(ma, _agent(approval_required=True,
+                                   mode=agent_config.MODE_EXECUTION))
+        self.assertIn("Execution mode", ma.triggers[0])
+        self.assertIn("Do not stage", ma.triggers[0])
+
+    def test_legacy_staged_apps_row_still_stages(self):
+        """A row written before approval became a whole-agent setting."""
+        ma = FakeMA()
+        agent = {**_agent(), "approval_required": None, "staged_apps": ["gmail"]}
+        runner.run_once(ma, agent)
+        self.assertEqual(ma.triggers[0], "Stage, don't execute.\n\nBegin.")
 
     def test_run_once_preserves_session_id_when_collect_fails(self):
         # Regression: the bogus "Couldn't run" that DISCARDED the real session id — the
@@ -252,13 +275,25 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(ma.sessions[0]["vault_ids"], ["vlt-1"])
 
     # --- Gap #3: uncertainty handling (agent-initiated pause) ---------------
-    def test_uncertainty_directive_on_every_run(self):
-        # Even a plain, non-staged run carries the uncertainty directive so the agent
-        # can pause when genuinely stuck.
+    def test_uncertainty_contract_is_in_the_system_prompt_not_every_run(self):
+        """It applies to every run and every mode, so it is sent once, as system.
+
+        It used to be appended to each run's text. That is per-run cost for text that
+        never varies — and on a deployment-backed agent it could only be changed by
+        rebuilding the deployment, because the opening message is immutable.
+        """
+        prompt = agent_config.agent_system_prompt("ROLE", approval_required=False)
+        self.assertIn("needs_input", prompt)
+        self.assertIn(str(runner._uncertainty_max_questions()), prompt)
         ma = FakeMA()
         runner.run_once(ma, _agent())
-        self.assertIn("needs_input", ma.triggers[0])
-        self.assertIn(str(runner._uncertainty_max_questions()), ma.triggers[0])
+        self.assertNotIn("needs_input", ma.triggers[0])
+
+    def test_the_uncertainty_contract_never_mentions_staging(self):
+        """It reaches autonomous agents too, whose prompts must not mention it."""
+        low = agent_config.uncertainty_directive().lower()
+        for word in ("stage", "staging", "propose", "approval"):
+            self.assertNotIn(word, low)
 
     def test_needs_input_run_gets_needs_input_status(self):
         ma = FakeMA(events=[{"type": "agent.message", "text": _NEEDS_INPUT_BLOCK},
@@ -394,8 +429,8 @@ class SchedulerPassTest(unittest.TestCase):
                               {"type": "session.status_idle", "text": ""}])
 
     def _staged_agent(self):
-        registry.agent_upsert(self.root, _agent(staged_apps=["gmail"]))
-        return _agent(staged_apps=["gmail"])
+        registry.agent_upsert(self.root, _agent(approval_required=True))
+        return _agent(approval_required=True)
 
     def test_activity_summarizes_surfaces_proposals_and_dedupes(self):
         agent = self._staged_agent()
@@ -464,7 +499,7 @@ class SchedulerPassTest(unittest.TestCase):
             with self.subTest(outcome=outcome):
                 # A distinct agent per outcome: the content hash covers agent_id, and
                 # the widened dedupe would (correctly) swallow a same-agent restage.
-                agent = _agent(agent_id=f"agent-{outcome}", staged_apps=["gmail"])
+                agent = _agent(agent_id=f"agent-{outcome}", approval_required=True)
                 registry.agent_upsert(self.root, agent)
                 self.state.run_agent(agent)                   # -> run-sess-<i>
                 self.state.agent_activity(agent)
@@ -564,13 +599,13 @@ class SchedulerPassTest(unittest.TestCase):
 
 
 # --- MA deployments: cron mapping, sync loop, run-now, memory attachment ----
-from trace.agent import config as agent_config  # noqa: E402
 
 
 def _dep_agent(agent_id="agent-d1", deployment_id="dep_live", store="mem_live",
-               owner="usr_1", staged_apps=None):
-    return {**_agent(owner=owner, agent_id=agent_id, staged_apps=staged_apps),
-            "deployment_id": deployment_id, "memory_store_id": store}
+               owner="usr_1", approval_required=False, deployments=None):
+    return {**_agent(owner=owner, agent_id=agent_id, approval_required=approval_required),
+            "deployment_id": deployment_id, "memory_store_id": store,
+            "deployments": deployments or {}}
 
 
 class CadenceToCronTest(unittest.TestCase):
@@ -689,10 +724,28 @@ class DeploymentSyncTest(unittest.TestCase):
         self.assertEqual(dep["schedule"]["expression"], "0 9 * * *")
         self.assertEqual(dep["vault_ids"], ["vlt-1"])
         self.assertEqual(dep["resources"][0]["memory_store_id"], "mem_live")
-        self.assertIn(agent_config.MEMORY_UPDATE_DIRECTIVE, dep["trigger_text"])
+        self.assertEqual(dep["trigger_text"], "Begin.")       # contracts live in system
         # the registry row now points at the NEW deployment
         row = next(a for a in registry.agents_all(self.root) if a["agent_id"] == "agent-d1")
         self.assertEqual(row["deployment_id"], new_id)
+
+    def test_apply_platform_schedule_rebuilds_the_pair_and_keeps_the_mode(self):
+        """A cadence change still rebuilds — deployments are immutable — but it has to
+        rebuild BOTH and leave the same one running as before."""
+        agent = _dep_agent(approval_required=True,
+                           deployments={agent_config.MODE_STAGING: "dep_live",
+                                        agent_config.MODE_EXECUTION: "dep_exec"})
+        registry.agent_upsert(self.root, agent)
+        new_id = self.state.apply_platform_schedule(agent, {"kind": "daily", "time": "09:00"})
+        self.assertEqual(len(self.ma.created_deployments), 2)
+        self.assertEqual(sorted(self.ma.archived), ["dep_exec", "dep_live"])
+        row = next(a for a in registry.agents_all(self.root) if a["agent_id"] == "agent-d1")
+        self.assertEqual(row["deployment_mode"], agent_config.MODE_STAGING)
+        self.assertEqual(row["deployments"][agent_config.MODE_STAGING], new_id)
+        self.assertEqual(row["deployment_id"], new_id)
+        # still exactly one running
+        self.assertEqual(self.ma.paused_deps,
+                         [row["deployments"][agent_config.MODE_EXECUTION]])
 
     def test_apply_platform_schedule_none_creates_manual(self):
         registry.agent_upsert(self.root, _dep_agent())
@@ -744,25 +797,34 @@ class DeploymentSyncTest(unittest.TestCase):
 
 
 class RunnerMemoryTest(unittest.TestCase):
-    def test_run_once_attaches_memory_and_directive(self):
+    def test_run_once_attaches_the_memory_store(self):
         ma = FakeMA()
         runner.run_once(ma, _dep_agent())
         self.assertEqual(ma.sessions[0]["resources"][0]["memory_store_id"], "mem_live")
-        self.assertIn(agent_config.MEMORY_UPDATE_DIRECTIVE, ma.triggers[0])
 
     def test_run_once_without_store_unchanged(self):
         ma = FakeMA()
         runner.run_once(ma, _agent())
         self.assertEqual(ma.sessions[0]["resources"], [])
-        self.assertNotIn(agent_config.MEMORY_UPDATE_DIRECTIVE, ma.triggers[0])
 
-    def test_execute_pending_attaches_memory_and_directive(self):
+    def test_the_memory_contract_is_not_repeated_on_every_run(self):
+        """It is in the system prompt now. It is identical on every run and in every
+        mode, so sending it with each trigger was paying for the same text forever."""
+        ma = FakeMA()
+        runner.run_once(ma, _dep_agent())
+        self.assertNotIn(agent_config.MEMORY_UPDATE_DIRECTIVE, ma.triggers[0])
+        self.assertIn(agent_config.MEMORY_UPDATE_DIRECTIVE,
+                      agent_config.agent_system_prompt("ROLE", approval_required=False))
+
+    def test_execute_pending_attaches_memory_and_overrides_staging(self):
         ma = FakeMA()
         pending = {"summary": "send the reply", "payload": {"to": "a@b.com"}}
-        rec = runner.execute_pending(ma, _dep_agent(), pending)
+        rec = runner.execute_pending(ma, _dep_agent(approval_required=True), pending)
         self.assertEqual(rec["status"], "executed")
         self.assertEqual(ma.sessions[0]["resources"][0]["type"], "memory_store")
-        self.assertIn(agent_config.MEMORY_UPDATE_DIRECTIVE, ma.triggers[0])
+        # the approved-action instruction must beat the system prompt's staging contract
+        self.assertIn("Do NOT stage", ma.triggers[0])
+        self.assertIn("send the reply", ma.triggers[0])
 
     def test_run_names_identify_the_user(self):
         # session titles + environment names carry owner identity + agent + purpose,

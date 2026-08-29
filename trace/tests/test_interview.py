@@ -96,25 +96,38 @@ class InterviewEngineTest(unittest.TestCase):
         qs = interview.generate_questions(b, ev, model_fn=fenced)["questions"]
         self.assertEqual(len(qs), 4)
 
-    def test_empty_model_output_falls_back_to_canonical_questions(self):
-        # The questions phase is mandatory: a model that returns nothing usable
-        # yields the deterministic FALLBACK_QUESTIONS, normalized like any other set.
+    def test_no_questions_is_a_valid_answer(self):
+        """A model that finds no real gap yields NO questions.
+
+        This used to back-fill three canned questions, on the theory that the interview
+        was mandatory. The gap-detector prompt already tells the model not to pad, so
+        the padding was code overriding a correct answer — and three generic questions
+        on a simple workflow teach the worker that the interview is boilerplate to click
+        through, which is what makes them rush the interview that does matter.
+        """
         ev, ak = _load("marcy")
         b = _bundle(ak["bundles"][0])
         qs = interview.generate_questions(b, ev, model_fn=lambda s, u: '{"questions": []}')["questions"]
-        self.assertEqual(len(qs), len(interview.FALLBACK_QUESTIONS))
-        self.assertEqual([q["id"] for q in qs], ["q1", "q2", "q3"])
-        self.assertEqual([q["cost_if_wrong"] for q in qs], ["high", "high", "medium"])
-        for q in qs:
-            self.assertTrue(q["question"].strip())
-            self.assertEqual(q["answer_type"], "short_text")
-            self.assertFalse(q["runtime_discoverable"])
+        self.assertEqual(qs, [])
 
-    def test_fallback_not_used_when_model_returns_questions(self):
-        qs = self._questions()                                  # CANNED stub -> 4 kept
-        fallback_texts = {f["question"] for f in interview.FALLBACK_QUESTIONS}
-        self.assertEqual(len(qs), 4)
-        self.assertFalse(any(q["question"] in fallback_texts for q in qs))
+    def test_unusable_questions_are_not_replaced_with_filler(self):
+        """Every question filtered out by normalization also yields none.
+
+        The old fallback fired on this path too, so a model that returned only
+        runtime-discoverable questions produced three unrelated canned ones.
+        """
+        ev, ak = _load("marcy")
+        b = _bundle(ak["bundles"][0])
+        raw = json.dumps({"questions": [
+            {"question": "What columns does the destination sheet have?",
+             "runtime_discoverable": True},
+            {"question": "", "runtime_discoverable": False}]})
+        qs = interview.generate_questions(b, ev, model_fn=lambda s, u: raw)["questions"]
+        self.assertEqual(qs, [])
+
+    def test_prompt_permits_an_empty_set(self):
+        # The model has to be told, or it invents a question rather than return none.
+        self.assertIn("NO MINIMUM", SYSTEM_PROMPT)
 
     def test_system_prompt_domain_neutral(self):
         low = SYSTEM_PROMPT.lower()

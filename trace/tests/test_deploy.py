@@ -64,7 +64,7 @@ class FakeDeployClient:
         # fresh and the reused path (a shared store's "reused" only means another
         # agent got there first); already-seeded paths are left untouched
         documents = documents or [("/current_workflow_status.md", ""),
-                                  ("/lessons_learned.md", "")]
+                                  ("/shared_lessons.md", "")]
         store = next((s for s in self.memory_stores if s["name"] == name), None)
         reused = store is not None
         if store is None:
@@ -203,7 +203,7 @@ class DeployTest(unittest.TestCase):
         self.assertEqual(client.memory_stores[0]["name"],
                          config.memory_store_name("trace-s1", live["name"]))
         self.assertEqual({p for _sid, p in client.seeded},
-                         {config.MEMORY_STATUS_DOC, config.MEMORY_LESSONS_DOC})
+                         {config.MEMORY_STATUS_DOC, config.MEMORY_SHARED_DOC})
         # one MANUAL deployment (no schedule at deploy; the dashboard attaches cron)
         dep = client.deployments[0]
         self.assertIsNone(dep["schedule"])
@@ -227,26 +227,82 @@ class DeployTest(unittest.TestCase):
                                            "timezone": config.TRACE_SCHEDULE_TZ})
         self.assertEqual(rec["start"], {"mode": "deployment-schedule", "value": "0 9 * * 1"})
 
-    def test_deployment_initial_message_has_task_and_memory_directive(self):
+    def test_autonomous_agent_gets_one_deployment_and_a_bare_message(self):
+        """No approval required -> one deployment, and the word "stage" appears nowhere.
+
+        Not a style preference. An instruction to withhold an action, present in the
+        prompt of an agent that is never meant to withhold, is a standing invitation to
+        withhold at the wrong moment — and the human who turned approval off is not
+        watching for a proposal nobody told them about.
+        """
         bundle, live = _live_dict()
         client = FakeDeployClient()
-        deploy.deploy_live(bundle, live, CONNECTION, client, trigger="on a new inbound PO")
-        text = client.deployments[0]["trigger_text"]
-        self.assertIn("Task: on a new inbound PO", text)
-        self.assertIn(config.MEMORY_UPDATE_DIRECTIVE, text)
-        self.assertNotIn("STAGING MODE", text)              # nothing staged here
+        rec = deploy.deploy_live(bundle, live, CONNECTION, client,
+                                 trigger="on a new inbound PO", approval_required=False)
+        self.assertEqual(len(client.deployments), 1)
+        dep = client.deployments[0]
+        self.assertEqual(dep["trigger_text"], "Begin.")
+        self.assertEqual(rec["deployment_mode"], config.MODE_EXECUTION)
+        self.assertEqual(rec["deployments"], {config.MODE_EXECUTION: dep["id"]})
+        for text in (dep["trigger_text"], client.agents[0]["system"]):
+            for word in ("stage", "staging", "propose", "proposed_actions"):
+                self.assertNotIn(word, text.lower())
 
-    def test_staged_deploy_message_contains_staging_directive(self):
+    def test_approval_agent_gets_both_deployments_with_one_line_messages(self):
+        bundle, live = _live_dict()
+        conn = {"external_user_id": "trace-s1", "vault_ref": "vlt-s1",
+                "apps": {"gmail": {"usable": True}}}
+        client = FakeDeployClient()
+        rec = deploy.deploy_live(bundle, live, conn, client,
+                                 trigger="on a new task", approval_required=True)
+        by_mode = {d["name"].rsplit("-", 1)[-1]: d for d in client.deployments}
+        self.assertEqual(set(by_mode), {config.MODE_STAGING, config.MODE_EXECUTION})
+        self.assertEqual(by_mode[config.MODE_STAGING]["trigger_text"],
+                         "Stage, don't execute.\n\nBegin.")
+        self.assertIn("Execution mode", by_mode[config.MODE_EXECUTION]["trigger_text"])
+        # both point at the same agent and the same memory store
+        self.assertEqual({d["agent_id"] for d in client.deployments}, {"agent_live"})
+        self.assertEqual({d["resources"][0]["memory_store_id"] for d in client.deployments},
+                         {rec["memory_store_id"]})
+        # exactly one runs; a new approval agent starts by proposing, not acting
+        self.assertEqual(rec["deployment_mode"], config.MODE_STAGING)
+        self.assertEqual(client.paused, [by_mode[config.MODE_EXECUTION]["id"]])
+        self.assertEqual(rec["deployment_id"], by_mode[config.MODE_STAGING]["id"])
+
+    def test_the_contracts_live_in_the_system_prompt_not_the_message(self):
+        """Everything constant across runs moved out of the opening message.
+
+        A deployment's opening message is baked in at create time and deployments are
+        immutable, so anything living there can only be changed by tearing the
+        deployment down — which is how the approval toggle came to have no effect on
+        scheduled runs. It is also per-run cost for text that never varies.
+        """
         bundle, live = _live_dict()
         conn = {"external_user_id": "trace-s1", "vault_ref": "vlt-s1",
                 "apps": {"gmail": {"usable": True}}}
         client = FakeDeployClient()
         deploy.deploy_live(bundle, live, conn, client,
-                           trigger="on a new task", staged_apps=["gmail"])
-        text = client.deployments[0]["trigger_text"]
-        self.assertIn("STAGING MODE", text)
-        self.assertIn("Gmail", text)                        # staged app named
-        self.assertIn(config.MEMORY_UPDATE_DIRECTIVE, text)
+                           trigger="on a new inbound PO", approval_required=True)
+        system = client.agents[0]["system"]
+        self.assertIn(config.MEMORY_UPDATE_DIRECTIVE, system)
+        self.assertIn("needs_input", system)                # the uncertainty contract
+        self.assertIn("proposed_actions", system)           # the staging contract
+        self.assertIn("on a new inbound PO", system)        # the workflow's own trigger
+        for dep in client.deployments:
+            self.assertNotIn(config.MEMORY_UPDATE_DIRECTIVE, dep["trigger_text"])
+            self.assertNotIn("needs_input", dep["trigger_text"])
+            self.assertLess(len(dep["trigger_text"]), 120)
+
+    def test_legacy_staged_apps_still_means_approval_required(self):
+        """Callers that predate the whole-agent setting keep working."""
+        bundle, live = _live_dict()
+        conn = {"external_user_id": "trace-s1", "vault_ref": "vlt-s1",
+                "apps": {"gmail": {"usable": True}}}
+        client = FakeDeployClient()
+        rec = deploy.deploy_live(bundle, live, conn, client,
+                                 trigger="on a new task", staged_apps=["gmail"])
+        self.assertTrue(rec["approval_required"])
+        self.assertEqual(len(client.deployments), 2)
 
     def test_memory_store_reused_on_redeploy_keeps_lessons(self):
         # a redeploy rotates the platform agent id, but the store name keys on

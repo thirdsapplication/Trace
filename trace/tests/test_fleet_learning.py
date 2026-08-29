@@ -183,13 +183,13 @@ class SharedAppGateTest(unittest.TestCase):
 
     def test_a_lesson_from_a_shared_app_survives(self):
         did = self._decision_from("1", ["shopify", "gmail"])
-        agent = {"agent_id": "a1", "owner_user_id": "u1", "staged_apps": ["shopify"]}
+        agent = {"agent_id": "a1", "owner_user_id": "u1", "staged_apps": ["shopify"]}   # legacy row: the only record of its apps
         kept = self.state._same_context_only(self.root, agent, [self._hit(did)])
         self.assertEqual(len(kept), 1)
 
     def test_a_lesson_from_somewhere_else_is_dropped(self):
         did = self._decision_from("2", ["xero"])
-        agent = {"agent_id": "a1", "owner_user_id": "u1", "staged_apps": ["shopify"]}
+        agent = {"agent_id": "a1", "owner_user_id": "u1", "staged_apps": ["shopify"]}   # legacy row: the only record of its apps
         self.assertEqual(
             self.state._same_context_only(self.root, agent, [self._hit(did)]), [])
 
@@ -200,7 +200,7 @@ class SharedAppGateTest(unittest.TestCase):
             "agent_id": "a2", "owner_user_id": "u2", "run_session_id": "s-old",
             "question": "old", "context": {}})
         did = registry.decisions_for_user(self.root, "u2")[-1]["id"]
-        agent = {"agent_id": "a1", "owner_user_id": "u1", "staged_apps": ["shopify"]}
+        agent = {"agent_id": "a1", "owner_user_id": "u1", "staged_apps": ["shopify"]}   # legacy row: the only record of its apps
         self.assertEqual(
             len(self.state._same_context_only(self.root, agent, [self._hit(did)])), 1)
 
@@ -214,7 +214,7 @@ class SharedAppGateTest(unittest.TestCase):
         """Your own agents share a context by definition; requiring an app match
         between them would be a filter with nothing to protect against."""
         did = self._decision_from("4", ["xero"])
-        agent = {"agent_id": "a1", "owner_user_id": "u1", "staged_apps": ["shopify"]}
+        agent = {"agent_id": "a1", "owner_user_id": "u1", "staged_apps": ["shopify"]}   # legacy row: the only record of its apps
         kept = self.state._same_context_only(self.root, agent, [self._hit(did, "own")])
         self.assertEqual(len(kept), 1)
 

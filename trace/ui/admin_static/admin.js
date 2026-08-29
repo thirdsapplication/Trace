@@ -134,7 +134,7 @@ async function renderAccounts() {
         <div class="spread"><b>${esc(g.name || g.agent_id)}</b>
           <span class="pill ${g.deployment_id ? "ok" : "idle"}">${g.deployment_id ? "deployment" : "legacy"}</span></div>
         <div class="mono tiny">agent ${esc(g.agent_id)}${g.deployment_id ? ` · ${esc(g.deployment_id)}` : ""}${g.memory_store_id ? ` · mem ${esc(g.memory_store_id)}` : ""}</div>
-        <div class="tiny">${g.schedule ? `schedule: ${esc(JSON.stringify(g.schedule.cadence))}${g.schedule.paused ? " (paused)" : ""}` : "no schedule (manual)"}${(g.staged_apps || []).length ? ` · staged: ${esc(g.staged_apps.join(", "))}` : ""}</div>
+        <div class="tiny">${g.schedule ? `schedule: ${esc(JSON.stringify(g.schedule.cadence))}${g.schedule.paused ? " (paused)" : ""}` : "no schedule (manual)"}${g.approval_required ? " · staging (approval required)" : " · execution (autonomous)"}</div>
         ${(g.recent_runs || []).slice(0, 3).map(r =>
           `<div class="tiny run"><span class="pill ${r.status === "failed" ? "bad" : "ok"}">${esc(r.status)}</span> ${esc(r.ran_at || "")} — ${esc(r.summary || "")}</div>`).join("")}
       </div>`).join("") || `<p class="muted tiny">No agents.</p>`;

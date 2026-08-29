@@ -370,7 +370,6 @@ class ManagedAgentsClient:
         failure raises (fail loud — a half-initialized store is worse than a failed
         deploy). Returns ``{id, reused}``."""
         documents = documents or [(config.MEMORY_STATUS_DOC, config.MEMORY_STATUS_SEED),
-                                  (config.MEMORY_LESSONS_DOC, config.MEMORY_LESSONS_SEED),
                                   (config.MEMORY_SHARED_DOC, config.MEMORY_SHARED_SEED)]
         stores = self._agents_ns("memory_stores")
         store_id, reused = None, False

@@ -79,14 +79,30 @@ class DeploymentGuidanceTest(unittest.TestCase):
         self.assertIn("Use the shipped date when order date is blank", doc["content"])
         self.assertIn("Skip rows with no tracking number", doc["content"])
 
-    def test_it_is_not_written_into_the_agents_own_lessons_file(self):
-        """lessons_learned.md is rewritten by the agent every session; borrowed lessons
-        put there would be clobbered, and would also look like its own conclusions."""
+    def test_it_is_not_written_into_the_agents_own_status_file(self):
+        """The status file is rewritten by the agent every session; lessons put there
+        would be clobbered, and would also read as its own conclusions."""
         self.state._retrieve_guidance = lambda a: ["a lesson"]
         self.state.run_deployment_now(self.agent)
         paths = [w["path"] for w in self.client.written]
-        self.assertNotIn(agent_config.MEMORY_LESSONS_DOC, paths)
-        self.assertNotIn(agent_config.MEMORY_STATUS_DOC, paths)
+        self.assertEqual(paths, [agent_config.MEMORY_SHARED_DOC])
+
+    def test_rejections_ride_the_same_door(self):
+        """A rejected proposal used to be baked into a freshly-created deployment.
+
+        Deployments are immutable, so telling an agent "don't propose that again" meant
+        destroying and rebuilding a live deployment to change one paragraph. The memory
+        store is rewritten before every run and costs nothing to change.
+        """
+        self.state._retrieve_guidance = lambda a: []
+        self.state._rejected_for = lambda a, limit=20: [
+            {"summary": "Email Ada about PO-9", "app": "gmail",
+             "why_rejected": "the ship date isn't confirmed yet"}]
+        self.state.run_deployment_now(self.agent)
+        content = self.client.written[0]["content"]
+        self.assertIn("Email Ada about PO-9", content)
+        self.assertIn("the ship date isn't confirmed yet", content)
+        self.assertEqual(self.client.written[0]["path"], agent_config.MEMORY_SHARED_DOC)
 
     def test_delivery_happens_before_the_run_is_triggered(self):
         """The run reads memory at session start, so a late write is a wasted write."""
@@ -147,8 +163,11 @@ class SharedDocumentTest(unittest.TestCase):
         self.assertIn("MEMORY_SHARED_DOC", head,
                       "the shared-lessons document is not in the default seed list, so "
                       "stores are created without it and nothing can be delivered")
-        self.assertIn("MEMORY_STATUS_DOC", head)            # the others must survive too
-        self.assertIn("MEMORY_LESSONS_DOC", head)
+        self.assertIn("MEMORY_STATUS_DOC", head)            # the other must survive too
+        # The agent's self-authored lessons file is NOT seeded any more: distilling a
+        # session into lessons is the self-improvement engine's job, and an agent that
+        # is not asked to write lessons has no use for a file to write them in.
+        self.assertNotIn("MEMORY_LESSONS_DOC", head)
 
     def test_the_run_directive_tells_the_agent_to_read_it(self):
         """Without this the file is written and never opened."""
@@ -157,6 +176,26 @@ class SharedDocumentTest(unittest.TestCase):
 
     def test_the_agent_is_told_not_to_edit_it(self):
         self.assertIn("never edit that file", agent_config.MEMORY_UPDATE_DIRECTIVE)
+
+    def test_the_agent_is_not_asked_to_write_its_own_lessons(self):
+        """Distilling a session into lessons belongs to the self-improvement engine.
+
+        An agent summarising the session it just lived is the worst-placed judge of what
+        went wrong in it, and what it writes becomes confident, unreviewed advice to its
+        own future self. It keeps a progress ledger; Trace keeps the lessons.
+        """
+        d = agent_config.MEMORY_UPDATE_DIRECTIVE
+        self.assertNotIn("lessons_learned.md", d)
+        self.assertNotIn("APPEND to", d)
+        self.assertIn("do not write up lessons or retrospectives", d)
+        self.assertFalse(hasattr(agent_config, "MEMORY_LESSONS_DOC"))
+        self.assertNotIn("lessons_learned.md", agent_config.MEMORY_STORE_DESCRIPTION)
+
+    def test_the_agent_still_tracks_its_progress(self):
+        """The half that stays: the cumulative ledger is what stops re-doing work."""
+        d = agent_config.MEMORY_UPDATE_DIRECTIVE
+        self.assertIn("REWRITE current_workflow_status.md", d)
+        self.assertIn("Already handled", d)
 
 
 if __name__ == "__main__":

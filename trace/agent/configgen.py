@@ -1,8 +1,8 @@
 """The Config Engine (Phase 1) — reviewed workflow -> agent configuration directly.
 
-One model call per approved bundle returns STRUCTURED CONTENT (role, steps, working
-rules, requirements, description), each item carrying a source tag. Deterministic
-code then (1) assembles the ``system`` prompt text in a fixed section order,
+One model call per approved bundle returns STRUCTURED CONTENT (role, apps, steps,
+description), each step carrying a source tag. Deterministic code then (1) assembles
+the ``system`` prompt text in a fixed section order,
 (2) stamps the test and live YAML variants (every structural field is a code
 constant — identical for every agent), and (3) builds the grounding record that
 footnotes every instruction to its source.
@@ -116,77 +116,31 @@ def _items(model_out, key):
     return out
 
 
-def _has_match_rule(working_rules):
-    """True if a working rule already tells the agent to match existing examples."""
-    for r in working_rules:
-        low = r["text"].lower()
-        if "match" in low and ("existing" in low or "example" in low):
-            return True
-    return False
+def assemble_system_text(model_out):
+    """Assemble the ``system`` prompt text: role, the apps it works in, the numbered
+    steps, then the two standing rules.
 
-
-def _has_no_dup_rule(working_rules):
-    """True if a working rule already guards against duplicating prior work (Spec 7)."""
-    for r in working_rules:
-        low = r["text"].lower()
-        if "duplicat" in low:
-            return True
-        if "already" in low and any(w in low for w in ("skip", "avoid", "again", "repeat")):
-            return True
-    return False
-
-
-def _has_prompt_injection_rule(working_rules):
-    """True if a working rule already guards against prompt injection (treating read
-    content as untrusted data rather than instructions)."""
-    for r in working_rules:
-        low = r["text"].lower()
-        if "injection" in low:
-            return True
-        if "instruction" in low and any(w in low for w in
-                                        ("ignore", "untrusted", "as data", "not instruction",
-                                         "do not comply", "do not follow", "don't follow")):
-            return True
-    return False
-
-
-def final_working_rules(model_out):
-    """Model working rules plus the canonical rules, each appended (with a stable key +
-    discovery source) only if the model omitted it: the 'match existing examples' rule
-    (P spec §5/§6.1), the anti-duplication rule (Spec 7), and the anti-prompt-injection
-    rule, so every agent always carries all three."""
-    rules = _items(model_out, "working_rules")
-    if not _has_match_rule(rules):
-        rules = rules + [{"text": config.MATCH_EXAMPLES_RULE,
-                          "source": {"type": "discovery"},
-                          "key": "rule_match_existing_examples"}]
-    if not _has_no_dup_rule(rules):
-        rules = rules + [{"text": config.NO_DUPLICATION_RULE,
-                          "source": {"type": "discovery"},
-                          "key": "rule_no_duplication"}]
-    if not _has_prompt_injection_rule(rules):
-        rules = rules + [{"text": config.PROMPT_INJECTION_RULE,
-                          "source": {"type": "discovery"},
-                          "key": "rule_prompt_injection"}]
-    return rules
-
-
-def assemble_system_text(model_out, working_rules):
-    """Assemble the ``system`` prompt text in the fixed section order (§6.1)."""
+    The agent's instructions used to carry two more sections — "How to do the work"
+    (working rules) and "Requirements" — both written by the model, both topped up with
+    canonical rules the code appended when the model left them out. They are gone. In
+    practice they restated the steps in weaker language and grew with every incident,
+    and a long prompt is not a careful one: the sentences that matter get read with the
+    same weight as the ones that no longer apply. Decisions the workflow depends on now
+    live in the step they govern (see ``config_prompt``), anti-duplication lives in the
+    memory ledger where it can be checked against state, and the two rules worth
+    stating unconditionally are fixed framing rather than generated content.
+    """
     tools_and_artifacts = [str(t).strip() for t in (model_out.get("tools_and_artifacts") or [])
                            if str(t).strip()]
     steps = _items(model_out, "steps")
-    requirements = _items(model_out, "requirements")
 
     lines = [str(model_out.get("role", "") or "").strip(), ""]
     lines.append("You work with:")
     lines += [f"- {t}" for t in tools_and_artifacts]
     lines += ["", "Steps:"]
     lines += [f"{i + 1}. {s['text']}" for i, s in enumerate(steps)]
-    lines += ["", "How to do the work:"]
-    lines += [f"- {r['text']}" for r in working_rules]
-    lines += ["", "Requirements:"]
-    lines += [f"- {q['text']}" for q in requirements]
+    lines += ["", "Always:"]
+    lines += [f"- {r}" for r in config.STANDING_RULES]
     return "\n".join(lines)
 
 
@@ -276,14 +230,18 @@ def _grounding_entry(prefix, i, item, used):
     return {"key": key, "text": item["text"], "source": source, "observed": observed}
 
 
-def build_grounding(bundle_id, steps, working_rules, requirements, unresolved=None):
-    """One entry per step/working-rule/requirement, keyed by a deterministic slug,
-    recording its source and whether it was directly observed (events-sourced).
-    ``unresolved`` (Phase 2: interview questions the worker skipped) is recorded as a
-    top-level list when non-empty — the agent falls back to reading the live
-    environment for those, and the gap is auditable."""
+def build_grounding(bundle_id, steps, unresolved=None):
+    """One entry per step, keyed by a deterministic slug, recording its source and
+    whether it was directly observed (events-sourced). ``unresolved`` (Phase 2:
+    interview questions the worker skipped) is recorded as a top-level list when
+    non-empty — the agent falls back to reading the live environment for those, and the
+    gap is auditable.
+
+    Steps are all there is to footnote now that the generated prompt has no working
+    rules and no requirements; the ``rule_``/``req_`` prefixes are retired with them.
+    """
     used, instructions = set(), []
-    for prefix, items in (("step_", steps), ("rule_", working_rules), ("req_", requirements)):
+    for prefix, items in (("step_", steps),):
         for i, item in enumerate(items):
             instructions.append(_grounding_entry(prefix, i, item, used))
     record = {"bundle_id": bundle_id, "instructions": instructions}
@@ -307,13 +265,10 @@ def compile_config(bundle, observed_events, user_answers, model_fn, model=DEFAUL
                                      test_feedback)
     model_out = _parse_json_object(model_fn(SYSTEM_PROMPT, user_msg))
 
-    working_rules = final_working_rules(model_out)
     steps = _items(model_out, "steps")
-    requirements = _items(model_out, "requirements")
-    system_text = assemble_system_text(model_out, working_rules)
+    system_text = assemble_system_text(model_out)
     envelope = build_envelope(bundle, model_out, system_text)
-    grounding = build_grounding(bundle.get("id"), steps, working_rules, requirements,
-                                unresolved=unresolved)
+    grounding = build_grounding(bundle.get("id"), steps, unresolved=unresolved)
     return {"live": envelope, "grounding": grounding, "content": model_out}
 
 
