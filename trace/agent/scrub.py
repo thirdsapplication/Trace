@@ -15,9 +15,17 @@ the model claimed and simply hunts for identifier SHAPES, and finally a second, 
 model that judges the scrubbed text on its own. Cheap checks run first; the paid one last.
 
 Everything here is best-effort and fails closed: the return value on any doubt is None, and
-None costs the fleet one publish. The sweep is deliberately trigger-happy for the same
-reason — a rejected batch is a non-event, a leaked one is a customer's data sitting in
-another customer's payload.
+None costs the fleet one publish, never an agent its cycle.
+
+Failing closed is not the same as failing often, and the first version of this module
+confused the two. The sweep rejected any run of four or more digits, on the theory that a
+rejected batch is a non-event while a leaked one is a customer's data in another
+customer's payload. But a year is four digits. So is a token count, a spreadsheet range,
+a row id. It rejected seven batches out of seven in production, published nothing, and
+left cross-agent learning looking like a tuning problem for a day. A gate that fires on
+everything does not protect anything — it removes the feature quietly, in the one place
+nobody is looking. The sweep now catches shapes that are hard to produce by accident and
+leaves the fuzzy cases to the two checks built for them.
 """
 
 import json
@@ -139,12 +147,24 @@ def scrub_batch(session_records, memory_docs, model_fn):
     user = json.dumps(build_payload(session_records, memory_docs),
                       ensure_ascii=False, default=str)
     try:
-        obj = _parse_json_object(model_fn(SCRUB_SYSTEM, user))
+        reply = model_fn(SCRUB_SYSTEM, user)
     except Exception as e:                                 # noqa: BLE001 — best-effort, but
         # say WHY: a reason-less "scrub failed" line cost a debugging round in learn.py.
         print(f"[scrub] scrub call failed: {type(e).__name__}: {str(e)[:200]}", flush=True)
         return None
-    return obj or None
+    obj = _parse_json_object(reply)
+    if obj:
+        return obj
+    # An unparseable reply used to surface as "produced nothing", which is indistinguishable
+    # from a call that never happened — and in production that ambiguity hid four failures
+    # in a row. A verbatim rewrite is the largest reply anything here asks for, so the two
+    # things worth knowing are how big it got and whether it stops mid-structure.
+    text = str(reply or "")
+    cut = (", ends mid-structure — raise SCRUB_MAX_TOKENS or lower the clips"
+           if text.strip() and not text.rstrip().endswith(("}", "```")) else "")
+    print(f"[scrub] reply did not parse as JSON: {len(user)} chars in, "
+          f"{len(text)} chars out{cut}. Tail: {text.rstrip()[-160:]!r}", flush=True)
+    return None
 
 
 def structural_check(session_records, scrubbed):
@@ -186,23 +206,93 @@ def structural_check(session_records, scrubbed):
     return True, ""
 
 
-# Identifier SHAPES. This sweep is unconditional — it does not care what the model declared
-# in redactions, because the dangerous case is the identifier it never declared at all. A
-# hit fails the whole batch even when the redactions list is empty.
+# Identifier SHAPES. This sweep is unconditional — it does not care what the model
+# declared in redactions, because the dangerous case is the identifier it never declared
+# at all. A hit fails the whole batch even when the redactions list is empty.
+#
+# PRECISION IS THE WHOLE PROBLEM HERE. The first version of this sweep rejected a run of
+# four or more digits outright, on the reasoning that order numbers and account numbers
+# look like that. So does a year. So does a token count, a spreadsheet range, a row id,
+# an HTTP status followed by a length. In production it rejected every batch it was ever
+# shown — seven for seven — and because a rejection publishes nothing, the peer table
+# stayed empty and cross-agent learning looked like a similarity-threshold problem for a
+# day. A gate that fires on everything protects nothing; it just turns the feature off
+# where no one can see it.
+#
+# So this sweep now catches only shapes that are hard to produce by accident: an address
+# with an @, a Luhn-valid card number, a conventionally formatted phone number, a URL
+# carrying query parameters. Everything fuzzier — an order id, an invoice number, an
+# account reference — is the scrubber's job to replace (the prompt names them) and the
+# declared-literal check's job to verify, with the independent model pass behind both.
+# The deterministic sweep is a backstop for the obvious, not the primary defence.
+_DATELIKE = re.compile(
+    r"\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?Z?)?"   # ISO date/time
+    r"|\b\d{2}:\d{2}(?::\d{2})?\b"                                       # bare clock time
+    r"|\b\d{10,13}\b"                                                    # epoch s / ms
+)
+
+
+def _luhn(digits):
+    """True if a digit string passes the Luhn checksum — the standard test every payment
+    card satisfies and a run of arbitrary digits passes only about a tenth of the time.
+    Without it, any 16-digit identifier reads as a card."""
+    total, alt = 0, False
+    for ch in reversed(digits):
+        d = ord(ch) - 48
+        if alt:
+            d *= 2
+            if d > 9:
+                d -= 9
+        total += d
+        alt = not alt
+    return total % 10 == 0
+
+
+_CARD_CANDIDATE = re.compile(r"(?<![\d-])(?:\d[ -]?){12,18}\d(?![\d-])")
+_IBAN = re.compile(r"\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b")
+
+
+def _card_like(text):
+    """A payment-card number: 13-19 digits, Luhn-valid, and either grouped by separators
+    or of a length a card actually uses. A 13-digit millisecond timestamp is bare and the
+    wrong length, so it does not reach Luhn at all."""
+    for m in _CARD_CANDIDATE.finditer(text):
+        raw = m.group(0)
+        digits = re.sub(r"\D", "", raw)
+        if not 13 <= len(digits) <= 19 or not _luhn(digits):
+            continue
+        grouped = bool(re.search(r"\d[ -]\d", raw))
+        if grouped or len(digits) in (15, 16):
+            return True
+    return bool(_IBAN.search(text))
+
+
+# +1 (555) 123-4567 and friends. A separator is REQUIRED — a bare digit run is an
+# identifier of some kind, not evidence of a phone number — and dates and clock times are
+# stripped before this runs, because "2026-08-28" is otherwise a nine-digit "phone".
+_PHONE = re.compile(r"(?<![\d.])\+?\d[\d ().-]{5,13}\d(?![\d.])")
+
+
+def _phone_like(text):
+    for m in _PHONE.finditer(_DATELIKE.sub(" ", text)):
+        raw = m.group(0)
+        if not re.search(r"[ ().-]", raw):        # separatorless: just a number
+            continue
+        if 7 <= len(re.sub(r"\D", "", raw)) <= 15:
+            return True
+    return False
+
+
 _SWEEP = (
-    # someone@somewhere.tld — the most direct re-identifier there is.
-    ("email address", re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")),
-    # 13-19 digits with optional separators (payment card), or IBAN's country + check
-    # digits + account body. Checked before the generic digit rule so the reason names it.
-    ("card/IBAN-shaped string",
-     re.compile(r"\b(?:\d[ \-]?){13,19}\b|\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b")),
-    # +1 (555) 123-4567 and friends: a digit run broken by spaces, dots, dashes, parens.
-    ("phone-shaped number", re.compile(r"\+?\d[\d ().\-]{7,}\d")),
+    # someone@somewhere.tld — the most direct re-identifier there is, and not a shape
+    # anything else in a transcript takes.
+    ("email address", lambda t: bool(re.search(
+        r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", t))),
+    ("card/IBAN-shaped string", _card_like),
+    ("phone-shaped number", _phone_like),
     # A URL with a query string: ?id=, ?email=, share tokens — the parameters carry the
     # identity even when the host does not.
-    ("url with a query string", re.compile(r"https?://\S+\?\S")),
-    # Any run of four or more digits: order numbers, invoice ids, account numbers, zip+4.
-    ("digit run of 4 or more", re.compile(r"\d{4,}")),
+    ("url with a query string", lambda t: bool(re.search(r"https?://\S+\?\S", t))),
 )
 
 
@@ -271,8 +361,8 @@ def leak_sweep(scrubbed, redactions):
         if pseudonym.lower() not in low:
             return False, f"pseudonym {pseudonym!r} declared but never used"
     text = _sweep_text(scrubbed)
-    for label, pattern in _SWEEP:
-        if pattern.search(text):
+    for label, detect in _SWEEP:
+        if detect(text):
             return False, f"{label} survived in the scrubbed text"
     return True, ""
 

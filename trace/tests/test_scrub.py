@@ -186,10 +186,27 @@ class LeakSweepTest(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("phone", reason)
 
-    def test_undeclared_digit_run_fails(self):
-        ok, reason = scrub.leak_sweep(_scrubbed("[agent] order 88213 shipped"), [])
-        self.assertFalse(ok)
-        self.assertIn("digit run", reason)
+    def test_a_bare_digit_run_is_NOT_caught_by_the_sweep(self):
+        """The tradeoff, stated so it is visible rather than assumed.
+
+        An undeclared order or invoice number no longer fails the sweep. It cannot: the
+        rule that caught it ("four or more digits") also caught every year, token count,
+        row range and timestamp, and rejected seven production batches out of seven. Such
+        an id is instead the scrubber's job to replace — the prompt names order and record
+        ids explicitly — the declared-literal check's job to verify once it has been, and
+        the independent model gate's job to catch when it has not. This test exists so
+        that anyone reading the suite knows the deterministic layer does NOT cover it."""
+        ok, _ = scrub.leak_sweep(_scrubbed("[agent] order 88213 shipped"), [])
+        self.assertTrue(ok)
+
+    def test_a_declared_order_number_that_survives_IS_caught(self):
+        # The half that does still hold deterministically: once the scrubber says it
+        # replaced an id, a surviving copy is a leak the code finds without any model.
+        scrubbed = _scrubbed("[agent] order 88213 shipped for restaurant client A")
+        red = [{"pseudonym": "restaurant client A", "literal": "88213",
+                "category": "id"}]
+        ok, reason = scrub.leak_sweep(scrubbed, red)
+        self.assertFalse(ok, reason)
 
     def test_url_with_query_string_fails(self):
         ok, reason = scrub.leak_sweep(
@@ -260,6 +277,92 @@ class ScrubBatchTest(unittest.TestCase):
 
     def test_unparseable_answer_is_none(self):
         self.assertIsNone(scrub.scrub_batch(_records(), {}, _fn("no json here")))
+
+
+class LeakSweepPrecisionTest(unittest.TestCase):
+    """The sweep must not fire on ordinary transcript furniture.
+
+    Every one of these is drawn from what a real compacted transcript contains, and every
+    one of them was REJECTED by the first version of this sweep, which failed any run of
+    four or more digits. In production that rejected seven batches out of seven: nothing
+    was ever published, the peer table stayed empty, and cross-agent learning read as a
+    similarity problem. These cases are the regression guard on that."""
+
+    ORDINARY = {
+        "iso timestamp": '[tool result] {"date": "2026-08-28T19:03:41Z"}',
+        "millisecond epoch": '[tool result] {"internalDate": "1756400621000"}',
+        "message id": '[tool call] gmail.get {"id": "19abc4d5e6f78901"}',
+        "a year in prose": "[agent] no invoices dated 2026 were outstanding",
+        "spreadsheet range": '[tool call] sheets.read {"range": "A2:D1500"}',
+        "a token count": "[end] completed after 41200 tokens",
+        "an order reference": "[agent] recorded order 100482 as handled",
+        "a clock time": "[agent] the digest is due at 09:30 each morning",
+        "an http status": "[tool result (error)] 429 after 15000 ms, retried once",
+    }
+
+    IDENTIFIERS = {
+        "email address": "[agent] emailed chef@mariospizzeria.example",
+        "grouped card": "[tool result] card 4111 1111 1111 1111 on file",
+        "bare card": "[tool result] 4111111111111111",
+        "international phone": "[agent] called +1 (555) 123-4567 twice",
+        "dashed phone": "[agent] contact 555-123-4567",
+        "iban": "[tool result] GB29NWBK60161331926819",
+        "url with a token": "[tool call] fetch https://x.example/share?token=abc123",
+    }
+
+    def _sweep(self, text):
+        scrubbed = {"sessions": [{"session_id": "s1", "transcript": text}], "memory": {}}
+        return scrub.leak_sweep(scrubbed, [])
+
+    def test_ordinary_transcript_content_is_not_a_leak(self):
+        for label, text in self.ORDINARY.items():
+            with self.subTest(label):
+                ok, reason = self._sweep(text)
+                self.assertTrue(ok, f"{label} was rejected as {reason!r}")
+
+    def test_real_identifiers_are_still_caught(self):
+        for label, text in self.IDENTIFIERS.items():
+            with self.subTest(label):
+                ok, _ = self._sweep(text)
+                self.assertFalse(ok, f"{label} was not caught")
+
+    def test_a_whole_realistic_transcript_passes(self):
+        # The shape that matters: many of the ordinary cases at once, as one batch.
+        ok, reason = self._sweep("\n".join(self.ORDINARY.values()))
+        self.assertTrue(ok, f"a realistic transcript was rejected as {reason!r}")
+
+    def test_one_identifier_among_ordinary_content_still_fails_the_batch(self):
+        text = "\n".join(list(self.ORDINARY.values())
+                          + ["[agent] emailed chef@mariospizzeria.example"])
+        ok, _ = self._sweep(text)
+        self.assertFalse(ok, "an email hiding among ordinary content was missed")
+
+
+class ScrubReplyDiagnosticsTest(unittest.TestCase):
+    """An unparseable reply used to log "produced nothing", which reads identically to a
+    call that never happened — and hid four consecutive failures in production."""
+
+    def test_an_unparseable_reply_reports_its_size_and_tail(self):
+        import io
+        import contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            out = scrub.scrub_batch(_records(), {},
+                                    _fn("here is your scrubbed text, no JSON at all"))
+        self.assertIsNone(out)
+        log = buf.getvalue()
+        self.assertIn("did not parse as JSON", log)
+        self.assertIn("chars out", log)
+        self.assertIn("no JSON at all", log)          # the tail, for diagnosis
+
+    def test_a_reply_stopping_mid_structure_says_so(self):
+        import io
+        import contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            scrub.scrub_batch(_records(), {},
+                              _fn('{"sessions": [{"transcript": "half a docum'))
+        self.assertIn("ends mid-structure", buf.getvalue())
 
 
 class LeakSweepEscapingTest(unittest.TestCase):
@@ -387,7 +490,9 @@ class ScrubAndVerifyTest(unittest.TestCase):
         self.assertEqual(calls, [])
 
     def test_leaked_identifier_is_rejected(self):
-        leaky = _scrubbed(SCRUBBED_TRANSCRIPT.replace("ok", "ok, ref 90210221"))
+        # An email survives the rewrite: a shape the sweep still catches on its own,
+        # before the paid gate is asked anything.
+        leaky = _scrubbed(SCRUBBED_TRANSCRIPT.replace("ok", "ok, chef@mario.example"))
         out = scrub.scrub_and_verify(_records(), {}, _fn(json.dumps(leaky)),
                                      _fn('{"safe": true}'))
         self.assertIsNone(out)
