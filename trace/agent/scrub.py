@@ -54,10 +54,14 @@ VERIFY_MODEL = config.SCRUB_VERIFY_MODEL
 # lessons are the most useful thing in a bundle, far more so than its raw transcripts.
 # If amplification ever shows up in practice, the fix is to mark peer-derived lessons in
 # the file so the next cycle can drop them first — not to stop publishing the document.
-# An EXCLUSION, not a whitelist, since the learning engine may now create documents of
-# its own: a store is whatever is in it, and a /playbook.md this agent worked out is
-# exactly the kind of thing a similar agent should see.
-UNSHAREABLE_DOCS = (config.MEMORY_SHARED_DOC,)
+# An EXCLUSION, not a whitelist: a store is whatever the engine has put in it, and a
+# /playbook.md this agent worked out is exactly the kind of thing a similar agent should
+# see. Two documents never travel. The STATUS file is live workflow state: the densest
+# concentration of current customer names and order references in the store and the least
+# transferable thing in it. The SHARED file is what Trace wrote INTO this store — republishing
+# it would send other agents' material back out under this agent's name, and corroboration
+# counts would be counting echoes instead of independent observations.
+UNSHAREABLE_DOCS = (config.MEMORY_STATUS_DOC, config.MEMORY_SHARED_DOC)
 
 
 def _default_model_fn(model=DEFAULT_MODEL):

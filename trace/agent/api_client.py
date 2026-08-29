@@ -426,9 +426,12 @@ class ManagedAgentsClient:
         document keeps its content — a redeploy never wipes memory); any other seed
         failure raises (fail loud — a half-initialized store is worse than a failed
         deploy). Returns ``{id, reused}``."""
-        documents = documents or [(config.MEMORY_STATUS_DOC, config.MEMORY_STATUS_SEED),
-                                  (config.MEMORY_LESSONS_DOC, config.MEMORY_LESSONS_SEED),
-                                  (config.MEMORY_SHARED_DOC, config.MEMORY_SHARED_SEED)]
+        # The STATUS document and nothing else. A store used to be seeded with three
+        # files chosen by Trace; it now starts with live state alone, and every other
+        # document exists because the self-improvement engine decided that agent's work
+        # needed one. Seeding a lessons file here would be Trace deciding the shape of a
+        # memory the engine is supposed to discover per workflow.
+        documents = documents or [(config.MEMORY_STATUS_DOC, config.MEMORY_STATUS_SEED)]
         stores = self._agents_ns("memory_stores")
         store_id, reused = None, False
         try:

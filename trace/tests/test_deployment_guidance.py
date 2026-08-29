@@ -160,19 +160,27 @@ class SharedDocumentTest(unittest.TestCase):
         from trace.agent import api_client
         src = inspect.getsource(api_client.ManagedAgentsClient.create_or_reuse_memory_store)
         head = src.split("stores = self._agents_ns")[0]     # the `documents = ...` default
-        self.assertIn("MEMORY_SHARED_DOC", head,
-                      "the shared-lessons document is not in the default seed list, so "
-                      "stores are created without it and nothing can be delivered")
-        self.assertIn("MEMORY_STATUS_DOC", head)            # the others must survive too
-        # lessons_learned.md is still seeded — it is the document the LEARNING ENGINE
-        # writes (learn.py). What changed is only who authors it: the agent no longer
-        # appends to it, so the engine is not rewriting over the top of its subject.
-        self.assertIn("MEMORY_LESSONS_DOC", head)
+        # ONLY live state is seeded now. A store's shape past that is the
+        # self-improvement engine's to discover per workflow, so shipping a lessons file
+        # with every agent was Trace deciding it in advance for all of them.
+        self.assertIn("MEMORY_STATUS_DOC", head)
+        self.assertNotIn("MEMORY_LESSONS_DOC", head)
+        # The shared document is not seeded either, and does not need to be: it is
+        # written on demand, and write_memory creates a path that does not exist. A
+        # fresh store therefore holds live state alone and delivery still works.
+        self.assertNotIn("MEMORY_SHARED_DOC", head)
 
     def test_the_run_directive_tells_the_agent_to_read_it(self):
-        """Without this the file is written and never opened."""
-        self.assertIn("shared_lessons.md", agent_config.MEMORY_UPDATE_DIRECTIVE)
-        self.assertIn("shared_lessons.md", agent_config.MEMORY_STORE_DESCRIPTION)
+        """Without this the file is written and never opened.
+
+        The rule is general rather than a clause naming this file: the engine can create
+        documents nobody anticipated, so an instruction that lists filenames goes stale
+        the first time it does. "List the directory and read every file" covers a document
+        Trace writes and one the engine invented equally."""
+        d = agent_config.MEMORY_UPDATE_DIRECTIVE
+        self.assertIn("LIST that directory", d)
+        self.assertIn("read EVERY file in it", d)
+        self.assertIn("read every file in it", agent_config.MEMORY_STORE_DESCRIPTION)
 
     def test_the_agent_is_told_not_to_edit_it(self):
         """The rule is general now, not one clause about shared_lessons.md.
@@ -197,19 +205,72 @@ class SharedDocumentTest(unittest.TestCase):
         self.assertNotIn("APPEND to", d)
         self.assertIn("do not write up lessons or retrospectives", d)
         self.assertIn("current_workflow_status.md is the ONLY file you write", d)
-        # The file still exists and the agent still READS it — the learning engine
-        # writes it. Two writers on one document was the bug: the engine rewrites it
-        # wholesale each cycle, so an agent's appends were discarded by the next cycle
-        # and, until then, read back to the engine as its own prior output.
-        self.assertIn("lessons_learned.md", d)
-        self.assertTrue(hasattr(agent_config, "MEMORY_LESSONS_DOC"))
-        self.assertIn("lessons_learned.md", agent_config.MEMORY_STORE_DESCRIPTION)
+        # The directive no longer NAMES a lessons file, because there may not be one:
+        # whether this agent has one, and what it is called, is the engine's decision.
+        # The prohibition is on writing anything but the ledger, which covers a file
+        # that does not exist yet as cleanly as one that does.
+        self.assertNotIn("lessons_learned.md", d)
 
     def test_the_agent_still_tracks_its_progress(self):
         """The half that stays: the cumulative ledger is what stops re-doing work."""
         d = agent_config.MEMORY_UPDATE_DIRECTIVE
         self.assertIn("REWRITE current_workflow_status.md", d)
         self.assertIn("Already handled", d)
+
+
+class StoreSeedingTest(unittest.TestCase):
+    """A store now starts with live state and nothing else.
+
+    shared_lessons.md is written by _deliver_guidance when there is something to say, and
+    lessons_learned.md exists only if the self-improvement engine decides this agent wants
+    one. Seeding either would be Trace deciding in advance the shape of a memory the
+    engine is meant to discover per workflow."""
+
+    def test_only_the_status_document_is_seeded(self):
+        seeded = []
+
+        class FakeMemories:
+            def list(self, *a, **k):
+                return []
+
+            def create(self, store_id, path=None, content=None):
+                seeded.append(path)
+                return {"id": "mem_1"}
+
+        class FakeStores:
+            memories = FakeMemories()
+
+            def list(self, *a, **k):
+                return []
+
+            def create(self, **kw):
+                return {"id": "memstore_1"}
+
+        from trace.tests.test_agent_api_client import _NSClient
+        client = _NSClient.build({"memory_stores": FakeStores()})
+        client.create_or_reuse_memory_store("store-name", "desc")
+        self.assertEqual(seeded, [agent_config.MEMORY_STATUS_DOC])
+
+
+class MemoryOwnershipTest(unittest.TestCase):
+    """Who may write what. Two documents have a writer that is not the engine, and both
+    are unreachable to it in code rather than merely discouraged in a prompt."""
+
+    def test_the_engine_cannot_write_either_trace_or_agent_owned_document(self):
+        from trace.agent import learn
+        self.assertIsNone(learn._doc_path(agent_config.MEMORY_STATUS_DOC))
+        self.assertIsNone(learn._doc_path(agent_config.MEMORY_SHARED_DOC))
+
+    def test_the_engine_can_write_anything_else(self):
+        from trace.agent import learn
+        self.assertEqual(learn._doc_path("/whatever_it_invents.md"),
+                         "/whatever_it_invents.md")
+
+    def test_the_agent_is_told_status_is_the_only_file_it_writes(self):
+        self.assertIn("ONLY file you write", agent_config.MEMORY_UPDATE_DIRECTIVE)
+
+    def test_the_agent_is_no_longer_told_to_append_lessons(self):
+        self.assertNotIn("lessons_learned", agent_config.MEMORY_UPDATE_DIRECTIVE)
 
 
 if __name__ == "__main__":

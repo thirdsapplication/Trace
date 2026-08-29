@@ -262,21 +262,22 @@ class LearningCycleTest(_CycleHarness):
         self.assertEqual(len(cycles), 1, "a clean answer must reset the counter")
         self.assertEqual(cycles[0]["docs_written"], [])
 
-    def test_the_engine_may_rewrite_and_create_any_document(self):
-        """The engine owns the whole store: the founding documents and new ones alike.
-        This replaces an earlier contract in which only the lessons file could be
-        touched — see learn.py's module docstring for what that widening costs."""
+    def test_the_engine_may_rewrite_and_create_any_document_but_live_state(self):
+        """The engine owns the store: documents it made and documents it inherits alike.
+        The one exception is live state, and it is an exception the engine cannot reach
+        rather than one it is asked to respect."""
         self.state.learn_fn = lambda s, u: json.dumps({
             "analysis": "x",
             "docs": {agent_config.MEMORY_LESSONS_DOC: "rewritten",
-                     agent_config.MEMORY_STATUS_DOC: "restructured",
+                     agent_config.MEMORY_STATUS_DOC: "a ledger rewrite, refused",
                      "/playbook.md": "a document that did not exist before"}})
         self._seed_runs(self.N)
         t = self.state.maybe_run_learning_cycle(self.agent)
         t.join(timeout=10)
         self.assertEqual(sorted(w["path"] for w in self.client.written),
-                         sorted([agent_config.MEMORY_LESSONS_DOC,
-                                 agent_config.MEMORY_STATUS_DOC, "/playbook.md"]))
+                         sorted([agent_config.MEMORY_LESSONS_DOC, "/playbook.md"]))
+        self.assertNotIn(agent_config.MEMORY_STATUS_DOC,
+                         [w["path"] for w in self.client.written])
 
     def test_a_path_that_is_not_a_store_path_is_never_written(self):
         """What the engine no longer chooses is WHICH documents exist; what it still

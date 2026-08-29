@@ -54,17 +54,23 @@ def _raiser(exc=RuntimeError("boom")):
 
 
 class BuildPayloadTest(unittest.TestCase):
-    def test_only_whitelisted_docs_travel(self):
+    def test_live_state_never_travels(self):
+        # An EXCLUSION, not a whitelist: whatever the engine has built for this agent
+        # goes, because a document it worked out is exactly what a similar agent should
+        # see. What never goes is the status file — live workflow state is the densest
+        # concentration of current customer names and order references in the store, and
+        # the least transferable thing in it.
         docs = {config.MEMORY_LESSONS_DOC: "lessons",
-                config.MEMORY_STATUS_DOC: "status",
-                config.MEMORY_SHARED_DOC: "fleet lessons from other agents"}
+                "/playbook.md": "a document the engine invented",
+                config.MEMORY_STATUS_DOC: "live state: order 8891 for a real customer"}
         payload = scrub.build_payload(_records(), docs)
         self.assertEqual(set(payload["memory"]),
-                         {config.MEMORY_LESSONS_DOC, config.MEMORY_STATUS_DOC})
+                         {config.MEMORY_LESSONS_DOC, "/playbook.md"})
+        self.assertNotIn("8891", json.dumps(payload))
 
     def test_unreadable_and_empty_docs_are_dropped(self):
         payload = scrub.build_payload(_records(), {config.MEMORY_LESSONS_DOC: None,
-                                                   config.MEMORY_STATUS_DOC: "   "})
+                                                   "/playbook.md": "   "})
         self.assertEqual(payload["memory"], {})
 
     def test_transcript_and_doc_are_clipped(self):
@@ -629,9 +635,9 @@ class ScrubAndVerifyTest(unittest.TestCase):
         self.assertEqual(out["sessions"][0]["status"], "completed")
         self.assertEqual(out["sessions"][0]["tokens"]["total_tokens"], 4510)
 
-    def test_non_whitelisted_doc_in_the_answer_is_dropped(self):
+    def test_live_state_invented_into_the_answer_is_dropped(self):
         payload = _scrubbed()
-        payload["memory"][config.MEMORY_SHARED_DOC] = "fleet lessons"
+        payload["memory"][config.MEMORY_STATUS_DOC] = "live state"
         out = scrub.scrub_and_verify(_records(), {}, _fn(json.dumps(payload)),
                                      _fn('{"safe": true}'))
         self.assertEqual(set(out["memory"]), {config.MEMORY_LESSONS_DOC})

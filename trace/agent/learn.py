@@ -121,6 +121,13 @@ def _doc_path(path):
         p = "/" + p
     if len(p) > MAX_DOC_PATH or ".." in p:
         return None
+    if p in config.UNWRITABLE_DOCS:
+        # The status document. Enforced here rather than argued in the prompt: it is the
+        # one file with a second author (the agent rewrites it every session) and the one
+        # whose loss reaches a customer, since its "Already handled" ledger is what stops
+        # a finished email being sent twice. A path the engine cannot produce needs no
+        # invariant over its contents.
+        return None
     return p if _PATH_OK.match(p) else None
 
 

@@ -105,15 +105,27 @@ class SanitizeDocsTest(unittest.TestCase):
         not, whatever the model asked for."""
         out = learn._sanitize_docs({
             config.MEMORY_LESSONS_DOC: "new lessons",
-            config.MEMORY_STATUS_DOC: "a restructured status",
-            config.MEMORY_SHARED_DOC: "overwritten before every run, but allowed",
             "/playbook.md": "a document that did not exist before",
+            "/tool_recipes.md": "and another",
         })
         self.assertEqual(out, {config.MEMORY_LESSONS_DOC: "new lessons",
-                               config.MEMORY_STATUS_DOC: "a restructured status",
-                               config.MEMORY_SHARED_DOC:
-                                   "overwritten before every run, but allowed",
-                               "/playbook.md": "a document that did not exist before"})
+                               "/playbook.md": "a document that did not exist before",
+                               "/tool_recipes.md": "and another"})
+
+    def test_the_status_document_can_never_be_written(self):
+        # The one file the engine cannot reach. It has a second author (the agent
+        # rewrites it every session) and it holds the "Already handled" ledger, so a
+        # dropped entry is a real email sent twice. Enforced as a path the engine cannot
+        # produce rather than as an invariant over the file's contents.
+        out = learn._sanitize_docs({config.MEMORY_STATUS_DOC: "a restructured status",
+                                    "current_workflow_status.md": "without the slash",
+                                    config.MEMORY_LESSONS_DOC: "this one lands"})
+        self.assertEqual(out, {config.MEMORY_LESSONS_DOC: "this one lands"})
+
+    def test_the_status_document_can_never_be_deleted(self):
+        self.assertEqual(
+            learn._sanitize_deletes([config.MEMORY_STATUS_DOC, "/stale.md"], {}),
+            ["/stale.md"])
 
     def test_a_path_that_is_not_a_store_path_is_dropped(self):
         out = learn._sanitize_docs({

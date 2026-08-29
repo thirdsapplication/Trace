@@ -2148,7 +2148,7 @@ class AppState:
             if not agent_config.LEARNING_ENABLED:           # TRACE_LEARNING_ENABLED=0
                 return None
             if not agent.get("memory_store_id"):
-                # pre-memory agents keep working, as in _deliver_guidance
+                # pre-memory agents keep working rather than erroring
                 if verbose:
                     print(f"[learning] {aid} has no memory store — deployed before "
                           f"memory stores existed; redeploy it to enable learning",
@@ -2297,10 +2297,11 @@ class AppState:
         if docs is None:
             print(f"[learning] could not list the memory store for {aid} — falling "
                   f"back to the three founding documents", flush=True)
-            docs = {p: client.read_memory(store_id, p)
-                    for p in (agent_config.MEMORY_STATUS_DOC,
-                              agent_config.MEMORY_LESSONS_DOC,
-                              agent_config.MEMORY_SHARED_DOC)}
+            # Status only: it is the one document guaranteed to exist. Everything else
+            # in a store is there because the engine created it, so there is no list of
+            # names to fall back to — an unlistable store simply reasons on live state.
+            docs = {agent_config.MEMORY_STATUS_DOC:
+                    client.read_memory(store_id, agent_config.MEMORY_STATUS_DOC)}
         prior = []
         for c in registry.learning_cycles_for_agent(self.sessions_root, aid, limit=3):
             stats = c.get("session_stats") or []

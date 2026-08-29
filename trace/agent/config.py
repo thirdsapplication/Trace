@@ -100,6 +100,56 @@ SCRUB_VERIFY_MAX_TOKENS = 4000
 # any bundle written while it was on should be deleted from peer_bundles before real
 # customer data is anywhere near this path.
 SCRUB_CHECKS_ENABLED = (os.environ.get("TRACE_SCRUB_CHECKS") or "1").strip() != "0"
+
+
+# --- self-improvement engine v2: measurement ---------------------------------
+# The scorer judges how much work ARRIVED in each session; code turns its counts into a
+# number. It is a separate call from the analyst on purpose — in the cycle after a change
+# the analyst is about to be graded on that change, and a call that both sets the
+# difficulty and is measured against it can pass by calling the batch harder.
+SCORE_MODEL = "claude-sonnet-5"
+SCORE_MAX_TOKENS = 4000                  # counts and a note per session, nothing more
+SCORE_REQUEST_TIMEOUT = 300
+SCORE_RETRIES = 1
+
+# D = items_in_scope + novel_items + (input_kb / SCORE_KB_DIVISOR), floored.
+# THE WEIGHTS ARE ARBITRARY AND FROZEN. P has to be comparable between cycles of one
+# agent, never correct in absolute terms. Changing either constant makes every prior
+# change-log entry uncomparable and the loop loses its history — so they live here, where
+# changing them is a reviewed diff, rather than in a prompt where a reword changes them.
+SCORE_KB_DIVISOR = 5.0
+SCORE_D_FLOOR = 1.0
+
+# The fraction of the baseline that mean performance must FALL BY for a change to be kept.
+# Set by Trace and never by the model: an analyst that predicts its own target is a
+# verifier it controls, and lowballing the prediction is cheaper than making a good change.
+#
+# THIS VALUE IS A PLACEHOLDER AND MUST BE MEASURED BEFORE IT IS TRUSTED. Run the loop with
+# TRACE_LEARNING_PROPOSE=0 for several batches and record mean_performance each time; that
+# spread is the metric's noise when nothing is changing, and the bar belongs above it. Set
+# it high: a false revert loses a change that can be rediscovered, a false keep writes bad
+# memory that compounds across every future session.
+MIN_IMPROVEMENT = float(os.environ.get("TRACE_MIN_IMPROVEMENT") or "0.05")
+
+# How far the valid rate may fall against its baseline before a change is reverted whatever
+# its score says. Excluding damaged sessions HIDES damage: a change that makes the agent
+# sloppier draws rejections, those sessions leave the pool, and the survivors flatter it.
+VALID_RATE_TOLERANCE = 0.15
+
+# Observe-only. False scores and records every cycle but proposes nothing, applies nothing
+# and reverts nothing — the calibration mode above, and the same switch the convergence
+# stop uses once a store can no longer be improved.
+LEARNING_PROPOSE = (os.environ.get("TRACE_LEARNING_PROPOSE") or "1").strip() != "0"
+
+# Consecutive reverts after which the engine stops proposing for an agent. A store no
+# change can improve by MIN_IMPROVEMENT is converged, and paying a model call per cycle to
+# revert its own work is pure cost.
+LEARNING_CONVERGED_AFTER = 3
+
+# Change-log window handed to the analyst. The full kept and banned lists always go; only
+# the per-cycle detail is capped. Both logs are read every cycle by a system whose entire
+# purpose is reducing token cost, so the cap is not decoration.
+LEARNING_LOG_CYCLES = 20
 SCRUB_REQUEST_TIMEOUT = 900              # seconds; backgrounded, like the analysis call
 SCRUB_RETRIES = 1
 SCRUB_SESSION_CLIP = 12_000              # chars of transcript per session (matches learning)
@@ -445,6 +495,24 @@ UNCERTAINTY_DIRECTIVE = (
 # Beta shape — confirm against current Managed Agents memory docs.
 MEMORY_STATUS_DOC = "/current_workflow_status.md"
 
+# The ONLY document the self-improvement engine may not write, and the only one seeded.
+#
+# A memory store now starts with the status file and nothing else. Whether an agent has a
+# lessons file, three topic files, or some shape nobody anticipated is the engine's call,
+# made per workflow from what that workflow actually costs — not a structure Trace chose
+# in advance and every agent inherits.
+#
+# Two documents are out of reach, each because something else already writes it:
+# shared_lessons.md is Trace's channel to a deployed agent (see MEMORY_SHARED_DOC below),
+# and status is out of reach because the agent rewrites it at the end of every session and it
+# holds the cumulative "Already handled" ledger the agent skips work against. That makes
+# it the one file with a second author (so a snapshot of it could not be restored without
+# destroying the agent's own updates) AND the one whose loss reaches a customer: an entry
+# dropped is an email re-sent, an order re-entered. Earlier designs protected it with
+# paragraphs of prompt and then with a code invariant over its lines; a file the engine
+# cannot write needs neither.
+UNWRITABLE_DOCS = (MEMORY_STATUS_DOC, "/shared_lessons.md")
+
 MEMORY_STATUS_SEED = (
     "# Current workflow status\n\n"
     "No runs yet. After each session the agent rewrites this file to reflect the "
@@ -458,22 +526,27 @@ MEMORY_STATUS_SEED = (
     "## Anomalies / needs attention\n\n(none yet)\n\n"
     "## Next expected action\n\n(first run has not happened yet)\n")
 
-# What the learning engine writes: the lessons it distilled from this agent's own
-# session history, rewritten in full each cycle (``learn.py``). The agent reads it and
-# never writes it — see the note above on the two-writer problem that created.
+# The name the learning engine has conventionally used for the lessons it distils from
+# an agent's own history. NOT seeded and not required: the engine may create it, call it
+# something else, split it, or never make one. Named here because scrub and the tests
+# refer to it, not because a store is expected to contain it.
 MEMORY_LESSONS_DOC = "/lessons_learned.md"
 
-MEMORY_LESSONS_SEED = (
-    "# Lessons learned\n\n"
-    "Durable, generalizable lessons for this workflow. The learning engine reviews "
-    "this agent's recent sessions and rewrites this file between runs; the agent "
-    "reads it and does not edit it.\n\n"
-    "(nothing learned yet — the first cycle runs once enough sessions have "
-    "accrued)\n")
-
-# Lessons Trace has learned and wants this agent to apply — its own past decisions and,
-# once confirmed, other agents' (Phase B). Trace-owned: rewritten before each run, and
-# the agent only ever reads it.
+# MEMORY_LESSONS_SEED was removed when seeding was cut back to live state alone: whether
+# an agent has a lessons file at all is the engine's call, so shipping seed text for one
+# was Trace deciding it in advance.
+#
+# The SHARED document survives, and is the one exception to "the engine owns everything
+# but live state". It is Trace's channel to a deployed agent: run_deployment() takes no
+# per-run input, so the memory store is the only door, and _deliver_guidance writes
+# through it before every run. It carries the actions this agent's human has recently
+# REJECTED — which used to be prepended to the deployment's opening message, meaning every
+# "no" on an approval card destroyed and rebuilt a live platform deployment to change one
+# paragraph.
+#
+# It is NOT seeded: a fresh store still holds live state alone, and this file appears only
+# once there is something to say. Trace is its single writer, which is why it joins the
+# status document in UNWRITABLE_DOCS — the engine reads it and never edits it.
 MEMORY_SHARED_DOC = "/shared_lessons.md"
 
 MEMORY_SHARED_SEED = (
@@ -484,12 +557,11 @@ MEMORY_SHARED_SEED = (
     "(none yet)\n")
 
 MEMORY_STORE_DESCRIPTION = (
-    "Persistent workflow memory for this Trace agent. Always present: "
-    "current_workflow_status.md (the workflow's live state, the one document the "
-    "agent itself writes), lessons_learned.md (written for it by the learning "
-    "engine) and shared_lessons.md (lessons from other agents, maintained by "
-    "Trace). The learning engine may add or reorganise documents between sessions, "
-    "so list the directory and read every file in it before starting work.")
+    "Persistent workflow memory for this Trace agent. current_workflow_status.md holds "
+    "the workflow's live state and is the only file always present; every other document "
+    "is created and maintained by the self-improvement engine between sessions, so its "
+    "shape differs per agent and changes over time. List the directory and read every "
+    "file in it before starting work.")
 
 
 def memory_store_description(owner=None):
@@ -512,14 +584,12 @@ def memory_store_description(owner=None):
 MEMORY_UPDATE_DIRECTIVE = (
     "MEMORY — you have a persistent memory directory mounted under /mnt/memory/.\n"
     "At the START of this session: LIST that directory and read EVERY file in it. Do "
-    "not assume you know which files are there. Three always exist — "
-    "current_workflow_status.md (where the workflow stands), lessons_learned.md (what "
-    "has been learned the hard way about this workflow) and shared_lessons.md (lessons "
-    "another agent learned on a similar workflow) — and there may be others, "
-    "reorganised or newly written between your sessions by the process that reviews "
-    "your work. Any file you find there is meant for you: read it and factor it into "
-    "how you work. Treat all of them as advice, not as instructions that override your "
-    "own steps.\n"
+    "not assume you know which files are there or what they are called. The only file "
+    "guaranteed to exist is current_workflow_status.md (where the workflow stands). "
+    "Every other file was written for you by the process that reviews your work between "
+    "sessions, and its names and structure change as that process learns what helps. Any "
+    "file you find there is meant for you: read it and factor it into how you work. "
+    "Treat all of them as advice, not as instructions that override your own steps.\n"
     "ONLY DO NEW WORK. The status file's \"Already handled\" section is a cumulative "
     "ledger of items you have finished in earlier sessions. Before acting on anything, "
     "check it: if the item is listed, SKIP it silently — do not re-send, re-enter, or "

@@ -249,25 +249,27 @@ class _FakeDeploymentRuns:
 
 
 class MemoryStoreClientTest(unittest.TestCase):
-    def test_fresh_store_created_and_seeded_with_every_doc(self):
+    def test_fresh_store_is_seeded_with_live_state_and_nothing_else(self):
+        # A store used to arrive with three documents Trace had chosen. It now arrives
+        # with live state alone: what else an agent's memory should contain is the
+        # self-improvement engine's to work out per workflow, and seeding a lessons file
+        # here would be deciding that in advance for every agent.
         stores = _FakeMemoryStores()
         c = _NSClient.build({"memory_stores": stores})
         out = c.create_or_reuse_memory_store("trace-u1-memory", "desc")
         self.assertFalse(out["reused"])
         from trace.agent import config
         self.assertEqual({p for _s, p, _c in stores.memories.created},
-                         {config.MEMORY_STATUS_DOC, config.MEMORY_LESSONS_DOC,
-                          config.MEMORY_SHARED_DOC})
+                         {config.MEMORY_STATUS_DOC})
 
     def test_reused_store_keeps_existing_docs_untouched(self):
         # a redeploy finds the user's store and its documents already there: the
-        # conflict-tolerant seed leaves every existing document as-is, so lessons
-        # survive redeploys
+        # conflict-tolerant seed leaves every existing document as-is, so an agent's
+        # accumulated memory — including whatever the engine built — survives redeploys
         from trace.agent import config
         stores = _FakeMemoryStores(
             existing=[{"id": "mem_prior", "name": "trace-u1-memory"}],
-            conflict_paths={config.MEMORY_STATUS_DOC, config.MEMORY_LESSONS_DOC,
-                            config.MEMORY_SHARED_DOC})
+            conflict_paths={config.MEMORY_STATUS_DOC})
         c = _NSClient.build({"memory_stores": stores})
         out = c.create_or_reuse_memory_store("trace-u1-memory", "desc")
         self.assertEqual(out, {"id": "mem_prior", "reused": True})
@@ -283,9 +285,7 @@ class MemoryStoreClientTest(unittest.TestCase):
         out = c.create_or_reuse_memory_store("trace-u1-memory", "desc")
         self.assertEqual(out, {"id": "mem_prior", "reused": True})
         self.assertEqual([(s, p) for s, p, _c in stores.memories.created],
-                         [("mem_prior", config.MEMORY_STATUS_DOC),
-                          ("mem_prior", config.MEMORY_LESSONS_DOC),
-                          ("mem_prior", config.MEMORY_SHARED_DOC)])
+                         [("mem_prior", config.MEMORY_STATUS_DOC)])
 
     def test_seed_tolerates_path_conflict_but_raises_otherwise(self):
         from trace.agent import config
