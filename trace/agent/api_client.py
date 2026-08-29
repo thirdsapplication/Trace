@@ -474,6 +474,65 @@ class ManagedAgentsClient:
                 return _idof(m)
         return None
 
+    def list_memory(self, store_id):
+        """Every document in the store as ``{path: text}``, or None when the store
+        cannot be listed.
+
+        One call, not one per path. The learning cycle used to read three documents it
+        knew by name; now that it may create and delete documents of its own, the set is
+        whatever is actually there — and a per-path read of an unknown set is not a thing
+        that can be written. A document whose content the listing does not carry is
+        included with None rather than dropped, so a caller can tell "this exists and I
+        could not read it" from "this does not exist"; substituting a seed or an empty
+        string for either would read as memory that had been wiped.
+
+        Best-effort — never raises."""
+        try:
+            memories = self._agents_ns("memory_stores").memories
+        except Exception:                                  # noqa: BLE001
+            return None
+        try:
+            res = _retry(lambda: memories.list(store_id, view="full"))
+        except TypeError:                                  # SDK without the view kwarg
+            try:
+                res = _retry(lambda: memories.list(store_id))
+            except Exception:                              # noqa: BLE001
+                return None
+        except Exception:                                  # noqa: BLE001
+            return None
+        out = {}
+        for m in _data(res) or []:
+            if _attr(m, "type") == "memory_prefix":        # a directory node, not a doc
+                continue
+            path = _attr(m, "path")
+            if not path:
+                continue
+            out[path] = _memory_text(m)
+        return out
+
+    def delete_memory(self, store_id, path):
+        """Remove the memory document at ``path``. True when it is gone (including when
+        it was never there), False when the delete was refused.
+
+        Id-addressed like update, for the reason write_memory's docstring records: only
+        create is path-addressed, and the earlier guess of a path-addressed delete failed
+        in production. Best-effort — never raises."""
+        try:
+            memories = self._agents_ns("memory_stores").memories
+        except Exception:                                  # noqa: BLE001
+            return False
+        mem_id = self._find_memory_id(store_id, path)
+        if not mem_id:
+            return True                                    # already absent is the goal state
+        try:
+            _retry(lambda: memories.delete(mem_id, memory_store_id=store_id))
+        except Exception as e:                             # noqa: BLE001
+            print(f"[memory] could not delete {path} from store {store_id}: "
+                  f"{type(e).__name__}: {str(e)[:120]}", flush=True)
+            return False
+        print(f"[memory] deleted {path}", flush=True)
+        return True
+
     def read_memory(self, store_id, path):
         """The text content of the memory document at ``path``, or None when it
         cannot be read. Documented shape: ``memories.list(store_id, view="full")``

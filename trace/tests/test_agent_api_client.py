@@ -371,6 +371,59 @@ class WriteMemoryTest(unittest.TestCase):
     could never clear the existing document.
     """
 
+    def test_list_memory_returns_every_document_in_one_call(self):
+        """The cycle no longer knows the store's paths in advance — the engine creates
+        and deletes documents — so it lists. One call, not one read per path, and a
+        directory node is not a document."""
+        m = RealShapeMemories(docs={"/lessons_learned.md": "lessons",
+                                    "/playbook.md": "a document the engine wrote"})
+        c = _memories_client(m)
+        self.assertEqual(c.list_memory("memstore_1"),
+                         {"/lessons_learned.md": "lessons",
+                          "/playbook.md": "a document the engine wrote"})
+
+    def test_list_memory_reports_an_unreadable_document_as_none_not_absent(self):
+        """"exists but I could not read it" and "does not exist" must not collapse:
+        the caller renders the first as "(unavailable)" and would otherwise hand the
+        model an empty document, which reads as memory that has been wiped."""
+        m = RealShapeMemories(docs={"/lessons_learned.md": "lessons"},
+                              content_on_list=False)
+        c = _memories_client(m)
+        self.assertEqual(c.list_memory("memstore_1"), {"/lessons_learned.md": None})
+
+    def test_list_memory_skips_directory_nodes(self):
+        class WithPrefix(RealShapeMemories):
+            def list(self, store_id, **kw):
+                return [{"type": "memory_prefix", "id": "pre_0", "path": "/"}] + \
+                    super().list(store_id, **kw)
+        c = _memories_client(WithPrefix(docs={"/lessons_learned.md": "lessons"}))
+        self.assertEqual(c.list_memory("memstore_1"), {"/lessons_learned.md": "lessons"})
+
+    def test_list_memory_is_none_when_the_store_cannot_be_listed(self):
+        class Broken(RealShapeMemories):
+            def list(self, *a, **k):
+                raise RuntimeError("service unavailable")
+        self.assertIsNone(_memories_client(Broken()).list_memory("memstore_1"))
+
+    def test_delete_memory_removes_by_memory_id(self):
+        m = RealShapeMemories(docs={"/stale.md": "gone soon"})
+        c = _memories_client(m)
+        self.assertTrue(c.delete_memory("memstore_1", "/stale.md"))
+        self.assertEqual(m.deleted, [("mem_0", "memstore_1")])
+        self.assertNotIn("/stale.md", m.docs)
+
+    def test_deleting_an_absent_document_is_success_not_failure(self):
+        # The goal state is "not there"; a path that was never there is already in it.
+        c = _memories_client(RealShapeMemories())
+        self.assertTrue(c.delete_memory("memstore_1", "/never_existed.md"))
+
+    def test_a_refused_delete_is_false_not_an_exception(self):
+        class NoDelete(RealShapeMemories):
+            def delete(self, *a, **k):
+                raise RuntimeError("permission denied")
+        c = _memories_client(NoDelete(docs={"/stale.md": "stays"}))
+        self.assertFalse(c.delete_memory("memstore_1", "/stale.md"))
+
     def test_an_existing_document_is_updated_by_memory_id(self):
         m = RealShapeMemories(docs={"/lessons_learned.md": "old"})
         c = _memories_client(m)

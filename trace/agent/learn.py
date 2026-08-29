@@ -13,18 +13,28 @@ relearn its own waste, one customer at a time: the re-read another agent already
 worked out it could drop is a saving this one should not have to pay for twice. What
 peers do NOT do is widen anything. The material arrives already scrubbed and
 de-identified, it is read for technique rather than for fact (the prompt's hard
-rules), and ``_sanitize_docs`` still admits exactly one document, whoever the
+rules), and it can reach no document the agent's own sessions could not, whoever the
 lesson came from.
 
-Only ``lessons_learned.md`` may be rewritten: ``current_workflow_status.md`` is
-agent-owned (rewritten at end of every session) and ``shared_lessons.md`` is owned by
-the guidance path (rewritten before every run) — an edit to either would be clobbered
-or clobber. ``_sanitize_docs`` enforces that whitelist in code, whatever the model
-answered, because the transcripts it reads carry external content (a prompt-injection
-surface) and whatever this engine writes steers every future session.
+The engine owns the WHOLE store. It may rewrite any document, create documents that
+did not exist, and delete any document — the memory an agent runs on is its to design,
+not a fixed set of three files. That is a deliberate widening of an earlier contract in
+which only ``lessons_learned.md`` could be touched, and it carries a real hazard the
+code no longer guards: ``current_workflow_status.md`` holds the cumulative "Already
+handled" ledger that MEMORY_UPDATE_DIRECTIVE tells the agent to skip work against. A
+cycle that drops or paraphrases those entries makes the agent redo finished work
+against live systems — re-sent mail, re-entered orders. Nothing here prevents that;
+the system prompt carries the warning instead, by explicit product decision.
+
+What ``_sanitize_docs`` still enforces is that a path is a path: inside the store, no
+traversal, no absurd length, non-empty content, clipped to the size contract. The
+transcripts this engine reads carry external content written by outside parties (a
+prompt-injection surface) and whatever it writes steers every future session, so the
+shape of what it may write is checked in code even though the SET no longer is.
 """
 
 import json
+import re
 
 from . import activity, config, model_call
 from .configgen import _parse_json_object
@@ -32,8 +42,12 @@ from .learn_prompt import SYSTEM_PROMPT
 
 DEFAULT_MODEL = config.LEARNING_MODEL
 
-# The one document a learning cycle may rewrite (see module docstring).
-EDITABLE_DOCS = (config.MEMORY_LESSONS_DOC,)
+# A memory store is flat: documents live at "/name.md" under the mounted directory.
+# These bound what a PATH may be, not which paths exist — the engine may create any
+# document it wants, but not one whose name would escape the store, collide with a
+# directory node, or be unreadable to the agent that has to open it.
+MAX_DOC_PATH = 128
+_PATH_OK = re.compile(r"^/[A-Za-z0-9][A-Za-z0-9._-]*\.md$")
 
 
 def _default_model_fn(model):
@@ -92,18 +106,39 @@ def build_payload(agent, session_records, memory_docs, prior_cycles, peers=None)
     return payload
 
 
+def _doc_path(path):
+    """A model-supplied path normalised to a store path, or None if it is not one.
+
+    Tolerates a missing leading slash (the model writes "lessons_learned.md" as often
+    as "/lessons_learned.md") and rejects everything else on shape: a traversal
+    segment, a nested directory, a name that is not markdown, an absurd length. The
+    engine chooses WHICH documents exist; it does not get to choose whether a path is
+    a path."""
+    p = str(path or "").strip()
+    if not p:
+        return None
+    if not p.startswith("/"):
+        p = "/" + p
+    if len(p) > MAX_DOC_PATH or ".." in p:
+        return None
+    return p if _PATH_OK.match(p) else None
+
+
 def _sanitize_docs(docs):
-    """Enforce the edit whitelist in code, whatever the model said: keep only
-    EDITABLE_DOCS (tolerating a missing leading slash), with non-empty string
-    content, clipped to the size contract. Returns ``{path: content}``."""
+    """The documents this cycle may write: any valid store path, with non-empty string
+    content, clipped to the size contract. Returns ``{path: content}``.
+
+    No longer a whitelist — the engine owns the store (see the module docstring) — but
+    still a gate: a path that is not a path, or content that is not a non-empty string,
+    is dropped rather than handed to write_memory. An empty document is silently a
+    DELETED one from the agent's point of view, so it must come through the delete
+    channel where it is deliberate, not through a write that happened to be blank."""
     out = {}
     if not isinstance(docs, dict):
         return out
     for path, content in docs.items():
-        p = str(path or "")
-        if not p.startswith("/"):
-            p = "/" + p
-        if p not in EDITABLE_DOCS:
+        p = _doc_path(path)
+        if not p:
             continue
         if not isinstance(content, str) or not content.strip():
             continue
@@ -111,11 +146,30 @@ def _sanitize_docs(docs):
     return out
 
 
+def _sanitize_deletes(paths, written):
+    """The documents this cycle may delete: valid store paths, minus any it is also
+    writing in the same answer.
+
+    A path in both lists is a contradiction the model has to lose: applying them in
+    either order gives a different store, and the write is the one carrying content, so
+    the write survives and the delete is dropped. Returns a list, order preserved,
+    de-duplicated."""
+    out, seen = [], set()
+    for path in (paths or []):
+        p = _doc_path(path)
+        if not p or p in written or p in seen:
+            continue
+        seen.add(p)
+        out.append(p)
+    return out
+
+
 def analyze_batch(agent, session_records, memory_docs, prior_cycles, model_fn,
                   peers=None):
     """ONE analysis call over the batch. Returns ``{"analysis": str, "docs":
-    {path: content}}`` with docs already sanitized (possibly empty — a valid
-    "nothing to change"), or None when the call/parse failed. Never raises.
+    {path: content}, "delete": [path]}`` with both already sanitized (either may be
+    empty — empty in both is a valid "nothing to change"), or None when the call/parse
+    failed. Never raises.
 
     The distinction matters to the caller: None records NO cycle, so the same
     batch is retried later; an empty-docs result IS recorded, so a clean
@@ -138,5 +192,7 @@ def analyze_batch(agent, session_records, memory_docs, prior_cycles, model_fn,
         return None
     if not obj:
         return None
+    docs = _sanitize_docs(obj.get("docs") or {})
     return {"analysis": str(obj.get("analysis") or "").strip(),
-            "docs": _sanitize_docs(obj.get("docs") or {})}
+            "docs": docs,
+            "delete": _sanitize_deletes(obj.get("delete") or [], docs)}

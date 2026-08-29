@@ -46,7 +46,10 @@ VERIFY_MODEL = config.SCRUB_VERIFY_MODEL
 # lessons are the most useful thing in a bundle, far more so than its raw transcripts.
 # If amplification ever shows up in practice, the fix is to mark peer-derived lessons in
 # the file so the next cycle can drop them first — not to stop publishing the document.
-SCRUBBED_DOCS = (config.MEMORY_LESSONS_DOC, config.MEMORY_STATUS_DOC)
+# An EXCLUSION, not a whitelist, since the learning engine may now create documents of
+# its own: a store is whatever is in it, and a /playbook.md this agent worked out is
+# exactly the kind of thing a similar agent should see.
+UNSHAREABLE_DOCS = (config.MEMORY_SHARED_DOC,)
 
 
 def _default_model_fn(model=DEFAULT_MODEL):
@@ -93,15 +96,17 @@ def _clip_transcript(text):
 
 
 def _sanitize_memory(docs):
-    """Keep only SCRUBBED_DOCS, with non-empty string content, clipped. Applied on the way
-    IN and again on the way OUT: the model echoes back what it was handed, but its answer
-    is what gets published, so the whitelist is enforced in code both times."""
+    """Every document except UNSHAREABLE_DOCS, with non-empty string content, clipped.
+    Applied on the way IN and again on the way OUT: the model echoes back what it was
+    handed, but its answer is what gets published, so the rule is enforced in code both
+    times — including against a path the model invented, which would otherwise ride out
+    of here having never been swept."""
     out = {}
     if not isinstance(docs, dict):
         return out
     for path, text in docs.items():
         p = _norm_path(path)
-        if p not in SCRUBBED_DOCS:
+        if not p or p in UNSHAREABLE_DOCS:
             continue
         if not isinstance(text, str) or not text.strip():
             continue

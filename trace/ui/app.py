@@ -2248,13 +2248,27 @@ class AppState:
         # fan-out of platform reads for material we already paid for once.
         fp = agent_peers.fingerprint([ev for _, ev in kept])
         vec = self._peer_vector(agent, fp)
-        # All three docs go in as context (status + shared read-only; only lessons
-        # may come back edited, enforced by learn._sanitize_docs). A doc that
-        # cannot be read stays None -> "(unavailable)" in the payload — never
-        # substitute a seed, which could read as wiped memory.
-        docs = {p: client.read_memory(store_id, p)
-                for p in (agent_config.MEMORY_STATUS_DOC, agent_config.MEMORY_LESSONS_DOC,
-                          agent_config.MEMORY_SHARED_DOC)}
+        # The WHOLE store, listed rather than named. The engine may create and delete
+        # documents, so the set is whatever is actually there — reading three known
+        # paths would hide from it the documents it wrote itself last cycle, and it
+        # would then reason about a store it had already changed. One call, not one
+        # per path. A doc that cannot be read stays None -> "(unavailable)" in the
+        # payload; never substitute a seed, which reads as wiped memory. If the
+        # listing itself fails, fall back to the three founding documents rather than
+        # sending an empty store, which would invite a rewrite from nothing.
+        try:
+            docs = client.list_memory(store_id)
+        except Exception as e:                             # noqa: BLE001 — a cycle is worth
+            print(f"[learning] listing the memory store for {aid} raised "     # more than
+                  f"{_why(e)}", flush=True)                                    # a listing
+            docs = None
+        if docs is None:
+            print(f"[learning] could not list the memory store for {aid} — falling "
+                  f"back to the three founding documents", flush=True)
+            docs = {p: client.read_memory(store_id, p)
+                    for p in (agent_config.MEMORY_STATUS_DOC,
+                              agent_config.MEMORY_LESSONS_DOC,
+                              agent_config.MEMORY_SHARED_DOC)}
         prior = []
         for c in registry.learning_cycles_for_agent(self.sessions_root, aid, limit=3):
             stats = c.get("session_stats") or []
@@ -2285,6 +2299,19 @@ class AppState:
             except Exception as e:                         # noqa: BLE001 — write_memory is already loud
                 print(f"[learning] could not write {path} for {aid}: {_why(e)}",
                       flush=True)
+        # Deletions AFTER the writes. A cycle that splits one document into two
+        # answers with both the new files and the old path to remove; doing the
+        # delete first would leave the agent with nothing to read if the writes then
+        # failed, whereas this order's worst case is a stale document that the next
+        # cycle sees and can remove again.
+        docs_deleted = []
+        for path in (result.get("delete") or []):
+            try:
+                if client.delete_memory(store_id, path):
+                    docs_deleted.append(path)
+            except Exception as e:                         # noqa: BLE001 — delete_memory is already loud
+                print(f"[learning] could not delete {path} for {aid}: {_why(e)}",
+                      flush=True)
         stats = [{"session_id": rec["session_id"], "status": rec["status"],
                   "total_tokens": rec["tokens"]["total_tokens"],
                   "estimated": rec["tokens"]["estimated"]} for rec in records]
@@ -2295,13 +2322,18 @@ class AppState:
             "total_output_tokens": sum(r["tokens"]["output_tokens"] for r in records),
             "tokens_estimated": any(r["tokens"]["estimated"] for r in records),
             "analysis": result.get("analysis") or "",
-            "docs_written": docs_written,
+            # Deletions ride in docs_written with a marker rather than in a new column:
+            # 021 is applied in production and a migration to record a rarer event than
+            # the writes beside it is not worth an operator step. The prefix keeps the
+            # two readable apart in the admin view.
+            "docs_written": docs_written + [f"-{p}" for p in docs_deleted],
         }
         registry.learning_cycle_add(self.sessions_root, cycle)
         total = sum(s["total_tokens"] for s in stats)
         est = " (est)" if cycle["tokens_estimated"] else ""
+        deleted = f", deleted {', '.join(docs_deleted)}" if docs_deleted else ""
         print(f"[learning] cycle for {aid}: {len(stats)} sessions, {total} tokens{est}, "
-              f"wrote {', '.join(docs_written) or 'nothing'}", flush=True)
+              f"wrote {', '.join(docs_written) or 'nothing'}{deleted}", flush=True)
         # Publishing is deliberately the LAST thing the cycle does. It is a second long
         # model call behind a gate that fails closed, so it is the step most likely to
         # fail — and by now everything this cycle owed its own agent (the rewritten
@@ -2424,9 +2456,10 @@ class AppState:
             return False
         aid = agent.get("agent_id")
         try:
-            # _sanitize_memory drops everything outside scrub.SCRUBBED_DOCS, so all three
-            # cycle docs (unreadable ones included) can go in as they are — the whitelist
-            # is enforced there, in code, rather than restated at each call site.
+            # _sanitize_memory drops scrub.UNSHAREABLE_DOCS and anything unreadable, so
+            # the whole store can go in as it is — including documents the engine created
+            # itself, which are exactly what a similar agent should see. The rule lives
+            # there, in code, rather than restated at each call site.
             scrubbed = agent_scrub.scrub_and_verify(records, docs,
                                                     self._scrub_model_fn(),
                                                     self._scrub_verify_model_fn())

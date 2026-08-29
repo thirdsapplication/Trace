@@ -63,6 +63,7 @@ class FakeLearnClient:
         self.fetches = 0                       # list_session_events call count
         self.docs = {agent_config.MEMORY_LESSONS_DOC: "# Lessons learned\n- old lesson\n"}
         self.written = []                      # {store_id, path, content}
+        self.deleted = []                      # paths removed from the store
         # One interleaved order of the calls a cycle makes to anything outside itself.
         # `written` says WHAT was written, this says WHEN relative to everything else —
         # which is the only way to assert that publishing a peer bundle happens after
@@ -75,13 +76,24 @@ class FakeLearnClient:
             raise RuntimeError(f"Error code: 404 - Session not found: {session_id}")
         return list(self.events.get(session_id, []))
 
+    def list_memory(self, store_id):
+        self.timeline.append("list_memory")
+        return dict(self.docs)
+
     def read_memory(self, store_id, path):
         return self.docs.get(path)
 
     def write_memory(self, store_id, path, content):
         self.written.append({"store_id": store_id, "path": path, "content": content})
+        self.docs[path] = content                # the store the NEXT cycle will list
         self.timeline.append(f"write_memory {path}")
         return "update"
+
+    def delete_memory(self, store_id, path):
+        self.deleted.append(path)
+        self.docs.pop(path, None)
+        self.timeline.append(f"delete_memory {path}")
+        return True
 
 
 class _CycleHarness(unittest.TestCase):
@@ -250,18 +262,71 @@ class LearningCycleTest(_CycleHarness):
         self.assertEqual(len(cycles), 1, "a clean answer must reset the counter")
         self.assertEqual(cycles[0]["docs_written"], [])
 
-    def test_disallowed_docs_in_the_reply_are_never_written(self):
+    def test_the_engine_may_rewrite_and_create_any_document(self):
+        """The engine owns the whole store: the founding documents and new ones alike.
+        This replaces an earlier contract in which only the lessons file could be
+        touched — see learn.py's module docstring for what that widening costs."""
+        self.state.learn_fn = lambda s, u: json.dumps({
+            "analysis": "x",
+            "docs": {agent_config.MEMORY_LESSONS_DOC: "rewritten",
+                     agent_config.MEMORY_STATUS_DOC: "restructured",
+                     "/playbook.md": "a document that did not exist before"}})
+        self._seed_runs(self.N)
+        t = self.state.maybe_run_learning_cycle(self.agent)
+        t.join(timeout=10)
+        self.assertEqual(sorted(w["path"] for w in self.client.written),
+                         sorted([agent_config.MEMORY_LESSONS_DOC,
+                                 agent_config.MEMORY_STATUS_DOC, "/playbook.md"]))
+
+    def test_a_path_that_is_not_a_store_path_is_never_written(self):
+        """What the engine no longer chooses is WHICH documents exist; what it still
+        cannot choose is whether a path is a path. A nested path, a traversal, or a
+        non-markdown name is dropped in code however the model asked for it."""
         self.state.learn_fn = lambda s, u: json.dumps({
             "analysis": "x",
             "docs": {agent_config.MEMORY_LESSONS_DOC: "ok",
-                     agent_config.MEMORY_STATUS_DOC: "must not land",
-                     agent_config.MEMORY_SHARED_DOC: "must not land",
-                     "/mnt/other.md": "must not land"}})
+                     "/mnt/other.md": "nested — must not land",
+                     "/../escape.md": "traversal — must not land",
+                     "/notes.txt": "not markdown — must not land",
+                     "/blank.md": "   "}})                # empty content is a delete in disguise
         self._seed_runs(self.N)
         t = self.state.maybe_run_learning_cycle(self.agent)
         t.join(timeout=10)
         self.assertEqual([w["path"] for w in self.client.written],
                          [agent_config.MEMORY_LESSONS_DOC])
+
+    def test_the_engine_may_delete_a_document(self):
+        self.client.docs["/stale.md"] = "no longer earns its place"
+        self.state.learn_fn = lambda s, u: json.dumps({
+            "analysis": "x", "docs": {}, "delete": ["/stale.md"]})
+        self._seed_runs(self.N)
+        t = self.state.maybe_run_learning_cycle(self.agent)
+        t.join(timeout=10)
+        self.assertEqual(self.client.deleted, ["/stale.md"])
+        self.assertNotIn("/stale.md", self.client.docs)
+
+    def test_a_path_written_and_deleted_in_one_answer_keeps_the_write(self):
+        # Applying both gives a different store depending on order, so the contradiction
+        # has to resolve one way in code: the write carries content and survives.
+        self.state.learn_fn = lambda s, u: json.dumps({
+            "analysis": "x",
+            "docs": {agent_config.MEMORY_LESSONS_DOC: "kept"},
+            "delete": [agent_config.MEMORY_LESSONS_DOC]})
+        self._seed_runs(self.N)
+        t = self.state.maybe_run_learning_cycle(self.agent)
+        t.join(timeout=10)
+        self.assertEqual(self.client.deleted, [])
+        self.assertEqual(self.client.docs[agent_config.MEMORY_LESSONS_DOC], "kept")
+
+    def test_the_whole_store_is_listed_not_three_known_paths(self):
+        # A document the engine wrote last cycle must be visible to the next one, or it
+        # reasons about a store it has already changed.
+        self.client.docs["/playbook.md"] = "written by an earlier cycle"
+        self._seed_runs(self.N)
+        t = self.state.maybe_run_learning_cycle(self.agent)
+        t.join(timeout=10)
+        payload = json.loads(self.learn_calls[0]["user"])
+        self.assertIn("/playbook.md", payload["memory"])
 
     def test_inflight_guard_blocks_a_concurrent_second_cycle(self):
         gate = threading.Event()
@@ -534,7 +599,8 @@ class CollectiveLearningCycleTest(_CycleHarness):
         self.addCleanup(setattr, registry, "peer_bundle_add", real_add)
         self._run_cycle()
         self.assertEqual(self.client.timeline,
-                         [f"write_memory {agent_config.MEMORY_LESSONS_DOC}",
+                         ["list_memory",
+                          f"write_memory {agent_config.MEMORY_LESSONS_DOC}",
                           "peer_bundle_add"],
                          "a bundle published before the memory write would advertise "
                          "practice this agent had not adopted yet — and would be lost "
