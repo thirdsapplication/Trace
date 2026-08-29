@@ -109,13 +109,36 @@ class _CycleHarness(unittest.TestCase):
         self.root = self._tmp.name
         self.learn_calls = []
 
+        self.score_calls = []
+
         def learn_fn(system, user):
             self.learn_calls.append({"system": system, "user": user})
-            return json.dumps({"analysis": "fewer rescans",
-                               "docs": {agent_config.MEMORY_LESSONS_DOC:
-                                        "# Lessons learned\n- check the ledger first\n"}})
+            return json.dumps(self.analyst_reply)
+
+        def score_fn(system, user):
+            self.score_calls.append({"system": system, "user": user})
+            payload = json.loads(user)
+            # Two items and no novelty on every session: the scorer's judgement is not
+            # what these tests are about, and a constant makes the arithmetic checkable.
+            return json.dumps({"sessions": [
+                {"session_id": s["session_id"], "items_in_scope": 2,
+                 "novel_items": 0, "note": ""} for s in payload["sessions"]]})
+
+        # The default analyst answer: one change, into a document the engine owns.
+        self.analyst_reply = {
+            "analysis": "fewer rescans",
+            "verdict": None,
+            "change": {"change_id": "c1", "summary": "check the ledger first",
+                       "technique": "front-load the cheap ledger check",
+                       "rationale": "saves a rescan per session",
+                       "peer_informed": "", "retry_of": "",
+                       "docs": {agent_config.MEMORY_LESSONS_DOC:
+                                "# Lessons learned\n- check the ledger first\n"},
+                       "delete": []},
+            "blocked_on": ""}
 
         self.state = app.AppState(sessions_root=self.root, learn_fn=learn_fn)
+        self.state.score_fn = score_fn
         self.client = FakeLearnClient()
         self.state._live_client = lambda: self.client
         self.agent = {"agent_id": "a1", "owner_user_id": "u1", "name": "Orders",
@@ -163,15 +186,29 @@ class LearningCycleTest(_CycleHarness):
         self.assertEqual(cycles[0]["total_input_tokens"], 100 * self.N)
         self.assertEqual(cycles[0]["total_output_tokens"], 20 * self.N)
 
-    def test_the_model_sees_costs_memory_and_the_batch(self):
+    def test_the_analyst_sees_a_measurement_memory_and_the_bar(self):
         self._seed_runs(self.N)
         t = self.state.maybe_run_learning_cycle(self.agent)
         t.join(timeout=10)
         payload = json.loads(self.learn_calls[0]["user"])
-        self.assertEqual(len(payload["sessions"]), self.N)
-        self.assertEqual(payload["sessions"][0]["tokens"]["total_tokens"], 120)
+        self.assertEqual(len(payload["scored"]["sessions"]), self.N)
+        self.assertEqual(payload["scored"]["sessions"][0]["total_tokens"], 120)
+        self.assertIn("mean_performance", payload["scored"])
+        self.assertEqual(payload["min_improvement"], agent_config.MIN_IMPROVEMENT)
         self.assertIn("old lesson", payload["memory"][agent_config.MEMORY_LESSONS_DOC])
         self.assertEqual(payload["agent"]["name"], "Orders")
+
+    def test_the_scorer_is_a_separate_call_that_sees_no_memory_or_log(self):
+        # The analyst authors the change it will be graded on. If the same call also set
+        # the difficulty, scoring the batch as harder would be the cheapest way to pass.
+        self._seed_runs(self.N)
+        t = self.state.maybe_run_learning_cycle(self.agent)
+        t.join(timeout=10)
+        self.assertEqual(len(self.score_calls), 1)
+        seen = json.loads(self.score_calls[0]["user"])
+        self.assertEqual(set(seen), {"sessions"})
+        for key in ("memory", "log", "pending", "min_improvement", "baseline_performance"):
+            self.assertNotIn(key, seen)
 
     def test_counter_resets_after_a_cycle(self):
         self._seed_runs(self.N)
@@ -189,7 +226,7 @@ class LearningCycleTest(_CycleHarness):
         t = self.state.maybe_run_learning_cycle(self.agent)
         t.join(timeout=10)
         payload = json.loads(self.learn_calls[0]["user"])
-        sids = {s["session_id"] for s in payload["sessions"]}
+        sids = {s["session_id"] for s in payload["scored"]["sessions"]}
         self.assertFalse(any(s.startswith("ap") for s in sids),
                          "approval-execution sessions run a different directive and "
                          "must not shape the workflow analysis")
@@ -204,7 +241,7 @@ class LearningCycleTest(_CycleHarness):
         t = self.state.maybe_run_learning_cycle(self.agent)
         t.join(timeout=10)
         payload = json.loads(self.learn_calls[0]["user"])
-        sids = {s["session_id"] for s in payload["sessions"]}
+        sids = {s["session_id"] for s in payload["scored"]["sessions"]}
         self.assertEqual(sids, {f"s{i}" for i in range(self.N)})
         self.assertEqual(len(self._cycles()), 1)
 
@@ -267,10 +304,13 @@ class LearningCycleTest(_CycleHarness):
         The one exception is live state, and it is an exception the engine cannot reach
         rather than one it is asked to respect."""
         self.state.learn_fn = lambda s, u: json.dumps({
-            "analysis": "x",
-            "docs": {agent_config.MEMORY_LESSONS_DOC: "rewritten",
-                     agent_config.MEMORY_STATUS_DOC: "a ledger rewrite, refused",
-                     "/playbook.md": "a document that did not exist before"}})
+            "analysis": "x", "verdict": None, "blocked_on": "",
+            "change": {"change_id": "c9", "summary": "s", "technique": "t",
+                       "rationale": "r", "peer_informed": "", "retry_of": "",
+                       "docs": {agent_config.MEMORY_LESSONS_DOC: "rewritten",
+                                agent_config.MEMORY_STATUS_DOC: "a ledger rewrite, refused",
+                                "/playbook.md": "a document that did not exist before"},
+                       "delete": []}})
         self._seed_runs(self.N)
         t = self.state.maybe_run_learning_cycle(self.agent)
         t.join(timeout=10)
@@ -284,12 +324,15 @@ class LearningCycleTest(_CycleHarness):
         cannot choose is whether a path is a path. A nested path, a traversal, or a
         non-markdown name is dropped in code however the model asked for it."""
         self.state.learn_fn = lambda s, u: json.dumps({
-            "analysis": "x",
-            "docs": {agent_config.MEMORY_LESSONS_DOC: "ok",
-                     "/mnt/other.md": "nested — must not land",
-                     "/../escape.md": "traversal — must not land",
-                     "/notes.txt": "not markdown — must not land",
-                     "/blank.md": "   "}})                # empty content is a delete in disguise
+            "analysis": "x", "verdict": None, "blocked_on": "",
+            "change": {"change_id": "c9", "summary": "s", "technique": "t",
+                       "rationale": "r", "peer_informed": "", "retry_of": "",
+                       "docs": {agent_config.MEMORY_LESSONS_DOC: "ok",
+                                "/mnt/other.md": "nested — must not land",
+                                "/../escape.md": "traversal — must not land",
+                                "/notes.txt": "not markdown — must not land",
+                                "/blank.md": "   "},
+                       "delete": []}})                # empty content is a delete in disguise
         self._seed_runs(self.N)
         t = self.state.maybe_run_learning_cycle(self.agent)
         t.join(timeout=10)
@@ -299,7 +342,10 @@ class LearningCycleTest(_CycleHarness):
     def test_the_engine_may_delete_a_document(self):
         self.client.docs["/stale.md"] = "no longer earns its place"
         self.state.learn_fn = lambda s, u: json.dumps({
-            "analysis": "x", "docs": {}, "delete": ["/stale.md"]})
+            "analysis": "x", "verdict": None, "blocked_on": "",
+            "change": {"change_id": "c9", "summary": "s", "technique": "t",
+                       "rationale": "r", "peer_informed": "", "retry_of": "",
+                       "docs": {}, "delete": ["/stale.md"]}})
         self._seed_runs(self.N)
         t = self.state.maybe_run_learning_cycle(self.agent)
         t.join(timeout=10)
@@ -310,9 +356,11 @@ class LearningCycleTest(_CycleHarness):
         # Applying both gives a different store depending on order, so the contradiction
         # has to resolve one way in code: the write carries content and survives.
         self.state.learn_fn = lambda s, u: json.dumps({
-            "analysis": "x",
-            "docs": {agent_config.MEMORY_LESSONS_DOC: "kept"},
-            "delete": [agent_config.MEMORY_LESSONS_DOC]})
+            "analysis": "x", "verdict": None, "blocked_on": "",
+            "change": {"change_id": "c9", "summary": "s", "technique": "t",
+                       "rationale": "r", "peer_informed": "", "retry_of": "",
+                       "docs": {agent_config.MEMORY_LESSONS_DOC: "kept"},
+                       "delete": [agent_config.MEMORY_LESSONS_DOC]}})
         self._seed_runs(self.N)
         t = self.state.maybe_run_learning_cycle(self.agent)
         t.join(timeout=10)
@@ -334,7 +382,7 @@ class LearningCycleTest(_CycleHarness):
 
         def slow(system, user):
             gate.wait(10)
-            return '{"analysis": "x", "docs": {}}'
+            return '{"analysis": "x", "verdict": null, "change": null, "blocked_on": ""}'
         self.state.learn_fn = slow
         self._seed_runs(self.N)
         t = self.state.maybe_run_learning_cycle(self.agent)
@@ -353,7 +401,7 @@ class LearningCycleTest(_CycleHarness):
 
         def slow(system, user):
             gate.wait(10)
-            return '{"analysis": "x", "docs": {}}'
+            return '{"analysis": "x", "verdict": null, "change": null, "blocked_on": ""}'
         self.state.learn_fn = slow
         self._seed_runs(self.N)
         registry.agent_upsert(self.root, {"agent_id": "a2", "owner_user_id": "u1",
@@ -409,22 +457,144 @@ class LearningCycleTest(_CycleHarness):
             self.state.maybe_run_learning_cycle(self.agent, verbose=True)
         self.assertIn(f"{self.N - 2} eligible session(s)", out.getvalue())
 
-    def test_prior_cycles_feed_the_next_analysis(self):
-        registry.learning_cycle_add(self.root, {
-            "agent_id": "a1", "owner_user_id": "u1",
-            "session_stats": [{"session_id": "old", "status": "completed",
-                               "total_tokens": 900, "estimated": False}],
-            "total_input_tokens": 800, "total_output_tokens": 100,
-            "tokens_estimated": False, "analysis": "earlier advice", "docs_written": []})
-        # seeded a second later so the new runs sort after the cycle watermark
+    def test_the_change_log_feeds_the_next_analysis(self):
+        """prior_cycles is replaced by a real record: what was tried, what it was measured
+        against, and what happened — as three standing lists the analyst reads and never
+        writes."""
+        registry.change_add(self.root, {
+            "agent_id": "a1", "owner_user_id": "u1", "change_id": "old_win",
+            "summary": "an earlier change that worked", "technique": "prune dead advice",
+            "rationale": "", "paths": [], "baseline": 1000.0})
+        registry.change_settle(self.root, "a1", "old_win", "kept", observed=800.0)
+        registry.change_add(self.root, {
+            "agent_id": "a1", "owner_user_id": "u1", "change_id": "old_loss",
+            "summary": "an earlier change that hurt", "technique": "merge everything",
+            "rationale": "", "paths": [], "baseline": 1000.0})
+        registry.change_settle(self.root, "a1", "old_loss", "reverted", observed=1200.0)
         time.sleep(1.1)
         self._seed_runs(self.N)
         t = self.state.maybe_run_learning_cycle(self.agent)
         self.assertIsNotNone(t)
         t.join(timeout=10)
         payload = json.loads(self.learn_calls[0]["user"])
-        self.assertEqual(payload["prior_cycles"][0]["analysis"], "earlier advice")
-        self.assertEqual(payload["prior_cycles"][0]["avg_tokens_per_session"], 900)
+        self.assertEqual([c["change_id"] for c in payload["log"]["kept"]], ["old_win"])
+        self.assertEqual([c["change_id"] for c in payload["log"]["banned"]], ["old_loss"])
+        self.assertEqual(payload["log"]["retryable"], [])
+
+
+class VerdictAndRevertTest(_CycleHarness):
+    """The loop closing: a change applied, measured, then kept or restored.
+
+    The revert is the part worth distrusting until it is seen, so it is asserted
+    byte-for-byte. A model asked to undo its own change paraphrases it back into
+    existence, which is why this is a file restore — and a restore is only sound because
+    every document the engine may write has exactly one author."""
+
+    ORIGINAL = "# Lessons learned\n- old lesson\n"
+    CHANGED = "# Lessons learned\n- a bold new idea\n"
+
+    def _propose(self, change_id="c1"):
+        self.analyst_reply = {
+            "analysis": "trying something", "verdict": None, "blocked_on": "",
+            "change": {"change_id": change_id, "summary": "a bold new idea",
+                       "technique": "restructure the lessons file", "rationale": "r",
+                       "peer_informed": "", "retry_of": "",
+                       "docs": {agent_config.MEMORY_LESSONS_DOC: self.CHANGED},
+                       "delete": []}}
+
+    def _cycle(self, prefix):
+        self._seed_runs(self.N, prefix=prefix)
+        t = self.state.maybe_run_learning_cycle(self.agent)
+        self.assertIsNotNone(t)
+        t.join(timeout=10)
+
+    def test_a_change_is_snapshotted_applied_and_logged(self):
+        self._propose()
+        self._cycle("a")
+        self.assertEqual(self.client.docs[agent_config.MEMORY_LESSONS_DOC], self.CHANGED)
+        snap = registry.snapshot_get(self.root, "a1", "c1")
+        self.assertEqual(snap[agent_config.MEMORY_LESSONS_DOC], self.ORIGINAL)
+        pending = registry.change_pending(self.root, "a1")
+        self.assertEqual(pending["change_id"], "c1")
+        self.assertIsNone(pending["outcome"], "not judged until the next cycle")
+
+    def test_a_change_that_misses_the_bar_is_restored_byte_for_byte(self):
+        self._propose()
+        self._cycle("a")
+        # Second cycle: same token cost as the first, so performance did not fall and the
+        # change cannot clear the bar.
+        self.analyst_reply = {"analysis": "no better", "verdict": None,
+                              "change": None, "blocked_on": ""}
+        time.sleep(1.1)
+        self._cycle("b")
+        self.assertEqual(self.client.docs[agent_config.MEMORY_LESSONS_DOC],
+                         self.ORIGINAL,
+                         "the revert must restore the exact prior bytes")
+        settled = [c for c in registry.changes_for_agent(self.root, "a1")
+                   if c["change_id"] == "c1"][0]
+        self.assertEqual(settled["outcome"], "reverted")
+        self.assertIsNotNone(settled["threshold"])
+
+    def test_a_document_the_change_created_is_removed_by_the_revert(self):
+        # The snapshot stores None for a path that did not exist, so undoing a creation
+        # is a deletion rather than a write of empty content.
+        self.analyst_reply = {
+            "analysis": "new doc", "verdict": None, "blocked_on": "",
+            "change": {"change_id": "c1", "summary": "s", "technique": "t",
+                       "rationale": "r", "peer_informed": "", "retry_of": "",
+                       "docs": {"/playbook.md": "invented"}, "delete": []}}
+        self._cycle("a")
+        self.assertIn("/playbook.md", self.client.docs)
+        self.analyst_reply = {"analysis": "no better", "verdict": None,
+                              "change": None, "blocked_on": ""}
+        time.sleep(1.1)
+        self._cycle("b")
+        self.assertNotIn("/playbook.md", self.client.docs)
+
+    def test_a_change_that_cannot_be_snapshotted_is_not_applied(self):
+        # A change that cannot be reverted must not be made.
+        real = registry.snapshot_add
+
+        def boom(*a, **k):
+            raise RuntimeError("no snapshot table")
+        registry.snapshot_add = boom
+        self.addCleanup(setattr, registry, "snapshot_add", real)
+        self._propose()
+        self._cycle("a")
+        self.assertEqual(self.client.docs[agent_config.MEMORY_LESSONS_DOC],
+                         self.ORIGINAL)
+
+    def test_observe_only_measures_and_records_but_changes_nothing(self):
+        # Calibration mode, and the convergence stop: the bar cannot be set honestly
+        # before the metric's noise floor has been seen, and this is how it is seen.
+        original = agent_config.LEARNING_PROPOSE
+        agent_config.LEARNING_PROPOSE = False
+        self.addCleanup(setattr, agent_config, "LEARNING_PROPOSE", original)
+        self._propose()
+        self._cycle("a")
+        self.assertEqual(self.client.docs[agent_config.MEMORY_LESSONS_DOC],
+                         self.ORIGINAL)
+        self.assertIsNone(registry.change_pending(self.root, "a1"))
+        cycles = registry.learning_cycles_for_agent(self.root, "a1")
+        self.assertIsNotNone(cycles[0]["mean_performance"],
+                             "the measurement is still recorded — it IS the calibration")
+
+    def test_the_arithmetic_overrules_the_analysts_stated_verdict(self):
+        self._propose()
+        self._cycle("a")
+        # The analyst claims its change worked. The numbers say otherwise, and the
+        # numbers are what execute: the one pen a graded party must not hold.
+        self.analyst_reply = {
+            "analysis": "it worked", "change": None, "blocked_on": "",
+            "verdict": {"change_id": "c1", "decision": "keep", "baseline": 1.0,
+                        "threshold": 1.0, "observed": 1.0, "reason": "trust me"}}
+        time.sleep(1.1)
+        self._cycle("b")
+        settled = [c for c in registry.changes_for_agent(self.root, "a1")
+                   if c["change_id"] == "c1"][0]
+        self.assertEqual(settled["outcome"], "reverted")
+        self.assertEqual(self.client.docs[agent_config.MEMORY_LESSONS_DOC],
+                         self.ORIGINAL)
 
 
 class CollectiveLearningCycleTest(_CycleHarness):
@@ -557,7 +727,7 @@ class CollectiveLearningCycleTest(_CycleHarness):
         # weighed against the paragraph above before it can land.
         self.assertEqual(set(payload["peers"][0]),
                          {"peer_ref", "tier", "tool_overlap", "shared_tools",
-                          "sessions", "memory"})
+                          "sessions", "memory", "improvement_log"})
 
     def test_a_failed_scrub_still_completes_the_agents_own_cycle(self):
         """Publication is best-effort and must never cost the agent its own learning:
@@ -679,7 +849,7 @@ class ForcedLearningCycleTest(_CycleHarness):
         self.assertIsNotNone(t)
         t.join(timeout=10)
         payload = json.loads(self.learn_calls[0]["user"])
-        self.assertEqual(len(payload["sessions"]), self.N - 1)
+        self.assertEqual(len(payload["scored"]["sessions"]), self.N - 1)
         self.assertEqual([w["path"] for w in self.client.written],
                          [agent_config.MEMORY_LESSONS_DOC])
         self.assertEqual(len(self._cycles()), 1)

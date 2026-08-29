@@ -169,6 +169,11 @@ def _cycle_to_caller(row):
         "tokens_estimated": bool(row.get("tokens_estimated")),
         "analysis": row.get("analysis"),
         "docs_written": row.get("docs_written") or [],
+        # The measurement. Both halves of the round trip name it: in observe-only mode
+        # this is the only place a cycle's score is recorded, and a column written and
+        # never read back would make the calibration data look like it was never gathered.
+        "mean_performance": row.get("mean_performance"),
+        "valid_rate": row.get("valid_rate"),
         "created_at": row.get("created_at"),
     }
 
@@ -189,6 +194,7 @@ def _bundle_to_caller(row):
         "owner_user_id": str(row.get("owner_id")) if row.get("owner_id") else None,
         "sessions": row.get("sessions") or [],
         "memory": row.get("memory") or {},
+        "improvement_log": row.get("improvement_log") or [],
         "fingerprint": row.get("fingerprint") or {},
         "embedding": row.get("embedding"),
         "verified": bool(row.get("verified")),
@@ -594,6 +600,8 @@ def learning_cycle_add(root, rec):
             "tokens_estimated": bool(rec.get("tokens_estimated")),
             "analysis": rec.get("analysis"),
             "docs_written": rec.get("docs_written") or [],
+            "mean_performance": rec.get("mean_performance"),
+            "valid_rate": rec.get("valid_rate"),
         }).execute()
         return
     with _LOCK:
@@ -642,6 +650,7 @@ def peer_bundle_add(root, bundle):
             "owner_id": bundle.get("owner_user_id"),
             "sessions": bundle.get("sessions") or [],
             "memory": bundle.get("memory") or {},
+            "improvement_log": bundle.get("improvement_log") or [],
             "fingerprint": bundle.get("fingerprint") or {},
             "embedding": bundle.get("embedding"),
             "verified": bool(bundle.get("verified")),
@@ -721,7 +730,7 @@ def peer_bundle_material(root, agent_id):
     if supa.is_configured():
         try:
             r = supa.get_admin().table("peer_bundles") \
-                .select("sessions, memory") \
+                .select("sessions, memory, improvement_log") \
                 .eq("agent_id", agent_id).eq("verified", True) \
                 .order("created_at", desc=True).limit(1).execute()
             rows = r.data or []
@@ -730,12 +739,158 @@ def peer_bundle_material(root, agent_id):
         if not rows:
             return None
         return {"sessions": rows[0].get("sessions") or [],
-                "memory": rows[0].get("memory") or {}}
+                "memory": rows[0].get("memory") or {},
+                "improvement_log": rows[0].get("improvement_log") or []}
     row = _load(root, f"peer_bundle_{_safe(agent_id)}.json")
     if not row or not row.get("verified"):
         return None
     return {"sessions": row.get("sessions") or [],
-            "memory": row.get("memory") or {}}
+            "memory": row.get("memory") or {},
+            "improvement_log": row.get("improvement_log") or []}
+
+
+# --- self-improvement change log + document snapshots (023) ------------------
+def _change_to_caller(row):
+    """A change-log row in caller shape. Every column named on BOTH halves of the round
+    trip — see the scars on _agent_to_caller, where a column written and never read back
+    looked exactly like a feature that did not work."""
+    return {
+        "agent_id": str(row.get("agent_id")) if row.get("agent_id") else None,
+        "owner_user_id": str(row.get("owner_id")) if row.get("owner_id") else None,
+        "change_id": row.get("change_id"),
+        "summary": row.get("summary"),
+        "technique": row.get("technique"),
+        "rationale": row.get("rationale"),
+        "paths": row.get("paths") or [],
+        "peer_informed": row.get("peer_informed"),
+        "retry_of": row.get("retry_of"),
+        "baseline": row.get("baseline"),
+        "observed": row.get("observed"),
+        "threshold": row.get("threshold"),
+        "valid_rate": row.get("valid_rate"),
+        "base_valid_rate": row.get("base_valid_rate"),
+        "outcome": row.get("outcome"),
+        "reason": row.get("reason"),
+        "applied_at": row.get("applied_at"),
+        "judged_at": row.get("judged_at"),
+    }
+
+
+def change_add(root, rec):
+    """Record a change the engine has just APPLIED. outcome stays null until the next
+    cycle measures it.
+
+    Written by CODE from the analyst's structured output, never by the model: a model that
+    can edit its own track record does not have one."""
+    if supa.is_configured():
+        supa.get_admin().table("agent_changes").insert({
+            "agent_id": rec.get("agent_id"),
+            "owner_id": rec.get("owner_user_id"),
+            "change_id": rec.get("change_id"),
+            "summary": rec.get("summary"),
+            "technique": rec.get("technique"),
+            "rationale": rec.get("rationale"),
+            "paths": rec.get("paths") or [],
+            "peer_informed": rec.get("peer_informed") or None,
+            "retry_of": rec.get("retry_of") or None,
+            "baseline": rec.get("baseline"),
+        }).execute()
+        return
+    with _LOCK:
+        p = os.path.join(_dir(root), f"changes_{_safe(rec['agent_id'])}.jsonl")
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(json.dumps({**rec, "outcome": None,
+                                "applied_at": _now_iso()}, default=str) + "\n")
+
+
+def change_settle(root, agent_id, change_id, outcome, observed=None, threshold=None,
+                  valid_rate=None, base_valid_rate=None, reason=""):
+    """Close a change out with the numbers the following cycle measured.
+
+    Numbers, not just a verdict: a change that missed the bar by a point on a noisy batch
+    and one that made performance fifteen percent worse are different evidence, and only
+    the figures preserve the difference for whoever reads this log later."""
+    fields = {"outcome": outcome, "observed": observed, "threshold": threshold,
+              "valid_rate": valid_rate, "base_valid_rate": base_valid_rate,
+              "reason": reason, "judged_at": _now_iso()}
+    if supa.is_configured():
+        supa.get_admin().table("agent_changes").update(fields) \
+            .eq("agent_id", agent_id).eq("change_id", change_id) \
+            .is_("outcome", "null").execute()
+        return
+    with _LOCK:
+        p = os.path.join(_dir(root), f"changes_{_safe(agent_id)}.jsonl")
+        try:
+            with open(p, encoding="utf-8") as f:
+                rows = [json.loads(line) for line in f if line.strip()]
+        except FileNotFoundError:
+            return
+        for r in rows:
+            if r.get("change_id") == change_id and not r.get("outcome"):
+                r.update(fields)
+        with open(p, "w", encoding="utf-8") as f:
+            for r in rows:
+                f.write(json.dumps(r, default=str) + "\n")
+
+
+def changes_for_agent(root, agent_id, limit=20):
+    """This agent's change log, newest first, in caller shape."""
+    if supa.is_configured():
+        try:
+            r = supa.get_admin().table("agent_changes").select("*") \
+                .eq("agent_id", agent_id) \
+                .order("applied_at", desc=True).limit(limit).execute()
+        except Exception:                                  # noqa: BLE001 — pre-migration
+            return []
+        return [_change_to_caller(row) for row in (r.data or [])]
+    p = os.path.join(_dir(root), f"changes_{_safe(agent_id)}.jsonl")
+    try:
+        with open(p, encoding="utf-8") as f:
+            rows = [json.loads(line) for line in f if line.strip()]
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+    rows.sort(key=lambda r: str(r.get("applied_at") or ""), reverse=True)
+    return rows[:limit]
+
+
+def change_pending(root, agent_id):
+    """The change awaiting judgment, or None. At most one exists: the engine applies one
+    change per cycle and the next cycle settles it before proposing another."""
+    for c in changes_for_agent(root, agent_id, limit=50):
+        if not c.get("outcome"):
+            return c
+    return None
+
+
+def snapshot_add(root, agent_id, change_id, docs):
+    """Store the documents as they were BEFORE a change, so a revert is a file restore.
+
+    Sound only because every document the engine may write has exactly one author: the
+    agent writes live state (which the engine cannot touch) and the engine writes the
+    rest, so nothing else has edited these bytes by the time they are restored."""
+    if supa.is_configured():
+        supa.get_admin().table("agent_doc_snapshots").insert({
+            "agent_id": agent_id, "change_id": change_id, "docs": docs or {}}).execute()
+        return
+    with _LOCK:
+        d = _load(root, f"snapshots_{_safe(agent_id)}.json")
+        d[str(change_id)] = {"docs": docs or {}, "created_at": _now_iso()}
+        _save(root, f"snapshots_{_safe(agent_id)}.json", d)
+
+
+def snapshot_get(root, agent_id, change_id):
+    """``{path: content}`` as it stood before ``change_id``, or None."""
+    if supa.is_configured():
+        try:
+            r = supa.get_admin().table("agent_doc_snapshots").select("docs") \
+                .eq("agent_id", agent_id).eq("change_id", change_id) \
+                .order("created_at", desc=True).limit(1).execute()
+        except Exception:                                  # noqa: BLE001 — pre-migration
+            return None
+        rows = r.data or []
+        return (rows[0].get("docs") or {}) if rows else None
+    entry = _load(root, f"snapshots_{_safe(agent_id)}.json").get(str(change_id))
+    return (entry or {}).get("docs") if entry else None
 
 
 # --- pending (staged) actions — Spec 8 -------------------------------------

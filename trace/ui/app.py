@@ -58,6 +58,8 @@ from ..agent import configgen as agent_configgen
 from ..agent import interview as agent_interview
 from ..agent import connect as agent_connect
 from ..agent import config as agent_config
+from ..agent import gate as agent_gate
+from ..agent import score as agent_score
 from ..agent import deploy as agent_deploy
 from ..agent import runner as agent_runner
 from ..agent import activity as agent_activity
@@ -2285,9 +2287,10 @@ class AppState:
         # paths would hide from it the documents it wrote itself last cycle, and it
         # would then reason about a store it had already changed. One call, not one
         # per path. A doc that cannot be read stays None -> "(unavailable)" in the
-        # payload; never substitute a seed, which reads as wiped memory. If the
-        # listing itself fails, fall back to the three founding documents rather than
-        # sending an empty store, which would invite a rewrite from nothing.
+        # payload; never substitute a seed, which reads as wiped memory. If the listing
+        # itself fails, fall back to live state alone — it is the only document a store is
+        # guaranteed to have, and sending an empty store would invite a rewrite from
+        # nothing.
         try:
             docs = client.list_memory(store_id)
         except Exception as e:                             # noqa: BLE001 — a cycle is worth
@@ -2296,21 +2299,54 @@ class AppState:
             docs = None
         if docs is None:
             print(f"[learning] could not list the memory store for {aid} — falling "
-                  f"back to the three founding documents", flush=True)
+                  f"back to live state alone", flush=True)
             # Status only: it is the one document guaranteed to exist. Everything else
             # in a store is there because the engine created it, so there is no list of
             # names to fall back to — an unlistable store simply reasons on live state.
             docs = {agent_config.MEMORY_STATUS_DOC:
                     client.read_memory(store_id, agent_config.MEMORY_STATUS_DOC)}
-        prior = []
-        for c in registry.learning_cycles_for_agent(self.sessions_root, aid, limit=3):
-            stats = c.get("session_stats") or []
-            tokens = [s.get("total_tokens") or 0 for s in stats if isinstance(s, dict)]
-            prior.append({
-                "created_at": c.get("created_at"),
-                "analysis": str(c.get("analysis") or "")[:600],
-                "avg_tokens_per_session": (sum(tokens) // len(tokens)) if tokens else None,
-                "estimated": bool(c.get("tokens_estimated"))})
+        # --- step 1: the gate. Which of these sessions is a MEASUREMENT ------------
+        # Facts only, and before any model call: a gate that is a judgement drifts toward
+        # whatever answer the loop wants, and the loop wants to pass.
+        try:
+            pend = registry.pending_for_user(self.sessions_root,
+                                             agent.get("owner_user_id"), status=None)
+        except Exception as e:                             # noqa: BLE001 — no rejections known
+            print(f"[learning] could not read pending actions for {aid}: {_why(e)} — "
+                  f"treating the batch as unintervened", flush=True)
+            pend = []
+        split = agent_gate.partition(list(reversed(kept)), pend)
+        valid_ids = {str((r or {}).get("run_session_id") or "") for r, _ in split["valid"]}
+        measured = [rec for rec in records if str(rec.get("session_id")) in valid_ids]
+        excluded = [{"session_id": str((r or {}).get("run_session_id") or ""),
+                     "reason": reason,
+                     "transcript": agent_activity._compact(ev or [])[
+                         :agent_config.LEARNING_TRANSCRIPT_CLIP]}
+                    for r, ev, reason in split["excluded"]]
+        if excluded:
+            print(f"[learning] {aid}: {len(excluded)} session(s) excluded from the "
+                  f"measurement ({', '.join(sorted({e['reason'] for e in excluded}))}) — "
+                  f"still read as evidence", flush=True)
+
+        # --- steps 2 and 3: score, then compute in code ----------------------------
+        by_id = {str((r or {}).get("run_session_id") or ""): ev for r, ev in split["valid"]}
+        for rec in measured:
+            rec["input_kb"] = agent_score.input_kb(by_id.get(str(rec.get("session_id"))))
+        scored = agent_score.measure(measured, self._score_model_fn()) if measured else None
+        if scored:
+            print(f"[learning] {aid}: mean performance {scored['mean_performance']} "
+                  f"tokens/difficulty over {len(scored['sessions'])} measured session(s), "
+                  f"valid rate {split['valid_rate']:.2f}", flush=True)
+        else:
+            print(f"[learning] {aid}: no measurement this cycle "
+                  f"({len(measured)} measurable session(s))", flush=True)
+
+        # --- step 4: judge the pending change, propose the next one ----------------
+        changes = registry.changes_for_agent(self.sessions_root, aid,
+                                             limit=agent_config.LEARNING_LOG_CYCLES)
+        log = agent_learn.log_lists(changes)
+        pending = registry.change_pending(self.sessions_root, aid)
+        base = self._baseline_for(aid, changes, pending)
         agent_info = {"name": agent.get("name"), "description": agent.get("description"),
                       "trigger": agent.get("trigger")}
         # No lock is held across any of this, and none may be: peer selection, the
@@ -2318,33 +2354,21 @@ class AppState:
         # self.lock across network I/O is exactly what once left a database-only page
         # waiting behind a scheduler pass, and is why the background locks were split.
         peers = self._collect_peers(agent, fp, vec)
-        result = agent_learn.analyze_batch(agent_info, records, docs, prior,
-                                           self._learning_model_fn(), peers=peers)
+        result = agent_learn.judge_and_propose(
+            agent_info, scored, excluded, docs, log, pending,
+            self._learning_model_fn(), peers=peers,
+            baseline=base.get("performance"), valid_rate=split["valid_rate"],
+            base_valid_rate=base.get("valid_rate"))
         if result is None:
             print(f"[learning] analysis failed for {aid} — will retry the batch "
                   f"on a later pass", flush=True)
             return None
-        docs_written = []
-        for path, content in (result.get("docs") or {}).items():
-            try:
-                if client.write_memory(store_id, path, content):
-                    docs_written.append(path)
-            except Exception as e:                         # noqa: BLE001 — write_memory is already loud
-                print(f"[learning] could not write {path} for {aid}: {_why(e)}",
-                      flush=True)
-        # Deletions AFTER the writes. A cycle that splits one document into two
-        # answers with both the new files and the old path to remove; doing the
-        # delete first would leave the agent with nothing to read if the writes then
-        # failed, whereas this order's worst case is a stale document that the next
-        # cycle sees and can remove again.
-        docs_deleted = []
-        for path in (result.get("delete") or []):
-            try:
-                if client.delete_memory(store_id, path):
-                    docs_deleted.append(path)
-            except Exception as e:                         # noqa: BLE001 — delete_memory is already loud
-                print(f"[learning] could not delete {path} for {aid}: {_why(e)}",
-                      flush=True)
+
+        # --- step 5: settle the verdict, then apply at most one change -------------
+        observed = (scored or {}).get("mean_performance")
+        self._settle_pending(agent, pending, observed, base, split["valid_rate"], result)
+        docs_written, docs_deleted = self._apply_change(agent, result.get("change"),
+                                                        docs, observed)
         stats = [{"session_id": rec["session_id"], "status": rec["status"],
                   "total_tokens": rec["tokens"]["total_tokens"],
                   "estimated": rec["tokens"]["estimated"]} for rec in records]
@@ -2355,6 +2379,10 @@ class AppState:
             "total_output_tokens": sum(r["tokens"]["output_tokens"] for r in records),
             "tokens_estimated": any(r["tokens"]["estimated"] for r in records),
             "analysis": result.get("analysis") or "",
+            # The measurement rides on the cycle row: it is what the next cycle uses as
+            # its baseline, and what a human reads to see whether the loop is working.
+            "mean_performance": (scored or {}).get("mean_performance"),
+            "valid_rate": split["valid_rate"],
             # Deletions ride in docs_written with a marker rather than in a new column:
             # 021 is applied in production and a migration to record a rarer event than
             # the writes beside it is not worth an operator step. The prefix keeps the
@@ -2376,7 +2404,8 @@ class AppState:
         # written content for anything that reached the memory store, the pre-cycle text
         # for the rest. Publishing a doc whose write failed would advertise practice this
         # agent never adopted.
-        fresh = {p: c for p, c in (result.get("docs") or {}).items() if p in docs_written}
+        applied = (result.get("change") or {}).get("docs") or {}
+        fresh = {p: c for p, c in applied.items() if p in docs_written}
         # Hand the fleet-wide slot back BEFORE publishing. LEARNING_MAX_CONCURRENT is 1, so
         # whatever holds that slot serialises every other agent's cycle behind it — and the
         # scrub is the longest call in this whole path (a verbatim rewrite streams as many
@@ -2416,6 +2445,153 @@ class AppState:
                   f"{agent.get('agent_id')}: {_why(e)}", flush=True)
             return None
         return vecs[0] if vecs else None
+
+    def _score_model_fn(self):
+        """The difficulty scorer. A DIFFERENT call from the analyst on purpose — see
+        score.py — and overridable in tests like every other model seam here."""
+        fn = getattr(self, "score_fn", None)
+        return fn or agent_score._default_model_fn()
+
+    @staticmethod
+    def _baseline_for(aid, changes, pending):
+        """What the pending change is measured against: the numbers recorded when it was
+        applied. ``{"performance": float|None, "valid_rate": float|None}``.
+
+        Taken from the change row rather than recomputed, because the baseline has to be
+        the figure that stood BEFORE the change — recomputing it from whatever is most
+        recent would compare a change against a world it had already altered."""
+        if not pending:
+            return {"performance": None, "valid_rate": None}
+        return {"performance": pending.get("baseline"),
+                "valid_rate": pending.get("base_valid_rate")}
+
+    def _settle_pending(self, agent, pending, observed, base, valid_rate, result):
+        """Close out the change awaiting judgment: keep it, or restore the snapshot.
+
+        The decision comes from learn.decide, NOT from the model's stated verdict. The
+        analyst authored the change it is being asked to grade, so the one thing it must
+        not hold is the pen on the grade; its answer is recorded beside this one and a
+        disagreement is worth a log line. Never raises — a cycle that cannot settle a
+        verdict must still be able to run."""
+        if not pending:
+            return
+        aid = agent.get("agent_id")
+        cid = pending.get("change_id")
+        try:
+            decision, threshold, reason = agent_learn.decide(
+                pending, observed, base.get("performance"), valid_rate,
+                base.get("valid_rate"))
+            said = ((result or {}).get("verdict") or {}).get("decision")
+            if said and said != decision:
+                print(f"[learning] {aid}: the analyst said {said!r} for {cid} and the "
+                      f"arithmetic says {decision!r} — the arithmetic stands", flush=True)
+            if decision == "revert":
+                self._restore_snapshot(agent, cid)
+            # decide() speaks in verbs ("keep"/"revert"); the log stores outcomes
+            # ("kept"/"reverted"), which is the vocabulary agent_changes_outcome_check
+            # allows and log_lists reads. Two vocabularies meeting at one boundary, as
+            # with AGENT_STATUS_DB in the registry — and for the same reason: sending the
+            # other one is a row the database refuses and a standing list that silently
+            # stays empty.
+            outcome = {"keep": "kept", "revert": "reverted"}[decision]
+            registry.change_settle(self.sessions_root, aid, cid, outcome,
+                                   observed=observed, threshold=threshold,
+                                   valid_rate=valid_rate,
+                                   base_valid_rate=base.get("valid_rate"), reason=reason)
+            print(f"[learning] {aid}: change {cid} {outcome.upper()} — {reason}",
+                  flush=True)
+        except Exception as e:                             # noqa: BLE001 — never lose the cycle
+            print(f"[learning] could not settle change {cid} for {aid}: {_why(e)}",
+                  flush=True)
+
+    def _restore_snapshot(self, agent, change_id):
+        """Put the documents back exactly as they were before ``change_id``.
+
+        A file restore, never a model call: a model asked to undo its own change
+        paraphrases it back into existence. Sound only because every document the engine
+        may write has one author — the agent writes live state, which the engine cannot
+        touch, and the engine writes the rest — so nothing has edited these bytes since."""
+        aid, store_id = agent.get("agent_id"), agent.get("memory_store_id")
+        docs = registry.snapshot_get(self.sessions_root, aid, change_id)
+        if docs is None:
+            print(f"[learning] no snapshot for {change_id} on {aid} — cannot revert, "
+                  f"the change stays in the store", flush=True)
+            return
+        client = self._live_client()
+        for path, content in (docs or {}).items():
+            try:
+                if content is None:
+                    # Absent before the change: the change created it, so undoing the
+                    # change removes it.
+                    client.delete_memory(store_id, path)
+                else:
+                    client.write_memory(store_id, path, content)
+            except Exception as e:                         # noqa: BLE001
+                print(f"[learning] could not restore {path} for {aid}: {_why(e)}",
+                      flush=True)
+        print(f"[learning] {aid}: reverted {change_id}, restored "
+              f"{len(docs)} document(s)", flush=True)
+
+    def _apply_change(self, agent, change, docs_before, observed):
+        """Snapshot, then write, then delete. Returns ``(written, deleted)``.
+
+        Snapshot FIRST: a revert that has nothing to restore is not a revert, so the
+        change is not applied at all unless its prior state is safely recorded. The
+        snapshot stores None for a path that did not exist, so undoing a creation is a
+        deletion rather than a write of empty content.
+
+        Deletions run AFTER the writes. A change that splits one document into two names
+        both the new files and the old path; deleting first would leave the agent with
+        nothing to read if the writes then failed, whereas this order's worst case is a
+        stale document the next cycle can remove again."""
+        if not change:
+            return [], []
+        aid, store_id = agent.get("agent_id"), agent.get("memory_store_id")
+        if not agent_config.LEARNING_PROPOSE:
+            print(f"[learning] {aid}: observe-only (TRACE_LEARNING_PROPOSE=0) — "
+                  f"change {change.get('change_id')} not applied", flush=True)
+            return [], []
+        paths = list((change.get("docs") or {}).keys()) + list(change.get("delete") or [])
+        snapshot = {p: (docs_before or {}).get(p) for p in paths}
+        try:
+            registry.snapshot_add(self.sessions_root, aid, change["change_id"], snapshot)
+        except Exception as e:                             # noqa: BLE001 — no snapshot, no change
+            print(f"[learning] could not snapshot before {change['change_id']} for "
+                  f"{aid}: {_why(e)} — the change is NOT applied, because a change that "
+                  f"cannot be reverted must not be made", flush=True)
+            return [], []
+        client = self._live_client()
+        written, deleted = [], []
+        for path, content in (change.get("docs") or {}).items():
+            try:
+                if client.write_memory(store_id, path, content):
+                    written.append(path)
+            except Exception as e:                         # noqa: BLE001 — write_memory is loud
+                print(f"[learning] could not write {path} for {aid}: {_why(e)}",
+                      flush=True)
+        for path in (change.get("delete") or []):
+            try:
+                if client.delete_memory(store_id, path):
+                    deleted.append(path)
+            except Exception as e:                         # noqa: BLE001 — delete_memory is loud
+                print(f"[learning] could not delete {path} for {aid}: {_why(e)}",
+                      flush=True)
+        try:
+            registry.change_add(self.sessions_root, {
+                "agent_id": aid, "owner_user_id": agent.get("owner_user_id"),
+                "change_id": change["change_id"], "summary": change.get("summary"),
+                "technique": change.get("technique"),
+                "rationale": change.get("rationale"),
+                "paths": written + deleted,
+                "peer_informed": change.get("peer_informed"),
+                "retry_of": change.get("retry_of"),
+                "baseline": observed})
+        except Exception as e:                             # noqa: BLE001
+            print(f"[learning] could not log change {change['change_id']} for {aid}: "
+                  f"{_why(e)}", flush=True)
+        print(f"[learning] {aid}: applied {change['change_id']} — "
+              f"{change.get('summary') or 'no summary'}", flush=True)
+        return written, deleted
 
     def _collect_peers(self, agent, fp, vec):
         """The scrubbed material from similar agents to put in front of this cycle, or []
@@ -2493,9 +2669,17 @@ class AppState:
             # the whole store can go in as it is — including documents the engine created
             # itself, which are exactly what a similar agent should see. The rule lives
             # there, in code, rather than restated at each call site.
+            # The improvement log rides with the bundle. A transcript is untested
+            # behaviour; a log entry is a result this agent already paid to obtain, and
+            # the failures travel better than the successes — a failure usually reflects
+            # the mechanism, which is portable, while a success often depends on what was
+            # in this particular store.
+            log = registry.changes_for_agent(self.sessions_root, aid,
+                                             limit=agent_config.SCRUB_LOG_ENTRIES)
             scrubbed = agent_scrub.scrub_and_verify(records, docs,
                                                     self._scrub_model_fn(),
-                                                    self._scrub_verify_model_fn())
+                                                    self._scrub_verify_model_fn(),
+                                                    log=log)
         except Exception as e:                             # noqa: BLE001 — costs one bundle
             print(f"[learning] scrub failed for {aid}: {_why(e)} — nothing published",
                   flush=True)
@@ -2513,6 +2697,7 @@ class AppState:
                 "owner_user_id": agent.get("owner_user_id"),
                 "sessions": scrubbed.get("sessions") or [],
                 "memory": scrubbed.get("memory") or {},
+                "improvement_log": scrubbed.get("log") or [],
                 "fingerprint": fp,
                 "embedding": vec,
                 # scrub_and_verify returns a dict ONLY after the structural check, the

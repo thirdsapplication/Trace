@@ -47,6 +47,7 @@ DEFAULT_MODEL = config.LEARNING_MODEL
 # document it wants, but not one whose name would escape the store, collide with a
 # directory node, or be unreadable to the agent that has to open it.
 MAX_DOC_PATH = 128
+STORED_OUTCOMES = ("kept", "reverted", "banned")
 _PATH_OK = re.compile(r"^/[A-Za-z0-9][A-Za-z0-9._-]*\.md$")
 
 
@@ -80,30 +81,164 @@ def session_record(run, events):
     }
 
 
-def build_payload(agent, session_records, memory_docs, prior_cycles, peers=None):
-    """The dict json.dumps'd into the user message. ``memory_docs`` maps doc path
-    -> text or None (None becomes "(unavailable)" so the model reasons without it
-    rather than treating an unreadable file as empty); ``prior_cycles`` is the
-    efficiency feedback loop — earlier analyses with their batches' average
-    tokens per session; ``peers`` is the scrubbed material from similar agents
-    (``peers.peer_payloads``), and having none is the ordinary case."""
+def log_lists(changes):
+    """The three standing lists, derived in CODE from the recorded numbers.
+
+    Not stored as flags: a change that missed the bar by a point on a noisy batch and one
+    that made performance fifteen percent worse are different evidence, and a pass/fail
+    column would have destroyed the difference the moment it was written. Deriving the
+    lists from ``baseline`` and ``observed`` keeps the distinction available forever.
+
+    - kept: in the store and working. Techniques worth extending.
+    - retryable: reverted, but performance was still BETTER than baseline — it missed the
+      bar rather than failing. May be proposed once more with a stated reason.
+    - banned: made performance worse, or was reverted twice. Permanent.
+    """
+    kept, retryable, banned = [], [], []
+    reverts = {}
+    # The stored vocabulary, which is also agent_changes_outcome_check's. decide() answers
+    # in verbs and app._settle_pending maps them; anything else here is a bug upstream.
+    for c in (changes or []):
+        cid = c.get("change_id")
+        root_id = c.get("retry_of") or cid
+        if c.get("outcome") in ("reverted", "banned"):
+            reverts[root_id] = reverts.get(root_id, 0) + 1
+    for c in (changes or []):
+        outcome = c.get("outcome")
+        if outcome not in STORED_OUTCOMES:
+            # Not just "if not outcome". An unsettled change has no outcome and belongs on
+            # no list; but a value from the WRONG vocabulary — "revert" where "reverted"
+            # was meant — used to fall through to retryable, quietly filing a failure as a
+            # near miss worth trying again. Unknown is ignored, loudly enough that a
+            # mismatch shows up as empty lists rather than as wrong ones.
+            continue
+        entry = {"change_id": c.get("change_id"), "summary": c.get("summary"),
+                 "technique": c.get("technique"), "baseline": c.get("baseline"),
+                 "observed": c.get("observed"), "reason": c.get("reason")}
+        if outcome == "kept":
+            kept.append(entry)
+            continue
+        root_id = c.get("retry_of") or c.get("change_id")
+        worse = (c.get("observed") is not None and c.get("baseline") is not None
+                 and c["observed"] >= c["baseline"])
+        if outcome == "banned" or worse or reverts.get(root_id, 0) >= 2:
+            banned.append(entry)
+        else:
+            retryable.append(entry)
+    return {"kept": kept, "retryable": retryable, "banned": banned}
+
+
+def decide(pending, observed, baseline, valid_rate, base_valid_rate):
+    """The verdict, computed in CODE. Returns ``(decision, threshold, reason)``.
+
+    The spec had the analyst apply the bar and report the arithmetic. It does still state
+    a verdict — that is discipline, and a disagreement between its answer and this one is
+    worth logging — but what EXECUTES is this function. A model can slip on arithmetic, and
+    the one place a graded party should never hold the pen is the grade.
+
+    The valid rate is checked FIRST and can revert a change whose score passed. Excluding
+    damaged sessions hides damage rather than catching it: a change that makes the agent
+    sloppier draws rejections, those sessions leave the measurement, and the survivors show
+    a better mean from a change that only did harm.
+    """
+    if not pending:
+        return None, None, ""
+    threshold = None
+    if baseline is not None:
+        threshold = round(float(baseline) * (1.0 - config.MIN_IMPROVEMENT), 1)
+    if (base_valid_rate is not None and valid_rate is not None
+            and valid_rate < base_valid_rate - config.VALID_RATE_TOLERANCE):
+        return "revert", threshold, (
+            f"valid rate fell from {base_valid_rate:.2f} to {valid_rate:.2f}: more "
+            f"sessions drew a human intervention than before, and those sessions left "
+            f"the measurement rather than entering it")
+    if baseline is None or observed is None:
+        return "revert", threshold, (
+            "no comparable measurement for the batch that should have judged this change")
+    if observed <= threshold:
+        return "keep", threshold, (
+            f"observed {observed} at or under the {threshold} bar "
+            f"(baseline {baseline}, {config.MIN_IMPROVEMENT:.0%} required)")
+    return "revert", threshold, (
+        f"observed {observed} above the {threshold} bar "
+        f"(baseline {baseline}, {config.MIN_IMPROVEMENT:.0%} required)")
+
+
+def build_payload(agent, scored, excluded, memory_docs, log, pending, peers=None,
+                  baseline=None, valid_rate=None, base_valid_rate=None):
+    """The dict json.dumps'd into the analyst's user message.
+
+    ``scored`` is the measurement from a SEPARATE call that saw only transcripts — no log,
+    no pending change, no memory store — so the party being graded did not set its own
+    difficulty. ``excluded`` are sessions that are evidence but never a number.
+    """
     payload = {
         "agent": {"name": agent.get("name"),
                   "description": agent.get("description"),
                   "trigger": agent.get("trigger")},
-        "sessions": list(session_records),
+        "min_improvement": config.MIN_IMPROVEMENT,
+        "scored": scored or {},
+        "baseline_performance": baseline,
+        "valid_rate": valid_rate,
+        "baseline_valid_rate": base_valid_rate,
+        "excluded": list(excluded or []),
         "memory": {path: ("(unavailable)" if text is None else text)
                    for path, text in (memory_docs or {}).items()},
-        "prior_cycles": list(prior_cycles or []),
+        "log": log or {"kept": [], "retryable": [], "banned": []},
+        "pending": pending,
     }
-    # Added only when there is something to add: with no peer — the common case, and
-    # what every existing payload test asserts against — the object stays byte for
-    # byte what it was before the collective path existed. An empty "peers": [] would
-    # also read to the model as "we looked and everyone is unlike you", which is a
-    # different claim from "we did not look".
     if peers:
         payload["peers"] = list(peers)
     return payload
+
+
+def judge_and_propose(agent, scored, excluded, memory_docs, log, pending, model_fn,
+                      peers=None, baseline=None, valid_rate=None, base_valid_rate=None):
+    """ONE analyst call: judge the pending change, then propose at most one new one.
+
+    Returns ``{"analysis", "verdict", "change", "blocked_on"}`` with the change's docs and
+    deletes already sanitized, or None when the call or the parse failed. Never raises.
+
+    ``verdict`` here is the MODEL'S stated answer and is recorded for comparison; the
+    decision that executes comes from ``decide`` above.
+    """
+    user = json.dumps(build_payload(agent, scored, excluded, memory_docs, log, pending,
+                                    peers=peers, baseline=baseline,
+                                    valid_rate=valid_rate,
+                                    base_valid_rate=base_valid_rate),
+                      ensure_ascii=False, default=str)
+    try:
+        reply = model_fn(SYSTEM_PROMPT, user)
+    except Exception as e:                                 # noqa: BLE001 — best-effort, but
+        print(f"[learn] analysis call failed: {type(e).__name__}: {str(e)[:200]}",
+              flush=True)
+        return None
+    obj = _parse_json_object(reply)
+    if not obj:
+        print(f"[learn] analysis reply did not parse as JSON. "
+              f"Tail: {str(reply or '').rstrip()[-160:]!r}", flush=True)
+        return None
+    change = obj.get("change")
+    if isinstance(change, dict):
+        docs = _sanitize_docs(change.get("docs") or {})
+        change = {"change_id": str(change.get("change_id") or "").strip()[:64],
+                  "summary": str(change.get("summary") or "").strip(),
+                  "technique": str(change.get("technique") or "").strip(),
+                  "rationale": str(change.get("rationale") or "").strip(),
+                  "peer_informed": str(change.get("peer_informed") or "").strip(),
+                  "retry_of": str(change.get("retry_of") or "").strip(),
+                  "docs": docs,
+                  "delete": _sanitize_deletes(change.get("delete") or [], docs)}
+        if not change["change_id"] or not (change["docs"] or change["delete"]):
+            # A change that names nothing to write and nothing to remove is not a change.
+            change = None
+    else:
+        change = None
+    verdict = obj.get("verdict") if isinstance(obj.get("verdict"), dict) else None
+    return {"analysis": str(obj.get("analysis") or "").strip(),
+            "verdict": verdict,
+            "change": change,
+            "blocked_on": str(obj.get("blocked_on") or "").strip()}
 
 
 def _doc_path(path):
@@ -169,37 +304,3 @@ def _sanitize_deletes(paths, written):
         seen.add(p)
         out.append(p)
     return out
-
-
-def analyze_batch(agent, session_records, memory_docs, prior_cycles, model_fn,
-                  peers=None):
-    """ONE analysis call over the batch. Returns ``{"analysis": str, "docs":
-    {path: content}, "delete": [path]}`` with both already sanitized (either may be
-    empty — empty in both is a valid "nothing to change"), or None when the call/parse
-    failed. Never raises.
-
-    The distinction matters to the caller: None records NO cycle, so the same
-    batch is retried later; an empty-docs result IS recorded, so a clean
-    "nothing to change" still resets the sessions-since-last-cycle counter.
-
-    ``peers`` is optional throughout: peer selection is best-effort upstream, so a
-    cycle that found nobody must run exactly as it always did rather than wait.
-    """
-    if not session_records:
-        return None
-    user = json.dumps(build_payload(agent, session_records, memory_docs, prior_cycles,
-                                    peers=peers),
-                      ensure_ascii=False, default=str)
-    try:
-        obj = _parse_json_object(model_fn(SYSTEM_PROMPT, user))
-    except Exception as e:                                 # noqa: BLE001 — best-effort, but
-        # say WHY: a reason-less "analysis failed" line cost a debugging round.
-        print(f"[learn] analysis call failed: {type(e).__name__}: {str(e)[:200]}",
-              flush=True)
-        return None
-    if not obj:
-        return None
-    docs = _sanitize_docs(obj.get("docs") or {})
-    return {"analysis": str(obj.get("analysis") or "").strip(),
-            "docs": docs,
-            "delete": _sanitize_deletes(obj.get("delete") or [], docs)}

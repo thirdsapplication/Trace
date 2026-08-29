@@ -245,8 +245,8 @@ def select_peers(agent_id, fp, vec, bundles, now=None):
 
 def peer_payloads(selected, budget_chars=config.LEARNING_PEER_BUDGET_CHARS):
     """The peer entries for the learning payload, in the order ``select_peers`` ranked
-    them: ``[{"peer_ref", "tier", "tool_overlap", "shared_tools", "sessions",
-    "memory"}]``.
+    them: ``[{"peer_ref", "tier", "tool_overlap", "shared_tools", "sessions", "memory",
+    "improvement_log"}]``.
 
     ``peer_ref`` is the ONLY identity a peer carries into the prompt, and it is a
     positional label, not a reference to anything. No agent id, agent name, owner id or
@@ -270,7 +270,12 @@ def peer_payloads(selected, budget_chars=config.LEARNING_PEER_BUDGET_CHARS):
                    "tool_overlap": entry.get("overlap"),
                    "shared_tools": list(entry.get("shared_tools") or []),
                    "sessions": list(bundle.get("sessions") or []),
-                   "memory": memory if isinstance(memory, dict) else {}}
+                   "memory": memory if isinstance(memory, dict) else {},
+                   # What this peer's own loop already tried, and what came of it. The
+                   # densest evidence in a bundle: a transcript is untested behaviour, a
+                   # log entry is a result somebody paid for. Descriptions only — a peer's
+                   # document contents and diffs never cross.
+                   "improvement_log": list(bundle.get("improvement_log") or [])}
         # Cost is measured on the serialized form, because that is what actually lands
         # in the user message the budget exists to bound.
         cost = len(json.dumps(payload, ensure_ascii=False, default=str))

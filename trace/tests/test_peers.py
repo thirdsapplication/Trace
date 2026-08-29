@@ -286,8 +286,9 @@ class PeerPayloadsTest(unittest.TestCase):
 
     def test_payload_carries_the_material_and_nothing_else(self):
         payload = peers.peer_payloads(self._selected())[0]
-        self.assertEqual(sorted(payload), ["memory", "peer_ref", "sessions",
-                                           "shared_tools", "tier", "tool_overlap"])
+        self.assertEqual(sorted(payload),
+                         ["improvement_log", "memory", "peer_ref", "sessions",
+                          "shared_tools", "tier", "tool_overlap"])
         self.assertEqual(round(payload["tool_overlap"], 2), 0.67)
         self.assertEqual(payload["memory"],
                          {config.MEMORY_LESSONS_DOC: "Batch the searches, one per run."})

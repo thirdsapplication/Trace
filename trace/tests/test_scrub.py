@@ -533,7 +533,7 @@ class ScrubAndVerifyTest(unittest.TestCase):
                                      _fn(json.dumps(_scrubbed(redactions=red))),
                                      _fn('{"safe": true}'))
         self.assertNotIn("redactions", out)
-        self.assertEqual(set(out), {"sessions", "memory"})
+        self.assertEqual(set(out), {"sessions", "memory", "log"})
 
     def test_a_pseudonym_reused_across_sessions_survives_verification(self):
         # Stable pseudonyms are why the batch is scrubbed as ONE payload: the

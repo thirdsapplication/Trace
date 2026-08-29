@@ -27,11 +27,19 @@ YOU RECEIVE one JSON object:
   tokens, and a compacted transcript of what actually happened, written as lines of the
   form [trigger] / [agent] / [tool call] / [tool result] / [end].
 - memory: the agent's memory documents, keyed by document path.
+- log: entries from this agent's improvement log — what its self-improvement loop tried
+  and what happened. Each has change_id, summary, technique, outcome and relative_delta.
+  Scrub summary and technique as prose, exactly like a document; leave change_id, outcome
+  and relative_delta untouched, since they are structural. These descriptions are the most
+  useful thing another agent receives — a result someone already paid to obtain rather than
+  behaviour nobody has tested — so scrub them rather than dropping them.
 
 RESPOND with ONLY a JSON object, no other prose:
 {"sessions": [{"session_id": "<UNCHANGED>", "ran_at": <unchanged>, "status": <unchanged>,
                "tokens": <unchanged>, "transcript": "<the scrubbed transcript, line for line>"}],
  "memory": {"<path, unchanged>": "<the scrubbed document>"},
+ "log": [{"change_id": <unchanged>, "summary": "<scrubbed>", "technique": "<scrubbed>",
+          "outcome": <unchanged>, "relative_delta": <unchanged>}],
  "redactions": [{"pseudonym": "restaurant client A",
                  "literal": "<the exact original string you replaced>",
                  "category": "person|company|email|phone|address|id|amount|other"}]}

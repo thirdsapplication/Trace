@@ -132,7 +132,32 @@ def _sanitize_memory(docs):
     return out
 
 
-def build_payload(session_records, memory_docs):
+def _sanitize_log(log):
+    """The improvement-log entries that may travel: descriptions of what was tried and
+    what happened, never a document or a diff.
+
+    A transcript is untested behaviour; a log entry is a result somebody already paid to
+    obtain, and the NEGATIVE results are the valuable half — a change that looks obviously
+    good and is not is exactly what no agent avoids independently, because it looks
+    obviously good to all of them.
+
+    ``technique`` was written by the analyst to be read by strangers and should already be
+    domain-general. ``summary`` was written for a human reading this customer's own log and
+    was not, which is why both still go through the scrub call rather than being trusted
+    because one of them was supposed to be safe."""
+    out = []
+    for e in (log or []):
+        if not isinstance(e, dict) or not e.get("outcome"):
+            continue                                       # unsettled: no result to share
+        out.append({"change_id": str(e.get("change_id") or ""),
+                    "summary": str(e.get("summary") or ""),
+                    "technique": str(e.get("technique") or ""),
+                    "outcome": str(e.get("outcome") or ""),
+                    "relative_delta": e.get("relative_delta")})
+    return out[:config.SCRUB_LOG_ENTRIES]
+
+
+def build_payload(session_records, memory_docs, log=None):
     """The dict json.dumps'd into the scrub call's user message: the batch as the learning
     call would see it, clipped so a VERBATIM rewrite of it still fits inside
     SCRUB_MAX_TOKENS. Unreadable docs (None) are dropped rather than sent as
@@ -144,17 +169,18 @@ def build_payload(session_records, memory_docs):
                  "tokens": rec.get("tokens"),
                  "transcript": _clip_transcript(rec.get("transcript"))}
                 for rec in (session_records or [])]
-    return {"sessions": sessions, "memory": _sanitize_memory(memory_docs)}
+    return {"sessions": sessions, "memory": _sanitize_memory(memory_docs),
+            "log": _sanitize_log(log)}
 
 
-def scrub_batch(session_records, memory_docs, model_fn):
+def scrub_batch(session_records, memory_docs, model_fn, log=None):
     """ONE scrub call over the batch. Returns the parsed answer — ``{"sessions", "memory",
     "redactions"}`` — or None when the call or the parse failed. Never raises: this runs
     inside a learning cycle, and a failed scrub must cost the fleet one publish, not the
     agent its cycle."""
     if not session_records:
         return None
-    user = json.dumps(build_payload(session_records, memory_docs),
+    user = json.dumps(build_payload(session_records, memory_docs, log),
                       ensure_ascii=False, default=str)
     try:
         reply = model_fn(SCRUB_SYSTEM, user)
@@ -453,7 +479,8 @@ def _reject(reason):
     return None
 
 
-def scrub_and_verify(session_records, memory_docs, model_fn, verify_model_fn):
+def scrub_and_verify(session_records, memory_docs, model_fn, verify_model_fn,
+                     log=None):
     """The whole gate: scrub, then structural check, then leak sweep, then the independent
     privacy model — deterministic checks first so a summarised or leaky answer is thrown
     out before a second model is paid to read it.
@@ -467,7 +494,7 @@ def scrub_and_verify(session_records, memory_docs, model_fn, verify_model_fn):
     Returns ``{"sessions": [...], "memory": {path: text}}`` ready to publish, or None.
     Never raises; prints one reason line on rejection.
     """
-    scrubbed = scrub_batch(session_records, memory_docs, model_fn)
+    scrubbed = scrub_batch(session_records, memory_docs, model_fn, log)
     if not scrubbed:
         return _reject("scrub call produced nothing")
     if not config.SCRUB_CHECKS_ENABLED:
@@ -490,4 +517,5 @@ def scrub_and_verify(session_records, memory_docs, model_fn, verify_model_fn):
     # scrub. It is used by the checks above and dropped here — it must never be persisted,
     # logged, or passed onward to any caller.
     return {"sessions": _publishable_sessions(session_records, scrubbed),
-            "memory": _sanitize_memory(scrubbed.get("memory"))}
+            "memory": _sanitize_memory(scrubbed.get("memory")),
+            "log": _sanitize_log(scrubbed.get("log"))}

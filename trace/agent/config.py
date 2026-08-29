@@ -155,6 +155,7 @@ SCRUB_RETRIES = 1
 SCRUB_SESSION_CLIP = 12_000              # chars of transcript per session (matches learning)
 # Far tighter than LEARNING_DOC_CLIP (90_000): the learning call READS the docs, this one
 # has to echo every scrubbed one back inside SCRUB_MAX_TOKENS alongside the sessions.
+SCRUB_LOG_ENTRIES = 20                   # improvement-log entries that travel with a bundle
 SCRUB_DOC_CLIP = 20_000
 # Peer selection. Two tiers: agents reaching for the SAME TOOLS (Jaccard overlap of tool
 # names) and agents doing the SAME JOB (embedding cosine). Both floors are deliberately
