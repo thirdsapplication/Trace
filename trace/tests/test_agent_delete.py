@@ -21,9 +21,17 @@ from trace.ui import app, registry, sessions
 
 
 class FakeCleanup:
-    def __init__(self, boom=False):
+    """Shaped like the real ManagedAgentsClient.cleanup, which returns
+    ``{"removed": {...}, "errors": [...]}`` and reports per-item failures THERE rather
+    than raising. The first version of this fake returned {"ok": True} and so could not
+    express a partial failure — the exact case that matters, because a deployment left
+    unarchived keeps running against a vault after the rows are gone.
+    """
+
+    def __init__(self, boom=False, fail_deployment=False):
         self.calls = []
         self.boom = boom
+        self.fail_deployment = fail_deployment
 
     def __call__(self, session_ids, file_ids, agent_ids, agent_names=None,
                  deployment_ids=None, memory_store_ids=None):
@@ -31,7 +39,14 @@ class FakeCleanup:
             raise RuntimeError("platform unreachable")
         self.calls.append({"deployment_ids": deployment_ids or [],
                            "memory_store_ids": memory_store_ids or []})
-        return {"ok": True}
+        removed = {"deployments": [], "memory_stores": list(memory_store_ids or [])}
+        errors = []
+        if self.fail_deployment:
+            for d in (deployment_ids or []):
+                errors.append({"kind": "deployment", "id": d, "error": "APIError: 500"})
+        else:
+            removed["deployments"] = list(deployment_ids or [])
+        return {"removed": removed, "errors": errors}
 
 
 class AgentDeleteTest(unittest.TestCase):
@@ -94,6 +109,18 @@ class AgentDeleteTest(unittest.TestCase):
         self.assertTrue(res["deleted"])
         self.assertTrue(res["errors"], "a failed platform cleanup was reported as success")
         self.assertIn("orphaned", res["errors"][0])
+
+    def test_a_deployment_that_would_not_archive_is_reported(self):
+        """cleanup() reports this in its RETURN value, not by raising. Missing it meant
+        the UI showed a clean delete while the agent kept running on its schedule."""
+        state = app.AppState(sessions_root=self.root,
+                             cleanup_fn=FakeCleanup(fail_deployment=True))
+        res = state.delete_agent("a1", "u1")
+        self.assertTrue(res["deleted"])                    # rows still go
+        joined = " ".join(res["errors"])
+        self.assertIn("depl_1", joined)
+        self.assertIn("NOT archived", joined,
+                      "a surviving deployment was not surfaced to the user")
 
     def test_children_go_with_it(self):
         registry.message_add(self.root, {"agent_id": "a1", "owner_user_id": "u1",

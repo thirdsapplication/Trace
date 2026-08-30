@@ -1643,17 +1643,29 @@ class AppState:
 
         # 1. Off the platform. Best-effort per id, but every failure is REPORTED —
         #    a half-deleted agent that looks fully deleted is the dangerous outcome.
+        depl = agent.get("deployment_id")
         try:
             res = self.cleanup_fn(
                 [], [], [],
                 agent_names=[],
-                deployment_ids=[agent["deployment_id"]] if agent.get("deployment_id") else [],
+                deployment_ids=[depl] if depl else [],
                 memory_store_ids=[] if shared_with or not store_id else [store_id])
             out["platform"] = res or {}
         except Exception as e:                             # noqa: BLE001
             out["platform"] = {"error": f"{type(e).__name__}: {e}"}
             out["errors"].append("platform cleanup failed — check for an orphaned "
                                  "deployment before assuming this agent is gone")
+        # cleanup() RETURNS per-item failures rather than raising, so catching an
+        # exception is not enough: an archive_deployment that failed would sit in
+        # platform["errors"] while this reported a clean delete. The whole point of
+        # archiving first is that a surviving deployment keeps running against a vault.
+        for err in (out["platform"].get("errors") or []):
+            out["errors"].append(f"{err.get('kind')} {err.get('id')}: {err.get('error')}")
+        removed = (out["platform"].get("removed") or {})
+        if depl and depl not in (removed.get("deployments") or []) \
+                and not out["platform"].get("error"):
+            out["errors"].append(f"deployment {depl} was NOT archived — it may still be "
+                                 f"running on a schedule")
 
         # 2. The recording behind it.
         sid = agent.get("session_id")
