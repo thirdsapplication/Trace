@@ -24,7 +24,11 @@ if (typeof window !== "undefined") {
 const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g,
   c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
-const S = { user: null, signupAllowed: true, session: null, conn: null, step: 0, busy: false, _timers: [] };
+const S = { user: null, signupAllowed: true, session: null, conn: null, step: 0, busy: false,
+            // The last failed deploy, held across renders. A deploy failure used to be
+            // painted into #liveMsg and then erased microseconds later by the render()
+            // below it, so the one message naming the cause was unreadable.
+            deployError: null, _timers: [] };
 
 const STEPS = [
   { key: "record",    label: "Record" },
@@ -3805,9 +3809,12 @@ async function renderGolive(sid) {
     $("#liveBody").innerHTML = `
       ${meet}
       ${stagingHtml}
-      <p id="liveMsg" class="msg err" style="margin-top:12px;"></p>
-      <button id="liveGo" class="btn-primary full" style="margin-top:6px;">Go live</button>`;
+      <p id="liveMsg" class="msg err" style="margin-top:12px;white-space:pre-wrap;overflow-wrap:anywhere;"
+         >${esc(S.deployError ? friendly(S.deployError) : "")}</p>
+      <button id="liveGo" class="btn-primary full" style="margin-top:6px;">${
+        S.deployError ? "Try again" : "Go live"}</button>`;
     $("#liveGo").onclick = async () => {
+      S.deployError = null; $("#liveMsg").textContent = "";
       $("#liveGo").disabled = true; $("#liveGo").textContent = "Deploying…";
       // Which agents existed BEFORE this deploy, so the ones that appear after it are
       // exactly the ones that need a shade picked (29).
@@ -3830,7 +3837,21 @@ async function renderGolive(sid) {
         }
         return;
       }
-      try { await pollJob(sid, "deploy"); } catch (e) { $("#liveMsg").textContent = friendly(e.message); }
+      try {
+        await pollJob(sid, "deploy");
+      } catch (e) {
+        // The `return` is the whole point. Without it execution fell through to the
+        // render() below, which rebuilds #liveBody — and with it an empty #liveMsg —
+        // so the deploy error was painted and erased in the same tick. It survived
+        // only in the server log, and a deploy that failed looked like one that did
+        // nothing. Holding it on S as well means any later render redraws it.
+        S.deployError = String((e && e.message) || e || "");
+        $("#liveGo").disabled = false; $("#liveGo").textContent = "Try again";
+        $("#liveMsg").className = "msg err";
+        $("#liveMsg").textContent = friendly(S.deployError);
+        return;
+      }
+      S.deployError = null;
       // Deploy is already done and recorded by here — this only paints the new agents.
       const after = await loadHome(true);
       await assignShadesTo(((after || {}).agents || [])

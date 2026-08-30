@@ -15,6 +15,7 @@ this module translates to/from the Supabase column names (``id``, ``owner_id``).
 
 import json
 import os
+import re
 import threading
 import time
 
@@ -245,59 +246,137 @@ def _save(root, name, obj):
 
 
 # --- agents ----------------------------------------------------------------
-# Bookkeeping columns: useful, but never worth losing the row over. `status` and
-# `deployed_at` began being written on 2026-08-26 and the agents table carries a
-# CHECK constraint (agents_status_check, from a migration older than this repo) that
-# rejects the value deploy.py writes — "live". Every go-live since then created a
-# real platform agent and was then refused by the database, so the agent existed in
-# the Managed Agents console and never appeared in the app.
-AGENT_OPTIONAL_COLUMNS = ("status", "deployed_at")
-_CHECK_VIOLATION = "23514"
+# Bookkeeping columns: useful, but never worth losing the row over. Registering the
+# agent is the last step of a deploy that has ALREADY created a live agent on the
+# platform, so a refused row strands it — present in the Managed Agents console,
+# absent from the app, with the user pressing Go live again to no effect.
+#
+# It has happened twice for two different reasons. `status` and `deployed_at` began
+# being written on 2026-08-26 and the agents table carries a CHECK constraint
+# (agents_status_check, older than this repo) that rejected the word deploy.py
+# writes — "live". Then migration 023 added `approval_required`, `deployments` and
+# `deployment_mode`, which every deploy has written since; on a database where that
+# migration has not been applied PostgREST answers PGRST204 and refuses the whole
+# row. The first fix recognised only the first cause, which is how the second one
+# cost a live agent as well.
+#
+# So the rule is now general: any column named here may be dropped to get the agent
+# registered. `id` and `owner_id` are NOT here and never will be — an agent with no
+# identity is not a registration, and a database refusing those is broken in a way
+# no retry should paper over.
+AGENT_OPTIONAL_COLUMNS = ("status", "deployed_at", "staged_apps",
+                          "approval_required", "deployments", "deployment_mode")
+AGENT_CORE_COLUMNS = ("id", "owner_id")
+
+# The three shapes a rejection about one COLUMN arrives in: a CHECK constraint the
+# value violates, a column PostgREST cannot find in its schema cache (an unapplied
+# migration), and a column Postgres itself does not have.
+_COLUMN_ERRORS = ("23514", "PGRST204", "42703")
+# PostgREST: "Could not find the 'deployments' column of 'agents' in the schema
+# cache". Postgres: 'column "deployments" of relation "agents" does not exist'.
+_NAMED_COLUMN = re.compile(r"'([A-Za-z_][A-Za-z0-9_]*)' column"
+                           r"|column \"([A-Za-z_][A-Za-z0-9_]*)\"")
 
 
-def _is_check_violation(exc):
-    """True for a Postgres check-constraint violation (SQLSTATE 23514), whether the
-    client raises it with a .code, in a dict-ish payload, or only in its message."""
-    code = getattr(exc, "code", None)
-    if code is None:
-        details = getattr(exc, "args", None)
-        if details and isinstance(details[0], dict):
-            code = details[0].get("code")
-    if str(code) == _CHECK_VIOLATION:
+def _error_text(exc):
+    """Everything an exception says, whether it carries a message, a dict-ish payload
+    or only a repr — the clients in play here use all three."""
+    parts = [str(exc)]
+    try:
+        for attr in ("message", "details", "hint", "code"):
+            v = getattr(exc, attr, None)
+            if v:
+                parts.append(str(v))
+        args = getattr(exc, "args", None)
+        if args and isinstance(args[0], dict):
+            parts.extend(str(v) for v in args[0].values() if v)
+    except Exception:                                  # noqa: BLE001 — reading the
+        pass                                           # error must never replace it
+    return " ".join(parts)
+
+
+def _is_column_error(exc):
+    """True when the database refused the row over a COLUMN — a violated CHECK, a
+    column PostgREST has never heard of, or one Postgres does not have."""
+    text = _error_text(exc)
+    if any(code in text for code in _COLUMN_ERRORS):
         return True
-    return _CHECK_VIOLATION in str(exc) or "check constraint" in str(exc).lower()
+    low = text.lower()
+    return ("check constraint" in low or "schema cache" in low
+            or ("does not exist" in low and "column" in low))
+
+
+def _cause_hint(exc):
+    """One line pointing at the fix, chosen by which refusal this was. A missing
+    column is a migration that has not been applied; a violated CHECK is a value the
+    column will not take. Sending an operator to the wrong one of those costs an hour."""
+    text = _error_text(exc)
+    if "PGRST204" in text or "42703" in text or "schema cache" in text.lower():
+        return "the column is missing — a schema migration has not been applied"
+    return "the column refused this value"
+
+
+def _droppable(exc, row):
+    """The columns to remove from ``row`` before retrying, or [] to give up and raise.
+
+    When the error NAMES a column, drop exactly that one: a database missing all
+    three of migration 023's columns is told about them one at a time, and dropping
+    the whole optional set on the first would discard bookkeeping the database was
+    perfectly willing to store. When it names none — the CHECK-constraint case, whose
+    message names the constraint rather than the column — fall back to dropping every
+    optional column present, which is what the original fix did.
+    """
+    if not _is_column_error(exc):
+        return []
+    m = _NAMED_COLUMN.search(_error_text(exc))
+    named = (m.group(1) or m.group(2)) if m else None
+    if named in AGENT_CORE_COLUMNS:            # identity: not ours to drop
+        return []
+    if named and named in row:
+        return [named]
+    return [k for k in AGENT_OPTIONAL_COLUMNS if k in row]
 
 
 def agent_upsert(root, agent):
     """agent: {agent_id, owner_user_id, external_user_id, bundle_id, name,
-    vault_ref, trigger, session_id, ...}.
+    vault_ref, trigger, session_id, ...}. Returns the list of columns it had to drop
+    to get the row written (empty on the normal path), so the caller can say so.
 
     Registering the agent is the load-bearing write — a deploy that reaches here has
     already created a live agent on the platform. If the database refuses the row
-    over one of the OPTIONAL bookkeeping columns, drop those and write the agent
-    anyway, loudly. Any other error still raises: this is a narrow allowance for a
-    metadata column disagreeing with a constraint, not a blanket swallow.
+    over one of the OPTIONAL bookkeeping columns, drop it and write the agent anyway,
+    loudly. Any other error still raises: this is a narrow allowance for metadata
+    columns a database will not take, not a blanket swallow.
     """
     if supa.is_configured():
         admin = supa.get_admin()
         sb = _agent_to_sb(agent)
-        try:
-            admin.table("agents").upsert(sb, on_conflict="id").execute()
-        except Exception as e:                             # noqa: BLE001
-            dropped = [k for k in AGENT_OPTIONAL_COLUMNS if k in sb]
-            if not dropped or not _is_check_violation(e):
-                raise
-            print(f"[registry] agents rejected {dropped} for "
-                  f"{agent.get('agent_id')} ({str(e)[:200]}) — registering the agent "
-                  f"without them so the deploy is not lost", flush=True)
-            for k in dropped:
-                sb.pop(k, None)
-            admin.table("agents").upsert(sb, on_conflict="id").execute()
-        return
+        dropped = []
+        # One attempt per droppable column, plus the first: a database missing every
+        # column of a migration refuses them one at a time. Bounded so a client that
+        # reports the same column forever cannot spin.
+        for _ in range(len(AGENT_OPTIONAL_COLUMNS) + 1):
+            try:
+                admin.table("agents").upsert(sb, on_conflict="id").execute()
+                return dropped
+            except Exception as e:                         # noqa: BLE001
+                names = _droppable(e, sb)
+                if not names:
+                    raise
+                print(f"[registry] agents rejected {names} for "
+                      f"{agent.get('agent_id')}: {_cause_hint(e)} ({str(e)[:200]})"
+                      f" — registering the agent without them so the deploy is "
+                      f"not lost", flush=True)
+                for k in names:
+                    sb.pop(k, None)
+                    dropped.append(k)
+        raise RuntimeError(
+            f"agents refused {agent.get('agent_id')} after dropping {dropped}")
     with _LOCK:
         d = _load(root, "agents.json")
         d[agent["agent_id"]] = {**agent, "deployed_at": _now_iso()}
         _save(root, "agents.json", d)
+    return []
 
 
 def agents_visible_to(root, owner_user_id, team_owner_ids=None):

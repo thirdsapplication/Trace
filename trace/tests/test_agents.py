@@ -743,14 +743,50 @@ class AgentUpsertResilienceTest(unittest.TestCase):
 
         return Admin(), calls
 
-    def _run(self, admin):
+    class _Missing(Exception):
+        """PostgREST's answer when a column is absent from its schema cache — what an
+        unapplied migration looks like from the client side. Unlike _Boom it NAMES the
+        column, which is what lets the retry drop that one and keep the rest."""
+
+        def __init__(self, column):
+            super().__init__({"message": f"Could not find the '{column}' column of "
+                                         "'agents' in the schema cache",
+                              "code": "PGRST204"})
+            self.code = "PGRST204"
+
+    def _fake_admin_missing(self, missing):
+        """An agents table that does not have the columns in ``missing`` — it refuses
+        the row naming one of them, one per attempt, exactly as Postgres/PostgREST do."""
+        calls = []
+
+        class Table:
+            def upsert(self, row, on_conflict=None):
+                calls.append(dict(row))
+                absent = [c for c in missing if c in row]
+                if absent:
+                    raise AgentUpsertResilienceTest._Missing(absent[0])
+                return self
+
+            def execute(self):
+                return type("R", (), {"data": []})()
+
+        class Admin:
+            def table(self, _name):
+                return Table()
+
+        return Admin(), calls
+
+    AGENT = {"agent_id": "agent_1", "owner_user_id": "u1", "name": "A",
+             "bundle_id": "B1", "status": "live", "deployed_at": "t"}
+    AGENT_023 = dict(AGENT, approval_required=True, deployment_mode="staging",
+                     deployments={"staging": "d1", "execution": "d2"})
+
+    def _run(self, admin, agent=None):
         real_conf, real_admin = registry.supa.is_configured, registry.supa.get_admin
         registry.supa.is_configured = lambda: True
         registry.supa.get_admin = lambda: admin
         try:
-            registry.agent_upsert("/tmp", {
-                "agent_id": "agent_1", "owner_user_id": "u1", "name": "A",
-                "bundle_id": "B1", "status": "live", "deployed_at": "t"})
+            return registry.agent_upsert("/tmp", dict(agent or self.AGENT))
         finally:
             registry.supa.is_configured, registry.supa.get_admin = real_conf, real_admin
 
@@ -774,6 +810,47 @@ class AgentUpsertResilienceTest(unittest.TestCase):
         admin, _ = self._fake_admin(lambda row: True)      # rejects even without them
         with self.assertRaises(Exception):
             self._run(admin)
+
+    # --- an unapplied migration must not cost a live agent --------------------
+    # Migration 023 added approval_required, deployments and deployment_mode, and
+    # every deploy has written all three since. On a database where 023 has not been
+    # applied PostgREST refuses the whole row with PGRST204 — which the original
+    # 23514-only guard did not recognise, so the agent was created on the platform
+    # and then lost here.
+
+    def test_only_the_column_the_database_names_is_dropped(self):
+        admin, calls = self._fake_admin_missing({"deployments"})
+        dropped = self._run(admin, self.AGENT_023)
+        self.assertEqual(dropped, ["deployments"])
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn("deployments", calls[1])
+        for kept in ("approval_required", "deployment_mode", "status", "deployed_at"):
+            self.assertIn(kept, calls[1],
+                          "a column the database never complained about is kept")
+        self.assertEqual(calls[1]["id"], "agent_1")
+
+    def test_a_database_missing_all_of_023_still_registers_the_agent(self):
+        admin, calls = self._fake_admin_missing(
+            {"deployments", "approval_required", "deployment_mode"})
+        dropped = self._run(admin, self.AGENT_023)
+        self.assertEqual(sorted(dropped),
+                         ["approval_required", "deployment_mode", "deployments"])
+        self.assertEqual(len(calls), 4, "one attempt per refusal, then the write")
+        self.assertEqual(calls[-1]["id"], "agent_1", "the agent is still registered")
+        self.assertEqual(calls[-1]["name"], "A")
+        self.assertEqual(calls[-1]["bundle_id"], "B1")
+
+    def test_a_refusal_naming_an_identity_column_raises(self):
+        """An agent row with no id is not a registration. Dropping identity to get a
+        write through would put a nameless row in the table and report success."""
+        admin, _ = self._fake_admin_missing({"id"})
+        with self.assertRaises(Exception):
+            self._run(admin, self.AGENT_023)
+
+    def test_the_normal_path_drops_nothing(self):
+        admin, calls = self._fake_admin_missing(set())
+        self.assertEqual(self._run(admin, self.AGENT_023), [])
+        self.assertEqual(len(calls), 1)
 
 
 class AgentStatusVocabularyTest(unittest.TestCase):

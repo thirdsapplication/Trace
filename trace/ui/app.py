@@ -1762,7 +1762,8 @@ class AppState:
         root = self.sessions_root
         specs_dir = sessions.path(root, sid, sessions.SPECS_DIR)
         start = start or {}
-        job = {"state": "running", "error": None, "deployed": 0, "errors": {}}
+        job = {"state": "running", "error": None, "deployed": 0, "errors": {},
+               "warnings": []}
         self.deploy_jobs[sid] = job
 
         def run():
@@ -1827,7 +1828,7 @@ class AppState:
                                                 client.archive_deployment(did)
                                 except Exception:          # noqa: BLE001 — best-effort
                                     pass
-                                registry.agent_upsert(root, {
+                                dropped = registry.agent_upsert(root, {
                                     "agent_id": rec["agent_id"], "owner_user_id": owner,
                                     "external_user_id": rec.get("external_user_id"),
                                     "bundle_id": bid, "name": b.get("name") or bid,
@@ -1851,6 +1852,16 @@ class AppState:
                                     # it went live.
                                     "status": rec.get("status"),
                                     "deployed_at": rec.get("deployed_at")})
+                                if dropped:
+                                    # The agent IS registered — agent_upsert dropped
+                                    # what the database would not take rather than
+                                    # lose it — but a dropped column means the row
+                                    # says less than the deploy knew. Carry it on the
+                                    # job so /deploy/status can say so; the registry
+                                    # has already named the cause in the log.
+                                    job["warnings"].append(
+                                        f"{bid}: registered without {', '.join(dropped)}"
+                                        " — a schema migration is pending")
                                 try:                  # Phase B: agent-kind gate. Best-effort
                                     self._embed_agent_kind({   # — an embedding hiccup must
                                         "agent_id": rec["agent_id"],   # never fail a deploy
@@ -1878,13 +1889,20 @@ class AppState:
                 # Only mark the session deployed if at least one agent was actually
                 # created; never report a total failure as "live" (the per-bundle
                 # platform error is surfaced so the real cause is visible).
+                errors_line = "; ".join(f"{k}: {msg}"
+                                        for k, msg in job["errors"].items())
                 if job["deployed"]:
                     sessions.update_meta(root, sid, deploy_at=sessions._now())
                     job.update(state="done")
                 elif job["errors"]:
+                    # "No agents were created" describes a creation that was ATTEMPTED
+                    # and failed. With nothing eligible the only entries here are the
+                    # rebind failures from above, and that sentence sends the reader
+                    # looking for a platform error that was never raised.
                     job.update(state="error",
-                               error="No agents were created. " +
-                                     "; ".join(f"{bid}: {msg}" for bid, msg in job["errors"].items()))
+                               error=("No agents were created. " if eligible else
+                                      "No agents were eligible to deploy. ")
+                                     + errors_line)
                 else:
                     job.update(state="done")          # nothing eligible -> nothing to do
             except Exception as e:

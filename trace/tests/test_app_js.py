@@ -34,6 +34,14 @@ def _render_profile_body(src):
     return src[start:end]
 
 
+def _go_live_handler(src):
+    """The text of the Go live click handler, from its assignment to the end of the
+    function it lives in."""
+    start = src.index('$("#liveGo").onclick = async () => {')
+    end = src.index('const { data } = await uget(sid, "/deploy-bundles");', start)
+    return src[start:end]
+
+
 class AppJsSyntaxTest(unittest.TestCase):
     @unittest.skipIf(shutil.which("node") is None, "node is not installed")
     def test_the_file_parses(self):
@@ -87,6 +95,50 @@ class RenderSafetyNetTest(unittest.TestCase):
         self.assertIn("_activityRepainted", body,
                       "without this guard a server that flips `refreshing` back on "
                       "makes the page re-render every few seconds forever")
+
+
+class DeployErrorSurvivesTest(unittest.TestCase):
+    """A failed deploy used to paint its error into #liveMsg and then call render(),
+    which rebuilds that element empty — so the one message naming the cause was
+    unreadable, and a deploy that created a live platform agent and then lost it
+    looked identical to one that did nothing at all.
+
+    These pin the two halves of the fix: the handler stops before the repaint, and
+    the repaint itself redraws the error rather than clearing it.
+    """
+
+    def test_the_failed_poll_returns_before_the_repaint(self):
+        body = _go_live_handler(_source())
+        catch = body.index("} catch (e) {")
+        ret = body.index("return;", catch)
+        repaint = body.index("await refreshSession(); render();", catch)
+        self.assertLess(ret, repaint,
+                        "the catch block must return — falling through to render() "
+                        "rebuilds #liveBody and erases the error that was just set")
+
+    def test_the_failure_is_held_across_renders(self):
+        src = _source()
+        self.assertIn("deployError: null", src,
+                      "the error has to live on S, not only in the DOM, or any other "
+                      "render clears it")
+        body = _go_live_handler(src)
+        self.assertIn("S.deployError = String(", body)
+
+    def test_the_go_live_body_redraws_a_held_error(self):
+        src = _source()
+        i = src.index('<p id="liveMsg"')
+        para = src[i:src.index("</p>", i)]
+        self.assertIn("S.deployError", para,
+                      "#liveMsg must be seeded from the held error, so a re-render "
+                      "from anywhere redraws the failure instead of blanking it")
+        self.assertIn("pre-wrap", para,
+                      "these messages carry a JSON payload and a platform agent id")
+
+    def test_a_new_attempt_clears_the_previous_failure(self):
+        body = _go_live_handler(_source())
+        first = body.index("S.deployError = null;")
+        self.assertLess(first, body.index("await upost(sid, \"/deploy\""),
+                        "a retry must clear the stale error before it starts")
 
 
 if __name__ == "__main__":
