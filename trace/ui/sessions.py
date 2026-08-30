@@ -287,6 +287,42 @@ def _upload_to_storage(root, sid, filename, owner_id):
             admin.table("sessions").update({col: storage_path}).eq("id", db_id).execute()
 
 
+def sids_with_capture(root, owner_id):
+    """Local sids for ``owner_id`` that still hold a recording ANYWHERE.
+
+    capture_present used to be ``os.path.isdir(session_dir(...))`` alone. Render has no
+    persistent disk, so after every deploy that is False for every agent — which
+    disabled the delete button and made the profile card announce "Capture data
+    deleted." while raw_events.jsonl sat in Storage. On 2026-08-30 that was true of 14
+    agents.
+
+    One query for the whole account, not one per agent: home_data is already the N+1
+    hot spot and this is called for every agent it returns.
+    """
+    out = set()
+    if supa.is_configured() and owner_id:
+        try:
+            r = supa.get_admin().table("sessions") \
+                .select("local_sid,raw_events_path,event_log_path,discovery") \
+                .eq("owner_id", owner_id).execute()
+            for row in (getattr(r, "data", None) or []):
+                if row.get("raw_events_path") or row.get("event_log_path") \
+                        or row.get("discovery"):
+                    if row.get("local_sid"):
+                        out.add(row["local_sid"])
+        except Exception:                                  # noqa: BLE001 — pre-migration
+            pass
+    try:                                                   # ...plus anything still local
+        base = os.path.join(root, "sessions") if os.path.isdir(
+            os.path.join(root, "sessions")) else root
+        for name in os.listdir(base):
+            if os.path.isdir(session_dir(root, name)):
+                out.add(name)
+    except OSError:
+        pass
+    return out
+
+
 def purge_cloud_artifacts(root, sid):
     """Delete a session's uploaded artifacts from Storage and blank the derived
     content on its row. Returns a small report; never raises.

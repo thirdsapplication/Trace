@@ -1611,6 +1611,63 @@ class AppState:
                               "memory_stores": memory_store_ids},
                 **(result or {})}
 
+    def delete_agent(self, agent_id, owner_user_id, delete_capture=True):
+        """Delete an agent for real: take it off the platform, then remove its rows.
+
+        Order matters. The deployment is archived FIRST, because the failure that
+        actually costs something is a live deployment left running against a vault
+        after its owner believes it is gone — an agent still sending mail on a
+        schedule nobody can see or stop. Losing a database row while the deployment
+        survives is recoverable; the reverse is not.
+
+        The memory store is deleted only when no OTHER agent of this owner uses it.
+        Two of the founder's own agents were found sharing one store, so deleting it
+        with the agent would have wiped a surviving agent's accumulated memory.
+
+        Capture data goes too by default: "delete this agent" meaning "keep the
+        recording of you working" is not what anyone would expect.
+        """
+        root = self.sessions_root
+        agent = next((a for a in registry.agents_for_user(root, owner_user_id)
+                      if a.get("agent_id") == agent_id), None)
+        if not agent:
+            return {"error": "not_found"}
+
+        out = {"agent_id": agent_id, "name": agent.get("name"),
+               "platform": {}, "capture": None, "errors": []}
+
+        store_id = agent.get("memory_store_id")
+        shared_with = registry.agents_sharing_memory_store(
+            root, owner_user_id, store_id, except_agent_id=agent_id)
+        out["memory_store_kept_for"] = shared_with
+
+        # 1. Off the platform. Best-effort per id, but every failure is REPORTED —
+        #    a half-deleted agent that looks fully deleted is the dangerous outcome.
+        try:
+            res = self.cleanup_fn(
+                [], [], [],
+                agent_names=[],
+                deployment_ids=[agent["deployment_id"]] if agent.get("deployment_id") else [],
+                memory_store_ids=[] if shared_with or not store_id else [store_id])
+            out["platform"] = res or {}
+        except Exception as e:                             # noqa: BLE001
+            out["platform"] = {"error": f"{type(e).__name__}: {e}"}
+            out["errors"].append("platform cleanup failed — check for an orphaned "
+                                 "deployment before assuming this agent is gone")
+
+        # 2. The recording behind it.
+        sid = agent.get("session_id")
+        if delete_capture and sid:
+            try:
+                out["capture"] = self.delete_capture_data(sid, owner_user_id)
+            except Exception as e:                         # noqa: BLE001
+                out["capture"] = {"error": f"{type(e).__name__}: {e}"}
+
+        # 3. The rows.
+        out["registry"] = registry.agent_delete(root, agent_id, owner_user_id)
+        out["deleted"] = bool(out["registry"].get("deleted"))
+        return out
+
     def delete_capture_data(self, sid, owner_user_id):
         """User-facing "delete my capture data": remove one workflow's capture session
         (raw recording + every derived artifact) from disk, plus the capture-derived
@@ -1619,8 +1676,14 @@ class AppState:
         path never reads the session dir). Owner-scoped. Best-effort on the platform
         side (an error there never blocks the on-disk delete)."""
         root = self.sessions_root
-        meta = sessions.read_meta(root, sid)
-        if not meta or meta.get("owner_user_id") != owner_user_id:
+        # owner_of, not read_meta. read_meta only ever looks at meta.json on the
+        # container filesystem and returns a bare {"id": sid} when it is missing --
+        # which is the normal state on Render, where there is no persistent disk and
+        # every deploy wipes captures/sessions/. The gate then failed for every
+        # pre-existing session and the endpoint answered not_found, so the ONE action
+        # that removes a recording from the cloud stopped working precisely when the
+        # recording still existed. owner_of asks the file first and Supabase second.
+        if sessions.owner_of(root, sid) != owner_user_id:
             return {"error": "not_found"}
         # Capture-derived data on the platform = uploaded files + test/manual-eval run
         # sessions. NOT the live agent/session ids (no agent_ids/agent_names), so a live
@@ -3240,6 +3303,7 @@ class AppState:
         for p in registry.lesson_promotions_for_user(root, uid, status="confirmed"):
             active_by_agent.setdefault(p.get("agent_id"), []).append(
                 {"decision_id": p.get("decision_id"), "lesson": p.get("lesson")})
+        capture_sids = sessions.sids_with_capture(root, uid)   # one query, not one per agent
         agents_out = []
         # READ path: teammates' agents are visible here and nowhere else. Every
         # mutation still resolves through agents_for_user, which cannot see them.
@@ -3298,8 +3362,10 @@ class AppState:
                 "deployed_at": a.get("deployed_at"),
                 "deployment": bool(a.get("deployment_id")),
                 "schedule": schedules_by_agent.get(aid),
-                "capture_present": bool(a.get("session_id")) and
-                os.path.isdir(sessions.session_dir(root, a.get("session_id"))),
+                # Disk OR cloud. A recording that only exists in Storage is still a
+                # recording, and saying otherwise both hid the delete control and
+                # claimed the data was already gone.
+                "capture_present": a.get("session_id") in capture_sids,
                 "stories": stories, "unreviewed": len(stories),
                 "open_decisions": open_decisions, "pending_approvals": pending_approvals,
                 "lesson_confirmations": lesson_confirmations,
@@ -3831,13 +3897,13 @@ def make_handler(state):
             ids = [a.get("agent_id") for a in agents]
             schedules = registry.schedules_for_agents(root, ids)     # batched: was 2 per agent
             runs = registry.runs_for_agents(root, ids, 5)
+            capture_sids = sessions.sids_with_capture(root, user["user_id"])
             for a in agents:
                 aid = a.get("agent_id")
                 out.append({**a,
                             "schedule": schedules.get(aid),
                             "recent_runs": runs.get(aid) or [],
-                            "capture_present": bool(a.get("session_id")) and
-                            os.path.isdir(sessions.session_dir(root, a.get("session_id")))})
+                            "capture_present": a.get("session_id") in capture_sids})
             return out
 
         def _agent_action(self, agent_id, action, body, user):
@@ -4239,6 +4305,35 @@ def make_handler(state):
                 return self._json(404, res)
             return self._json(200, res)
 
+        def _delete_agent(self, agent_id, body, user):
+            """Delete an agent. Owner-scoped inside delete_agent, which also refuses to
+            remove a memory store another of this user's agents still relies on."""
+            keep = bool((body or {}).get("keep_capture"))
+            res = state.delete_agent(agent_id, user["user_id"],
+                                     delete_capture=not keep)
+            if res.get("error"):
+                return self._json(404, res)
+            # 200 even with platform errors: the rows ARE gone, and the response
+            # carries what failed so the UI can say so rather than imply a clean sweep.
+            return self._json(200, res)
+
+        def _delete_session_capture(self, sid, user):
+            """Delete the capture data of a session directly, agent or no agent.
+
+            Both existing entry points resolve through an AGENT, so a recording that
+            never produced one had no delete path at all: on 2026-08-30 that was 51 of
+            the 66 sessions holding cloud artifacts, including every session belonging
+            to accounts with no agents. The recordings were real, listed in Storage, and
+            unreachable by anything the user could click.
+
+            Ownership is enforced inside delete_capture_data (via owner_of), so this
+            cannot reach another account's session.
+            """
+            res = state.delete_capture_data(sid, user["user_id"])
+            if res.get("error"):
+                return self._json(404, res)
+            return self._json(200, res)
+
         # --- end-user namespace (WS3): same pipeline, scoped to the logged-in user ---
         def _user_get(self, rest, user):
             if rest in ("/me", ""):
@@ -4426,6 +4521,12 @@ def make_handler(state):
             md = re.match(r"^/agents/([^/]+)/delete-capture-data$", rest)
             if md:                                       # delete this workflow's capture data
                 return self._delete_capture_data(md.group(1), user)
+            mdel = re.match(r"^/agents/([^/]+)/delete$", rest)
+            if mdel:                                     # remove the agent itself
+                return self._delete_agent(mdel.group(1), body, user)
+            msd = re.match(r"^/sessions/([^/]+)/delete-capture-data$", rest)
+            if msd:                                      # ...and one that never became an agent
+                return self._delete_session_capture(msd.group(1), user)
             maa = re.match(r"^/agents/([^/]+)/approve-actions$", rest)
             if maa:                                      # approve selected staged actions (activity screen)
                 agent = next((a for a in registry.agents_for_user(root, user["user_id"])

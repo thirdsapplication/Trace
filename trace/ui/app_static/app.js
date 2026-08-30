@@ -2331,7 +2331,17 @@ async function renderProfile(agentId) {
             </div>
             <button id="pDelCap" class="btn-danger btn-sm">Delete…</button>
           </div>` : `
-          <div class="prof-card"><div class="sub muted">Capture data deleted.</div></div>`}
+          <div class="prof-card"><div class="sub muted">No recording is being kept for
+            this agent.</div></div>`}
+          ${a.can_edit === false ? "" : `
+          <div class="prof-card prof-danger">
+            <div style="flex:1;">
+              <div class="t">Delete this agent</div>
+              <div class="d">Takes it off the platform, releases its connections and
+                removes its history and recordings. This can't be undone.</div>
+            </div>
+            <button id="pDelAgent" class="btn-danger btn-sm">Delete…</button>
+          </div>`}
         </div>
         <div class="prof-rail">
           ${(a.lesson_confirmations || []).map(c => `
@@ -2487,6 +2497,39 @@ async function renderProfile(agentId) {
     await api("POST", `/api/u/agents/${agentId}/delete-capture-data`, {});
     S.igHome = null; renderProfile(agentId);
   };
+  const da = $("#pDelAgent");
+  if (da) da.onclick = async () => {
+    // The typed confirmation, not the quiet one: this stops a live agent, drops its
+    // connections and destroys its history. It is the most destructive thing here.
+    const okd = await confirmDestructive({
+      title: `Delete ${a.name || "this agent"}?`,
+      body: `This stops it running, removes it from the platform, and deletes its
+        history and recordings permanently. Anything it already sent or changed stays
+        as it is. This can't be undone.`,
+    });
+    if (!okd) return;
+    da.disabled = true; da.textContent = "Deleting…";
+    const { ok, data } = await api("POST", `/api/u/agents/${agentId}/delete`, {});
+    if (!ok) {
+      da.disabled = false;
+      da.textContent = friendly((data || {}).error || "could not delete");
+      return;
+    }
+    S.igHome = null;
+    // Say it plainly if the platform half did not fully succeed, rather than
+    // returning to a home screen that implies a clean sweep.
+    if ((data.errors || []).length) {
+      // Reuses the existing modal as an acknowledgement (word: null drops the typed
+      // confirmation) rather than inventing a notice widget for one message.
+      await confirmDestructive({
+        title: "Deleted, with one problem",
+        body: data.errors.join(" · "),
+        verb: "OK", word: null, tone: "primary",
+      });
+    }
+    renderHome();
+  };
+
   // the log: real per-session activity (summaries + proposals), newest first
   const act = await api("GET", `/api/u/agents/${agentId}/activity`);
   const { data } = act;
