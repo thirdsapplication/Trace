@@ -19,9 +19,14 @@ ALTER TABLE agents ADD COLUMN IF NOT EXISTS deployments JSONB DEFAULT '{}'::json
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS deployment_mode TEXT;
 
 -- Backfill: whatever the row said about staged apps is what the human wanted.
+-- CASE rather than AND: SQL does not promise to short-circuit a conjunction, and
+-- jsonb_array_length raises on a scalar, so a single row holding `null` or an object
+-- in staged_apps would abort the whole migration. CASE evaluates in order.
 UPDATE agents
-   SET approval_required = (staged_apps IS NOT NULL
-                            AND jsonb_array_length(COALESCE(staged_apps, '[]'::jsonb)) > 0)
+   SET approval_required = CASE
+         WHEN jsonb_typeof(staged_apps) = 'array' THEN jsonb_array_length(staged_apps) > 0
+         ELSE false
+       END
  WHERE approval_required IS NULL;
 
 -- Existing agents keep their single deployment as the ACTIVE one; `deployment_id`
