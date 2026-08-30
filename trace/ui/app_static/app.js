@@ -2483,7 +2483,22 @@ async function renderProfile(agentId) {
       return;
     }
     S.igHome = null;
-    await loadAndRender();
+    // use-as-template kicks off the SAME background describe job the typed-description
+    // path uses, and that path waits for it before rendering. This one did not, so it
+    // re-rendered while the new session still had no event_log or discovery.json --
+    // and the step it derives from an empty session is the very first one. Pressing
+    // "Build my own" therefore dropped you back on the recording screen, looking like
+    // the button had done nothing.
+    try {
+      await pollJob(data.session_id, "describe", (d) => {
+        tpl.textContent = d && d.stage ? `Setting up… ${d.stage}` : "Setting up…";
+      });
+    } catch (e) {
+      tpl.disabled = false;
+      tpl.textContent = friendly(e.message || "could not set it up");
+      return;
+    }
+    await loadAndRender();                   // now lands on Review, like describe does
   };
 
   const dc = $("#pDelCap");
