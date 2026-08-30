@@ -231,7 +231,7 @@ class AppState:
                  discovery_fn=None, describe_fn=None, score_fn=None, artifact_fn=None,
                  interview_fn=None, config_fn=None, cleanup_fn=None,
                  connect_fn=None, deploy_fn=None, cloud_backend=None, proxy_fn=None,
-                 summarize_fn=None, learn_fn=None,
+                 summarize_fn=None, learn_fn=None, learn_score_fn=None,
                  scrub_fn=None, scrub_verify_fn=None):
         self.sessions_root = sessions_root
         self.collector_port = collector_port
@@ -274,6 +274,13 @@ class AppState:
         # sessions and rewrites lessons_learned.md (Fable). Stub in tests; built
         # lazily from the key.
         self.learn_fn = learn_fn
+        # The DIFFICULTY scorer of the learning cycle (Sonnet), a different call from
+        # the analyst above on purpose — see score.py. Named learn_score_fn and not
+        # score_fn because ``score_fn`` is taken, by the discovery scorer, and the seam
+        # that reached for it silently got that instead of a model caller: every cycle
+        # in production called discovery_scorer.score(system, user), which raised, and
+        # no cycle ever produced a measurement.
+        self.learn_score_fn = learn_score_fn
         # Collective learning: the scrub pass and its independent privacy gate. Two
         # seams, not one, because the whole point of the gate is that it is a SECOND
         # opinion — a test that stubs both with the same callable is testing plumbing,
@@ -2529,9 +2536,25 @@ class AppState:
 
     def _score_model_fn(self):
         """The difficulty scorer. A DIFFERENT call from the analyst on purpose — see
-        score.py — and overridable in tests like every other model seam here."""
-        fn = getattr(self, "score_fn", None)
-        return fn or agent_score._default_model_fn()
+        score.py — and overridable in tests like every other model seam here.
+
+        Built exactly like _learning_model_fn, including the tap, so a scoring call
+        shows up in the admin prompt log beside the analysis it feeds. It used to read
+        ``self.score_fn``, which is the DISCOVERY scorer and is always set, so the
+        fallback to a real model caller was unreachable: every cycle called
+        discovery_scorer.score(system, user), which raises on a string, and score_batch
+        swallowed it into "no measurement this cycle". The tests injected over the same
+        attribute, so they could not see it.
+        """
+        if self.learn_score_fn:
+            return self._tap("scoring", None, agent_config.SCORE_MODEL,
+                             lambda: self.learn_score_fn)
+        key = self.keystore.get_key()
+        if not key:
+            raise RuntimeError("no_api_key")
+        os.environ["ANTHROPIC_API_KEY"] = key
+        return self._tap("scoring", None, agent_config.SCORE_MODEL,
+                         lambda: agent_score._default_model_fn())
 
     @staticmethod
     def _baseline_for(aid, changes, pending):

@@ -26,6 +26,7 @@ import time
 import unittest
 
 from trace.agent import config as agent_config
+from trace.discovery import scorer as discovery_scorer
 from trace.ui import app, registry
 
 
@@ -96,6 +97,76 @@ class FakeLearnClient:
         return True
 
 
+class LearningScorerSeamTest(unittest.TestCase):
+    """The cycle's difficulty scorer has to be a MODEL caller.
+
+    It read ``self.score_fn`` — which is the DISCOVERY scorer, set unconditionally in
+    the constructor — so the `or` that was meant to fall back to a real caller was
+    unreachable. Every production cycle called discovery_scorer.score(system, user),
+    which raises on a string, score_batch swallowed it, and the cycle recorded "no
+    measurement". mean_performance was null on every row of learning_cycles, and
+    learn.decide reverts a change it cannot measure, so the loop could never keep
+    anything it tried.
+
+    Nothing behavioural could catch it: the harness injected over that same attribute,
+    so the tests exercised a correct stub while production ran the wrong function. These
+    assert on the seam itself, with nothing injected.
+    """
+
+    class _Keystore:
+        def __init__(self, key):
+            self._key = key
+
+        def get_key(self):
+            return self._key
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = self._tmp.name
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _state(self, key=None, **kw):
+        state = app.AppState(sessions_root=self.root, **kw)
+        state.keystore = self._Keystore(key)
+        return state
+
+    def test_with_nothing_injected_it_does_not_hand_back_the_discovery_scorer(self):
+        """No key means no scorer — which is a loud failure, not a wrong callable."""
+        state = self._state(key=None)
+        with self.assertRaises(RuntimeError) as caught:
+            state._score_model_fn()
+        self.assertIn("no_api_key", str(caught.exception))
+
+    def test_a_real_key_builds_a_caller_that_is_not_the_discovery_scorer(self):
+        state = self._state(key="sk-test")
+        fn = state._score_model_fn()
+        self.assertIsNot(fn, discovery_scorer.score)
+        # The tap builds the real client lazily, so having a callable back is the whole
+        # assertion — calling it would reach the network.
+        self.assertTrue(callable(fn))
+
+    def test_the_injected_scorer_is_the_one_called(self):
+        seen = []
+        state = self._state(key="sk-test",
+                            learn_score_fn=lambda system, user: seen.append(user) or "{}")
+        state._score_model_fn()("sys", "usr")
+        self.assertEqual(seen, ["usr"])
+
+    def test_the_discovery_scorer_keeps_its_own_seam(self):
+        """The two must not converge again from the other direction either."""
+        self.assertIs(self._state().score_fn, discovery_scorer.score)
+
+    def test_a_scoring_call_reaches_the_admin_prompt_log(self):
+        """Tapped like every other engine: a cycle that scored badly should be readable
+        beside the analysis it fed."""
+        state = self._state(key="sk-test", learn_score_fn=lambda system, user: "{}")
+        state._score_model_fn()("sys", "usr")
+        self.assertTrue(any(e.get("engine") == "scoring" for e in state.prompt_log),
+                        "the scoring call must be recorded like the others")
+
+
 class _CycleHarness(unittest.TestCase):
     """Shared fixture: a file-mode registry in a tempdir, the fake platform client, and
     an AppState whose learning call is a stub. No tests of its own — the collective and
@@ -137,8 +208,11 @@ class _CycleHarness(unittest.TestCase):
                        "delete": []},
             "blocked_on": ""}
 
-        self.state = app.AppState(sessions_root=self.root, learn_fn=learn_fn)
-        self.state.score_fn = score_fn
+        # learn_score_fn, not score_fn: score_fn is the DISCOVERY scorer, and injecting
+        # over it is what hid a production bug where the cycle's scorer seam read that
+        # same attribute and got discovery_scorer.score instead of a model caller.
+        self.state = app.AppState(sessions_root=self.root, learn_fn=learn_fn,
+                                  learn_score_fn=score_fn)
         self.client = FakeLearnClient()
         self.state._live_client = lambda: self.client
         self.agent = {"agent_id": "a1", "owner_user_id": "u1", "name": "Orders",
