@@ -333,13 +333,23 @@ _SWEEP = (
 
 
 def _sweep_text(scrubbed):
-    """The free text of a scrubbed payload — every transcript and every document — as one
-    string.
+    """The scrubbed payload's FREE TEXT as one string: every transcript, every memory
+    document — its PATH as well as its body — and the prose of every improvement-log
+    entry.
 
-    Deliberately NOT the whole serialised object: session_id, ran_at and tokens are
-    structural fields the scrub is REQUIRED to copy through untouched, and an ISO
-    timestamp or a five-figure token total trips the four-digit rule on literally every
-    payload that will ever be produced. They carry no identity. The text does.
+    This is the surface the model was asked to rewrite, and the surface that gets
+    published. Everything else it returns is structural and copied through by
+    instruction: session_id, ran_at, tokens, change_id, outcome, relative_delta.
+    Searching those carries no safety and costs every batch — an ISO timestamp or a
+    five-figure token total trips a four-digit rule on literally every payload that will
+    ever be produced, and a date the model redacted in a transcript is still sitting in
+    the ran_at it was ordered not to touch, so its declared literal can never be absent.
+    That rejected a real batch in production with "declared literal still present
+    (pseudonym 'this date')".
+
+    Memory PATHS are in, and they are not decoration: the engine names the documents it
+    creates, so a playbook it filed under one customer's name is a leak in a key rather
+    than a value.
     """
     parts = []
     for entry in ((scrubbed or {}).get("sessions") or []):
@@ -347,7 +357,13 @@ def _sweep_text(scrubbed):
             parts.append(str(entry.get("transcript") or ""))
     memory = (scrubbed or {}).get("memory")
     if isinstance(memory, dict):
-        parts.extend(str(text or "") for text in memory.values())
+        for path, text in memory.items():
+            parts.append(str(path))
+            parts.append(str(text or ""))
+    for entry in ((scrubbed or {}).get("log") or []):
+        if isinstance(entry, dict):
+            parts.append(str(entry.get("summary") or ""))
+            parts.append(str(entry.get("technique") or ""))
     return "\n".join(parts)
 
 
@@ -372,16 +388,19 @@ def leak_sweep(scrubbed, redactions):
     payload: every declared literal is gone, every declared pseudonym is actually there
     (a declaration the model never carried out), and no identifier shape appears in the
     free text at all. Reasons never quote what was found: this line gets printed."""
-    # Everything the model returned EXCEPT its own redactions list: that list quotes every
-    # original literal by design, so searching it for those literals would fail every
-    # scrub ever written. Any other key the model invented is still searched.
-    content = {k: v for k, v in (scrubbed or {}).items() if k != "redactions"}
-    # Walked, not json.dumps'd. Serialising first would compare against ESCAPED text, so a
-    # literal holding a quote, a backslash, a newline or a tab — O'Brien's Bar, a Windows
-    # path, a pasted signature block — could survive verbatim in the published string and
-    # still never match here. That would silently disarm the one check in this file that
-    # does not take the model's word for anything.
-    low = "\n".join(_strings(content)).lower()
+    # ONE surface for all three checks: the free text, which is what the model rewrote
+    # and what gets published. It used to be every key the model returned except
+    # redactions, which meant the literal check searched the structural fields the
+    # prompt orders copied through — see _sweep_text for why that rejected every batch
+    # in which the model redacted a date.
+    #
+    # Assembled from real strings, never json.dumps'd. Serialising first would compare
+    # against ESCAPED text, so a literal holding a quote, a backslash, a newline or a
+    # tab — O'Brien's Bar, a Windows path, a pasted signature block — could survive
+    # verbatim in the published string and still never match here. That would silently
+    # disarm the one check in this file that does not take the model's word for anything.
+    text = _sweep_text(scrubbed)
+    low = text.lower()
     for item in (redactions or []):
         if not isinstance(item, dict):
             return False, "redaction entry is not an object"
@@ -396,7 +415,6 @@ def leak_sweep(scrubbed, redactions):
             return False, f"declared literal still present (pseudonym {pseudonym!r})"
         if pseudonym.lower() not in low:
             return False, f"pseudonym {pseudonym!r} declared but never used"
-    text = _sweep_text(scrubbed)
     for label, detect in _SWEEP:
         if detect(text):
             return False, f"{label} survived in the scrubbed text"

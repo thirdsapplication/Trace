@@ -224,6 +224,61 @@ class LeakSweepTest(unittest.TestCase):
         ok, _ = scrub.leak_sweep(_scrubbed("[agent] card 4111-1111-1111-1111 on file"), [])
         self.assertFalse(ok)
 
+    # --- the checks run over the FREE TEXT, not the structural fields ---------
+    # Production, on the first cycle that scored: the scrubber redacted a date (the
+    # prompt used to call any run of four or more digits an identifier, which catches
+    # every year), declared the literal, and the sweep found that literal still sitting
+    # in the ran_at it had been ordered to copy unchanged. "declared literal still
+    # present (pseudonym 'this date')" — a leak that was never a leak, and no peer
+    # bundle published.
+
+    def test_a_redacted_date_is_not_hunted_in_the_fields_the_scrub_must_preserve(self):
+        red = [{"pseudonym": "this date", "literal": "2026-05-01", "category": "other"}]
+        payload = _scrubbed("[agent] the order was placed on this date", red)
+        ok, reason = scrub.leak_sweep(payload, red)
+        self.assertTrue(ok, reason)
+
+    def test_a_pseudonym_must_be_used_in_the_text_not_merely_present_somewhere(self):
+        """"Used" means used where it matters. A pseudonym that only collides with a
+        session id was reading as carried out."""
+        red = [{"pseudonym": "s1", "literal": "Mario's Pizzeria", "category": "company"}]
+        ok, reason = scrub.leak_sweep(_scrubbed("[agent] emailed the client", red), red)
+        self.assertFalse(ok)
+        self.assertIn("never used", reason)
+
+    def test_an_identifier_in_the_improvement_log_is_caught(self):
+        """The log crosses to other customers with everything else, and was not being
+        swept at all — the shape checks ran over transcripts and documents only."""
+        payload = _scrubbed()
+        payload["log"] = [{"change_id": "c1", "summary": "escalate to dana@example.com",
+                           "technique": "front-load the cheap check", "outcome": "kept",
+                           "relative_delta": -0.1}]
+        ok, reason = scrub.leak_sweep(payload, [])
+        self.assertFalse(ok)
+        self.assertIn("email", reason)
+
+    def test_a_declared_literal_surviving_in_the_log_is_caught(self):
+        red = [{"pseudonym": "restaurant client A", "literal": "Mario's Pizzeria",
+                "category": "company"}]
+        payload = _scrubbed(SCRUBBED_TRANSCRIPT, red)
+        payload["log"] = [{"change_id": "c1", "summary": "Mario's Pizzeria orders late",
+                           "technique": "t", "outcome": "kept", "relative_delta": -0.1}]
+        ok, reason = scrub.leak_sweep(payload, red)
+        self.assertFalse(ok)
+        self.assertIn("literal still present", reason)
+
+    def test_a_customer_named_in_a_document_PATH_is_still_caught(self):
+        """Narrowing the search must not lose the keys. The engine NAMES the documents
+        it creates, so a playbook filed under one customer is a leak in a key."""
+        red = [{"pseudonym": "restaurant client A", "literal": "Mario's Pizzeria",
+                "category": "company"}]
+        payload = _scrubbed(SCRUBBED_TRANSCRIPT, red)
+        payload["memory"] = {"/Mario's Pizzeria playbook.md":
+                             "restaurant client A ships weekly."}
+        ok, reason = scrub.leak_sweep(payload, red)
+        self.assertFalse(ok)
+        self.assertIn("literal still present", reason)
+
     def test_leak_in_memory_doc_is_caught(self):
         payload = _scrubbed()
         payload["memory"]["/lessons_learned.md"] = "Escalate to dana@example.com."

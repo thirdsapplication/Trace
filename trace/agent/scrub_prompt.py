@@ -57,11 +57,14 @@ HARD RULES:
   "Dana Whitfield" -> "the client contact", "$18,400.00" -> "a mid-size invoice",
   "PO-99182" -> "an order id". Never leave a hole and never write "[REDACTED]" — the
   reader still has to understand what happened.
-- A run of four or more digits, a URL carrying a query string, and anything card- or
-  account-number-shaped are identifiers too: none of them may survive inside a
-  transcript or a document. Replace each with what it was ("an order id", "a
-  four-figure amount", "roughly fifteen thousand tokens"). The tokens field itself is
-  structural and is copied through unchanged.
+- A RECORD IDENTIFIER is an identifier however it is written — an order, invoice,
+  account, customer or card number — as is a URL carrying a query string. None of them
+  may survive inside a transcript or a document. Replace each with what it was ("an
+  order id", "a four-figure amount").
+- DATES, TIMES AND COUNTS ARE NOT IDENTIFIERS. Leave every one of them exactly as it is.
+  When a retry happened, how long a gap was, how many rows arrived, how many tokens a
+  session spent: that is the mechanics the reader is here for, and none of it identifies
+  anyone on its own. The tokens field is structural and is copied through unchanged.
 - Pseudonyms are STABLE across the whole payload: the same real entity gets the same
   pseudonym in session 1, in session 5, and in the memory documents, so cross-session
   patterns stay visible.
