@@ -856,7 +856,16 @@ class AppState:
         — a status derived while the session was still mid-run got cached, and this
         gate then reported "nothing to do", so it was never re-derived after the
         session went idle. Terminal statuses (completed/failed/staged/needs_input)
-        stay cached and don't re-fetch. Cheap: two registry reads."""
+        stay cached and don't re-fetch. Cheap: two registry reads.
+
+        A session that STAGED and has no pending row is the one terminal status worth
+        re-visiting. Its proposals were parsed (that is what makes the status "staged")
+        and then not persisted, which is the state every session left behind while the
+        write path was gating on the retired column. Without this the fix above only
+        helps future runs and the staged work already sitting on the platform stays
+        invisible for good. Self-limiting: session_status says "staged" only when
+        extract_proposals found something, and _session_proposals inserts from that same
+        parse, so one refresh closes the gap and this goes quiet."""
         root = self.sessions_root
         try:
             runs = registry.runs_for_agent(root, agent.get("agent_id"), limit)
@@ -865,8 +874,23 @@ class AppState:
             if not sids:
                 return False
             cached = registry.summaries_many(root, sids)
-            return any((cached.get(s) or {}).get("status") in (None, "", "running")
-                       for s in sids)
+            if any((cached.get(s) or {}).get("status") in (None, "", "running")
+                   for s in sids):
+                return True
+            if not agent_config.approval_required(agent):
+                return False
+            kinds = {r.get("run_session_id"): r.get("kind") for r in runs}
+            # sids is already free of sessions the platform has lost, so one that can
+            # never be re-read cannot keep asking to be.
+            staged = {s for s in sids
+                      if kinds.get(s) != "approval"
+                      and (cached.get(s) or {}).get("status") == "staged"}
+            if not staged:
+                return False
+            harvested = {p.get("run_session_id") for p in
+                         registry.pending_for_user(root, agent.get("owner_user_id"),
+                                                   status=None)}
+            return bool(staged - harvested)
         except Exception:                                  # noqa: BLE001
             return False
 
@@ -956,7 +980,13 @@ class AppState:
         """
         root = self.sessions_root
         owner = agent.get("owner_user_id")
-        staged = bool(agent.get("staged_apps"))
+        # THE one reader of "does this agent stage?", the same call agent_activity
+        # makes. This line read agent["staged_apps"] directly until it was found
+        # gating the only path that turns a staged proposal into an approvable row —
+        # so every agent deployed after approval became a whole-agent flag (which
+        # stopped writing that column) staged its actions into a session nobody
+        # harvested, and no approval card ever appeared.
+        staged = agent_config.approval_required(agent)
         try:
             client = self._live_client()
         except Exception:                                  # noqa: BLE001 — no key: nothing

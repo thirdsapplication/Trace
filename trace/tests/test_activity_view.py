@@ -9,6 +9,8 @@ them runs on a background thread. These tests pin that split: the request path
 touches NO network, and the refresh writes what the request path reads.
 """
 
+import ast
+import os
 import tempfile
 import threading
 import time
@@ -24,6 +26,22 @@ class FakeActivityClient:
 
     def list_session_events(self, session_id):
         return list(self.events)
+
+
+# A session that STAGED: its final message is the proposed_actions fence the staging
+# contract asks for. Deliberately not the prompt's fictional example — runner drops
+# anything echoing PO-1234/buyer@acme.com, and a fixture that tripped that filter would
+# pass these tests for the wrong reason.
+STAGED_EVENTS = [
+    {"type": "user.message", "text": "Task: go"},
+    {"type": "agent.message", "text":
+        '```proposed_actions\n'
+        '[{"app": "shopify", "action": "archive product", '
+        '"summary": "Archive SKU-9 (discontinued in the sheet)", '
+        '"rationale": "the inventory sheet marks SKU-9 discontinued", '
+        '"details": {"sku": "SKU-9"}}]\n```'},
+    {"type": "session.status_idle", "text": ""},
+]
 
 
 class ActivityViewTest(unittest.TestCase):
@@ -214,6 +232,78 @@ class ActivityViewTest(unittest.TestCase):
             self.assertFalse(self.state.activity_needs_refresh(self.agent),
                              f"{terminal!r} should not need a refresh")
 
+    # --- staging reads the flag, not the column it replaced ------------------
+    # Approval moved from a per-app `staged_apps` list to a whole-agent
+    # `approval_required` flag. The read path (agent_activity) was migrated to
+    # config.approval_required and the WRITE path (refresh_activity) was not, so every
+    # agent deployed after deploys stopped writing that column staged its actions into
+    # a session nobody harvested: no pending row, no approval card, no way to say yes.
+
+    def _staged_agent(self, approval=True):
+        agent = dict(self.agent, approval_required=approval)
+        registry.agent_upsert(self.root, agent)
+        self.client.events = list(STAGED_EVENTS)
+        return agent
+
+    def test_proposals_are_persisted_for_an_agent_whose_flag_is_set(self):
+        """approval_required True, staged_apps absent — the shape of every agent
+        deployed since the flag replaced the column."""
+        agent = self._staged_agent()
+        self._runs(1)
+        self.state.refresh_activity(agent)
+        rows = [r for r in registry.pending_for_user(self.root, "u1", status=None)
+                if r.get("run_session_id") == "s0"]
+        self.assertEqual(len(rows), 1, "the staged action must reach pending_actions")
+        self.assertEqual(rows[0]["summary"], "Archive SKU-9 (discontinued in the sheet)")
+        out = self.state.agent_activity(agent)
+        self.assertEqual(len(out[0]["proposals"]), 1,
+                         "and the session history must render it")
+
+    def test_the_legacy_column_still_works_on_its_own(self):
+        """Rows written before the flag existed carry only staged_apps, and
+        config.approval_required falls back to it. They must keep staging."""
+        agent = dict(self.agent, staged_apps=["shopify"])
+        registry.agent_upsert(self.root, agent)
+        self.client.events = list(STAGED_EVENTS)
+        self._runs(1)
+        self.state.refresh_activity(agent)
+        self.assertEqual(len([r for r in registry.pending_for_user(self.root, "u1",
+                                                                   status=None)
+                              if r.get("run_session_id") == "s0"]), 1)
+
+    def test_an_autonomous_agent_stages_nothing(self):
+        """The gate is right; only its predicate was wrong. An agent nobody asked to
+        stage must not have its final message turned into approvable rows."""
+        agent = self._staged_agent(approval=False)
+        self._runs(1)
+        self.state.refresh_activity(agent)
+        self.assertEqual(list(registry.pending_for_user(self.root, "u1", status=None)),
+                         [])
+
+    def test_a_staged_session_with_nothing_harvested_reopens_the_gate(self):
+        """Fixing the predicate does not recover the backlog on its own: a session that
+        staged is cached as "staged", which is terminal, so the refresh would never run
+        for it again and the proposals already sitting on the platform would stay
+        invisible for good."""
+        agent = self._staged_agent()
+        self._runs(1)
+        registry.summary_set(self.root, "s0", "Proposed something.", "staged")
+        self.assertTrue(self.state.activity_needs_refresh(agent))
+        self.state.refresh_activity(agent)
+        self.assertEqual(len(list(registry.pending_for_user(self.root, "u1",
+                                                            status=None))), 1)
+        self.assertFalse(self.state.activity_needs_refresh(agent),
+                         "and it closes again once harvested — not a refresh on every "
+                         "page load")
+
+    def test_a_staged_session_on_an_autonomous_agent_stays_shut(self):
+        """The exception is narrow. Only an approval-required agent has proposals worth
+        harvesting, so "staged" stays terminal everywhere else."""
+        agent = dict(self.agent)
+        self._runs(1)
+        registry.summary_set(self.root, "s0", "done", "staged")
+        self.assertFalse(self.state.activity_needs_refresh(agent))
+
     def test_a_failing_refresh_never_raises(self):
         def boom(session_id):
             raise RuntimeError("platform down")
@@ -323,6 +413,52 @@ class LockIndependenceTest(unittest.TestCase):
             gate.set()
             for t in started:
                 t.join(timeout=10)
+
+
+class OnePredicateTest(unittest.TestCase):
+    """The read path and the write path must decide "does this agent stage?" the same
+    way, or one of them harvests nothing the other renders.
+
+    That invariant is what broke. An earlier change split the activity view into
+    agent_activity (reads what is cached) and refresh_activity (writes it), copying the
+    approval predicate into both; the change that replaced the per-app `staged_apps`
+    list with a whole-agent flag then migrated one copy and missed the other. The
+    behavioural tests above catch the specific failure; this catches the shape of it,
+    the next time a field is retired and only some of its readers are found.
+    """
+
+    APP_PY = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                          "ui", "app.py")
+    PATHS = ("agent_activity", "refresh_activity")
+
+    def _body(self, name):
+        """The function's CODE, parsed — not its text. A pin that a comment can trip is
+        a pin that argues with whoever explains the bug it exists for, so the docstring
+        and every comment are gone by the time these assertions see it."""
+        with open(self.APP_PY, encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == name:
+                body = node.body
+                if (body and isinstance(body[0], ast.Expr)
+                        and isinstance(body[0].value, ast.Constant)
+                        and isinstance(body[0].value.value, str)):
+                    body = body[1:]                        # drop the docstring
+                # unparse, not dump: the assertions below read like the source they
+                # are protecting, and comments are gone either way.
+                return "\n".join(ast.unparse(n) for n in body)
+        self.fail(f"{name} is gone from app.py — this pin needs updating with it")
+
+    def test_both_paths_ask_the_same_question(self):
+        for name in self.PATHS:
+            self.assertIn("agent_config.approval_required(agent)", self._body(name),
+                          f"{name} must use the one approval predicate")
+
+    def test_neither_path_reads_the_retired_column(self):
+        for name in self.PATHS:
+            self.assertNotIn("staged_apps", self._body(name),
+                             f"{name} reads a field migration 023 calls 'unread by new "
+                             f"code'; config.approval_required owns that fallback")
 
 
 class ProfileCacheTest(unittest.TestCase):
