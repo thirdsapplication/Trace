@@ -2882,7 +2882,31 @@ function renderRecBody(mode, started, wasPaused) {
     };
     $("#recStop").onclick = async () => {
       $("#recStop").disabled = true; $("#recStop").textContent = "Saving…";
-      await api("POST", "/api/u/capture/stop", {});
+      const { ok, data } = await api("POST", "/api/u/capture/stop", {});
+      // Every outcome used to end at loadAndRender(). When the stop had actually
+      // FAILED that call finds no new session, deriveStep sees no raw artifact and
+      // returns 0, and the wizard repaints "Record your day" — so a failed upload, a
+      // controller lost to a restart, and a recording that captured nothing were all
+      // one silent bounce back to the start with no reason given. The server said
+      // which it was every time; nothing read the answer.
+      if (!ok) {
+        clearTimers();
+        $("#recMsg").textContent = captureStopError(data);
+        $("#recStop").disabled = false; $("#recStop").textContent = "Try again";
+        return;
+      }
+      if (!data.raw_event_count) {
+        // Advancing would run the whole pipeline over an empty stream and find nothing,
+        // which reads as "palza couldn't understand my work" rather than "palza never
+        // saw any".
+        clearTimers();
+        $("#recMsg").textContent = "That recording captured nothing — palza saw no "
+          + "activity to learn from. Check the permissions above, then record again, "
+          + "or use a sample day.";
+        $("#recStop").disabled = false; $("#recStop").textContent = "Back";
+        $("#recStop").onclick = () => renderRecBody("idle");
+        return;
+      }
       await loadAndRender();
     };
     return;
@@ -3894,6 +3918,20 @@ async function renderGolive(sid) {
 }
 
 /* ---------------- helpers ---------------- */
+/* What a failed "Finish recording" actually means, in the user's terms. The server
+   distinguishes these and the UI used to discard all of them. */
+function captureStopError(data) {
+  const e = (data && data.error) || "";
+  if (e === "not_running")
+    return "That recording had already stopped — palza may have restarted while it ran. "
+         + "Nothing was saved, so start a new recording.";
+  if (e === "upload_failed")
+    return `Recorded ${(data && data.raw_event_count) || 0} events, but they could not be `
+         + "uploaded to palza. Check your connection and try again — the recording is "
+         + "still on this Mac.";
+  return friendly(e || "the recording could not be saved");
+}
+
 function friendly(err) {
   const e = String(err || "").toLowerCase();
   if (e.includes("no_api_key")) return "the service isn't configured yet — please contact your administrator";

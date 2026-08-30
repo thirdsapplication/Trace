@@ -34,6 +34,15 @@ def _render_profile_body(src):
     return src[start:end]
 
 
+def _capture_stop_handler(src):
+    """The Finish-recording click handler."""
+    start = src.index('$("#recStop").onclick = async () => {')
+    # To the handler's own closing brace, not the first `return;` inside it -- the
+    # early returns ARE the fix, so stopping at one would hide what is being asserted.
+    end = src.index("\n    };", start)
+    return src[start:end]
+
+
 def _go_live_handler(src):
     """The text of the Go live click handler, from its assignment to the end of the
     function it lives in."""
@@ -139,6 +148,41 @@ class DeployErrorSurvivesTest(unittest.TestCase):
         first = body.index("S.deployError = null;")
         self.assertLess(first, body.index("await upost(sid, \"/deploy\""),
                         "a retry must clear the stale error before it starts")
+
+
+class CaptureStopSurvivesTest(unittest.TestCase):
+    """Finishing a recording used to discard the server's answer.
+
+    Whatever happened — the upload failed, the controller was lost to a restart, the
+    recording captured nothing — the handler called loadAndRender(), which finds no new
+    session, derives step 0 from the missing raw artifact, and repaints "Record your
+    day". One silent bounce for three different failures, each of which the server had
+    named in its response.
+    """
+
+    def test_a_failed_stop_returns_before_the_repaint(self):
+        body = _capture_stop_handler(_source())
+        self.assertIn("if (!ok) {", body)
+        fail = body.index("if (!ok) {")
+        self.assertLess(body.index("return;", fail), body.index("loadAndRender", fail),
+                        "a failed stop must not fall through to the repaint that "
+                        "erases the reason")
+
+    def test_the_server_s_reason_is_read_rather_than_dropped(self):
+        body = _capture_stop_handler(_source())
+        self.assertIn("captureStopError(data)", body)
+        src = _source()
+        for code in ("not_running", "upload_failed"):
+            self.assertIn(code, src, f"{code} is a distinct outcome and must be named")
+
+    def test_a_recording_that_captured_nothing_does_not_advance(self):
+        """It used to: an empty raw file still creates a session, so the wizard ran the
+        whole pipeline over an empty stream and reported finding no workflows — which
+        reads as palza failing to understand the work rather than never seeing any."""
+        body = _capture_stop_handler(_source())
+        self.assertIn("if (!data.raw_event_count) {", body)
+        zero = body.index("if (!data.raw_event_count) {")
+        self.assertLess(body.index("return;", zero), body.index("loadAndRender", zero))
 
 
 if __name__ == "__main__":
