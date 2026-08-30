@@ -482,6 +482,124 @@ class LearningCycleTest(_CycleHarness):
         self.assertEqual(payload["log"]["retryable"], [])
 
 
+class MeasurementIsRecordedTest(_CycleHarness):
+    """The per-session measurement has to survive the cycle that computed it.
+
+    score.measure works out items_in_scope, difficulty and performance for every session
+    and code averages them into one number. Only the mean was stored, so a batch was a
+    single figure with no way to see inside it — whether the scorer counted the work that
+    arrived at all, and whether D is absorbing volume or P is still tracking the workload.
+    Both are read from items against performance, and both were being thrown away.
+    """
+
+    def _run_one_cycle(self):
+        t = self.state.maybe_run_learning_cycle(self.agent)
+        self.assertIsNotNone(t)
+        t.join(timeout=10)
+        return self._cycles()[0]
+
+    def test_every_measured_session_carries_its_own_numbers(self):
+        self._seed_runs(self.N)
+        stats = self._run_one_cycle()["session_stats"]
+        self.assertEqual(len(stats), self.N)
+        for row in stats:
+            # The stub scorer says two items and no novelty; the trigger is the only
+            # arriving text, so D = 2 and each session spends 120 tokens.
+            self.assertEqual(row["items_in_scope"], 2)
+            self.assertEqual(row["novel_items"], 0)
+            self.assertEqual(row["difficulty"], 2.0)
+            self.assertEqual(row["performance"], 60.0)
+            self.assertIn("input_kb", row)
+            self.assertEqual(row["total_tokens"], 120, "the old fields survive")
+
+    def test_an_excluded_session_says_why_instead_of_carrying_a_score(self):
+        """A batch whose valid rate moved is unreadable without the reason."""
+        self._seed_runs(self.N)
+        registry.run_add(self.root, {
+            "agent_id": "a1", "owner_user_id": "u1", "status": "failed",
+            "summary": "", "details": [], "run_session_id": "bad0",
+            "drun_id": "d_bad0"})
+        self.client.events["bad0"] = _terminal_events()
+        cycle = self._run_one_cycle()
+        rows = {r["session_id"]: r for r in cycle["session_stats"]}
+        self.assertEqual(rows["bad0"]["excluded"], "failed")
+        self.assertNotIn("performance", rows["bad0"],
+                         "an excluded session is not a measurement and must not read "
+                         "as one")
+        self.assertEqual(rows["s0"]["performance"], 60.0)
+        self.assertLess(cycle["valid_rate"], 1.0)
+
+
+class ObserveOnlyTest(_CycleHarness):
+    """Calibration mode. Observe-only has to mean the store does not change and the
+    measurements stay comparable, or the numbers the bar is set from are not measuring
+    what they claim to."""
+
+    ORIGINAL = "# Lessons learned\n- old lesson\n"
+    CHANGED = "# Lessons learned\n- a bold new idea\n"
+
+    def _observe_only(self):
+        original = agent_config.LEARNING_PROPOSE
+        agent_config.LEARNING_PROPOSE = False
+        self.addCleanup(setattr, agent_config, "LEARNING_PROPOSE", original)
+
+    def _propose(self):
+        self.analyst_reply = {
+            "analysis": "trying something", "verdict": None, "blocked_on": "",
+            "change": {"change_id": "c1", "summary": "a bold new idea",
+                       "technique": "restructure the lessons file", "rationale": "r",
+                       "peer_informed": "", "retry_of": "",
+                       "docs": {agent_config.MEMORY_LESSONS_DOC: self.CHANGED},
+                       "delete": []}}
+
+    def _cycle(self, prefix):
+        self._seed_runs(self.N, prefix=prefix)
+        t = self.state.maybe_run_learning_cycle(self.agent)
+        self.assertIsNotNone(t)
+        t.join(timeout=10)
+
+    def test_a_change_left_over_from_propose_on_is_not_judged_or_reverted(self):
+        """_apply_change was gated on the switch and _settle_pending was not, so a
+        revert verdict still WROTE — the one thing observe-only promises it will not do.
+        The change stays pending for whenever propose comes back on."""
+        self._propose()
+        self._cycle("a")                       # propose is on: the change is applied
+        self.assertEqual(self.client.docs[agent_config.MEMORY_LESSONS_DOC], self.CHANGED)
+        self._observe_only()
+        self.analyst_reply = {"analysis": "no better", "verdict": None,
+                              "change": None, "blocked_on": ""}
+        time.sleep(1.1)
+        writes_before = len(self.client.written)
+        self._cycle("b")                       # same cost: it would have been reverted
+        self.assertEqual(self.client.docs[agent_config.MEMORY_LESSONS_DOC], self.CHANGED,
+                         "observe-only must not restore a snapshot")
+        self.assertEqual(len(self.client.written), writes_before,
+                         "observe-only must not write to the store at all")
+        pending = registry.change_pending(self.root, "a1")
+        self.assertEqual(pending["change_id"], "c1")
+        self.assertIsNone(pending["outcome"], "left pending, not judged")
+
+    def test_a_failed_analysis_does_not_discard_the_measurement(self):
+        """Batches are 'runs since the last recorded cycle', so deferring folds this one
+        into the next. A mean over eight sessions is not comparable with a mean over
+        five, and comparing batch means is the whole of a calibration run."""
+        self._observe_only()
+        self.state.learn_fn = lambda system, user: "not json at all"
+        self._cycle("a")
+        cycles = self._cycles()
+        self.assertEqual(len(cycles), 1)
+        self.assertEqual(cycles[0]["mean_performance"], 60.0)
+        self.assertEqual(cycles[0]["analysis"], "")
+        self.assertEqual(self.client.written, [], "still changes nothing")
+
+    def test_with_propose_on_a_failed_analysis_still_defers(self):
+        """The retry is right when the analysis is the point: it costs one
+        re-measurement of overlapping sessions and buys another attempt at the change."""
+        self.state.learn_fn = lambda system, user: "not json at all"
+        self._cycle("a")
+        self.assertEqual(self._cycles(), [])
+
+
 class VerdictAndRevertTest(_CycleHarness):
     """The loop closing: a change applied, measured, then kept or restored.
 

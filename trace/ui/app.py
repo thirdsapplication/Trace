@@ -2378,18 +2378,51 @@ class AppState:
             baseline=base.get("performance"), valid_rate=split["valid_rate"],
             base_valid_rate=base.get("valid_rate"))
         if result is None:
-            print(f"[learning] analysis failed for {aid} — will retry the batch "
-                  f"on a later pass", flush=True)
-            return None
+            # With propose ON the analysis IS the cycle, so deferring costs only a
+            # re-measurement of overlapping sessions. In observe-only the analysis is
+            # discarded anyway, and deferring would fold this batch into the next one
+            # — a mean over eight sessions is not comparable with a mean over five,
+            # and comparing batch means is the entire point of a calibration run.
+            if agent_config.LEARNING_PROPOSE or not scored:
+                print(f"[learning] analysis failed for {aid} — will retry the batch "
+                      f"on a later pass", flush=True)
+                return None
+            print(f"[learning] {aid}: analysis failed, but the measurement stands — "
+                  f"recording the cycle rather than folding this batch into the next",
+                  flush=True)
+            result = {}
 
         # --- step 5: settle the verdict, then apply at most one change -------------
         observed = (scored or {}).get("mean_performance")
         self._settle_pending(agent, pending, observed, base, split["valid_rate"], result)
         docs_written, docs_deleted = self._apply_change(agent, result.get("change"),
                                                         docs, observed)
-        stats = [{"session_id": rec["session_id"], "status": rec["status"],
-                  "total_tokens": rec["tokens"]["total_tokens"],
-                  "estimated": rec["tokens"]["estimated"]} for rec in records]
+        # The per-session measurement rides on the cycle row beside the mean it was
+        # averaged into. Without it a batch is one number with no way to see inside:
+        # whether the scorer counted the work that arrived at all, and whether D is
+        # absorbing volume or P is still tracking the workload. Both are read from
+        # the spread of items against performance, and both were being computed and
+        # discarded. Everything here is already in hand — no extra call.
+        scored_rows = {str(r["session_id"]): r
+                       for r in ((scored or {}).get("sessions") or [])}
+        excluded_why = {str(e["session_id"]): e["reason"] for e in excluded}
+        stats = []
+        for rec in records:
+            sid = str(rec["session_id"])
+            row = {"session_id": rec["session_id"], "status": rec["status"],
+                   "total_tokens": rec["tokens"]["total_tokens"],
+                   "estimated": rec["tokens"]["estimated"]}
+            sr = scored_rows.get(sid)
+            if sr:
+                row.update(items_in_scope=sr["items_in_scope"],
+                           novel_items=sr["novel_items"], input_kb=sr["input_kb"],
+                           difficulty=sr["difficulty"], performance=sr["performance"],
+                           note=sr["note"])
+            elif sid in excluded_why:
+                # Why this session is not in the mean. A batch whose valid rate moved
+                # is unreadable without it.
+                row["excluded"] = excluded_why[sid]
+            stats.append(row)
         cycle = {
             "agent_id": aid, "owner_user_id": agent.get("owner_user_id"),
             "session_stats": stats,
@@ -2495,6 +2528,15 @@ class AppState:
             return
         aid = agent.get("agent_id")
         cid = pending.get("change_id")
+        if not agent_config.LEARNING_PROPOSE:
+            # Observe-only has to mean the store does not change, or a calibration run
+            # is measuring a store that moved under it. _apply_change is already gated;
+            # this path was not, and a revert verdict WRITES (via _restore_snapshot).
+            # The change stays pending and is judged when propose comes back on —
+            # settling it now would file a verdict against a store still holding it.
+            print(f"[learning] {aid}: observe-only (TRACE_LEARNING_PROPOSE=0) — change "
+                  f"{cid} left pending, not judged", flush=True)
+            return
         try:
             decision, threshold, reason = agent_learn.decide(
                 pending, observed, base.get("performance"), valid_rate,
