@@ -26,7 +26,6 @@ import time
 import unittest
 
 from trace.agent import config as agent_config
-from trace.discovery import scorer as discovery_scorer
 from trace.ui import app, registry
 
 
@@ -97,74 +96,9 @@ class FakeLearnClient:
         return True
 
 
-class LearningScorerSeamTest(unittest.TestCase):
-    """The cycle's difficulty scorer has to be a MODEL caller.
-
-    It read ``self.score_fn`` — which is the DISCOVERY scorer, set unconditionally in
-    the constructor — so the `or` that was meant to fall back to a real caller was
-    unreachable. Every production cycle called discovery_scorer.score(system, user),
-    which raises on a string, score_batch swallowed it, and the cycle recorded "no
-    measurement". mean_performance was null on every row of learning_cycles, and
-    learn.decide reverts a change it cannot measure, so the loop could never keep
-    anything it tried.
-
-    Nothing behavioural could catch it: the harness injected over that same attribute,
-    so the tests exercised a correct stub while production ran the wrong function. These
-    assert on the seam itself, with nothing injected.
-    """
-
-    class _Keystore:
-        def __init__(self, key):
-            self._key = key
-
-        def get_key(self):
-            return self._key
-
-    def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
-        self.root = self._tmp.name
-
-    def tearDown(self):
-        self._tmp.cleanup()
-
-    def _state(self, key=None, **kw):
-        state = app.AppState(sessions_root=self.root, **kw)
-        state.keystore = self._Keystore(key)
-        return state
-
-    def test_with_nothing_injected_it_does_not_hand_back_the_discovery_scorer(self):
-        """No key means no scorer — which is a loud failure, not a wrong callable."""
-        state = self._state(key=None)
-        with self.assertRaises(RuntimeError) as caught:
-            state._score_model_fn()
-        self.assertIn("no_api_key", str(caught.exception))
-
-    def test_a_real_key_builds_a_caller_that_is_not_the_discovery_scorer(self):
-        state = self._state(key="sk-test")
-        fn = state._score_model_fn()
-        self.assertIsNot(fn, discovery_scorer.score)
-        # The tap builds the real client lazily, so having a callable back is the whole
-        # assertion — calling it would reach the network.
-        self.assertTrue(callable(fn))
-
-    def test_the_injected_scorer_is_the_one_called(self):
-        seen = []
-        state = self._state(key="sk-test",
-                            learn_score_fn=lambda system, user: seen.append(user) or "{}")
-        state._score_model_fn()("sys", "usr")
-        self.assertEqual(seen, ["usr"])
-
-    def test_the_discovery_scorer_keeps_its_own_seam(self):
-        """The two must not converge again from the other direction either."""
-        self.assertIs(self._state().score_fn, discovery_scorer.score)
-
-    def test_a_scoring_call_reaches_the_admin_prompt_log(self):
-        """Tapped like every other engine: a cycle that scored badly should be readable
-        beside the analysis it fed."""
-        state = self._state(key="sk-test", learn_score_fn=lambda system, user: "{}")
-        state._score_model_fn()("sys", "usr")
-        self.assertTrue(any(e.get("engine") == "scoring" for e in state.prompt_log),
-                        "the scoring call must be recorded like the others")
+# The difficulty scorer is GONE, along with the seam that once collided with the
+# discovery scorer's. v6 scores mean total tokens, which is arithmetic, so there is
+# nothing left for a second model to judge. OneCallPerCycleTest below pins that.
 
 
 class _CycleHarness(unittest.TestCase):
@@ -180,20 +114,9 @@ class _CycleHarness(unittest.TestCase):
         self.root = self._tmp.name
         self.learn_calls = []
 
-        self.score_calls = []
-
         def learn_fn(system, user):
             self.learn_calls.append({"system": system, "user": user})
             return json.dumps(self.analyst_reply)
-
-        def score_fn(system, user):
-            self.score_calls.append({"system": system, "user": user})
-            payload = json.loads(user)
-            # Two items and no novelty on every session: the scorer's judgement is not
-            # what these tests are about, and a constant makes the arithmetic checkable.
-            return json.dumps({"sessions": [
-                {"session_id": s["session_id"], "items_in_scope": 2,
-                 "novel_items": 0, "note": ""} for s in payload["sessions"]]})
 
         # The default analyst answer: one change, into a document the engine owns.
         self.analyst_reply = {
@@ -208,11 +131,7 @@ class _CycleHarness(unittest.TestCase):
                        "delete": []},
             "blocked_on": ""}
 
-        # learn_score_fn, not score_fn: score_fn is the DISCOVERY scorer, and injecting
-        # over it is what hid a production bug where the cycle's scorer seam read that
-        # same attribute and got discovery_scorer.score instead of a model caller.
-        self.state = app.AppState(sessions_root=self.root, learn_fn=learn_fn,
-                                  learn_score_fn=score_fn)
+        self.state = app.AppState(sessions_root=self.root, learn_fn=learn_fn)
         self.client = FakeLearnClient()
         self.state._live_client = lambda: self.client
         self.agent = {"agent_id": "a1", "owner_user_id": "u1", "name": "Orders",
@@ -265,24 +184,25 @@ class LearningCycleTest(_CycleHarness):
         t = self.state.maybe_run_learning_cycle(self.agent)
         t.join(timeout=10)
         payload = json.loads(self.learn_calls[0]["user"])
-        self.assertEqual(len(payload["scored"]["sessions"]), self.N)
-        self.assertEqual(payload["scored"]["sessions"][0]["total_tokens"], 120)
-        self.assertIn("mean_performance", payload["scored"])
+        self.assertEqual(len(payload["sessions"]), self.N)
+        self.assertEqual(payload["sessions"][0]["turns"], 1)
+        self.assertIn("tool_calls", payload["sessions"][0])
+        self.assertEqual(payload["score"]["mean_total_tokens"], 120.0)
         self.assertEqual(payload["min_improvement"], agent_config.MIN_IMPROVEMENT)
         self.assertIn("old lesson", payload["memory"][agent_config.MEMORY_LESSONS_DOC])
         self.assertEqual(payload["agent"]["name"], "Orders")
 
-    def test_the_scorer_is_a_separate_call_that_sees_no_memory_or_log(self):
-        # The analyst authors the change it will be graded on. If the same call also set
-        # the difficulty, scoring the batch as harder would be the cheapest way to pass.
+    def test_exactly_one_model_call_per_cycle(self):
+        """The difficulty scorer was a second call, and it is gone. v6 scores mean total
+        tokens, which is arithmetic, so nothing is left for a model to judge -- and the
+        call that used to do it cost real money on every cycle to produce a number code
+        can compute exactly."""
         self._seed_runs(self.N)
         t = self.state.maybe_run_learning_cycle(self.agent)
         t.join(timeout=10)
-        self.assertEqual(len(self.score_calls), 1)
-        seen = json.loads(self.score_calls[0]["user"])
-        self.assertEqual(set(seen), {"sessions"})
-        for key in ("memory", "log", "pending", "min_improvement", "baseline_performance"):
-            self.assertNotIn(key, seen)
+        self.assertEqual(len(self.learn_calls), 1)
+        engines = [e.get("engine") for e in self.state.prompt_log]
+        self.assertNotIn("scoring", engines, "the scorer call must be gone entirely")
 
     def test_counter_resets_after_a_cycle(self):
         self._seed_runs(self.N)
@@ -300,7 +220,7 @@ class LearningCycleTest(_CycleHarness):
         t = self.state.maybe_run_learning_cycle(self.agent)
         t.join(timeout=10)
         payload = json.loads(self.learn_calls[0]["user"])
-        sids = {s["session_id"] for s in payload["scored"]["sessions"]}
+        sids = {s["session_id"] for s in payload["sessions"]}
         self.assertFalse(any(s.startswith("ap") for s in sids),
                          "approval-execution sessions run a different directive and "
                          "must not shape the workflow analysis")
@@ -315,7 +235,7 @@ class LearningCycleTest(_CycleHarness):
         t = self.state.maybe_run_learning_cycle(self.agent)
         t.join(timeout=10)
         payload = json.loads(self.learn_calls[0]["user"])
-        sids = {s["session_id"] for s in payload["scored"]["sessions"]}
+        sids = {s["session_id"] for s in payload["sessions"]}
         self.assertEqual(sids, {f"s{i}" for i in range(self.N)})
         self.assertEqual(len(self._cycles()), 1)
 
@@ -551,9 +471,9 @@ class LearningCycleTest(_CycleHarness):
         self.assertIsNotNone(t)
         t.join(timeout=10)
         payload = json.loads(self.learn_calls[0]["user"])
-        self.assertEqual([c["change_id"] for c in payload["log"]["kept"]], ["old_win"])
-        self.assertEqual([c["change_id"] for c in payload["log"]["banned"]], ["old_loss"])
-        self.assertEqual(payload["log"]["retryable"], [])
+        self.assertEqual([c["change_id"] for c in payload["attempts"]["kept"]], ["old_win"])
+        self.assertEqual([c["change_id"] for c in payload["attempts"]["banned"]], ["old_loss"])
+        self.assertEqual(payload["attempts"]["retryable"], [])
 
 
 class MeasurementIsRecordedTest(_CycleHarness):
@@ -577,13 +497,10 @@ class MeasurementIsRecordedTest(_CycleHarness):
         stats = self._run_one_cycle()["session_stats"]
         self.assertEqual(len(stats), self.N)
         for row in stats:
-            # The stub scorer says two items and no novelty; the trigger is the only
-            # arriving text, so D = 2 and each session spends 120 tokens.
-            self.assertEqual(row["items_in_scope"], 2)
-            self.assertEqual(row["novel_items"], 0)
-            self.assertEqual(row["difficulty"], 2.0)
-            self.assertEqual(row["performance"], 60.0)
-            self.assertIn("input_kb", row)
+            # Each stub session is one turn spending 120 tokens, with no repeated calls.
+            self.assertEqual(row["turns"], 1)
+            self.assertEqual(row["repeated_calls"], 0)
+            self.assertIn("documents_referenced", row)
             self.assertEqual(row["total_tokens"], 120, "the old fields survive")
 
     def test_an_excluded_session_says_why_instead_of_carrying_a_score(self):
@@ -597,10 +514,10 @@ class MeasurementIsRecordedTest(_CycleHarness):
         cycle = self._run_one_cycle()
         rows = {r["session_id"]: r for r in cycle["session_stats"]}
         self.assertEqual(rows["bad0"]["excluded"], "failed")
-        self.assertNotIn("performance", rows["bad0"],
+        self.assertNotIn("turns", rows["bad0"],
                          "an excluded session is not a measurement and must not read "
                          "as one")
-        self.assertEqual(rows["s0"]["performance"], 60.0)
+        self.assertEqual(rows["s0"]["turns"], 1)
         self.assertLess(cycle["valid_rate"], 1.0)
 
 
@@ -617,10 +534,10 @@ class ObserveOnlyTest(_CycleHarness):
         agent_config.LEARNING_PROPOSE = False
         self.addCleanup(setattr, agent_config, "LEARNING_PROPOSE", original)
 
-    def _propose(self):
+    def _propose(self, change_id="c1"):
         self.analyst_reply = {
-            "analysis": "trying something", "verdict": None, "blocked_on": "",
-            "change": {"change_id": "c1", "summary": "a bold new idea",
+            "analysis": "trying something", "attempt_review": None, "blocked_on": "",
+            "change": {"change_id": change_id, "summary": "a bold new idea",
                        "technique": "restructure the lessons file", "rationale": "r",
                        "peer_informed": "", "retry_of": "",
                        "docs": {agent_config.MEMORY_LESSONS_DOC: self.CHANGED},
@@ -662,7 +579,7 @@ class ObserveOnlyTest(_CycleHarness):
         self._cycle("a")
         cycles = self._cycles()
         self.assertEqual(len(cycles), 1)
-        self.assertEqual(cycles[0]["mean_performance"], 60.0)
+        self.assertEqual(cycles[0]["mean_performance"], 120.0)
         self.assertEqual(cycles[0]["analysis"], "")
         self.assertEqual(self.client.written, [], "still changes nothing")
 
@@ -770,6 +687,74 @@ class VerdictAndRevertTest(_CycleHarness):
         cycles = registry.learning_cycles_for_agent(self.root, "a1")
         self.assertIsNotNone(cycles[0]["mean_performance"],
                              "the measurement is still recorded — it IS the calibration")
+
+    def test_the_revert_happens_BEFORE_the_engine_is_asked_to_propose(self):
+        """The whole ordering argument for v6, asserted on the payload.
+
+        The engine must reason about, and write against, the state that will actually
+        run. If it proposed while the failed change was still in place, the document it
+        wrote would be built on text about to be deleted. So by the time the call
+        happens the store is already restored, and what was undone arrives as a separate
+        field of evidence rather than as memory."""
+        self._propose()
+        self._cycle("a")
+        self.assertEqual(self.client.docs[agent_config.MEMORY_LESSONS_DOC], self.CHANGED)
+        self.analyst_reply = {"analysis": "no better", "attempt_review": None,
+                              "change": None, "blocked_on": ""}
+        time.sleep(1.1)
+        self._cycle("b")                       # same cost, so the attempt cannot clear
+        payload = json.loads(self.learn_calls[-1]["user"])
+        self.assertEqual(payload["memory"][agent_config.MEMORY_LESSONS_DOC],
+                         self.ORIGINAL,
+                         "the engine must be handed the RESTORED store, not the one "
+                         "that is about to be undone")
+        self.assertEqual(payload["reverted_change"]["attempt_id"], "c1")
+        self.assertEqual(payload["reverted_change"]["grade"], "F")
+
+    def test_the_explanation_is_stored_after_the_grade(self):
+        """The grade is computed before the call now, so the prose explaining it can only
+        arrive afterwards. It is the field the whole fleet reads."""
+        self._propose()
+        self._cycle("a")
+        self.analyst_reply = {
+            "analysis": "no better", "change": None, "blocked_on": "",
+            "attempt_review": {"attempt_id": "c1",
+                               "why_it_worked_or_failed": "the probe cost a turn"}}
+        time.sleep(1.1)
+        self._cycle("b")
+        rec = [c for c in registry.changes_for_agent(self.root, "a1")
+               if c["change_id"] == "c1"][0]
+        self.assertEqual(rec["grade"], "F")
+        self.assertEqual(rec["why_it_worked_or_failed"], "the probe cost a turn")
+
+    def test_the_snapshot_is_discarded_once_it_has_been_restored_from(self):
+        """Exactly one version back. One attempt is outstanding at a time, so a snapshot
+        left behind after its restore is a second version nobody can reach."""
+        self._propose()
+        self._cycle("a")
+        self.assertIsNotNone(registry.snapshot_get(self.root, "a1", "c1"))
+        self.analyst_reply = {"analysis": "no better", "attempt_review": None,
+                              "change": None, "blocked_on": ""}
+        time.sleep(1.1)
+        self._cycle("b")
+        self.assertIsNone(registry.snapshot_get(self.root, "a1", "c1"))
+
+    def test_three_reverts_in_a_row_stop_the_engine_proposing(self):
+        """A store no change has improved is converged, and paying a model call per
+        cycle to watch the engine undo its own work is pure cost."""
+        for i, prefix in enumerate(("a", "b", "c", "d")):
+            self._propose(change_id=f"c{i}")
+            if i:
+                time.sleep(1.1)
+            self._cycle(prefix)
+        self.assertEqual(self.client.docs[agent_config.MEMORY_LESSONS_DOC],
+                         self.ORIGINAL)
+        payload = json.loads(self.learn_calls[-1]["user"])
+        self.assertTrue(payload.get("converged"),
+                        "the engine is TOLD it has converged, not left to infer it")
+        applied = [c for c in registry.changes_for_agent(self.root, "a1")
+                   if c["change_id"] == "c3"]
+        self.assertEqual(applied, [], "a converged cycle applies nothing")
 
     def test_the_arithmetic_overrules_the_analysts_stated_verdict(self):
         self._propose()
@@ -1041,7 +1026,7 @@ class ForcedLearningCycleTest(_CycleHarness):
         self.assertIsNotNone(t)
         t.join(timeout=10)
         payload = json.loads(self.learn_calls[0]["user"])
-        self.assertEqual(len(payload["scored"]["sessions"]), self.N - 1)
+        self.assertEqual(len(payload["sessions"]), self.N - 1)
         self.assertEqual([w["path"] for w in self.client.written],
                          [agent_config.MEMORY_LESSONS_DOC])
         self.assertEqual(len(self._cycles()), 1)

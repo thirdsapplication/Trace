@@ -59,6 +59,8 @@ from ..agent import interview as agent_interview
 from ..agent import connect as agent_connect
 from ..agent import config as agent_config
 from ..agent import gate as agent_gate
+from ..agent import grade as agent_grade
+from ..agent import profile as agent_profile
 from ..agent import score as agent_score
 from ..agent import deploy as agent_deploy
 from ..agent import runner as agent_runner
@@ -231,7 +233,7 @@ class AppState:
                  discovery_fn=None, describe_fn=None, score_fn=None, artifact_fn=None,
                  interview_fn=None, config_fn=None, cleanup_fn=None,
                  connect_fn=None, deploy_fn=None, cloud_backend=None, proxy_fn=None,
-                 summarize_fn=None, learn_fn=None, learn_score_fn=None,
+                 summarize_fn=None, learn_fn=None,
                  scrub_fn=None, scrub_verify_fn=None):
         self.sessions_root = sessions_root
         self.collector_port = collector_port
@@ -274,13 +276,6 @@ class AppState:
         # sessions and rewrites lessons_learned.md (Fable). Stub in tests; built
         # lazily from the key.
         self.learn_fn = learn_fn
-        # The DIFFICULTY scorer of the learning cycle (Sonnet), a different call from
-        # the analyst above on purpose — see score.py. Named learn_score_fn and not
-        # score_fn because ``score_fn`` is taken, by the discovery scorer, and the seam
-        # that reached for it silently got that instead of a model caller: every cycle
-        # in production called discovery_scorer.score(system, user), which raised, and
-        # no cycle ever produced a measurement.
-        self.learn_score_fn = learn_score_fn
         # Collective learning: the scrub pass and its independent privacy gate. Two
         # seams, not one, because the whole point of the gate is that it is a SECOND
         # opinion — a test that stubs both with the same callable is testing plumbing,
@@ -2383,25 +2378,59 @@ class AppState:
                   f"measurement ({', '.join(sorted({e['reason'] for e in excluded}))}) — "
                   f"still read as evidence", flush=True)
 
-        # --- steps 2 and 3: score, then compute in code ----------------------------
+        # --- step 2: measure. Code only — there is no scorer model call any more ---
+        # The score is the mean TOTAL TOKENS of the valid sessions. See score.py for why
+        # the difficulty-normalised version was removed: on real data it varied 31% where
+        # raw tokens varied 9.3%, so it needed a bar almost no real change could clear.
         by_id = {str((r or {}).get("run_session_id") or ""): ev for r, ev in split["valid"]}
+        doc_paths = list((docs or {}).keys())
+        profiles = []
         for rec in measured:
-            rec["input_kb"] = agent_score.input_kb(by_id.get(str(rec.get("session_id"))))
-        scored = agent_score.measure(measured, self._score_model_fn()) if measured else None
-        if scored:
-            print(f"[learning] {aid}: mean performance {scored['mean_performance']} "
-                  f"tokens/difficulty over {len(scored['sessions'])} measured session(s), "
-                  f"valid rate {split['valid_rate']:.2f}", flush=True)
+            ev = by_id.get(str(rec.get("session_id")))
+            rec["input_kb"] = agent_score.input_kb(ev)
+            profiles.append(agent_profile.session_profile(
+                ev, doc_paths, rec.get("session_id")))
+        observed = agent_score.mean_tokens(measured)
+        # The prefix is read off the oldest valid session: its first turn's reported input
+        # IS the prefix, so this is measured rather than estimated.
+        prefix = agent_profile.prefix(
+            by_id.get(str((measured[0] or {}).get("session_id"))) if measured else None,
+            docs)
+        preconditions = agent_profile.precondition_vector(profiles, docs)
+        if observed is not None:
+            print(f"[learning] {aid}: {observed:.0f} mean tokens over "
+                  f"{len(measured)} measured session(s), valid rate "
+                  f"{split['valid_rate']:.2f}", flush=True)
         else:
             print(f"[learning] {aid}: no measurement this cycle "
                   f"({len(measured)} measurable session(s))", flush=True)
 
-        # --- step 4: judge the pending change, propose the next one ----------------
-        changes = registry.changes_for_agent(self.sessions_root, aid,
-                                             limit=agent_config.LEARNING_LOG_CYCLES)
-        log = agent_learn.log_lists(changes)
+        # --- step 3: grade the pending attempt. Arithmetic, in code ----------------
+        attempts = registry.changes_for_agent(self.sessions_root, aid,
+                                              limit=agent_config.LEARNING_LOG_CYCLES)
+        log = agent_grade.log_lists(attempts)
         pending = registry.change_pending(self.sessions_root, aid)
-        base = self._baseline_for(aid, changes, pending)
+        base = self._baseline_for(aid, attempts, pending)
+        verdict = agent_grade.judge(pending, observed, base.get("performance"))
+        if verdict:                            # so _converged can tell this cycle's grade
+            verdict["attempt_id"] = pending.get("change_id")   # from the stored rows
+
+        # --- step 4: REVERT, before the model is asked to propose anything ---------
+        # The engine must reason about, and write against, the state that will actually
+        # run. Proposing first would have it build a document on top of text that is
+        # about to be deleted. So the store is put back BEFORE the call, and the engine
+        # is handed what was undone as evidence rather than as content.
+        reverted = self._settle_pending(agent, pending, verdict, split["valid_rate"])
+        if reverted:
+            try:                                   # re-read: `docs` is now the OLD state
+                docs = client.list_memory(store_id) or docs
+            except Exception as e:                 # noqa: BLE001 — a stale read here would
+                print(f"[learning] could not re-read the store for {aid} after the "     # put
+                      f"revert: {_why(e)} — proposing against the pre-revert state is "  # the
+                      f"not safe, so this cycle proposes nothing", flush=True)           # engine
+                reverted = {**reverted, "propose_blocked": True}                     # on stale
+        converged = self._converged(attempts, verdict)
+        # --- step 5: propose ------------------------------------------------------
         agent_info = {"name": agent.get("name"), "description": agent.get("description"),
                       "trigger": agent.get("trigger")}
         # No lock is held across any of this, and none may be: peer selection, the
@@ -2410,17 +2439,19 @@ class AppState:
         # waiting behind a scheduler pass, and is why the background locks were split.
         peers = self._collect_peers(agent, fp, vec)
         result = agent_learn.judge_and_propose(
-            agent_info, scored, excluded, docs, log, pending,
+            agent_info, observed, excluded, docs, log, pending,
             self._learning_model_fn(), peers=peers,
             baseline=base.get("performance"), valid_rate=split["valid_rate"],
-            base_valid_rate=base.get("valid_rate"))
+            base_valid_rate=base.get("valid_rate"),
+            profiles=profiles, prefix=prefix, preconditions=preconditions,
+            reverted_change=reverted, converged=converged)
         if result is None:
             # With propose ON the analysis IS the cycle, so deferring costs only a
             # re-measurement of overlapping sessions. In observe-only the analysis is
             # discarded anyway, and deferring would fold this batch into the next one
             # — a mean over eight sessions is not comparable with a mean over five,
             # and comparing batch means is the entire point of a calibration run.
-            if agent_config.LEARNING_PROPOSE or not scored:
+            if agent_config.LEARNING_PROPOSE or observed is None:
                 print(f"[learning] analysis failed for {aid} — will retry the batch "
                       f"on a later pass", flush=True)
                 return None
@@ -2429,19 +2460,18 @@ class AppState:
                   flush=True)
             result = {}
 
-        # --- step 5: settle the verdict, then apply at most one change -------------
-        observed = (scored or {}).get("mean_performance")
-        self._settle_pending(agent, pending, observed, base, split["valid_rate"], result)
-        docs_written, docs_deleted = self._apply_change(agent, result.get("change"),
-                                                        docs, observed)
+        # --- step 6: record. The revert already happened in step 4 ----------------
+        self._explain_attempt(aid, pending, result)
+        blocked = bool((reverted or {}).get("propose_blocked")) or converged
+        docs_written, docs_deleted = ([], []) if blocked else self._apply_change(
+            agent, result.get("change"), docs, observed, preconditions)
         # The per-session measurement rides on the cycle row beside the mean it was
         # averaged into. Without it a batch is one number with no way to see inside:
         # whether the scorer counted the work that arrived at all, and whether D is
         # absorbing volume or P is still tracking the workload. Both are read from
         # the spread of items against performance, and both were being computed and
         # discarded. Everything here is already in hand — no extra call.
-        scored_rows = {str(r["session_id"]): r
-                       for r in ((scored or {}).get("sessions") or [])}
+        profile_rows = {str(r.get("session_id")): r for r in profiles}
         excluded_why = {str(e["session_id"]): e["reason"] for e in excluded}
         stats = []
         for rec in records:
@@ -2449,12 +2479,11 @@ class AppState:
             row = {"session_id": rec["session_id"], "status": rec["status"],
                    "total_tokens": rec["tokens"]["total_tokens"],
                    "estimated": rec["tokens"]["estimated"]}
-            sr = scored_rows.get(sid)
-            if sr:
-                row.update(items_in_scope=sr["items_in_scope"],
-                           novel_items=sr["novel_items"], input_kb=sr["input_kb"],
-                           difficulty=sr["difficulty"], performance=sr["performance"],
-                           note=sr["note"])
+            pr = profile_rows.get(sid)
+            if pr:
+                row.update(turns=pr["turns"],
+                           repeated_calls=len(pr["repeated_calls"]),
+                           documents_referenced=pr["documents_referenced"])
             elif sid in excluded_why:
                 # Why this session is not in the mean. A batch whose valid rate moved
                 # is unreadable without it.
@@ -2469,7 +2498,7 @@ class AppState:
             "analysis": result.get("analysis") or "",
             # The measurement rides on the cycle row: it is what the next cycle uses as
             # its baseline, and what a human reads to see whether the loop is working.
-            "mean_performance": (scored or {}).get("mean_performance"),
+            "mean_performance": observed,     # now mean TOTAL TOKENS
             "valid_rate": split["valid_rate"],
             # Deletions ride in docs_written with a marker rather than in a new column:
             # 021 is applied in production and a migration to record a rarer event than
@@ -2534,28 +2563,6 @@ class AppState:
             return None
         return vecs[0] if vecs else None
 
-    def _score_model_fn(self):
-        """The difficulty scorer. A DIFFERENT call from the analyst on purpose — see
-        score.py — and overridable in tests like every other model seam here.
-
-        Built exactly like _learning_model_fn, including the tap, so a scoring call
-        shows up in the admin prompt log beside the analysis it feeds. It used to read
-        ``self.score_fn``, which is the DISCOVERY scorer and is always set, so the
-        fallback to a real model caller was unreachable: every cycle called
-        discovery_scorer.score(system, user), which raises on a string, and score_batch
-        swallowed it into "no measurement this cycle". The tests injected over the same
-        attribute, so they could not see it.
-        """
-        if self.learn_score_fn:
-            return self._tap("scoring", None, agent_config.SCORE_MODEL,
-                             lambda: self.learn_score_fn)
-        key = self.keystore.get_key()
-        if not key:
-            raise RuntimeError("no_api_key")
-        os.environ["ANTHROPIC_API_KEY"] = key
-        return self._tap("scoring", None, agent_config.SCORE_MODEL,
-                         lambda: agent_score._default_model_fn())
-
     @staticmethod
     def _baseline_for(aid, changes, pending):
         """What the pending change is measured against: the numbers recorded when it was
@@ -2569,53 +2576,99 @@ class AppState:
         return {"performance": pending.get("baseline"),
                 "valid_rate": pending.get("base_valid_rate")}
 
-    def _settle_pending(self, agent, pending, observed, base, valid_rate, result):
-        """Close out the change awaiting judgment: keep it, or restore the snapshot.
+    def _settle_pending(self, agent, pending, verdict, valid_rate):
+        """Close out the attempt awaiting judgment, BEFORE the model is asked anything.
 
-        The decision comes from learn.decide, NOT from the model's stated verdict. The
-        analyst authored the change it is being asked to grade, so the one thing it must
-        not hold is the pen on the grade; its answer is recorded beside this one and a
-        disagreement is worth a log line. Never raises — a cycle that cannot settle a
-        verdict must still be able to run."""
-        if not pending:
-            return
+        Returns what was undone (``{attempt_id, grade, improvement, reason, docs}``) when
+        the attempt was reverted, so the engine can be shown it as evidence, or None. The
+        grade comes from grade.judge — arithmetic, not the model's opinion of its own
+        work.
+
+        The ordering is the point. The engine must reason about, and write against, the
+        state that will actually run; if it proposed while a failed change was still in
+        place, its new document would be built on text about to be deleted. Never raises:
+        a cycle that cannot settle must still be able to run.
+        """
+        if not pending or not verdict:
+            return None
         aid = agent.get("agent_id")
         cid = pending.get("change_id")
         if not agent_config.LEARNING_PROPOSE:
-            # Observe-only has to mean the store does not change, or a calibration run
-            # is measuring a store that moved under it. _apply_change is already gated;
-            # this path was not, and a revert verdict WRITES (via _restore_snapshot).
-            # The change stays pending and is judged when propose comes back on —
-            # settling it now would file a verdict against a store still holding it.
-            print(f"[learning] {aid}: observe-only (TRACE_LEARNING_PROPOSE=0) — change "
-                  f"{cid} left pending, not judged", flush=True)
+            # Observe-only has to mean the store does not change, or a calibration run is
+            # measuring a store that moved under it. A revert WRITES (via
+            # _restore_snapshot), so this path is gated too — the attempt stays pending
+            # and is judged when proposing comes back on.
+            print(f"[learning] {aid}: observe-only (TRACE_LEARNING_PROPOSE=0) — attempt "
+                  f"{cid} left pending, not graded", flush=True)
+            return None
+        try:
+            reverted = None
+            if verdict["outcome"] == agent_grade.REVERTED:
+                restored = self._restore_snapshot(agent, cid)
+                reverted = {"attempt_id": cid,
+                            "grade": verdict["grade"],
+                            "improvement": verdict["improvement"],
+                            "reason": verdict["reason"],
+                            "summary": pending.get("summary"),
+                            "restored_paths": sorted(restored or [])}
+            registry.change_settle(self.sessions_root, aid, cid, verdict["outcome"],
+                                   observed=verdict["observed"],
+                                   threshold=verdict["bar"], valid_rate=valid_rate,
+                                   base_valid_rate=None, reason=verdict["reason"],
+                                   grade=verdict["grade"],
+                                   improvement=verdict["improvement"])
+            print(f"[learning] {aid}: attempt {cid} graded {verdict['grade'] or '-'} "
+                  f"({verdict['outcome'].upper()}) — {verdict['reason']}", flush=True)
+            return reverted
+        except Exception as e:                             # noqa: BLE001 — never lose the cycle
+            print(f"[learning] could not settle attempt {cid} for {aid}: {_why(e)}",
+                  flush=True)
+            return None
+
+    def _explain_attempt(self, aid, pending, result):
+        """Store the engine's after-the-fact explanation of the attempt just graded.
+
+        Written in a second pass because the grade now happens BEFORE the model call, so
+        the prose that explains it can only arrive afterwards. It is the field the whole
+        fleet reads, which is why it is stored even though the verdict no longer waits on
+        it. Best-effort: an explanation that fails to save never costs the cycle."""
+        review = (result or {}).get("attempt_review") or {}
+        why = str(review.get("why_it_worked_or_failed") or "").strip()
+        cid = (pending or {}).get("change_id")
+        if not cid or not why:
+            return
+        if str(review.get("attempt_id") or "") not in ("", str(cid)):
+            print(f"[learning] {aid}: the engine explained "
+                  f"{review.get('attempt_id')!r}, not the pending {cid!r} — not stored",
+                  flush=True)
             return
         try:
-            decision, threshold, reason = agent_learn.decide(
-                pending, observed, base.get("performance"), valid_rate,
-                base.get("valid_rate"))
-            said = ((result or {}).get("verdict") or {}).get("decision")
-            if said and said != decision:
-                print(f"[learning] {aid}: the analyst said {said!r} for {cid} and the "
-                      f"arithmetic says {decision!r} — the arithmetic stands", flush=True)
-            if decision == "revert":
-                self._restore_snapshot(agent, cid)
-            # decide() speaks in verbs ("keep"/"revert"); the log stores outcomes
-            # ("kept"/"reverted"), which is the vocabulary agent_changes_outcome_check
-            # allows and log_lists reads. Two vocabularies meeting at one boundary, as
-            # with AGENT_STATUS_DB in the registry — and for the same reason: sending the
-            # other one is a row the database refuses and a standing list that silently
-            # stays empty.
-            outcome = {"keep": "kept", "revert": "reverted"}[decision]
-            registry.change_settle(self.sessions_root, aid, cid, outcome,
-                                   observed=observed, threshold=threshold,
-                                   valid_rate=valid_rate,
-                                   base_valid_rate=base.get("valid_rate"), reason=reason)
-            print(f"[learning] {aid}: change {cid} {outcome.upper()} — {reason}",
+            registry.change_explain(self.sessions_root, aid, cid, why)
+        except Exception as e:                             # noqa: BLE001
+            print(f"[learning] could not store the explanation for {cid}: {_why(e)}",
                   flush=True)
-        except Exception as e:                             # noqa: BLE001 — never lose the cycle
-            print(f"[learning] could not settle change {cid} for {aid}: {_why(e)}",
-                  flush=True)
+
+    @staticmethod
+    def _converged(attempts, verdict=None):
+        """True when the last few attempts were all reverted.
+
+        A store that no change has improved by the bar in several tries is converged, and
+        paying a model call per cycle to watch the engine undo its own work is pure cost.
+        This and observe-only are the same switch wearing two hats: both stop the store
+        being written to while measurement carries on.
+
+        ``verdict`` is THIS cycle's grade, and it counts. Reading only the stored rows
+        made the check a cycle stale: the attempt being reverted right now is still
+        pending in the table, so the third consecutive revert never closed the loop and a
+        fourth change was applied before anything stopped."""
+        n = agent_config.LEARNING_CONVERGED_AFTER
+        outcomes = [verdict["outcome"]] if verdict else []
+        pending_id = None if not verdict else str(verdict.get("attempt_id") or "")
+        for a in (attempts or []):
+            if a.get("outcome") and str(a.get("change_id") or "") != pending_id:
+                outcomes.append(a["outcome"])
+        recent = outcomes[:n]
+        return len(recent) == n and all(o == agent_grade.REVERTED for o in recent)
 
     def _restore_snapshot(self, agent, change_id):
         """Put the documents back exactly as they were before ``change_id``.
@@ -2623,14 +2676,20 @@ class AppState:
         A file restore, never a model call: a model asked to undo its own change
         paraphrases it back into existence. Sound only because every document the engine
         may write has one author — the agent writes live state, which the engine cannot
-        touch, and the engine writes the rest — so nothing has edited these bytes since."""
+        touch, and the engine writes the rest — so nothing has edited these bytes since.
+
+        Returns the paths it put back. Exactly ONE version back is ever stored: the
+        snapshot is discarded once used, and the next applied change writes a fresh one.
+        There is no history and no rollback chain, because only one attempt is ever
+        outstanding."""
         aid, store_id = agent.get("agent_id"), agent.get("memory_store_id")
         docs = registry.snapshot_get(self.sessions_root, aid, change_id)
         if docs is None:
             print(f"[learning] no snapshot for {change_id} on {aid} — cannot revert, "
                   f"the change stays in the store", flush=True)
-            return
+            return []
         client = self._live_client()
+        restored = []
         for path, content in (docs or {}).items():
             try:
                 if content is None:
@@ -2639,13 +2698,20 @@ class AppState:
                     client.delete_memory(store_id, path)
                 else:
                     client.write_memory(store_id, path, content)
+                restored.append(path)
             except Exception as e:                         # noqa: BLE001
                 print(f"[learning] could not restore {path} for {aid}: {_why(e)}",
                       flush=True)
+        try:                                   # superseded the moment it is used
+            registry.snapshot_clear(self.sessions_root, aid, change_id)
+        except Exception:                                  # noqa: BLE001 — a stale snapshot
+            pass                                           # is harmless; a lost revert is not
         print(f"[learning] {aid}: reverted {change_id}, restored "
-              f"{len(docs)} document(s)", flush=True)
+              f"{len(restored)} document(s)", flush=True)
+        return restored
 
-    def _apply_change(self, agent, change, docs_before, observed):
+    def _apply_change(self, agent, change, docs_before, observed,
+                      preconditions=None):
         """Snapshot, then write, then delete. Returns ``(written, deleted)``.
 
         Snapshot FIRST: a revert that has nothing to restore is not a revert, so the
@@ -2698,6 +2764,12 @@ class AppState:
                 "paths": written + deleted,
                 "peer_informed": change.get("peer_informed"),
                 "retry_of": change.get("retry_of"),
+                # What the record is ROUTED on when another agent reads it: the type it
+                # aggregates under, the engine's prose preconditions, and the countable
+                # vector a matcher can actually filter with.
+                "change_type": change.get("change_type"),
+                "preconditions": change.get("preconditions"),
+                "precondition_vector": preconditions,
                 "baseline": observed})
         except Exception as e:                             # noqa: BLE001
             print(f"[learning] could not log change {change['change_id']} for {aid}: "

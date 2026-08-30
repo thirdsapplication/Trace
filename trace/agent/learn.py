@@ -81,131 +81,80 @@ def session_record(run, events):
     }
 
 
-def log_lists(changes):
-    """The three standing lists, derived in CODE from the recorded numbers.
-
-    Not stored as flags: a change that missed the bar by a point on a noisy batch and one
-    that made performance fifteen percent worse are different evidence, and a pass/fail
-    column would have destroyed the difference the moment it was written. Deriving the
-    lists from ``baseline`` and ``observed`` keeps the distinction available forever.
-
-    - kept: in the store and working. Techniques worth extending.
-    - retryable: reverted, but performance was still BETTER than baseline — it missed the
-      bar rather than failing. May be proposed once more with a stated reason.
-    - banned: made performance worse, or was reverted twice. Permanent.
-    """
-    kept, retryable, banned = [], [], []
-    reverts = {}
-    # The stored vocabulary, which is also agent_changes_outcome_check's. decide() answers
-    # in verbs and app._settle_pending maps them; anything else here is a bug upstream.
-    for c in (changes or []):
-        cid = c.get("change_id")
-        root_id = c.get("retry_of") or cid
-        if c.get("outcome") in ("reverted", "banned"):
-            reverts[root_id] = reverts.get(root_id, 0) + 1
-    for c in (changes or []):
-        outcome = c.get("outcome")
-        if outcome not in STORED_OUTCOMES:
-            # Not just "if not outcome". An unsettled change has no outcome and belongs on
-            # no list; but a value from the WRONG vocabulary — "revert" where "reverted"
-            # was meant — used to fall through to retryable, quietly filing a failure as a
-            # near miss worth trying again. Unknown is ignored, loudly enough that a
-            # mismatch shows up as empty lists rather than as wrong ones.
-            continue
-        entry = {"change_id": c.get("change_id"), "summary": c.get("summary"),
-                 "technique": c.get("technique"), "baseline": c.get("baseline"),
-                 "observed": c.get("observed"), "reason": c.get("reason")}
-        if outcome == "kept":
-            kept.append(entry)
-            continue
-        root_id = c.get("retry_of") or c.get("change_id")
-        worse = (c.get("observed") is not None and c.get("baseline") is not None
-                 and c["observed"] >= c["baseline"])
-        if outcome == "banned" or worse or reverts.get(root_id, 0) >= 2:
-            banned.append(entry)
-        else:
-            retryable.append(entry)
-    return {"kept": kept, "retryable": retryable, "banned": banned}
+# log_lists and decide moved to grade.py when grading became A-F. The verdict is
+# arithmetic over one number now, and it belongs beside the grade table rather than
+# beside the prompt that must not see it.
 
 
-def decide(pending, observed, baseline, valid_rate, base_valid_rate):
-    """The verdict, computed in CODE. Returns ``(decision, threshold, reason)``.
+def build_payload(agent, observed, excluded, memory_docs, log, pending, peers=None,
+                  baseline=None, valid_rate=None, base_valid_rate=None,
+                  profiles=None, prefix=None, preconditions=None,
+                  reverted_change=None, converged=False):
+    """The dict json.dumps'd into the engine's user message.
 
-    The spec had the analyst apply the bar and report the arithmetic. It does still state
-    a verdict — that is discipline, and a disagreement between its answer and this one is
-    worth logging — but what EXECUTES is this function. A model can slip on arithmetic, and
-    the one place a graded party should never hold the pen is the grade.
+    ``observed`` is the score: mean TOTAL TOKENS per valid session, computed in code. No
+    model produced it and none may argue with it. ``profiles`` say where those tokens went
+    per session, ``prefix`` says what share of the per-turn cost the engine can even reach,
+    and ``excluded`` sessions are evidence that never becomes a number.
 
-    The valid rate is checked FIRST and can revert a change whose score passed. Excluding
-    damaged sessions hides damage rather than catching it: a change that makes the agent
-    sloppier draws rejections, those sessions leave the measurement, and the survivors show
-    a better mean from a change that only did harm.
-    """
-    if not pending:
-        return None, None, ""
-    threshold = None
-    if baseline is not None:
-        threshold = round(float(baseline) * (1.0 - config.MIN_IMPROVEMENT), 1)
-    if (base_valid_rate is not None and valid_rate is not None
-            and valid_rate < base_valid_rate - config.VALID_RATE_TOLERANCE):
-        return "revert", threshold, (
-            f"valid rate fell from {base_valid_rate:.2f} to {valid_rate:.2f}: more "
-            f"sessions drew a human intervention than before, and those sessions left "
-            f"the measurement rather than entering it")
-    if baseline is None or observed is None:
-        return "revert", threshold, (
-            "no comparable measurement for the batch that should have judged this change")
-    if observed <= threshold:
-        return "keep", threshold, (
-            f"observed {observed} at or under the {threshold} bar "
-            f"(baseline {baseline}, {config.MIN_IMPROVEMENT:.0%} required)")
-    return "revert", threshold, (
-        f"observed {observed} above the {threshold} bar "
-        f"(baseline {baseline}, {config.MIN_IMPROVEMENT:.0%} required)")
-
-
-def build_payload(agent, scored, excluded, memory_docs, log, pending, peers=None,
-                  baseline=None, valid_rate=None, base_valid_rate=None):
-    """The dict json.dumps'd into the analyst's user message.
-
-    ``scored`` is the measurement from a SEPARATE call that saw only transcripts — no log,
-    no pending change, no memory store — so the party being graded did not set its own
-    difficulty. ``excluded`` are sessions that are evidence but never a number.
+    ``reverted_change`` is present only when the pending attempt was graded D or F. By the
+    time this payload is built the store has ALREADY been restored, so ``memory`` holds
+    the state that will actually run and this field holds what was undone.
     """
     payload = {
         "agent": {"name": agent.get("name"),
                   "description": agent.get("description"),
                   "trigger": agent.get("trigger")},
         "min_improvement": config.MIN_IMPROVEMENT,
-        "scored": scored or {},
-        "baseline_performance": baseline,
-        "valid_rate": valid_rate,
-        "baseline_valid_rate": base_valid_rate,
+        "score": {"mean_total_tokens": observed,
+                  "baseline_mean_total_tokens": baseline,
+                  "sessions_valid": len(profiles or []),
+                  "sessions_excluded": len(excluded or []),
+                  "valid_rate": valid_rate,
+                  "baseline_valid_rate": base_valid_rate,
+                  "prefix": prefix or {}},
+        "preconditions": preconditions or {},
+        "sessions": list(profiles or []),
         "excluded": list(excluded or []),
         "memory": {path: ("(unavailable)" if text is None else text)
                    for path, text in (memory_docs or {}).items()},
-        "log": log or {"kept": [], "retryable": [], "banned": []},
+        "attempts": log or {"kept": [], "retryable": [], "banned": []},
         "pending": pending,
     }
+    if reverted_change:
+        payload["reverted_change"] = reverted_change
+    if converged:
+        # Several attempts in a row reverted. The engine is told so plainly rather than
+        # being left to infer it from the log, because "propose nothing" is the answer
+        # here and it is the one answer a proposing engine will not reach on its own.
+        payload["converged"] = True
     if peers:
         payload["peers"] = list(peers)
     return payload
 
 
-def judge_and_propose(agent, scored, excluded, memory_docs, log, pending, model_fn,
-                      peers=None, baseline=None, valid_rate=None, base_valid_rate=None):
-    """ONE analyst call: judge the pending change, then propose at most one new one.
+def judge_and_propose(agent, observed, excluded, memory_docs, log, pending, model_fn,
+                      peers=None, baseline=None, valid_rate=None, base_valid_rate=None,
+                      profiles=None, prefix=None, preconditions=None,
+                      reverted_change=None, converged=False):
+    """ONE model call per cycle: explain the graded attempt, then propose at most one.
 
-    Returns ``{"analysis", "verdict", "change", "blocked_on"}`` with the change's docs and
-    deletes already sanitized, or None when the call or the parse failed. Never raises.
+    Returns ``{"analysis", "attempt_review", "change", "blocked_on"}`` with the change's
+    docs and deletes already sanitized, or None when the call or the parse failed. Never
+    raises.
 
-    ``verdict`` here is the MODEL'S stated answer and is recorded for comparison; the
-    decision that executes comes from ``decide`` above.
+    The engine no longer decides anything. The grade was computed in code before this call
+    and, when it was a revert, applied before it too — so what comes back is an
+    explanation and a proposal, not a verdict.
     """
-    user = json.dumps(build_payload(agent, scored, excluded, memory_docs, log, pending,
+    user = json.dumps(build_payload(agent, observed, excluded, memory_docs, log, pending,
                                     peers=peers, baseline=baseline,
                                     valid_rate=valid_rate,
-                                    base_valid_rate=base_valid_rate),
+                                    base_valid_rate=base_valid_rate,
+                                    profiles=profiles, prefix=prefix,
+                                    preconditions=preconditions,
+                                    reverted_change=reverted_change,
+                                    converged=converged),
                       ensure_ascii=False, default=str)
     try:
         reply = model_fn(SYSTEM_PROMPT, user)
@@ -221,11 +170,17 @@ def judge_and_propose(agent, scored, excluded, memory_docs, log, pending, model_
     change = obj.get("change")
     if isinstance(change, dict):
         docs = _sanitize_docs(change.get("docs") or {})
-        change = {"change_id": str(change.get("change_id") or "").strip()[:64],
-                  "summary": str(change.get("summary") or "").strip(),
+        change = {"change_id": str(change.get("change_id")
+                                   or change.get("attempt_id") or "").strip()[:64],
+                  "change_type": _change_type(change.get("change_type")),
+                  "summary": str(change.get("summary")
+                                 or change.get("description") or "").strip(),
                   "technique": str(change.get("technique") or "").strip(),
-                  "rationale": str(change.get("rationale") or "").strip(),
-                  "peer_informed": str(change.get("peer_informed") or "").strip(),
+                  "rationale": str(change.get("rationale")
+                                   or change.get("reasoning") or "").strip(),
+                  "preconditions": str(change.get("preconditions") or "").strip(),
+                  "peer_informed": str(change.get("peer_informed")
+                                       or change.get("fleet_informed") or "").strip(),
                   "retry_of": str(change.get("retry_of") or "").strip(),
                   "docs": docs,
                   "delete": _sanitize_deletes(change.get("delete") or [], docs)}
@@ -234,11 +189,24 @@ def judge_and_propose(agent, scored, excluded, memory_docs, log, pending, model_
             change = None
     else:
         change = None
-    verdict = obj.get("verdict") if isinstance(obj.get("verdict"), dict) else None
+    review = obj.get("attempt_review")
+    if not isinstance(review, dict):
+        review = obj.get("verdict") if isinstance(obj.get("verdict"), dict) else None
     return {"analysis": str(obj.get("analysis") or "").strip(),
-            "verdict": verdict,
+            "attempt_review": review,
             "change": change,
             "blocked_on": str(obj.get("blocked_on") or "").strip()}
+
+
+CHANGE_TYPES = ("prune", "restructure", "add_lesson", "tool_recipe", "early_exit",
+                "reorder", "output_brevity")
+
+
+def _change_type(value):
+    """One of the known types, or "other". A free-text type would make the fleet's
+    aggregate outcomes by type uncountable, which is the one thing they are for."""
+    v = str(value or "").strip().lower()
+    return v if v in CHANGE_TYPES else "other"
 
 
 def _doc_path(path):

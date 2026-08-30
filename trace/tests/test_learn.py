@@ -16,7 +16,7 @@ memory or transcript looked like.
 import json
 import unittest
 
-from trace.agent import activity, config, learn, learn_prompt
+from trace.agent import activity, config, grade, learn, learn_prompt
 
 
 def _events(usage=None, text="did the work"):
@@ -186,8 +186,8 @@ def _reply(**over):
 
 class JudgeAndProposeTest(unittest.TestCase):
     def _call(self, model_fn, **kw):
-        return learn.judge_and_propose({"name": "A"}, {"mean_performance": 900.0},
-                                       [], {}, learn.log_lists([]), None, model_fn, **kw)
+        return learn.judge_and_propose({"name": "A"}, 900.0,
+                                       [], {}, grade.log_lists([]), None, model_fn, **kw)
 
     def test_a_well_formed_reply_parses_into_a_sanitized_change(self):
         out = self._call(_fn(_reply()))
@@ -252,111 +252,53 @@ class JudgeAndProposeTest(unittest.TestCase):
         self.assertNotIn("peers", seen["payload"])
 
 
-class DecideTest(unittest.TestCase):
-    """The verdict is arithmetic and it belongs to code. The analyst authored the change
-    it is being asked to grade, and the one pen a graded party must not hold is the one
-    that writes the grade."""
-
-    PENDING = {"change_id": "c1"}
-
-    def test_nothing_pending_decides_nothing(self):
-        self.assertEqual(learn.decide(None, 1.0, 1.0, 1.0, 1.0), (None, None, ""))
-
-    def test_clearing_the_bar_is_kept(self):
-        d, threshold, _ = learn.decide(self.PENDING, 900.0, 1000.0, 1.0, 1.0)
-        self.assertEqual(d, "keep")
-        self.assertEqual(threshold, round(1000.0 * (1 - config.MIN_IMPROVEMENT), 1))
-
-    def test_missing_the_bar_is_reverted_even_when_performance_improved(self):
-        # Better than baseline but short of the bar: reverted, and it lands on the
-        # RETRYABLE list rather than the banned one.
-        d, _, _ = learn.decide(self.PENDING, 990.0, 1000.0, 1.0, 1.0)
-        self.assertEqual(d, "revert")
-
-    def test_a_fallen_valid_rate_reverts_whatever_the_score_says(self):
-        d, _, reason = learn.decide(self.PENDING, 1.0, 1000.0, 0.4, 1.0)
-        self.assertEqual(d, "revert")
-        self.assertIn("valid rate", reason)
-
-    def test_no_measurement_reverts_rather_than_keeping_on_faith(self):
-        d, _, _ = learn.decide(self.PENDING, None, 1000.0, 1.0, 1.0)
-        self.assertEqual(d, "revert")
-
-
-class OutcomeVocabularyTest(unittest.TestCase):
-    """decide() answers in verbs; the log stores outcomes. The two vocabularies meet at
-    one boundary in app._settle_pending, and sending the wrong one is a row Postgres
-    refuses (agent_changes_outcome_check) plus standing lists that silently stay empty."""
-
-    STORED = {"kept", "reverted", "banned"}
-
-    def test_decide_speaks_verbs(self):
-        for observed, expected in ((1.0, "keep"), (10_000.0, "revert")):
-            d, _, _ = learn.decide({"change_id": "c"}, observed, 1000.0, 1.0, 1.0)
-            self.assertEqual(d, expected)
-            self.assertNotIn(d, self.STORED)
-
-    def test_log_lists_reads_only_stored_outcomes(self):
-        # A verb reaching log_lists puts the change on no list at all — which reads
-        # exactly like a loop that has never tried anything.
-        for verb in ("keep", "revert"):
-            lists = learn.log_lists([{"change_id": "c", "outcome": verb,
-                                      "baseline": 10, "observed": 8}])
-            self.assertEqual((lists["kept"], lists["retryable"], lists["banned"]),
-                             ([], [], []))
-        lists = learn.log_lists([{"change_id": "c", "outcome": "kept",
-                                  "baseline": 10, "observed": 8}])
-        self.assertEqual(len(lists["kept"]), 1)
-
-
-class LogListsTest(unittest.TestCase):
-    def test_kept_retryable_and_banned_are_derived_from_the_numbers(self):
-        lists = learn.log_lists([
-            {"change_id": "a", "outcome": "kept", "baseline": 10, "observed": 8},
-            {"change_id": "b", "outcome": "reverted", "baseline": 10, "observed": 9.6},
-            {"change_id": "c", "outcome": "reverted", "baseline": 10, "observed": 12},
-        ])
-        self.assertEqual([c["change_id"] for c in lists["kept"]], ["a"])
-        self.assertEqual([c["change_id"] for c in lists["retryable"]], ["b"])
-        self.assertEqual([c["change_id"] for c in lists["banned"]], ["c"])
-
-    def test_reverted_twice_is_banned_however_close_it_came(self):
-        lists = learn.log_lists([
-            {"change_id": "b", "outcome": "reverted", "baseline": 10, "observed": 9.6},
-            {"change_id": "b2", "retry_of": "b", "outcome": "reverted",
-             "baseline": 10, "observed": 9.7},
-        ])
-        self.assertEqual(lists["retryable"], [])
-        self.assertEqual({c["change_id"] for c in lists["banned"]}, {"b", "b2"})
-
-    def test_a_change_still_awaiting_judgment_is_on_no_list(self):
-        lists = learn.log_lists([{"change_id": "p", "outcome": None}])
-        self.assertEqual((lists["kept"], lists["retryable"], lists["banned"]), ([], [], []))
+# DecideTest, OutcomeVocabularyTest and LogListsTest moved to test_grade.py when the
+# verdict became an A-F grade computed in grade.py. They test the same invariants there.
 
 
 class BuildPayloadTest(unittest.TestCase):
-    def test_the_measurement_and_the_bar_both_reach_the_analyst(self):
-        p = learn.build_payload({"name": "A"}, {"mean_performance": 42.0}, [], {},
-                                learn.log_lists([]), None, baseline=50.0,
-                                valid_rate=0.8, base_valid_rate=1.0)
-        self.assertEqual(p["scored"]["mean_performance"], 42.0)
-        self.assertEqual(p["baseline_performance"], 50.0)
+    def test_the_measurement_and_the_bar_both_reach_the_engine(self):
+        p = learn.build_payload({"name": "A"}, 42.0, [], {}, grade.log_lists([]), None,
+                                baseline=50.0, valid_rate=0.8, base_valid_rate=1.0,
+                                profiles=[{"session_id": "s1", "turns": 3}])
+        self.assertEqual(p["score"]["mean_total_tokens"], 42.0)
+        self.assertEqual(p["score"]["baseline_mean_total_tokens"], 50.0)
+        self.assertEqual(p["score"]["sessions_valid"], 1)
         self.assertEqual(p["min_improvement"], config.MIN_IMPROVEMENT)
-        self.assertEqual((p["valid_rate"], p["baseline_valid_rate"]), (0.8, 1.0))
+        self.assertEqual(p["score"]["valid_rate"], 0.8)
 
     def test_excluded_sessions_travel_as_evidence_and_never_as_a_number(self):
         excluded = [{"session_id": "s9", "reason": "rejected", "transcript": "..."}]
-        p = learn.build_payload({"name": "A"}, {"mean_performance": 1.0}, excluded, {},
-                                learn.log_lists([]), None)
+        p = learn.build_payload({"name": "A"}, 1.0, excluded, {}, grade.log_lists([]),
+                                None, profiles=[{"session_id": "s1"}])
         self.assertEqual(p["excluded"], excluded)
-        self.assertNotIn("s9", [s.get("session_id")
-                                for s in p["scored"].get("sessions", [])])
+        self.assertNotIn("s9", [s.get("session_id") for s in p["sessions"]])
+        self.assertEqual(p["score"]["sessions_excluded"], 1)
 
     def test_an_unreadable_document_is_marked_not_blanked(self):
         # Blanking would read as wiped memory and invite a rewrite from nothing.
-        p = learn.build_payload({"name": "A"}, {}, [], {"/a.md": None},
-                                learn.log_lists([]), None)
+        p = learn.build_payload({"name": "A"}, None, [], {"/a.md": None},
+                                grade.log_lists([]), None)
         self.assertEqual(p["memory"]["/a.md"], "(unavailable)")
+
+    def test_a_revert_reaches_the_engine_as_evidence_not_as_content(self):
+        """By the time the payload is built the store has already been restored, so the
+        memory it carries is what will run and the undone change is a separate field.
+        An engine that saw the reverted text as memory would write on top of text that
+        no longer exists."""
+        reverted = {"attempt_id": "c1", "grade": "F", "improvement": -0.2}
+        p = learn.build_payload({"name": "A"}, 1.0, [], {"/a.md": "restored"},
+                                grade.log_lists([]), None, reverted_change=reverted)
+        self.assertEqual(p["reverted_change"]["grade"], "F")
+        self.assertEqual(p["memory"]["/a.md"], "restored")
+
+    def test_convergence_is_stated_not_left_to_be_inferred(self):
+        p = learn.build_payload({"name": "A"}, 1.0, [], {}, grade.log_lists([]), None,
+                                converged=True)
+        self.assertTrue(p["converged"])
+        self.assertNotIn("converged",
+                         learn.build_payload({"name": "A"}, 1.0, [], {},
+                                             grade.log_lists([]), None))
 
 
 class PromptPinsTest(unittest.TestCase):
@@ -393,9 +335,31 @@ class PromptPinsTest(unittest.TestCase):
         self.assertIn("one change per cycle", p)
         self.assertIn("this is not a budget, it is the measurement design", p)
 
-    def test_the_analyst_is_told_it_does_not_apply_the_bar(self):
+    def test_the_engine_is_told_it_neither_sets_nor_applies_the_bar(self):
         p = " ".join(learn_prompt.SYSTEM_PROMPT.lower().split())
-        self.assertIn("you do not set the standard and you do not apply it", p)
+        self.assertIn("you do not set the standard, you do not apply it", p)
+
+    def test_the_engine_is_told_the_revert_already_happened(self):
+        """v6 grades and reverts BEFORE the call. An engine that thought it was still
+        deciding would argue with a verdict, and one that thought the failed change was
+        still in the store would write its replacement on top of deleted text."""
+        p = " ".join(learn_prompt.SYSTEM_PROMPT.lower().split())
+        self.assertIn("it has already been applied", p)
+        self.assertIn("trace has already restored the memory store", p)
+
+    def test_the_score_is_named_as_raw_tokens_with_no_division(self):
+        p = " ".join(learn_prompt.SYSTEM_PROMPT.lower().split())
+        self.assertIn("mean total tokens per valid session", p)
+        self.assertIn("nothing is divided", p)
+
+    def test_the_grade_table_is_stated_in_full(self):
+        """A D and an F are both reverts and are not the same evidence. An engine shown
+        only "reverted" cannot tell a technique that underdelivered from one that
+        backfired, which is the distinction the fleet record exists to carry."""
+        p = " ".join(learn_prompt.SYSTEM_PROMPT.lower().split())
+        for line in ("improved, but under the bar", "no improvement, or worse",
+                     "may be retried once", "never repeat"):
+            self.assertIn(line, p)
 
     def test_no_pre_determined_structure_is_promised(self):
         """A store begins with live state alone; what else it holds is the engine's call.

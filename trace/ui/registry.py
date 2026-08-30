@@ -850,6 +850,17 @@ def _change_to_caller(row):
         "base_valid_rate": row.get("base_valid_rate"),
         "outcome": row.get("outcome"),
         "reason": row.get("reason"),
+        # Both halves of the round trip name these, or a column written every cycle would
+        # read back empty and the grade would look like a feature that never worked.
+        "grade": row.get("grade"),
+        "improvement": row.get("improvement"),
+        "change_type": row.get("change_type"),
+        "preconditions": row.get("preconditions"),
+        "precondition_vector": row.get("precondition_vector") or {},
+        "why_it_worked_or_failed": row.get("why_it_worked_or_failed"),
+        # attempt_id is the v6 name for change_id; both are exposed so the engine's
+        # vocabulary and the table's can differ without a migration in between.
+        "attempt_id": row.get("change_id"),
         "applied_at": row.get("applied_at"),
         "judged_at": row.get("judged_at"),
     }
@@ -873,6 +884,12 @@ def change_add(root, rec):
             "peer_informed": rec.get("peer_informed") or None,
             "retry_of": rec.get("retry_of") or None,
             "baseline": rec.get("baseline"),
+            # v6: the change_type and the preconditions are what a record is ROUTED on.
+            # The prose half is for the next engine to read; the vector is the half a
+            # matcher can filter, because prose cannot be compared against numbers.
+            "change_type": rec.get("change_type") or None,
+            "preconditions": rec.get("preconditions") or None,
+            "precondition_vector": rec.get("precondition_vector") or {},
         }).execute()
         return
     with _LOCK:
@@ -883,15 +900,18 @@ def change_add(root, rec):
 
 
 def change_settle(root, agent_id, change_id, outcome, observed=None, threshold=None,
-                  valid_rate=None, base_valid_rate=None, reason=""):
-    """Close a change out with the numbers the following cycle measured.
+                  valid_rate=None, base_valid_rate=None, reason="", grade=None,
+                  improvement=None):
+    """Close an attempt out with the numbers the following group measured.
 
-    Numbers, not just a verdict: a change that missed the bar by a point on a noisy batch
-    and one that made performance fifteen percent worse are different evidence, and only
-    the figures preserve the difference for whoever reads this log later."""
+    Numbers and a GRADE, not just a verdict. A D and an F are both reverts and they are
+    not the same evidence: a D is a technique that worked and underdelivered, an F is one
+    that backfired, and collapsing them throws away the distinction that matters most
+    when another agent reads the record."""
     fields = {"outcome": outcome, "observed": observed, "threshold": threshold,
               "valid_rate": valid_rate, "base_valid_rate": base_valid_rate,
-              "reason": reason, "judged_at": _now_iso()}
+              "reason": reason, "grade": grade, "improvement": improvement,
+              "judged_at": _now_iso()}
     if supa.is_configured():
         supa.get_admin().table("agent_changes").update(fields) \
             .eq("agent_id", agent_id).eq("change_id", change_id) \
@@ -970,6 +990,55 @@ def snapshot_get(root, agent_id, change_id):
         return (rows[0].get("docs") or {}) if rows else None
     entry = _load(root, f"snapshots_{_safe(agent_id)}.json").get(str(change_id))
     return (entry or {}).get("docs") if entry else None
+
+
+def snapshot_clear(root, agent_id, change_id):
+    """Discard a snapshot once it has been restored from.
+
+    Exactly one version back is ever kept. One attempt is outstanding at a time, so one
+    snapshot is all that can ever be needed, and a snapshot left behind after its restore
+    is a second version nobody can reach."""
+    if supa.is_configured():
+        try:
+            supa.get_admin().table("agent_doc_snapshots").delete() \
+                .eq("agent_id", agent_id).eq("change_id", change_id).execute()
+        except Exception:                                  # noqa: BLE001 — pre-migration
+            pass
+        return
+    with _LOCK:
+        name = f"snapshots_{_safe(agent_id)}.json"
+        d = _load(root, name)
+        if d.pop(str(change_id), None) is not None:
+            _save(root, name, d)
+
+
+def change_explain(root, agent_id, change_id, why):
+    """Store the engine's after-the-fact account of why an attempt worked or failed.
+
+    A second write because the grade is computed BEFORE the model call now, so the prose
+    explaining it can only arrive after. It is the field every other agent reads, which is
+    why it is kept even though no verdict waits on it."""
+    if supa.is_configured():
+        try:
+            supa.get_admin().table("agent_changes") \
+                .update({"why_it_worked_or_failed": why}) \
+                .eq("agent_id", agent_id).eq("change_id", change_id).execute()
+        except Exception:                                  # noqa: BLE001 — pre-migration
+            pass
+        return
+    with _LOCK:
+        p = os.path.join(_dir(root), f"changes_{_safe(agent_id)}.jsonl")
+        try:
+            with open(p, encoding="utf-8") as f:
+                rows = [json.loads(line) for line in f if line.strip()]
+        except (FileNotFoundError, json.JSONDecodeError):
+            return
+        for r in rows:
+            if r.get("change_id") == change_id:
+                r["why_it_worked_or_failed"] = why
+        with open(p, "w", encoding="utf-8") as f:
+            for r in rows:
+                f.write(json.dumps(r, default=str) + "\n")
 
 
 # --- pending (staged) actions — Spec 8 -------------------------------------
