@@ -1,4 +1,4 @@
--- 024: repair agent_embeddings, which has never accepted a single row.
+-- 026: repair agent_embeddings, which has never accepted a single row.
 --
 -- Found 2026-08-31 from a Render log line Philip pasted:
 --
