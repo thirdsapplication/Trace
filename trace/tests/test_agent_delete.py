@@ -38,7 +38,8 @@ class FakeCleanup:
         if self.boom:
             raise RuntimeError("platform unreachable")
         self.calls.append({"deployment_ids": deployment_ids or [],
-                           "memory_store_ids": memory_store_ids or []})
+                           "memory_store_ids": memory_store_ids or [],
+                           "session_ids": session_ids or []})
         removed = {"deployments": [], "memory_stores": list(memory_store_ids or [])}
         errors = []
         if self.fail_deployment:
@@ -129,6 +130,30 @@ class AgentDeleteTest(unittest.TestCase):
         self.state.delete_agent("a1", "u1")
         self.assertIsNone(registry.schedule_get(self.root, "a1"))
         self.assertEqual(registry.messages_for_agent(self.root, "u1", "a1"), [])
+
+    def test_platform_run_sessions_are_swept(self):
+        """Each run leaves a session on Anthropic holding the transcript of what the
+        agent did — which is where the contents of the user's mail and spreadsheets end
+        up. delete_agent passed [] for session_ids, so every one of them survived a
+        "full" delete. They are recoverable from agent_runs.run_session_id; the local
+        specs/run_*.json records are not, because Render's disk is wiped each deploy.
+        """
+        for n in (1, 2):
+            registry.run_add(self.root, {"agent_id": "a1", "owner_user_id": "u1",
+                                         "run_session_id": f"sesn_{n}",
+                                         "status": "completed"})
+        self.state.delete_agent("a1", "u1")
+        swept = self.cleanup.calls[0]["session_ids"]
+        self.assertEqual(sorted(swept), ["sesn_1", "sesn_2"],
+                         "platform run sessions were left on Anthropic's side")
+
+    def test_another_agents_platform_sessions_are_not_swept(self):
+        registry.run_add(self.root, {"agent_id": "a1", "owner_user_id": "u1",
+                                     "run_session_id": "sesn_mine", "status": "completed"})
+        registry.run_add(self.root, {"agent_id": "a2", "owner_user_id": "u1",
+                                     "run_session_id": "sesn_theirs", "status": "completed"})
+        self.state.delete_agent("a1", "u1")
+        self.assertEqual(self.cleanup.calls[0]["session_ids"], ["sesn_mine"])
 
     def test_run_summaries_go_too(self):
         """session_summaries is keyed by SESSION id, not agent_id, so it is not in

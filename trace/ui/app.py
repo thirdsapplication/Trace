@@ -1644,9 +1644,23 @@ class AppState:
         # 1. Off the platform. Best-effort per id, but every failure is REPORTED —
         #    a half-deleted agent that looks fully deleted is the dangerous outcome.
         depl = agent.get("deployment_id")
+        # The agent's PLATFORM sessions — one per run, each holding the transcript of
+        # what it did, which is where the contents of the user's mail and spreadsheets
+        # end up. Passing [] here left every one of them on Anthropic's side after a
+        # "full" delete. They are recoverable from Supabase (agent_runs.run_session_id),
+        # unlike the local specs/run_*.json records, which Render's ephemeral disk loses
+        # on every deploy — so this must be read from the registry, not the filesystem.
+        try:
+            run_sessions = [r.get("run_session_id")
+                            for r in registry.runs_for_agent(root, agent_id, 1000)
+                            if r.get("run_session_id")]
+            run_sessions = list(dict.fromkeys(run_sessions))
+        except Exception:                                  # noqa: BLE001
+            run_sessions = []
+        out["platform_sessions"] = len(run_sessions)
         try:
             res = self.cleanup_fn(
-                [], [], [],
+                run_sessions, [], [],
                 agent_names=[],
                 deployment_ids=[depl] if depl else [],
                 memory_store_ids=[] if shared_with or not store_id else [store_id])
