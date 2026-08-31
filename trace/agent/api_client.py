@@ -201,6 +201,20 @@ def _event_dict(event):
     return {"type": et, "text": text, "name": name, "stop_reason": stop_reason}
 
 
+def _is_missing(exc):
+    """True when the platform says the thing does not exist.
+
+    Matched on the exception's text rather than a type, because the SDK surface has
+    already changed shape under this code once (56d7911) and a NotFoundError class that
+    moves would silently turn "already gone" back into "archive failed".
+    """
+    name = type(exc).__name__.lower()
+    if "notfound" in name:
+        return True
+    text = str(exc).lower()
+    return "not_found" in text or "not found" in text or "404" in text
+
+
 class ManagedAgentsClient:
     def __init__(self, api_key=None, beta=BETA_VERSION):
         import anthropic
@@ -688,11 +702,25 @@ class ManagedAgentsClient:
 
     def archive_deployment(self, deployment_id):
         """Archive (terminal). Tolerant of already-archived/missing deployments —
-        used at schedule changes and cleanup, where a stale id must not block."""
+        used at schedule changes and cleanup, where a stale id must not block.
+
+        A deployment the platform no longer has is a SUCCESS, not a failure: there is
+        nothing left running, which is the whole point of archiving. Returning False for
+        it made delete_agent warn "may still be running on a schedule" every time an
+        agent whose deployment had already been reclaimed was deleted — and a warning
+        that fires when nothing is wrong is one people learn to ignore, which is worse
+        than not warning at all. Only a real failure returns False now.
+        """
         try:
             _retry(lambda: self._agents_ns("deployments").archive(deployment_id))
             return True
-        except Exception:                                  # noqa: BLE001
+        except Exception as exc:                           # noqa: BLE001
+            if _is_missing(exc):
+                print(f"[cleanup] deployment {deployment_id} was already gone — "
+                      f"nothing to archive", flush=True)
+                return True
+            print(f"[cleanup] could not archive deployment {deployment_id}: "
+                  f"{type(exc).__name__}: {exc}", flush=True)
             return False
 
     def list_deployment_runs(self, deployment_id):
