@@ -521,14 +521,24 @@ _AGENT_CHILD_TABLES = (
     "chat_group_members", "schedules",
 )
 
-# The file-mode stores, keyed the same way. Kept beside the table list on purpose: the
-# two paths drifting apart is the single most common bug in this codebase.
+# The file-mode stores. Kept beside the table list on purpose: the two paths drifting
+# apart is the single most common bug in this codebase, and the first version of this
+# list drifted immediately -- it named "reviews.json" (really run_reviews.json) and
+# "runs.json" for runs that are actually kept in PER-AGENT JSONL files. Both were
+# no-ops, so file mode deleted far less than it reported.
+#
+# Dict stores whose VALUES carry an agent_id field.
 _AGENT_CHILD_FILES = (
-    ("pending.json", "agent_id"), ("reviews.json", "agent_id"),
-    ("runs.json", "agent_id"), ("messages.json", "agent_id"),
-    ("promotions.json", "agent_id"), ("agent_embeddings.json", None),
-    ("schedules.json", None),
+    ("pending.json", "agent_id"), ("run_reviews.json", "agent_id"),
+    ("messages.json", "agent_id"), ("promotions.json", "agent_id"),
+    ("applications.json", "agent_id"),
 )
+# Dict stores keyed BY the agent id itself.
+_AGENT_KEYED_FILES = ("schedules.json", "agent_embeddings.json")
+# One file per agent, named for it. These are the ones the old list missed entirely.
+_AGENT_OWN_FILES = ("runs_{a}.jsonl", "changes_{a}.jsonl",
+                    "learning_cycles_{a}.jsonl", "peer_bundle_{a}.json",
+                    "snapshots_{a}.json")
 
 
 def agent_delete(root, agent_id, owner_user_id):
@@ -551,7 +561,25 @@ def agent_delete(root, agent_id, owner_user_id):
 
     if supa.is_configured():
         admin = supa.get_admin()
-        # decision_embeddings first: once the decisions are gone their ids are
+        # session_summaries is keyed by SESSION id, not agent_id, so it is not in
+        # _AGENT_CHILD_TABLES and cannot be -- it has no agent_id column. It holds the
+        # plain-English summary of what the agent did on each run, which is real
+        # content, and it would have survived a "full" delete untouched. The session
+        # ids are only reachable through agent_runs, so they must be collected BEFORE
+        # those rows go.
+        try:
+            r = admin.table("agent_runs").select("run_session_id") \
+                .eq("agent_id", agent_id).execute()
+            sids = [x["run_session_id"] for x in (getattr(r, "data", None) or [])
+                    if x.get("run_session_id")]
+            sids = list(dict.fromkeys(sids))
+            if sids:
+                admin.table("session_summaries").delete() \
+                    .in_("session_id", sids).execute()
+            report["rows"]["session_summaries"] = len(sids)
+        except Exception as e:                             # noqa: BLE001
+            report["errors"].append(f"session_summaries: {type(e).__name__}")
+        # decision_embeddings next: once the decisions are gone their ids are
         # unrecoverable and the vectors would be orphaned forever.
         try:
             r = admin.table("agent_decisions").select("id") \
@@ -580,14 +608,36 @@ def agent_delete(root, agent_id, owner_user_id):
         return report
 
     with _LOCK:
+        # Run summaries are keyed by SESSION id, so the session ids have to come off the
+        # agent's own run file before that file is removed.
+        sids = set()
+        runs_path = os.path.join(_dir(root), f"runs_{_safe(agent_id)}.jsonl")
+        try:
+            with open(runs_path, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except ValueError:
+                        continue
+                    if rec.get("run_session_id"):
+                        sids.add(rec["run_session_id"])
+        except OSError:
+            pass
+        if sids:
+            summ = _load(root, "session_summaries.json")
+            drop = [k for k in summ if k in sids]
+            for k in drop:
+                summ.pop(k, None)
+            if drop:
+                _save(root, "session_summaries.json", summ)
+                report["rows"]["session_summaries.json"] = len(drop)
+
         for fname, key in _AGENT_CHILD_FILES:
             d = _load(root, fname)
             if not d:
-                continue
-            if key is None:                                # keyed BY agent id
-                if d.pop(agent_id, None) is not None:
-                    report["rows"][fname] = 1
-                    _save(root, fname, d)
                 continue
             drop = [k for k, v in d.items()
                     if isinstance(v, dict) and v.get(key) == agent_id]
@@ -596,6 +646,21 @@ def agent_delete(root, agent_id, owner_user_id):
             if drop:
                 report["rows"][fname] = len(drop)
                 _save(root, fname, d)
+
+        for fname in _AGENT_KEYED_FILES:
+            d = _load(root, fname)
+            if d and d.pop(agent_id, None) is not None:
+                report["rows"][fname] = 1
+                _save(root, fname, d)
+
+        for pattern in _AGENT_OWN_FILES:
+            fp = os.path.join(_dir(root), pattern.format(a=_safe(agent_id)))
+            try:
+                os.remove(fp)
+                report["rows"][os.path.basename(fp)] = "removed"
+            except OSError:
+                pass
+
         decs = _load(root, "decisions.json")
         gone = [k for k, v in decs.items() if v.get("agent_id") == agent_id]
         if gone:
@@ -606,6 +671,7 @@ def agent_delete(root, agent_id, owner_user_id):
             _save(root, "decisions.json", decs)
             _save(root, "decision_embeddings.json", embs)
             report["rows"]["decisions.json"] = len(gone)
+
         ag = _load(root, "agents.json")
         if ag.pop(agent_id, None) is not None:
             _save(root, "agents.json", ag)

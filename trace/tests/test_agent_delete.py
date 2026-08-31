@@ -130,6 +130,32 @@ class AgentDeleteTest(unittest.TestCase):
         self.assertIsNone(registry.schedule_get(self.root, "a1"))
         self.assertEqual(registry.messages_for_agent(self.root, "u1", "a1"), [])
 
+    def test_run_summaries_go_too(self):
+        """session_summaries is keyed by SESSION id, not agent_id, so it is not in
+        _AGENT_CHILD_TABLES and cannot be. It holds the plain-English summary of what
+        the agent did on each run — real content — and survived a "full" delete
+        untouched until 2026-08-31. 168 rows were live at the time.
+        """
+        registry.run_add(self.root, {"agent_id": "a1", "owner_user_id": "u1",
+                                     "run_session_id": "sesn_a1", "status": "completed"})
+        registry.summary_set(self.root, "sesn_a1", "Sent three emails.", "completed")
+        self.assertIsNotNone(registry.summary_get(self.root, "sesn_a1"))
+        self.state.delete_agent("a1", "u1")
+        self.assertIsNone(registry.summary_get(self.root, "sesn_a1"),
+                          "the agent is gone but its run summaries are still readable")
+
+    def test_another_agents_summaries_are_untouched(self):
+        registry.run_add(self.root, {"agent_id": "a1", "owner_user_id": "u1",
+                                     "run_session_id": "sesn_a1", "status": "completed"})
+        registry.run_add(self.root, {"agent_id": "a2", "owner_user_id": "u1",
+                                     "run_session_id": "sesn_a2", "status": "completed"})
+        registry.summary_set(self.root, "sesn_a1", "mine", "completed")
+        registry.summary_set(self.root, "sesn_a2", "theirs", "completed")
+        self.state.delete_agent("a1", "u1")
+        self.assertIsNone(registry.summary_get(self.root, "sesn_a1"))
+        self.assertIsNotNone(registry.summary_get(self.root, "sesn_a2"),
+                             "deleting one agent took another's run summaries")
+
     def test_the_other_agents_schedule_survives(self):
         registry.schedule_set(self.root, "a2", "u1", {"kind": "daily", "time": "09:00"})
         self.state.delete_agent("a1", "u1")
