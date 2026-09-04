@@ -358,6 +358,56 @@ def _memories_client(memories):
     return _NSClient.build({"memory_stores": stores})
 
 
+class ArchiveDeploymentTest(unittest.TestCase):
+    """A deployment the platform no longer has is archived by definition.
+
+    Philip's agents kept failing with "Couldn't start the run: NotFoundError" —
+    Anthropic reclaims deployments — and archive_deployment returned False for that,
+    which made delete_agent warn "may still be running on a schedule" on every such
+    delete. A warning that fires when nothing is wrong gets ignored, and then the real
+    one does too.
+    """
+
+    class _Deployments:
+        def __init__(self, exc=None):
+            self.exc = exc
+            self.archived = []
+
+        def archive(self, did):
+            if self.exc:
+                raise self.exc
+            self.archived.append(did)
+
+    def _client(self, exc=None):
+        deps = self._Deployments(exc)
+        return _NSClient.build({"deployments": deps}), deps
+
+    def test_a_normal_archive_succeeds(self):
+        c, deps = self._client()
+        self.assertTrue(c.archive_deployment("depl_1"))
+        self.assertEqual(deps.archived, ["depl_1"])
+
+    def test_a_missing_deployment_counts_as_archived(self):
+        class NotFoundError(Exception):
+            pass
+        c, _ = self._client(NotFoundError("deployment not found"))
+        self.assertTrue(c.archive_deployment("depl_gone"),
+                        "an already-reclaimed deployment was reported as a failure")
+
+    def test_a_404_in_the_message_counts_too(self):
+        c, _ = self._client(RuntimeError("APIError: 404 no such deployment"))
+        self.assertTrue(c.archive_deployment("depl_gone"))
+
+    def test_a_REAL_failure_still_fails(self):
+        """The warning has to survive for the case it exists for."""
+        c, _ = self._client(RuntimeError("APIError: 500 internal"))
+        self.assertFalse(c.archive_deployment("depl_1"))
+
+    def test_a_permission_error_is_not_mistaken_for_missing(self):
+        c, _ = self._client(RuntimeError("APIError: 403 forbidden"))
+        self.assertFalse(c.archive_deployment("depl_1"))
+
+
 class WriteMemoryTest(unittest.TestCase):
     """Refreshing a memory document against the real memories surface.
 
