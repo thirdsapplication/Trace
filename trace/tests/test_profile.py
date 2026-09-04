@@ -58,19 +58,74 @@ class ReferencedDocsTest(unittest.TestCase):
         self.assertEqual(profile.referenced_docs([_turn()], ["/a.md"]), set())
 
 
-class PrefixTest(unittest.TestCase):
-    def test_the_prefix_is_measured_from_the_first_turn_not_estimated(self):
-        """The first turn's reported input IS the prefix: system prompt, tool schemas,
-        memory and the trigger. Only the memory share is an estimate."""
-        events = [_turn(inp=40000), _turn(inp=52000)]
-        p = profile.prefix(events, {"/a.md": "z" * 8000})
-        self.assertEqual(p["prefix_tokens_measured"], 40000)
-        self.assertEqual(p["memory_store_tokens_estimated"], 2000)
-        self.assertEqual(p["memory_share_of_prefix"], 0.05)
+def _session_level(turn_count, total_input=1_750_000):
+    """The shape this platform actually sends: many turns, ONE usage payload carrying
+    the session's whole total. Five production sessions looked exactly like this, and
+    one of them reported a single turn spending 1.75 million tokens."""
+    ev = [{"type": "user.message", "text": "go"}]
+    for i in range(turn_count):
+        ev += [{"type": "mcp_tool_use", "name": "q", "input": {"i": i}},
+               {"type": "tool_result", "text": "x" * 100},
+               {"type": "agent.message", "text": "step"}]
+    ev[-1] = {"type": "agent.message", "text": "done",
+              "usage": {"input_tokens": total_input, "output_tokens": 2315}}
+    ev.append({"type": "session.status_idle", "text": ""})
+    return ev
 
-    def test_a_session_with_no_usage_reports_no_prefix_rather_than_a_guess(self):
-        self.assertIsNone(profile.prefix([], {"/a.md": "z"})["prefix_tokens_measured"])
-        self.assertIsNone(profile.prefix(None, {})["memory_share_of_prefix"])
+
+class TurnCountTest(unittest.TestCase):
+    """Turns are counted from the agent's MESSAGES. Counting usage payloads was the
+    first attempt: on this platform there is one per session, so every session read as a
+    single turn -- including one spending 1.75 million tokens, which no context window
+    would hold."""
+
+    def test_a_session_level_usage_payload_does_not_read_as_one_turn(self):
+        self.assertEqual(profile.turns(_session_level(16)), 16)
+
+    def test_per_turn_usage_is_recognised_as_such(self):
+        self.assertFalse(profile.per_turn_usage_reported(_session_level(16)))
+        self.assertTrue(profile.per_turn_usage_reported([_turn(), _turn()]))
+
+    def test_a_stream_with_no_agent_messages_falls_back_to_tool_results(self):
+        events = _call("q", {}, "r") + _call("q", {"b": 1}, "r")
+        self.assertEqual(profile.turns(events), 3)          # two results, plus the answer
+
+    def test_a_session_that_ran_at_all_took_at_least_one_turn(self):
+        self.assertEqual(profile.turns([]), 1)
+        self.assertEqual(profile.turns([{"type": "user.message", "text": "go"}]), 1)
+
+
+class PrefixTest(unittest.TestCase):
+    def test_an_unmeasurable_prefix_is_None_and_says_why(self):
+        """A number labelled "prefix" that is silently the whole session's input is worse
+        than an absent one: it told the engine memory was a rounding error on every agent
+        it would ever see."""
+        p = profile.prefix(_session_level(16), {"/a.md": "z" * 40000})
+        self.assertIsNone(p["prefix_tokens_measured"])
+        self.assertIn("one usage total per session", p["note"])
+
+    def test_a_real_per_turn_prefix_is_reported_when_it_exists(self):
+        p = profile.prefix([_turn(inp=40000), _turn(inp=52000)], {"/a.md": "z" * 8000})
+        self.assertEqual(p["prefix_tokens_measured"], 40000)
+
+    def test_memory_is_counted_once_per_turn_because_it_is_re_sent_every_turn(self):
+        """10K of memory over 16 turns is 160K of input, not 10K. Counting it once was
+        what made memory look negligible."""
+        p = profile.prefix(_session_level(16, total_input=1_750_000),
+                           {"/a.md": "z" * 40000})
+        self.assertEqual(p["turns"], 16)
+        self.assertEqual(p["memory_store_tokens_estimated"], 10000)
+        self.assertEqual(p["memory_reads_estimated"], 160000)
+        self.assertEqual(p["memory_share_of_input"], 0.091)
+
+    def test_tokens_per_turn_is_empty_rather_than_a_fabricated_single_row(self):
+        self.assertEqual(profile.tokens_per_turn(_session_level(16)), [])
+        self.assertEqual(len(profile.tokens_per_turn([_turn(), _turn()])), 2)
+
+    def test_a_session_with_no_usage_at_all_reports_no_totals(self):
+        p = profile.prefix([{"type": "agent.message", "text": "x"}], {"/a.md": "z"})
+        self.assertIsNone(p["total_input_tokens"])
+        self.assertIsNone(p["memory_share_of_input"])
 
 
 class PreconditionVectorTest(unittest.TestCase):

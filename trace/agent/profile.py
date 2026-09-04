@@ -27,15 +27,49 @@ def _usage_events(events):
 
 
 def turns(events):
-    """One turn per assistant message that reported usage. That is the unit the prefix is
-    re-sent on, which is the unit cost is actually paid in."""
-    return len(_usage_events(events))
+    """How many times the agent took a turn — which is how many times it re-sent its
+    whole prefix, and therefore the unit cost is actually paid in.
+
+    Counted from the agent's MESSAGES, not from usage payloads. Counting usage was the
+    first attempt and it was wrong on the real platform: five production sessions each
+    reported exactly one usage payload carrying the session's whole total, so every
+    session read as a single turn — one of them a single turn spending 1.75 million
+    tokens, which no context window would hold. The platform reports usage per session,
+    not per turn.
+
+    Falls back to one turn per tool result plus the final answer, for a stream that
+    carries tool calls but no assistant text. Never below 1: a session that ran at all
+    took at least one turn.
+    """
+    msgs = sum(1 for e in (events or [])
+               if isinstance(e, dict) and "agent.message" in str(e.get("type") or "").lower())
+    if msgs:
+        return msgs
+    results = sum(1 for e in (events or [])
+                  if isinstance(e, dict) and "tool_result" in str(e.get("type") or "").lower())
+    return max(results + 1, 1) if results else 1
+
+
+def per_turn_usage_reported(events):
+    """Whether the platform broke usage down by turn, or reported one session total.
+
+    Load bearing for how the prefix is described: with a session total there is no first
+    turn to read the prefix off, and a number labelled "prefix" that is really the whole
+    session's input would tell the engine memory is a rounding error on every agent it
+    ever sees."""
+    return len(_usage_events(events)) > 1
 
 
 def tokens_per_turn(events):
-    """``[{turn, input_tokens, output_tokens}]``, oldest first. Cache reads and cache
-    creation count as input, the same way session_token_usage counts them, or a cached
-    prefix would look free when it is merely cheaper."""
+    """``[{turn, input_tokens, output_tokens}]``, oldest first — EMPTY when the platform
+    reported one session-level total, because then there is no per-turn breakdown to
+    give and inventing one from the aggregate would be a fabrication.
+
+    Cache reads and cache creation count as input, the same way session_token_usage
+    counts them, or a cached prefix would look free when it is merely cheaper.
+    """
+    if not per_turn_usage_reported(events):
+        return []
     out = []
     for i, e in enumerate(_usage_events(events), 1):
         u = e["usage"]
@@ -45,6 +79,17 @@ def tokens_per_turn(events):
                     + int(u.get("cache_creation_input_tokens") or 0),
                     "output_tokens": int(u.get("output_tokens") or 0)})
     return out
+
+
+def _total_input(events):
+    """Every input token the session paid for, however the platform chose to report it."""
+    total = 0
+    for e in _usage_events(events):
+        u = e["usage"]
+        total += (int(u.get("input_tokens") or 0)
+                  + int(u.get("cache_read_input_tokens") or 0)
+                  + int(u.get("cache_creation_input_tokens") or 0))
+    return total
 
 
 def _is_tool_call(t):
@@ -120,11 +165,12 @@ def referenced_docs(events, doc_paths):
 def session_profile(events, doc_paths=None, session_id=None):
     """The per-session profile the engine reads instead of guessing from a transcript."""
     calls = tool_calls(events)
-    per_turn = tokens_per_turn(events)
     return {
         "session_id": session_id,
-        "turns": len(per_turn),
-        "tokens_per_turn": per_turn,
+        # turns(), not len(tokens_per_turn): the latter is empty whenever the platform
+        # reports one session-level usage total, which is always here.
+        "turns": turns(events),
+        "tokens_per_turn": tokens_per_turn(events),
         "tool_calls": [{"name": c["name"], "args": c["args"][:200],
                         "result_chars": c["result_chars"]} for c in calls],
         "repeated_calls": [{"name": r["name"], "args": r["args"][:200],
@@ -135,33 +181,49 @@ def session_profile(events, doc_paths=None, session_id=None):
 
 
 def prefix(events, memory_docs):
-    """What the agent re-sends on every turn, and how much of it the engine can reach.
+    """What the agent re-sends every turn, and how much of it the engine can reach.
 
-    ``prefix_tokens`` is MEASURED, not estimated: the first turn's input is the system
-    prompt, the tool schemas, the memory store and the trigger, and the platform reported
-    its size. Only the memory share is an estimate (characters over four), because that is
-    the one part whose text is in hand.
+    The honest version of this was hard-won. It used to report the first turn's input as
+    ``prefix_tokens_measured``, which is right only if the platform breaks usage down by
+    turn. It does not: it sends ONE payload per session carrying the session total. So
+    the "prefix" was the whole session's input, and dividing a 10K memory store by a
+    1.75M-token session said memory was 0.6% of cost -- on every agent, always. The one
+    field built to tell the engine whether memory is worth touching told it no, every
+    time, confidently and wrongly.
 
-    The remainder is not broken down further and says so. System prompt and tool schemas
-    are both outside what the engine may change, so the number that matters is what share
-    of the per-turn cost is memory -- if it is small, the largest saving available is not
-    the engine's to make, and saying so is worth more than a marginal change.
+    So the per-turn prefix is reported only when it can actually be measured, and is None
+    with a stated reason otherwise. What is always computable is better anyway:
+    memory is re-sent on EVERY turn, so ``memory_reads_estimated`` is the store's size
+    times the turn count, and its share of the session's total input is the question the
+    engine is actually asking -- what fraction of everything this session paid for was
+    memory being read again.
     """
-    per_turn = tokens_per_turn(events)
-    measured = per_turn[0]["input_tokens"] if per_turn else None
+    n_turns = turns(events)
+    total_in = _total_input(events)
     chars = sum(len(str(v or "")) for v in (memory_docs or {}).values())
     est = int(chars / 4)
-    share = None
-    if measured:
-        share = round(min(est / measured, 1.0), 3)
-    return {"prefix_tokens_measured": measured,
-            "memory_store_chars": chars,
-            "memory_store_tokens_estimated": est,
-            "memory_share_of_prefix": share,
-            "unattributed_tokens": None if measured is None else max(measured - est, 0),
-            "note": ("prefix_tokens_measured is the first turn's reported input. The "
-                     "memory figure is characters over four. The remainder is the system "
-                     "prompt and the tool schemas, neither of which the engine may change.")}
+    reads = est * n_turns
+    per_turn = tokens_per_turn(events)
+    measured = per_turn[0]["input_tokens"] if per_turn else None
+    share = round(min(reads / total_in, 1.0), 3) if total_in else None
+    return {
+        "turns": n_turns,
+        "total_input_tokens": total_in or None,
+        "memory_store_chars": chars,
+        "memory_store_tokens_estimated": est,
+        "memory_reads_estimated": reads,
+        "memory_share_of_input": share,
+        "prefix_tokens_measured": measured,
+        "note": ("memory_share_of_input is the share of this session's total input that "
+                 "was the memory store, counting it once per turn because it is re-sent "
+                 "every turn. The memory figure is characters over four. "
+                 + ("prefix_tokens_measured is the first turn's reported input."
+                    if measured is not None else
+                    "prefix_tokens_measured is unavailable: this platform reports one "
+                    "usage total per session, not per turn, so there is no first turn to "
+                    "read it from. The rest of the prefix is the system prompt and the "
+                    "tool schemas, neither of which the engine may change.")),
+    }
 
 
 def precondition_vector(profiles, memory_docs):

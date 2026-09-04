@@ -125,12 +125,18 @@ YOU RECEIVE one JSON object:
   not something to comment on except in blocked_on if you believe it unreachable.
 - score: mean_total_tokens for this group and baseline_mean_total_tokens from before the
   pending attempt, plus sessions_valid, sessions_excluded, valid_rate, and prefix.
-  READ prefix FIRST, every cycle. prefix_tokens_measured is what the agent re-sends on
-  every turn — it is the first turn's reported input, so it is measured, not estimated.
-  memory_share_of_prefix is the share of that you can actually reach. If it is small, the
-  largest saving available is not yours to make, and saying so in blocked_on is worth more
-  than a marginal change: the rest is system prompt and tool schemas, and you may change
-  neither.
+  READ prefix FIRST, every cycle. The figure that matters is memory_share_of_input: the
+  share of everything this session paid for that was the memory store being read. Memory
+  is re-sent on every turn, so it is counted once per turn (memory_reads_estimated) rather
+  than once per session — counting it once is what used to make it look negligible.
+  If that share is genuinely small, the largest saving available is not yours to make and
+  saying so in blocked_on is worth more than a marginal change: the rest is system prompt
+  and tool schemas, and you may change neither.
+  prefix_tokens_measured is often null. Most platforms report one usage total per session
+  rather than a figure per turn, and there is then no first turn to read the prefix from.
+  Null means UNKNOWN, not zero and not small: reason from memory_share_of_input and the
+  turn counts instead, and do not treat a missing number as evidence that there is nothing
+  to save.
 - preconditions: this agent's countable facts — store size, documents never referenced,
   median turns, share of short sessions, share of sessions with a repeated identical call.
   These are what your record will be matched on by other agents, and what you should check

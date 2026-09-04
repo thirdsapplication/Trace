@@ -347,6 +347,15 @@ class PromptPinsTest(unittest.TestCase):
         self.assertIn("it has already been applied", p)
         self.assertIn("trace has already restored the memory store", p)
 
+    def test_a_null_prefix_is_named_as_unknown_not_as_nothing_to_save(self):
+        """prefix_tokens_measured is null whenever the platform reports one usage total
+        per session, which is the normal case. An engine that read null as "small" would
+        conclude the cost is out of its reach and propose nothing, every cycle, for a
+        reason that is not true."""
+        p = " ".join(learn_prompt.SYSTEM_PROMPT.lower().split())
+        self.assertIn("null means unknown, not zero and not small", p)
+        self.assertIn("memory_share_of_input", p)
+
     def test_the_score_is_named_as_raw_tokens_with_no_division(self):
         p = " ".join(learn_prompt.SYSTEM_PROMPT.lower().split())
         self.assertIn("mean total tokens per valid session", p)
