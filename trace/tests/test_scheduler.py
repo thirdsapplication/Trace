@@ -177,7 +177,7 @@ class RunnerTest(unittest.TestCase):
         ma = FakeMA(events=[{"type": "agent.message", "text": _PROPOSAL_BLOCK},
                             {"type": "session.thread_status_idle", "stop_reason": {"type": "end_turn"}}])
         rec = runner.run_once(ma, _agent(approval_required=True))
-        self.assertEqual(ma.triggers[0], "Stage, don't execute.\n\nBegin.")
+        self.assertEqual(ma.triggers[0], agent_config.STAGING_INITIAL_MESSAGE)
         self.assertEqual(rec["run_session_id"], "run-sess-1")
         self.assertEqual(ma.approved, [])                      # never executes on the staged run
 
@@ -205,7 +205,7 @@ class RunnerTest(unittest.TestCase):
         ma = FakeMA()
         agent = {**_agent(), "approval_required": None, "staged_apps": ["gmail"]}
         runner.run_once(ma, agent)
-        self.assertEqual(ma.triggers[0], "Stage, don't execute.\n\nBegin.")
+        self.assertEqual(ma.triggers[0], agent_config.STAGING_INITIAL_MESSAGE)
 
     def test_run_once_preserves_session_id_when_collect_fails(self):
         # Regression: the bogus "Couldn't run" that DISCARDED the real session id — the

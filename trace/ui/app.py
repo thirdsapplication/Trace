@@ -3296,8 +3296,9 @@ class AppState:
         approval = agent_config.approval_required(agent)
         directive = agent_config.GROUP_DIRECT_DIRECTIVE.replace("{text}", text)
         # The staging contract is in an approval-required agent's system prompt, so a
-        # directed message only has to name the mode; an autonomous agent gets none.
-        trigger = (f"{agent_config.STAGING_INITIAL_MESSAGE}\n\n{directive}"
+        # directed message only has to name the mode (without the scheduled run's
+        # "Begin." — the directive is what this run is for); an autonomous agent gets none.
+        trigger = (f"{agent_config.STAGING_MODE_PREAMBLE}\n\n{directive}"
                    if approval else directive)
         try:
             client = self._live_client()

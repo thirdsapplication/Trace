@@ -260,7 +260,7 @@ class DeployTest(unittest.TestCase):
         by_mode = {d["name"].rsplit("-", 1)[-1]: d for d in client.deployments}
         self.assertEqual(set(by_mode), {config.MODE_STAGING, config.MODE_EXECUTION})
         self.assertEqual(by_mode[config.MODE_STAGING]["trigger_text"],
-                         "Stage, don't execute.\n\nBegin.")
+                         config.STAGING_INITIAL_MESSAGE)
         self.assertIn("Execution mode", by_mode[config.MODE_EXECUTION]["trigger_text"])
         # both point at the same agent and the same memory store
         self.assertEqual({d["agent_id"] for d in client.deployments}, {"agent_live"})
@@ -293,7 +293,12 @@ class DeployTest(unittest.TestCase):
         for dep in client.deployments:
             self.assertNotIn(config.MEMORY_UPDATE_DIRECTIVE, dep["trigger_text"])
             self.assertNotIn("needs_input", dep["trigger_text"])
-            self.assertLess(len(dep["trigger_text"]), 120)
+            # The staging message explains the read/write boundary (a deliberate ~700
+            # chars) but never the proposal block's field list — that is the contract,
+            # and the contract lives in the system prompt.
+            for field in ('"summary"', '"rationale"', '"details"'):
+                self.assertNotIn(field, dep["trigger_text"])
+            self.assertLess(len(dep["trigger_text"]), 1000)
 
     def test_legacy_staged_apps_still_means_approval_required(self):
         """Callers that predate the whole-agent setting keep working."""
@@ -676,6 +681,32 @@ class UIDeployTest(unittest.TestCase):
         self.assertIn("agent_live", agent_ids)
         # the session's workflow names are passed so cleanup can sweep stale duplicates
         self.assertIn("Order intake", captured["agent_names"])
+
+
+class StagingMessageTest(unittest.TestCase):
+    """The staging opening message: mode first, the read/write boundary spelled out,
+    the two places a staged run went wrong (status file, empty run) settled, and no
+    restatement of the proposal block's fields — that is the system prompt's job."""
+
+    def test_shape(self):
+        m = config.STAGING_INITIAL_MESSAGE
+        self.assertTrue(m.startswith("Stage, don't execute."))
+        self.assertTrue(m.endswith("Begin."))
+        self.assertEqual(m, config.STAGING_MODE_PREAMBLE + "\n\nBegin.")
+        self.assertIn("READS ARE ALLOWED", m)
+        self.assertIn("WRITES ARE NOT", m)
+        self.assertIn("proposed_actions", m)               # names the block the runner parses
+        self.assertIn("empty block", m)                    # an empty run is a successful run
+        self.assertIn("status file", m)                    # the ledger still carries forward
+        for field in ('"summary"', '"rationale"', '"details"'):
+            self.assertNotIn(field, m)                     # the field list stays in the contract
+        for fictional in ("PO-1234", "buyer@acme.com"):
+            self.assertNotIn(fictional, m)                 # runner drops echoes of the example
+
+    def test_execution_override_still_reads_against_it(self):
+        self.assertIn("Do not stage or propose anything", config.EXECUTION_INITIAL_MESSAGE_OVERRIDE)
+        self.assertEqual(config.deployment_initial_message(config.MODE_STAGING, True),
+                         config.STAGING_INITIAL_MESSAGE)
 
 
 if __name__ == "__main__":

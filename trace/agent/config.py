@@ -326,10 +326,30 @@ def pipedream_mcp_servers(external_user_id, app_slugs, staged_slugs=None):
 MODE_STAGING = "staging"
 MODE_EXECUTION = "execution"
 
-# The staging deployment's opening message. Deliberately this short: the shape of a
-# proposal is in the system prompt (STAGING_CONTRACT), so the message only has to
-# select the mode.
-STAGING_INITIAL_MESSAGE = "Stage, don't execute.\n\nBegin."
+# The staging deployment's opening message. It selects the mode and spells out the
+# one boundary that matters — reads yes, writes no — plus the two places a staged
+# run most often went wrong: whether the agent may still rewrite its own status
+# file (it must, or the ledger stops carrying forward) and what an empty run should
+# output. It does NOT restate the proposal block's field list; that lives in the
+# system prompt (STAGING_CONTRACT), and this message is re-read on every turn.
+#
+# STAGING_MODE_PREAMBLE is the mode selection without the closing "Begin.", for the
+# one caller that follows it with a different task (a group-chat @mention): "Begin."
+# and then "DIRECT MESSAGE ..." would be two instructions about what this run is for.
+STAGING_MODE_PREAMBLE = (
+    "Stage, don't execute.\n\n"
+    "This run is a rehearsal for a person who will approve or reject each action "
+    "before it happens. Two rules:\n\n"
+    "READS ARE ALLOWED. Open, search, look up, compare, and check everything your "
+    "steps require, exactly as on a real run. Read your memory directory first as "
+    "always.\n\n"
+    "WRITES ARE NOT. Do not call any tool that sends, creates, updates, or deletes "
+    "anything in a connected app. When your steps reach such an action, stop short "
+    "of the tool call, gather every exact value it would need, and put it in your "
+    "final proposed_actions block instead. A run that finds nothing to do outputs an "
+    "empty block; that is a successful run. You may still rewrite your own status "
+    "file at the end.")
+STAGING_INITIAL_MESSAGE = STAGING_MODE_PREAMBLE + "\n\nBegin."
 
 # The execution deployment's opening message. An approval-required agent carries the
 # staging contract in its system prompt, so its execution message must override it
