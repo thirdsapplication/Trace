@@ -70,13 +70,15 @@ other app is an anti-bundle, regardless of how mechanical it is.
 5. Carry forward what capture could not see. Where a workflow's tasks have
    target "unknown" or low confidence, list those as unknowns on the
    workflow so later stages ask rather than assume.
-6. Anything that occurred once, or is clearly ad hoc, is not a workflow.
-   Leave it out; do not force it into a group.
+6. Frequency is evidence about how safely a workflow can be automated, not
+   a requirement for being one. A workflow seen several times earns high
+   confidence; one seen once, with a clear trigger, steps, and outcome, is
+   still a candidate at lower confidence. Leave out only what is clearly ad
+   hoc or noise; do not force it into a group.
 
 ## Rules
 
-- Every workflow cites the event ids of at least two instances. One
-  occurrence is not recurrence.
+- Every workflow cites the event ids of every instance it rests on.
 - Never split a workflow to make its parts easier to automate. If the
   whole is an anti-bundle, say so.
 - An unsupported app makes the whole workflow an anti-bundle. Do not split

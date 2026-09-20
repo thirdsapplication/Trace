@@ -3218,9 +3218,8 @@ async function stepReview() {
   const paint = () => {
     $("#revStack").innerHTML = items.length
       ? items.map(card).join("")
-      : `<p class="muted">No repeatable workflows were found in this recording. Palza only
-         proposes a workflow it saw happen at least twice, so a short session where each
-         task came up once will land here. Record a longer stretch of your day, or describe
+      : `<p class="muted">No workflows were found in this recording. Record a longer
+         stretch of your day so palza can see a task from start to finish, or describe
          your workflow instead.</p>`;
     root.querySelectorAll(".rev-3").forEach(b => b.onclick = () => {
       setChoice(b.dataset.id, b.dataset.choice); paint();
