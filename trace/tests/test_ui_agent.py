@@ -43,7 +43,7 @@ class FakeKeystore:
     def clear_key(self): self.key = None
 
 
-def fake_interview_fn(bundle, event_log, model_fn=None):
+def fake_interview_fn(bundle, event_log, model_fn=None, draft=None, **kw):
     return {"questions": [
         {"id": "q1", "unknown": "tab", "lens": "capture_blind_spot", "why_it_matters": "wrong tab",
          "question": "Which tab do new records go in?", "suggested_answers": ["the main tab"],
@@ -124,9 +124,10 @@ class UIChainTest(unittest.TestCase):
         captured = {}
         real_iv, real_cf = self.state.interview_fn, self.state.config_fn
 
-        def iv_spy(bundle, event_log, model_fn=None):
+        def iv_spy(bundle, event_log, model_fn=None, draft=None, **kw):
             captured["interview"] = bundle
-            return real_iv(bundle, event_log, model_fn=model_fn)
+            captured["draft"] = draft
+            return real_iv(bundle, event_log, model_fn=model_fn, draft=draft)
 
         def cf_spy(bundle, observed, answers, model_fn, unresolved=None, test_feedback=None):
             captured["config"] = bundle
@@ -140,13 +141,17 @@ class UIChainTest(unittest.TestCase):
                          "I enter each tracking number into the destination record.")
         self.assertEqual(captured["config"]["user_description"],
                          "I enter each tracking number into the destination record.")
+        # the detector was handed the author's draft, and the draft was kept on disk
+        self.assertEqual(captured["draft"]["role"], CONFIG_CONTENT["role"])
+        saved = sessions.read_json_artifact(self.root, self.sid, sessions.author_filename("B1"))
+        self.assertEqual(saved["role"], CONFIG_CONTENT["role"])
 
     def test_stale_answers_dropped_when_question_text_changes(self):
         # ids are positional (q1..qN): after a regenerate that rewrites a question,
         # the old answer must not silently attach to the different new q1
         self._interview_and_answer({"q1": "Open_Orders", "q2": "the source wins"})
 
-        def new_iv(bundle, event_log, model_fn=None):
+        def new_iv(bundle, event_log, model_fn=None, draft=None, **kw):
             qs = fake_interview_fn(bundle, event_log, model_fn=model_fn)["questions"]
             qs[0]["question"] = "Where does each tracking number go?"   # q1 rewritten
             return {"questions": qs}                                    # q2 unchanged

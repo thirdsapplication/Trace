@@ -63,6 +63,43 @@ CANNED = {
     ],
 }
 
+# The Prompt Library v2 shape: every section, flat source tags with sibling evidence,
+# a branch condition on a step, and two unknowns (one with a bogus lens).
+CANNED_V2 = {
+    "name": "Process inbound items",
+    "description": "Processes each inbound item end to end.",
+    "role": "You process inbound items one at a time, carefully, checking before you write.",
+    "apps": ["Email", "Spreadsheet"],
+    "preflight": [
+        {"text": "Open the destination and read its column headers and the last rows.",
+         "source": "events", "evidence": ["e001"]},
+    ],
+    "steps": [
+        {"n": 1, "text": "Open the inbound item and read its contents.",
+         "branch_if": None, "source": "events", "evidence": ["e001", "e002"]},
+        {"n": 2, "text": "Flag it before entering.", "branch_if": "the item is marked urgent",
+         "source": "user_description"},
+    ],
+    "working_rules": [
+        {"text": "Enter values exactly as on the source; never substitute.",
+         "source": "events", "evidence": ["e003"]},
+    ],
+    "acceptance_criteria": [
+        {"n": 1, "text": "Exactly one record per inbound item.",
+         "source": "user_answer", "q": "q1", "evidence": ["e002"]},
+    ],
+    "stop_conditions": [
+        {"text": "The item names a party not present in the destination — ask before adding.",
+         "source": "discovery"},
+    ],
+    "unknowns": [
+        {"what": "one record per item or per line", "lens": "capture_blind_spot",
+         "why_it_matters": "wrong layout is hard to undo", "evidence": ["e002"]},
+        {"what": "what counts as a duplicate", "lens": "bogus",
+         "why_it_matters": "a repeat is a double entry"},
+    ],
+}
+
 # Variant whose working rules already include a match-existing-examples rule.
 CANNED_WITH_MATCH = json.loads(json.dumps(CANNED))
 CANNED_WITH_MATCH["working_rules"].append(
@@ -142,20 +179,73 @@ class ConfigGenTest(unittest.TestCase):
         self.assertTrue(sys_text.startswith(CANNED["role"]))
         self.assertIn("1. Open the inbound item", sys_text)
 
-    def test_working_rules_and_requirements_sections_are_gone(self):
-        """The two sections the agent no longer carries — and their content with them.
-
-        Deleting the headings is not the point; a model that still emits working rules
-        would otherwise have them silently folded in somewhere. CANNED supplies both
-        lists and neither may reach the prompt.
-        """
+    def test_working_rules_render_and_legacy_requirements_are_ignored(self):
+        """Prompt Library v2 brought working rules back as their own section; the old
+        ``requirements`` list is not part of the contract and must not be folded in
+        anywhere."""
         sys_text = configgen.assemble_system_text(CANNED)
-        self.assertNotIn("How to do the work:", sys_text)
-        self.assertNotIn("Requirements:", sys_text)
+        self.assertIn("Working rules:", sys_text)
         for rule in CANNED["working_rules"]:
-            self.assertNotIn(rule["text"], sys_text)
+            self.assertIn(rule["text"], sys_text)
+        self.assertNotIn("Requirements:", sys_text)
         for req in CANNED["requirements"]:
             self.assertNotIn(req["text"], sys_text)
+
+    def test_v2_sections_render_in_order_and_empty_ones_are_omitted(self):
+        """role -> apps -> Before every run -> Steps -> Working rules -> Done looks like
+        -> Stop and ask when -> Always. A section the model left empty is omitted with
+        its heading, so an agent never reads a heading with nothing under it."""
+        sys_text = configgen.assemble_system_text(CANNED_V2)
+        markers = ("You work with:", "Before every run:", "Steps:", "Working rules:",
+                   "Done looks like:", "Stop and ask when:", "Always:")
+        order = [sys_text.index(m) for m in markers]
+        self.assertEqual(order, sorted(order))
+        self.assertIn("- Open the destination and read its column headers", sys_text)
+        self.assertIn("- Exactly one record per inbound item", sys_text)
+        self.assertIn("- The item names a party not present in the destination", sys_text)
+        # branch_if is folded into the step so the condition is never lost
+        self.assertIn("2. If the item is marked urgent: Flag it before entering", sys_text)
+        # empty sections vanish
+        thin = dict(CANNED_V2, preflight=[], stop_conditions=[], acceptance_criteria=[])
+        sys_thin = configgen.assemble_system_text(thin)
+        for m in ("Before every run:", "Done looks like:", "Stop and ask when:"):
+            self.assertNotIn(m, sys_thin)
+
+    def test_flat_v2_source_tags_normalise_to_the_grounding_shape(self):
+        """The v2 prompt writes ``"source": "events"`` + a sibling ``evidence`` list;
+        the grounding record has always carried ``{type, ids}``. Both forms must land
+        in the same shape, and an unknown tag becomes None rather than a guess."""
+        out = _compile("marcy", model_out=CANNED_V2)
+        by_key = {i["key"]: i for i in out["grounding"]["instructions"]}
+        pre = next(v for k, v in by_key.items() if k.startswith("preflight_"))
+        self.assertEqual(pre["source"], {"type": "events", "ids": ["e001"]})
+        self.assertTrue(pre["observed"])
+        crit = next(v for k, v in by_key.items() if k.startswith("criterion_"))
+        self.assertEqual(crit["source"], {"type": "user_answer", "q": "q1"})
+        self.assertFalse(crit["observed"])
+        stop = next(v for k, v in by_key.items() if k.startswith("stop_"))
+        self.assertEqual(stop["source"], {"type": "discovery"})
+        bad = configgen.normalize_content({"steps": [{"text": "x", "source": "gossip"}]})
+        self.assertIsNone(bad["steps"][0]["source"])
+
+    def test_unknowns_are_normalised_and_recorded(self):
+        out = _compile("marcy", model_out=CANNED_V2)
+        unknowns = out["content"]["unknowns"]
+        self.assertEqual(len(unknowns), 2)
+        self.assertEqual(unknowns[0]["lens"], "capture_blind_spot")
+        self.assertEqual(unknowns[1]["lens"], "undetermined_decision")   # bogus -> default
+        self.assertEqual(unknowns[0]["evidence"], ["e002"])
+        self.assertEqual(out["grounding"]["unknowns"], unknowns)
+        # never rendered into the agent's prompt: an unknown is a question, not a rule
+        self.assertNotIn(unknowns[0]["what"], out["live"]["dict"]["system"])
+
+    def test_platform_name_is_the_bundles_not_the_models(self):
+        """The memory store, deployment names and cleanup sweep key on the agent name,
+        so it must not change between the draft pass and the build pass even though
+        the model writes its own outcome-named ``name``."""
+        out = _compile("marcy", name="Handle inbound items", model_out=CANNED_V2)
+        self.assertEqual(out["live"]["dict"]["name"], "Handle inbound items")
+        self.assertEqual(out["content"]["name"], CANNED_V2["name"])
 
     # 5 — the two standing rules, fixed framing rather than generated content ---
     def test_standing_rules_always_present(self):
@@ -219,11 +309,11 @@ class ConfigGenTest(unittest.TestCase):
     def test_grounding_complete_and_well_formed(self):
         out = _compile("marcy", model_out=CANNED)
         instr = out["grounding"]["instructions"]
-        # steps(2). Working rules and requirements are no longer part of the prompt, so
-        # there is nothing of them to footnote; the standing rules are fixed framing,
-        # not generated content, and are not grounded either.
-        self.assertEqual(len(instr), 2)
-        self.assertTrue(all(i["key"].startswith("step_") for i in instr))
+        # steps(2) + working rules(2). The legacy requirements list is not part of the
+        # contract and is not footnoted; the standing rules are fixed framing, not
+        # generated content, and are not grounded either.
+        self.assertEqual(len(instr), 4)
+        self.assertTrue(all(i["key"].startswith(("step_", "rule_")) for i in instr))
         self.assertEqual(out["grounding"]["bundle_id"], "AKB1")
         for it in instr:
             self.assertTrue(it["key"])
@@ -410,9 +500,12 @@ class UserDescriptionTest(unittest.TestCase):
 
     def test_config_prompt_declares_correction_authoritative(self):
         from trace.agent.config_prompt import SYSTEM_PROMPT
+        from trace.agent.foundation import FOUNDATION
+        self.assertTrue(SYSTEM_PROMPT.startswith(FOUNDATION))     # the shared block leads
         self.assertIn("user_description", SYSTEM_PROMPT)
-        self.assertIn("AUTHORITATIVE", SYSTEM_PROMPT)
-        self.assertIn("{type:'user_description'}", SYSTEM_PROMPT.replace('"', "'"))
+        self.assertIn("The worker's word is authoritative", SYSTEM_PROMPT)
+        self.assertIn("Take user_description as the truth", SYSTEM_PROMPT)
+        self.assertIn('"source": "user_description"', SYSTEM_PROMPT)
 
 
 def _retag(out, bid):

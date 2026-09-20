@@ -1,6 +1,7 @@
 """The activity engine: summarize real session logs (injected model_fn) + extract
 staged proposed actions + classify the session outcome. Offline, no platform."""
 
+import json
 import unittest
 
 from trace.agent import activity
@@ -90,6 +91,29 @@ class ActivityEngineTest(unittest.TestCase):
         def boom(system, user):
             raise RuntimeError("model down")
         self.assertEqual(activity.summarize_session(_staged_session(), "a", boom), "")
+
+    def test_structured_account_is_rendered_to_the_one_paragraph_the_view_shows(self):
+        """v2: the model returns {headline, actions, needs_you, problems, status}; the
+        view and the summary store still hold one plain paragraph, so the account is
+        rendered into that — empty sections omitted — and the run mode reaches the
+        prompt so a staged run's proposals read as waiting on the worker."""
+        seen = {}
+
+        def model_fn(system, user):
+            seen["system"], seen["user"] = system, user
+            return json.dumps({
+                "headline": "Entered 2 orders into the sheet",
+                "actions": [{"text": "Added order 12 as one row", "ref": None}],
+                "needs_you": [{"type": "proposal", "text": "Reply confirming order 12 — awaiting approval"}],
+                "problems": [],
+                "status": "waiting"})
+        out = activity.summarize_session(_staged_session(), "Order agent", model_fn, mode="staged")
+        self.assertEqual(out, "Entered 2 orders into the sheet. Done: Added order 12 as one row. "
+                              "Needs you: Reply confirming order 12 — awaiting approval.")
+        self.assertIn("Mode: staged", seen["user"])
+        self.assertTrue(seen["system"].startswith("## Trace"))
+        self.assertNotIn("## How capture works", seen["system"])    # lite foundation only
+        self.assertEqual(activity.render_summary({"headline": "", "actions": []}), "")
 
 
 class ProposalParsingTest(unittest.TestCase):

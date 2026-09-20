@@ -187,6 +187,13 @@ def validate_event(ev, raw_by_id, report):
         "evidence": clean_ev,
         "confidence": confidence,
     }
+    # Optional (Prompt Library v2): where the typed value went — a field, button,
+    # record or tab as capture saw it, or "unknown" when no READ/FOCUS/CLICK line
+    # showed the destination. Carried only when the model wrote one, so an older
+    # log or model output stays byte-identical on the contract.
+    target = ev.get("target")
+    if isinstance(target, str) and target.strip():
+        cleaned["target"] = target.strip()
     _check_fragmentation(cleaned, raw_by_id, report)
     return cleaned
 

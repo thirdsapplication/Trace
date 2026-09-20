@@ -3383,6 +3383,7 @@ function renderInterview(sid, data) {
     // leave the other looking unanswered and the gate would never clear.
     const qs = (iv.questions || []).filter(q => !isShared(bid, q.id)).map(q => `
       <div class="field">
+        ${(q.observed && q.observed.text) ? `<div class="sub" style="margin-bottom:6px;">We saw: ${esc(q.observed.text)}</div>` : ""}
         <div class="title" style="margin-bottom:8px;">${esc(q.question)}</div>
         <input type="text" class="iv-a" data-bid="${esc(bid)}" data-q="${esc(q.id)}"
           value="${esc(prior[q.id] || "")}" placeholder="one line — every question needs an answer">

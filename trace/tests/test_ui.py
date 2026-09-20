@@ -241,7 +241,7 @@ class UIBackendTest(unittest.TestCase):
         self.assertEqual(code, 200)
         self.assertEqual(data["event_count"], 6)
         self.assertGreaterEqual(data["chunk_count"], 1)
-        self.assertIn("perception layer", data["system_prompt"])
+        self.assertIn("transcriber, not an interpreter", data["system_prompt"])
 
     def test_sessions_list(self):
         sessions.create_session(self._tmp.name)

@@ -95,7 +95,8 @@ class UIDiscoveryTest(unittest.TestCase):
         code, data = self.req("POST", f"/api/sessions/{sid}/discovery-dry-run")
         self.assertEqual(code, 200)
         self.assertGreater(data["event_count"], 0)
-        self.assertIn("workflow discovery engine", data["system_prompt"].lower())
+        self.assertIn("apps an agent can connect to", data["system_prompt"].lower())
+        self.assertNotIn("{{connectable_apps}}", data["system_prompt"].lower())   # filled in
         self.assertIn("e001", data["rendered_log"])
 
     def test_discover_requires_key(self):

@@ -465,6 +465,12 @@ def interview_filename(bid):
     return f"interview_{_safe_id(bid)}.json"
 
 
+def author_filename(bid):
+    """The Agent Author's DRAFT for one bundle (its first pass, before the interview):
+    the content record whose unknowns the questions were generated from."""
+    return f"author_{_safe_id(bid)}.json"
+
+
 def grounding_name(bid):
     return f"grounding_{_safe_id(bid)}.json"
 

@@ -50,6 +50,19 @@ artifact, stays visible. The engine consumes the log as-is; it does not repair i
 }
 ```
 
+### Optional fields (Prompt Library v2)
+The v2 Discovery prompt writes four more fields. The validator carries each through
+**only when present**, so an older `discovery.json` stays byte-identical:
+- bundle `apps: [..]` — the connectable apps the workflow runs in, as human names
+  (the prompt is given the connectable list at call time from `CONNECT_APP_TABLE`);
+- bundle `grouping_rationale` — one line: why these tasks belong to one agent;
+- bundle `unknowns: [{what, evidence}]` — what capture could not see (events with
+  `target: "unknown"` or low confidence), so later stages ask rather than assume;
+- anti-bundle `reason: {type: "unsupported_app"|"judgment", app, step, why}` — the
+  specific app or step that makes it an anti-bundle. `reason.why` also fills
+  `why_judgment` when the model wrote the reason but not the field, because that is
+  what the Review UI renders. Anti-bundles may also carry `apps`, `trigger`, `steps`.
+
 ### Rules baked into the contract
 - **Bundles are automatable**; **anti-bundles require per-instance human judgment**
   and are **never** proposed for full automation — they are surfaced as a

@@ -14,9 +14,11 @@ Stage 2 — Discovery Engine     (event_log.json -> bundles + anti-bundles)
    ▼
 Review / edit (Test UI)        (worker approves / edits / reclassifies)
    ▼
-Interview                      (gap detector asks what capture couldn't see)   [Phase 2]
+Agent Author (draft)           (bundle + events -> the agent's system prompt + its unknowns)
    ▼
-Config engine                  (workflow + events + answers -> agent YAML + grounding) [Phase 1]
+Gap Detector                   (unknowns -> questions anchored on what the worker was seen doing)
+   ▼
+Agent Author (build)           (bundle + events + answers -> agent YAML + grounding)
    ▼
 Connect                        (Pipedream OAuth -> a vault bound per customer)  [Phase 4]
    ▼
@@ -229,10 +231,13 @@ trace/
     prompt.py              the domain-neutral spec-writing prompt
     cli.py                 entry point + --dry-run
     reviewed_bundles.schema.json, environment.schema.json, ARTIFACT_SCHEMA.md
-  agent/                   the in-product chain — interview -> config -> connect -> live
-    interview_prompt.py, interview.py   Phase 2 — gap detector: what capture couldn't reveal -> questions
-                           (as many as the workflow needs, up to 10 — often none)
-    config_prompt.py, configgen.py      Phase 1 — write agent_<id>.{test,live}.yaml + grounding_<id>.json directly
+  agent/                   the in-product chain — author -> questions -> author -> connect -> live
+    foundation.py          the foundation block every pipeline prompt opens with (Prompt Library v2)
+    config_prompt.py, configgen.py      Agent Author — ONE call writes the agent's system prompt
+                           (role, apps, preflight, steps, rules, acceptance criteria, stop
+                           conditions) + its unknowns; replaces the spec + config engines
+    interview_prompt.py, interview.py   Gap Detector — the draft's unknowns -> questions anchored
+                           on what the worker was seen doing (up to 10 — often none)
     config.schema.json, CONFIG_SCHEMA.md  the model's content-JSON contract
     connect_client.py, connect.py       Phase 4 — Pipedream Connect + Managed Agents vault (read+bind), offline orchestration
     deploy.py              Phase 6 — create the LIVE agent over the connection, plus its staging
@@ -401,12 +406,13 @@ and the review contract — plus the whole **in-product chain**, every step prov
 two fixtures (Marcy + recruiter) with no code change and run entirely offline against
 injected stubs:
 
-- **Phase 1 — config engine:** content-only model JSON, byte-identical structural YAML
-  across domains, the deterministic system-prompt order + canonical-rule append, the
-  grounding record (every instruction sourced), test-vs-live toolsets, no markdown.
-- **Phase 2 — interview:** triage normalization (enum coercion, runtime-discoverable drop,
-  cost sort, cap 5), domain-neutrality, and the answers + skips flowing into the grounding
-  as `user_answer` / `unresolved`.
+- **Agent Author:** content-only model JSON (every section, flat source tags), byte-identical
+  structural YAML across domains, the deterministic system-prompt order + standing-rule
+  append, the grounding record (every instruction sourced), no markdown.
+- **Gap Detector:** triage normalization (enum coercion, runtime-discoverable drop, cost
+  sort, near-duplicate drop, cap 10), the link from each question to the draft's unknown
+  and the observed moment it quotes, domain-neutrality, and the answers + skips flowing
+  into the grounding as `user_answer` / `unresolved`.
 - **Phase 4 — connection:** the app union across domains, per-session `external_user_id`
   isolation, backend-driven vault create+bind, identity match→verified /
   mismatch→flagged-not-usable, and a guard that the orchestration imports no platform SDK.

@@ -814,7 +814,9 @@ $("intDryRun").onclick = async () => {
 function questionRow(bid, q, answer) {
   const chips = (q.suggested_answers || []).map(s =>
     `<button class="link int-chip" data-bid="${ESC(bid)}" data-q="${ESC(q.id)}">${ESC(s)}</button>`).join(" ");
+  const observed = (q.observed && q.observed.text) ? q.observed.text : "";
   return `<div class="field" style="flex-direction:column">
+    ${observed ? `<div class="muted">We saw: ${ESC(observed)}</div>` : ""}
     <div><b>${ESC(q.question)}</b>
       <span class="muted">[${ESC(q.lens)} · ${ESC(q.cost_if_wrong)} cost]</span></div>
     <div class="muted">${ESC(q.why_it_matters)}</div>

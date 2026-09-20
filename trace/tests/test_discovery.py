@@ -138,7 +138,52 @@ class DiscoverPipelineTest(unittest.TestCase):
 class RobustnessInstructionTest(unittest.TestCase):
     """§7 behaviors must be explicit in the instructions."""
 
+    def test_v2_fields_carry_through_only_when_present(self):
+        """apps, grouping_rationale, unknowns and the anti-bundle reason are carried
+        when the model wrote them and absent otherwise; reason.why fills why_judgment
+        (what the Review UI renders) when the model wrote the reason but not the field;
+        an object-shaped step is folded to one string with its branch condition."""
+        from trace.discovery import validate as dv
+        rep = dv.DiscoveryReport()
+        out = dv.validate_discovery({
+            "bundles": [{"name": "b", "steps": [{"n": 1, "text": "Enter it",
+                                                 "branch_if": "the item is urgent"}],
+                         "evidence_event_ids": ["e001"], "apps": ["Gmail", " "],
+                         "grouping_rationale": "same record",
+                         "unknowns": [{"what": "destination tab", "evidence": ["e001", "e999"]}],
+                         "confidence": "high"},
+                        {"name": "plain", "steps": ["s"], "evidence_event_ids": ["e001"],
+                         "confidence": "high"}],
+            "anti_bundles": [{"name": "a", "evidence_event_ids": ["e001"], "confidence": "low",
+                              "reason": {"type": "judgment", "app": None, "step": "2",
+                                         "why": "deciding the exception"}}],
+        }, {"e001"}, rep)
+        b, plain = out["bundles"]
+        self.assertEqual(b["steps"], ["If the item is urgent: Enter it"])
+        self.assertEqual(b["apps"], ["Gmail"])
+        self.assertEqual(b["grouping_rationale"], "same record")
+        self.assertEqual(b["unknowns"], [{"what": "destination tab", "evidence": ["e001"]}])
+        for k in ("apps", "grouping_rationale", "unknowns"):
+            self.assertNotIn(k, plain)
+        a = out["anti_bundles"][0]
+        self.assertEqual(a["reason"], {"type": "judgment", "app": None, "step": 2,
+                                       "why": "deciding the exception"})
+        self.assertEqual(a["why_judgment"], "deciding the exception")
+
+    def test_connectable_apps_are_injected_from_the_connect_table(self):
+        from trace.discovery import prompt as dp
+        from trace.agent import config
+        self.assertIn(dp.APPS_PLACEHOLDER, dp.SYSTEM_PROMPT)         # template
+        filled = dp.system_prompt()
+        self.assertNotIn(dp.APPS_PLACEHOLDER, filled)
+        for label in {v["label"] for v in config.CONNECT_APP_TABLE.values()}:
+            self.assertIn(f"- {label}", filled)
+        custom = dp.system_prompt(["One", "Two"])
+        self.assertIn("- One\n- Two", custom)
+
     def test_prompt_covers_imperfect_log_behaviors(self):
+        from trace.agent.foundation import FOUNDATION
+        self.assertTrue(SYSTEM_PROMPT.startswith(FOUNDATION))
         p = SYSTEM_PROMPT.lower()
         self.assertIn("duplicate", p)
         self.assertIn("conflicting", p)

@@ -91,6 +91,39 @@ class ReconstructPipelineTest(unittest.TestCase):
     def test_module_exports_default_model(self):
         self.assertEqual(DEFAULT_MODEL, "claude-fable-5-1")
 
+    def test_optional_target_is_kept_when_written_and_absent_otherwise(self):
+        """Prompt Library v2 added ``target`` to the contract as OPTIONAL: kept verbatim
+        when the model wrote one (``"unknown"`` included — that is the signal Discovery
+        carries forward), and absent, not blanked, when it did not, so an older log or
+        model stays byte-identical on the frozen shape."""
+        from trace.reconstruct import validate
+        raw = {"r0001": {"id": "r0001", "ts": "t", "source": "window",
+                         "payload": {"app": "App", "title": "W"}}}
+        rep = validate.ValidationReport()
+        with_target = validate.validate_event(
+            {"action": "enter_data", "detail": "typed a value", "evidence": ["r0001"],
+             "confidence": "medium", "target": "unknown"}, raw, rep)
+        self.assertEqual(with_target["target"], "unknown")
+        without = validate.validate_event(
+            {"action": "enter_data", "detail": "typed a value", "evidence": ["r0001"],
+             "confidence": "medium"}, raw, rep)
+        self.assertNotIn("target", without)
+        blank = validate.validate_event(
+            {"action": "enter_data", "detail": "typed a value", "evidence": ["r0001"],
+             "confidence": "medium", "target": "  "}, raw, rep)
+        self.assertNotIn("target", blank)
+
+    def test_prompt_opens_with_the_foundation_and_names_the_real_signals(self):
+        from trace.agent.foundation import FOUNDATION
+        from trace.reconstruct.prompt import SYSTEM_PROMPT, ACTION_VOCAB
+        self.assertTrue(SYSTEM_PROMPT.startswith(FOUNDATION))
+        for line in ("WINDOW", "TYPED", "CLICK", "FOCUS", "CLIPBOARD", "READ"):
+            self.assertIn(line, SYSTEM_PROMPT)          # the six rendered signal types
+        self.assertNotIn("screenshot", SYSTEM_PROMPT.split("## Your job")[1].lower())
+        self.assertIn("[REDACTED]", SYSTEM_PROMPT)      # the real redaction token
+        for verb in ACTION_VOCAB:
+            self.assertIn(verb, SYSTEM_PROMPT)          # the controlled vocabulary survives
+
 
 if __name__ == "__main__":
     unittest.main()

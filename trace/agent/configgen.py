@@ -1,15 +1,20 @@
-"""The Config Engine (Phase 1) — reviewed workflow -> agent configuration directly.
+"""The Agent Author engine (Prompt Library v2) — reviewed workflow -> agent, in one call.
 
-One model call per approved bundle returns STRUCTURED CONTENT (role, apps, steps,
-description), each step carrying a source tag. Deterministic code then (1) assembles
-the ``system`` prompt text in a fixed section order,
-(2) stamps the test and live YAML variants (every structural field is a code
-constant — identical for every agent), and (3) builds the grounding record that
+One model call per approved bundle writes the deployed agent's system prompt as
+STRUCTURED CONTENT — role, apps, preflight checks, steps, working rules, acceptance
+criteria, stop conditions — plus the unknowns the interview needs, every item carrying
+one source tag. Deterministic code then (1) assembles the ``system`` prompt text in a
+fixed section order, (2) stamps the live YAML envelope (every structural field is a
+code constant — identical for every agent), and (3) builds the grounding record that
 footnotes every instruction to its source.
 
-This replaces the old two-step path (Artifact Engine markdown -> Compiler wrap):
-no build-spec markdown is produced, and every live agent uses ONE Pipedream
-connection instead of a per-app MCP table.
+This is the merge of two earlier engines: the Artifact engine (a markdown build spec
+with acceptance criteria) and the Config engine (a content-only config call). One
+call now writes both what the agent does and what done looks like.
+
+The same engine runs twice per workflow: once before the interview, with no answers,
+to draft the agent and surface its unknowns (the Gap Detector turns those into
+questions); and once at build, with the worker's answers folded in.
 
 ``model_fn(system, user) -> str`` is injectable so the whole engine runs offline
 against a stub. The YAML emitter and round-trip validator are reused from the
@@ -26,6 +31,20 @@ from .config_prompt import SYSTEM_PROMPT
 from ..artifact import review
 
 DEFAULT_MODEL = config.DEFAULT_MODEL
+
+SOURCE_TYPES = ("events", "discovery", "user_description", "user_answer", "user_test_feedback")
+LENSES = ("capture_blind_spot", "undetermined_decision")
+
+# The content sections, in the order they are rendered into the system prompt and
+# footnoted in the grounding record. (prefix, key, heading) — the heading is None for
+# a section that is grounded but not rendered.
+SECTIONS = (
+    ("preflight_", "preflight", "Before every run:"),
+    ("step_", "steps", "Steps:"),
+    ("rule_", "working_rules", "Working rules:"),
+    ("criterion_", "acceptance_criteria", "Done looks like:"),
+    ("stop_", "stop_conditions", "Stop and ask when:"),
+)
 
 
 # --------------------------------------------------------------------------
@@ -75,7 +94,7 @@ def _parse_json_object(text):
 
 
 # --------------------------------------------------------------------------
-# Inputs: reviewed bundle (+ event log + answers) -> the three engine inputs
+# Inputs: reviewed bundle (+ event log + answers) -> the engine inputs
 # --------------------------------------------------------------------------
 def _workflow_description(bundle):
     """The ``workflow_description`` engine input for one reviewed bundle. Carries the
@@ -117,47 +136,137 @@ def build_prompt_material(workflow_description, observed_events, user_answers,
 
 
 # --------------------------------------------------------------------------
-# Deterministic assembly
+# Normalising the model's content
 # --------------------------------------------------------------------------
-def _items(model_out, key):
-    """The model's list under ``key`` as [{text, source}], dropping empties."""
-    out = []
-    for it in (model_out.get(key) or []):
-        if isinstance(it, dict) and str(it.get("text", "")).strip():
-            out.append({"text": str(it["text"]).strip(), "source": it.get("source")})
+def _ids(v):
+    return [str(x).strip() for x in (v if isinstance(v, list) else [v] if v else [])
+            if str(x).strip()]
+
+
+def _normalize_source(item):
+    """One item's source tag as the ``{type, ...}`` dict the grounding record has always
+    carried. The v2 prompt writes the flat form — ``"source": "events"`` with a sibling
+    ``evidence`` list, ``"source": "user_answer"`` with a sibling ``q`` — and the older
+    object form ``{"type": "events", "ids": [...]}`` is accepted unchanged. An
+    unrecognised tag becomes ``None`` rather than a guess."""
+    src = item.get("source")
+    if isinstance(src, dict):
+        stype = src.get("type")
+        if stype not in SOURCE_TYPES:
+            return None
+        out = {"type": stype}
+        if stype == "events":
+            out["ids"] = _ids(src.get("ids")) or _ids(item.get("evidence"))
+        elif stype == "user_answer":
+            out["q"] = str(src.get("q") or item.get("q") or "").strip()
+        elif stype == "user_test_feedback":
+            note = str(src.get("note") or item.get("note") or "").strip()
+            if note:
+                out["note"] = note
+        return out
+    stype = str(src or "").strip()
+    if stype not in SOURCE_TYPES:
+        return None
+    out = {"type": stype}
+    if stype == "events":
+        out["ids"] = _ids(item.get("evidence"))
+    elif stype == "user_answer":
+        out["q"] = str(item.get("q") or "").strip()
+    elif stype == "user_test_feedback":
+        note = str(item.get("note") or "").strip()
+        if note:
+            out["note"] = note
     return out
 
 
+def _items(model_out, key):
+    """The model's list under ``key`` as [{text, source}], dropping empties. A step's
+    ``branch_if`` is folded into its text so the condition is never lost."""
+    out = []
+    for it in (model_out.get(key) or []):
+        if not isinstance(it, dict):
+            continue
+        text = str(it.get("text", "") or "").strip()
+        if not text:
+            continue
+        cond = str(it.get("branch_if") or "").strip()
+        if cond and not text.lower().startswith("if "):
+            text = f"If {cond}: {text}"
+        out.append({"text": text, "source": _normalize_source(it)})
+    return out
+
+
+def _unknowns(model_out):
+    """The model's unknowns as ``[{what, lens, why_it_matters, evidence}]``."""
+    out = []
+    for u in (model_out.get("unknowns") or []):
+        if isinstance(u, dict):
+            what = str(u.get("what") or "").strip()
+            if not what:
+                continue
+            lens = u.get("lens") if u.get("lens") in LENSES else "undetermined_decision"
+            out.append({"what": what, "lens": lens,
+                        "why_it_matters": str(u.get("why_it_matters") or "").strip(),
+                        "evidence": _ids(u.get("evidence"))})
+        elif str(u or "").strip():
+            out.append({"what": str(u).strip(), "lens": "undetermined_decision",
+                        "why_it_matters": "", "evidence": []})
+    return out
+
+
+def normalize_content(model_out):
+    """The canonical content record: every section as [{text, source}], the apps as
+    strings, the unknowns normalised. This is what the build writes out and what the
+    Gap Detector reads as the draft agent."""
+    content = {
+        "name": str(model_out.get("name", "") or "").strip(),
+        "description": str(model_out.get("description", "") or "").strip(),
+        "role": str(model_out.get("role", "") or "").strip(),
+        "apps": _ids(model_out.get("apps") or model_out.get("tools_and_artifacts")),
+    }
+    for _, key, _ in SECTIONS:
+        content[key] = _items(model_out, key)
+    content["unknowns"] = _unknowns(model_out)
+    return content
+
+
+# --------------------------------------------------------------------------
+# Deterministic assembly
+# --------------------------------------------------------------------------
 def assemble_system_text(model_out):
-    """Assemble the ``system`` prompt text: role, the apps it works in, the numbered
-    steps, then the two standing rules.
+    """Assemble the ``system`` prompt text in a fixed order: role; the apps it works
+    in; what it checks before every run (preflight); the numbered steps; its working
+    rules; what done looks like (acceptance criteria); when it stops and asks; then the
+    two standing rules.
 
-    The agent's instructions used to carry two more sections — "How to do the work"
-    (working rules) and "Requirements" — both written by the model, both topped up with
-    canonical rules the code appended when the model left them out. They are gone. In
-    practice they restated the steps in weaker language and grew with every incident,
-    and a long prompt is not a careful one: the sentences that matter get read with the
-    same weight as the ones that no longer apply. Decisions the workflow depends on now
-    live in the step they govern (see ``config_prompt``), anti-duplication lives in the
-    memory ledger where it can be checked against state, and the two rules worth
-    stating unconditionally are fixed framing rather than generated content.
+    Empty sections are omitted, heading and all, so a workflow with no stop
+    conditions does not carry an empty "Stop and ask when:" — a heading with nothing
+    under it reads as an instruction with no object. The standing rules are fixed
+    framing appended by code, never generated content.
     """
-    tools_and_artifacts = [str(t).strip() for t in (model_out.get("tools_and_artifacts") or [])
-                           if str(t).strip()]
-    steps = _items(model_out, "steps")
-
-    lines = [str(model_out.get("role", "") or "").strip(), ""]
+    content = normalize_content(model_out)
+    lines = [content["role"], ""]
     lines.append("You work with:")
-    lines += [f"- {t}" for t in tools_and_artifacts]
-    lines += ["", "Steps:"]
-    lines += [f"{i + 1}. {s['text']}" for i, s in enumerate(steps)]
+    lines += [f"- {t}" for t in content["apps"]]
+    for _, key, heading in SECTIONS:
+        items = content[key]
+        if not items:
+            continue
+        lines += ["", heading]
+        if key == "steps":
+            lines += [f"{i + 1}. {s['text']}" for i, s in enumerate(items)]
+        else:
+            lines += [f"- {s['text']}" for s in items]
     lines += ["", "Always:"]
     lines += [f"- {r}" for r in config.STANDING_RULES]
     return "\n".join(lines)
 
 
 def _envelope(bundle, model_out, system_text):
-    """Stamp the live YAML envelope dict; structural fields are code constants."""
+    """Stamp the live YAML envelope dict; structural fields are code constants. The
+    agent's platform NAME is the bundle's, not the model's: the memory store, the
+    deployment names and the cleanup sweep all key on it, so it must not change
+    between the draft run and the build run."""
     name = str(bundle.get("name") or bundle.get("id") or "Agent").strip()
     description = str(model_out.get("description", "") or bundle.get("description", "")
                       or name).strip()
@@ -242,21 +351,22 @@ def _grounding_entry(prefix, i, item, used):
     return {"key": key, "text": item["text"], "source": source, "observed": observed}
 
 
-def build_grounding(bundle_id, steps, unresolved=None):
-    """One entry per step, keyed by a deterministic slug, recording its source and
-    whether it was directly observed (events-sourced). ``unresolved`` (Phase 2:
-    interview questions the worker skipped) is recorded as a top-level list when
-    non-empty — the agent falls back to reading the live environment for those, and the
-    gap is auditable.
-
-    Steps are all there is to footnote now that the generated prompt has no working
-    rules and no requirements; the ``rule_``/``req_`` prefixes are retired with them.
+def build_grounding(bundle_id, content, unresolved=None):
+    """One entry per preflight check, step, working rule, acceptance criterion and stop
+    condition, keyed by a deterministic prefixed slug, recording its source and whether
+    it was directly observed (events-sourced). ``content`` is a ``normalize_content``
+    record. ``unresolved`` (interview questions the worker skipped) is recorded as a
+    top-level list when non-empty — the agent falls back to reading the live
+    environment for those, and the gap is auditable. The unknowns the author left
+    open are recorded too, so an audit can see what the interview was asked to close.
     """
     used, instructions = set(), []
-    for prefix, items in (("step_", steps),):
-        for i, item in enumerate(items):
+    for prefix, key, _ in SECTIONS:
+        for i, item in enumerate(content.get(key) or []):
             instructions.append(_grounding_entry(prefix, i, item, used))
     record = {"bundle_id": bundle_id, "instructions": instructions}
+    if content.get("unknowns"):
+        record["unknowns"] = list(content["unknowns"])
     if unresolved:
         record["unresolved"] = list(unresolved)
     return record
@@ -267,21 +377,30 @@ def build_grounding(bundle_id, steps, unresolved=None):
 # --------------------------------------------------------------------------
 def compile_config(bundle, observed_events, user_answers, model_fn, model=DEFAULT_MODEL,
                    unresolved=None, test_feedback=None):
-    """Run the model once and assemble the live config + grounding for one bundle.
-    Returns ``{live, grounding, content}``. ``model_fn`` is required (callers
-    that want the default should construct it; tests inject a stub). ``unresolved``
-    (skipped interview questions) is recorded in the grounding record.
-    ``test_feedback`` (worker corrections) is AUTHORITATIVE and folded in."""
+    """Run the Agent Author once and assemble the live config + grounding for one
+    bundle. Returns ``{live, grounding, content}``, where ``content`` is the normalised
+    content record (the draft agent the Gap Detector reads, unknowns included).
+    ``model_fn`` is required (callers that want the default should construct it; tests
+    inject a stub). ``unresolved`` (skipped interview questions) is recorded in the
+    grounding record. ``user_answers`` and ``test_feedback`` are AUTHORITATIVE and
+    folded in by the model."""
     workflow_description = _workflow_description(bundle)
     user_msg = build_prompt_material(workflow_description, observed_events, user_answers,
                                      test_feedback)
     model_out = _parse_json_object(model_fn(SYSTEM_PROMPT, user_msg))
 
-    steps = _items(model_out, "steps")
+    content = normalize_content(model_out)
     system_text = assemble_system_text(model_out)
     envelope = build_envelope(bundle, model_out, system_text)
-    grounding = build_grounding(bundle.get("id"), steps, unresolved=unresolved)
-    return {"live": envelope, "grounding": grounding, "content": model_out}
+    grounding = build_grounding(bundle.get("id"), content, unresolved=unresolved)
+    return {"live": envelope, "grounding": grounding, "content": content}
+
+
+def draft_agent(bundle, event_log, model_fn):
+    """The Agent Author's first pass for one bundle, with no answers yet: the content
+    record whose ``unknowns`` the Gap Detector turns into questions."""
+    _, observed_events, _ = make_engine_inputs(bundle, event_log)
+    return compile_config(bundle, observed_events, [], model_fn)["content"]
 
 
 def _interview_path(answers_dir, bundle_id):

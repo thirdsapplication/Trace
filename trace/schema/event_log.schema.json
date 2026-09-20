@@ -19,7 +19,11 @@
         "type": "array",
         "items": { "type": "string" }
       },
-      "confidence": { "type": "string", "enum": ["high", "medium", "low"] }
+      "confidence": { "type": "string", "enum": ["high", "medium", "low"] },
+      "target": {
+        "type": "string",
+        "description": "Optional. The field, button, record, or tab the action acted on, as capture saw it; 'unknown' when the destination of a typed value was not visible."
+      }
     }
   }
 }

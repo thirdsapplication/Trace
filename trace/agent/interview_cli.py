@@ -1,11 +1,12 @@
-"""CLI for the Structured Interview gap detector (Phase 2).
+"""CLI for the Gap Detector (Prompt Library v2).
 
     python -m trace.agent.interview_cli reviewed_bundles.json event_log.json \
         -o <session_dir> [--model M] [--dry-run]
 
-Seeds ``interview_<id>.json`` per approved bundle (questions only; answers are
-collected in the UI). ``--dry-run`` prints the gap-detector system prompt and each
-bundle's exact prompt material with NO model call (free).
+Per approved bundle: runs the Agent Author's draft pass, writes ``author_<id>.json``
+(the draft whose unknowns the questions came from), then seeds ``interview_<id>.json``
+(questions only; answers are collected in the UI). ``--dry-run`` prints both system
+prompts and each bundle's exact prompt material with NO model call (free).
 """
 
 import argparse
@@ -34,13 +35,20 @@ def _approved(reviewed_path, event_log_path):
 
 
 def _dry_run(reviewed_path, event_log_path):
+    """Both prompts of the questions step: the Agent Author drafts the agent (its
+    unknowns are what the detector asks about), then the Gap Detector. With no model
+    call there is no draft, so the detector's material shows an empty one."""
     approved, event_log = _approved(reviewed_path, event_log_path)
-    print("===== SYSTEM PROMPT =====")
+    print("===== AGENT AUTHOR SYSTEM PROMPT (draft pass) =====")
+    print(configgen.SYSTEM_PROMPT)
+    print("\n===== GAP DETECTOR SYSTEM PROMPT =====")
     print(SYSTEM_PROMPT)
     for b in approved:
         wf, observed, _ = configgen.make_engine_inputs(b, event_log)
-        print(f"\n===== BUNDLE {b['id']} =====")
-        print(interview.build_prompt_material(wf, observed))
+        print(f"\n===== BUNDLE {b['id']} (author material) =====")
+        print(configgen.build_prompt_material(wf, observed, []))
+        print(f"\n===== BUNDLE {b['id']} (gap detector material, empty draft) =====")
+        print(interview.build_prompt_material(wf, observed, None))
 
 
 def main():
@@ -60,8 +68,13 @@ def main():
     approved, event_log = _approved(args.reviewed, args.event_log)
     os.makedirs(args.out, exist_ok=True)
     n = 0
+    model_fn = configgen._default_model_fn(args.model)
     for b in approved:
-        result = interview.generate_questions(b, event_log, model=args.model)
+        draft = configgen.draft_agent(b, event_log, model_fn)
+        with open(os.path.join(args.out, f"author_{_safe(b['id'])}.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump(draft, f, indent=2, ensure_ascii=False)
+        result = interview.generate_questions(b, event_log, model_fn=model_fn, draft=draft)
         questions = result["questions"]
         record = {"bundle_id": b["id"], "questions": questions, "answers": [],
                   "unresolved": [q["id"] for q in questions],

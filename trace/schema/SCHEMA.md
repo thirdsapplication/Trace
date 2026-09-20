@@ -84,6 +84,7 @@ interface Engine 2 consumes. **Do not change this shape without versioning it.**
 | `detail`   | string      | Human-readable description, **fully grounded** in the evidence. Preserves concrete observed values exactly (line items, totals, prices, tracking #s, recipients, message text, dropdown selections). |
 | `evidence` | string[]    | Raw-event ids (`rNNNN`, the 1-based index assigned to each line of `raw_events.jsonl` at load time) that support this event. |
 | `confidence` | string    | `high` \| `medium` \| `low`. Ambiguous signals (stray keystrokes, find-bar queries, shortcuts) are recorded with low confidence rather than guessed. |
+| `target`   | string (optional) | The field, button, record, or tab the action acted on, as capture saw it. `unknown` when a value was typed but no READ/FOCUS/CLICK line showed where it went — Discovery carries those forward as unknowns instead of assuming. Present only when the reconstruction model wrote one. |
 
 ### Why these constraints exist (Engine 2 depends on them)
 - **Normalized `action` vocabulary.** Engine 2 finds workflows by detecting action

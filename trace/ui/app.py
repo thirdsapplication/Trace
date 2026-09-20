@@ -47,7 +47,7 @@ from ..discovery.discover import discover as _real_discover
 from ..discovery.discover import (DEFAULT_MODEL as _DISCOVER_MODEL,
                                   _default_model_fn as _discover_model_fn)
 from ..discovery.discover import load_event_log, render_event_log
-from ..discovery.prompt import SYSTEM_PROMPT as DISCOVERY_SYSTEM_PROMPT
+from ..discovery.prompt import system_prompt as discovery_system_prompt
 from ..artifact import review as artifact_review
 from ..artifact.artifact import build_prompt_material, write_spec_bundle
 from ..artifact.artifact import generate_specs as _real_generate_specs
@@ -1030,7 +1030,8 @@ class AppState:
             todo = need[:ACTIVITY_SUMMARY_BUDGET]
             done = self._fanout([
                 lambda s=s: agent_activity.summarize_session(
-                    events_by_sid[s], agent.get("name"), model_fn) for s in todo])
+                    events_by_sid[s], agent.get("name"), model_fn,
+                    mode=("staged" if staged else "live")) for s in todo])
             fresh = {s: t for s, t in zip(todo, done) if t}
 
         wrote = 0
@@ -1386,12 +1387,21 @@ class AppState:
                 if selected_ids is not None:
                     approved = [b for b in approved if b["id"] in set(selected_ids)]
                 model_fn = self._build_model_fn("interview", sid) if approved else None
+                author_fn = self._build_model_fn("author", sid) if approved else None
 
                 def _questions_for(b):
                     """One workflow's questions. Runs CONCURRENTLY with the others: this
-                    is a model call each, and in series three workflows meant three waits
-                    on the slowest step of the wizard."""
-                    questions = self.interview_fn(b, event_log, model_fn=model_fn)["questions"]
+                    is two model calls each — the Agent Author drafts the agent and lists
+                    what it could not settle, then the Gap Detector turns those unknowns
+                    into questions anchored on what the worker was seen doing — and in
+                    series three workflows meant three waits on the slowest step of the
+                    wizard. The draft is kept beside the questions so each one can be
+                    traced to the unknown it came from."""
+                    _, observed, _ = agent_configgen.make_engine_inputs(b, event_log)
+                    draft = self.config_fn(b, observed, [], author_fn)["content"]
+                    _write_json(sessions.path(root, sid, sessions.author_filename(b["id"])), draft)
+                    questions = self.interview_fn(b, event_log, model_fn=model_fn,
+                                                  draft=draft)["questions"]
                     # preserve any prior answer whose question still maps — ids are
                     # positional (q1..qN), so the stored question text must match too
                     # or an old answer could silently attach to a different question
@@ -5410,7 +5420,7 @@ def make_handler(state):
                 return self._json(404, {"error": "no_event_log"})
             return self._json(200, {
                 "event_count": len(events),
-                "system_prompt": DISCOVERY_SYSTEM_PROMPT,
+                "system_prompt": discovery_system_prompt(),
                 "rendered_log": render_event_log(events),
             })
 
@@ -5623,11 +5633,23 @@ def make_handler(state):
             return self._json(202, {"state": "running", "session_id": sid})
 
         def _interview_dry_run(self, sid):
+            """Both prompts of the questions step, with no model call: the Agent Author's
+            (whose draft the detector reads) and the Gap Detector's. The detector's
+            material uses the stored draft when one exists, else an empty draft."""
             approved, event_log = state._approved_for_stage4(sid)
+            bundles = []
+            for b in approved:
+                wf, observed, _ = agent_configgen.make_engine_inputs(b, event_log)
+                draft = sessions.read_json_artifact(root, sid, sessions.author_filename(b["id"]))
+                bundles.append({
+                    "id": b["id"],
+                    "author_material": agent_configgen.build_prompt_material(wf, observed, []),
+                    "material": agent_interview.build_prompt_material(wf, observed, draft),
+                })
             return self._json(200, {
                 "system_prompt": agent_interview.SYSTEM_PROMPT,
-                "bundles": [{"id": b["id"], "material": agent_interview.build_prompt_material(
-                    *agent_configgen.make_engine_inputs(b, event_log)[:2])} for b in approved],
+                "author_system_prompt": agent_configgen.SYSTEM_PROMPT,
+                "bundles": bundles,
             })
 
         def _save_interview(self, sid, bid, body):

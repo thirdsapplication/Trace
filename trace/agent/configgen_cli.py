@@ -1,4 +1,4 @@
-"""CLI for the Config Engine (Phase 1) — reviewed bundles -> agent configs.
+"""CLI for the Agent Author (Prompt Library v2) — reviewed bundles -> agent configs.
 
     python -m trace.agent.configgen_cli reviewed_bundles.json event_log.json \
         -o configs/ [--answers-dir DIR] [--model M] [--dry-run]
@@ -44,7 +44,7 @@ def _dry_run(reviewed_path, event_log_path, answers_dir):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Trace Phase 1 — Config Engine")
+    ap = argparse.ArgumentParser(description="Trace — Agent Author (build pass)")
     ap.add_argument("reviewed", help="reviewed_bundles.json")
     ap.add_argument("event_log", help="event_log.json")
     ap.add_argument("-o", "--out", default="configs", help="output dir for configs + grounding")

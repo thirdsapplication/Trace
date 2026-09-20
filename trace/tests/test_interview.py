@@ -130,9 +130,63 @@ class InterviewEngineTest(unittest.TestCase):
         self.assertIn("NO MINIMUM", SYSTEM_PROMPT)
 
     def test_system_prompt_domain_neutral(self):
+        # No fixture name, no fixture customer, no fixture record id. (The shared
+        # foundation block names Gmail and Google Sheets as EXAMPLES of the two capture
+        # categories — product names from the connect table, not fixture content.)
         low = SYSTEM_PROMPT.lower()
-        for term in ("marcy", "recruiter", "gmail", "riverbend", "po-1001"):
+        for term in ("marcy", "recruiter", "riverbend", "po-1001"):
             self.assertNotIn(term, low)
+
+    def test_questions_link_to_the_draft_unknowns_and_carry_the_observed_moment(self):
+        """v2: each question points at the draft agent's unknown it came from
+        (inheriting its lens and why when the model omits them) and quotes what the
+        worker was seen doing, with event ids, so the modal can show it."""
+        ev, ak = _load("marcy")
+        b = _bundle(ak["bundles"][0])
+        draft = {"unknowns": [
+            {"what": "rows per item", "lens": "capture_blind_spot",
+             "why_it_matters": "layout is hard to undo", "evidence": ["e002"]}]}
+        raw = json.dumps({"questions": [
+            {"unknown_ref": 0,
+             "observed": {"text": "You entered the three-line item as one row.",
+                          "evidence": ["e002", "e003"]},
+             "question": "Is it always one row per item?", "suggested_answers": ["Always"],
+             "cost_if_wrong": "high"},
+            {"unknown_ref": 7, "question": "Which tab do new records go in?",
+             "cost_if_wrong": "medium"}]})
+        seen = {}
+
+        def spy(system, user):
+            seen["user"] = user
+            return raw
+
+        qs = interview.generate_questions(b, ev, model_fn=spy, draft=draft)["questions"]
+        self.assertIn('"draft_agent"', seen["user"])              # the detector reads the draft
+        self.assertIn("rows per item", seen["user"])
+        q1, q2 = qs
+        self.assertEqual((q1["unknown_ref"], q1["unknown"], q1["lens"]),
+                         (0, "rows per item", "capture_blind_spot"))
+        self.assertEqual(q1["why_it_matters"], "layout is hard to undo")
+        self.assertEqual(q1["observed"], {"text": "You entered the three-line item as one row.",
+                                          "evidence": ["e002", "e003"]})
+        self.assertIsNone(q2["unknown_ref"])                     # out of range -> unlinked
+        self.assertEqual(q2["observed"], {"text": "", "evidence": []})
+        self.assertEqual([q["id"] for q in qs], ["q1", "q2"])
+
+    def test_without_a_draft_the_author_runs_first(self):
+        """The detector cannot ask about unknowns nobody listed: with no draft supplied
+        it runs the Agent Author on the same bundle first, on the author model when one
+        is given."""
+        ev, ak = _load("marcy")
+        b = _bundle(ak["bundles"][0])
+        calls = []
+        author = lambda s, u: (calls.append("author"), json.dumps(
+            {"role": "r", "unknowns": [{"what": "tab", "why_it_matters": "x"}]}))[1]
+        detector = lambda s, u: (calls.append("detector"), json.dumps(
+            {"questions": [{"unknown_ref": 0, "question": "Which tab?", "cost_if_wrong": "high"}]}))[1]
+        qs = interview.generate_questions(b, ev, model_fn=detector, author_model_fn=author)["questions"]
+        self.assertEqual(calls, ["author", "detector"])
+        self.assertEqual(qs[0]["unknown"], "tab")
 
     def test_cap_doubled_to_ten(self):
         # 12 substantively distinct, well-formed questions -> capped at the doubled
@@ -252,8 +306,12 @@ class UserDescriptionToInterviewTest(unittest.TestCase):
         self.assertIn("I enter each tracking number into the destination record.", material)
 
     def test_system_prompt_declares_correction_authoritative(self):
+        from trace.agent.foundation import FOUNDATION
+        self.assertTrue(SYSTEM_PROMPT.startswith(FOUNDATION))
         self.assertIn("user_description", SYSTEM_PROMPT)
-        self.assertIn("AUTHORITATIVE", SYSTEM_PROMPT)
+        self.assertIn("The worker's word is authoritative", SYSTEM_PROMPT)
+        self.assertIn("Never ask the worker to confirm something user_description settles",
+                      SYSTEM_PROMPT)
 
 
 if __name__ == "__main__":

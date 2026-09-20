@@ -72,6 +72,35 @@ def _norm_confidence(c, report, where):
     return "low"
 
 
+def _step_text(s):
+    """A step as a string. The v2 prompt writes plain strings, but an object of the
+    ``{n, text, branch_if}`` shape is folded into one line rather than dropped."""
+    if isinstance(s, dict):
+        text = str(s.get("text") or "").strip()
+        cond = str(s.get("branch_if") or "").strip()
+        return f"If {cond}: {text}" if cond and text else text
+    return str(s)
+
+
+def _str_list(v):
+    return [str(x).strip() for x in _as_list(v) if str(x).strip()]
+
+
+def _norm_unknowns(raw, valid_ids, report, where):
+    """The v2 ``unknowns`` list: ``[{what, evidence}]``, evidence filtered to real ids.
+    Optional; absent or empty stays absent."""
+    out = []
+    for u in _as_list(raw):
+        if isinstance(u, dict):
+            what = str(u.get("what") or "").strip()
+            ev = _clean_evidence(u.get("evidence"), valid_ids, report, f"{where} unknown")
+        else:
+            what, ev = str(u).strip(), []
+        if what:
+            out.append({"what": what, "evidence": ev})
+    return out
+
+
 def _norm_bundle(b, idx, valid_ids, report):
     if not isinstance(b, dict):
         report.error("dropped a non-object bundle")
@@ -84,14 +113,46 @@ def _norm_bundle(b, idx, valid_ids, report):
         "name": str(b.get("name") or "").strip(),
         "description": str(b.get("description") or "").strip(),
         "trigger": str(b.get("trigger") or "").strip(),
-        "steps": [str(s) for s in _as_list(b.get("steps"))],
+        "steps": [_step_text(s) for s in _as_list(b.get("steps"))],
         "frequency": str(b.get("frequency") or "").strip(),
         "evidence_event_ids": ev,
         "why_automatable": str(b.get("why_automatable") or "").strip(),
         "rationale": str(b.get("rationale") or "").strip(),
         "confidence": _norm_confidence(b.get("confidence"), report, f"bundle #{idx}"),
     }
+    # Prompt Library v2 additions — carried through only when present, so an older
+    # discovery file (or model output) stays byte-identical on the frozen contract.
+    apps = _str_list(b.get("apps"))
+    if apps:
+        out["apps"] = apps
+    gr = str(b.get("grouping_rationale") or "").strip()
+    if gr:
+        out["grouping_rationale"] = gr
+    unknowns = _norm_unknowns(b.get("unknowns"), valid_ids, report, f"bundle #{idx}")
+    if unknowns:
+        out["unknowns"] = unknowns
     return out
+
+
+_REASON_TYPES = ("unsupported_app", "judgment")
+
+
+def _norm_reason(raw):
+    """The v2 anti-bundle ``reason``: ``{type, app, step, why}``, or None when absent."""
+    if not isinstance(raw, dict):
+        return None
+    rtype = raw.get("type") if raw.get("type") in _REASON_TYPES else None
+    app = str(raw.get("app") or "").strip() or None
+    step = raw.get("step")
+    try:
+        step = int(step) if step not in (None, "") else None
+    except (TypeError, ValueError):
+        step = None
+    why = str(raw.get("why") or "").strip()
+    if not (rtype or app or step or why):
+        return None
+    return {"type": rtype or ("unsupported_app" if app else "judgment"),
+            "app": app, "step": step, "why": why}
 
 
 def _norm_anti(a, idx, valid_ids, report):
@@ -101,16 +162,32 @@ def _norm_anti(a, idx, valid_ids, report):
     ev = _clean_evidence(a.get("evidence_event_ids"), valid_ids, report, f"anti-bundle #{idx}")
     if not ev:
         report.flag(f"anti-bundle #{idx} has no valid evidence ids")
-    return {
+    reason = _norm_reason(a.get("reason"))
+    # The Review UI renders why_judgment as the classification rationale, so the v2
+    # reason.why lands there whenever the model wrote the reason but not the field.
+    why_judgment = str(a.get("why_judgment") or "").strip() or (reason or {}).get("why", "")
+    out = {
         "id": str(a.get("id") or f"A{idx}"),
         "name": str(a.get("name") or "").strip(),
         "description": str(a.get("description") or "").strip(),
-        "why_judgment": str(a.get("why_judgment") or "").strip(),
+        "why_judgment": why_judgment,
         "recommended_handling": str(a.get("recommended_handling") or "").strip(),
         "rationale": str(a.get("rationale") or "").strip(),
         "evidence_event_ids": ev,
         "confidence": _norm_confidence(a.get("confidence"), report, f"anti-bundle #{idx}"),
     }
+    apps = _str_list(a.get("apps"))
+    if apps:
+        out["apps"] = apps
+    if reason:
+        out["reason"] = reason
+    trigger = str(a.get("trigger") or "").strip()
+    if trigger:
+        out["trigger"] = trigger
+    steps = [_step_text(s) for s in _as_list(a.get("steps"))]
+    if steps:
+        out["steps"] = steps
+    return out
 
 
 def _dedupe_ids(items, prefix):

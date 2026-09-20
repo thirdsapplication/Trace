@@ -1,24 +1,86 @@
-"""Activity engine — turn an agent's real Managed Agents session logs into a plain
--language summary (via a small model) and extract any staged proposed actions.
+"""Activity engine — turn an agent's real Managed Agents session logs into the account
+the worker reads (via a small model call) and extract any staged proposed actions.
 
 The activity view is driven by GROUND TRUTH (the session's actual event stream fetched
 with ``client.list_session_events``), not Trace's own run self-report — which was
 unreliable. The model call is injected (``model_fn(system, user) -> str``) so this runs
-offline against a stub; the real caller is a Haiku model built in AppState.
+offline against a stub; the real caller is built in AppState.
+
+Prompt Library v2: the summary prompt opens with the foundation's Trace + Vocabulary
+sections only (it reads a session log, not capture data, and runs on a summarizer
+budget) and asks for a structured account — headline, actions taken, what needs the
+worker, problems, status. ``summarize_session`` renders that JSON into the one plain
+paragraph the activity view already shows and the summary store already holds, so the
+view and the approve -> execute flow are untouched: proposals and questions are still
+extracted from the session's structured blocks by code (``extract_proposals`` /
+``extract_questions``), never from the model's account of them. A reply that is not
+JSON is used as-is, which is also the fallback for an older cached summary.
 """
 
 import json
 
 from . import runner
+from .configgen import _parse_json_object
+from .foundation import FOUNDATION_LITE
 
-SUMMARY_SYSTEM = (
-    "You summarize one run of an automated work agent for a non-technical business "
-    "user. From the session transcript (the agent's own messages, the tools it called, "
-    "and the results), write 2–4 short, plain-English sentences: what the agent looked "
-    "at, what it found, and what it did or proposed to do. Be concrete (names, counts) "
-    "but brief. No code and no raw tool names (say 'searched Gmail', not "
-    "'gmail-find-email'). If it proposed actions for approval instead of doing them, "
-    "say so plainly.")
+_STAGE = """\
+## Your job
+
+You receive the session log of one agent run. Write the account of it the
+worker will read: what the agent did, what it is waiting on, and anything
+that went wrong. The worker is not technical and did not watch the run.
+They want to know whether their work got done and whether they need to
+do anything.
+
+The log is a compacted transcript, one line per event: [trigger] the
+message that started the run, [agent] what the agent said, [tool call] a
+tool it called with its input, [tool result] what came back (marked
+"(error)" when the call failed), and [end] how the run stopped. On a
+STAGED run the agent does not act: its final message carries a
+proposed_actions block listing what it would have done, for the worker
+to approve. On a run that stopped to ask, the final message carries a
+needs_input block with its questions.
+
+## Method
+
+1. Read the whole log. Separate what the agent actually did (a tool call
+   that returned success) from what it proposed, tried, or said it would
+   do.
+2. Write the headline: one sentence, what got done, in the worker's own
+   record names ("Entered 3 orders into the tracking sheet and sent 3
+   confirmations").
+3. List actions taken: one line each, with the record it touched. Only
+   completed actions. Staged proposals are not actions.
+4. List what needs the worker: staged proposals awaiting approval, halts
+   where the agent stopped and asked, and anything it could not do. Say
+   what the worker has to decide, not what the agent was thinking.
+5. Note problems plainly: errors, retries, a run that ended early. If
+   the agent skipped something because it was already done, say so —
+   that is correct behaviour, not a problem.
+
+## Rules
+
+- Report only what the log shows. Never infer that an action succeeded
+  from the agent saying it did; a tool result is the evidence.
+- Never invent a record name, count, or recipient. If the log is unclear,
+  say "one or more".
+- Plain words. No tool names (say "searched the inbox", not the tool's
+  name), no session ids, no pipeline vocabulary.
+- Short. The worker reads this in a list of runs; the headline should
+  usually be enough.
+
+## Output
+
+{ "headline": "one sentence",
+  "actions": [ { "text": "Added order 4471 (three items) as one row to the Orders tab", "ref": "tool event id or null" } ],
+  "needs_you": [ { "type": "proposal | question | blocked",
+                   "text": "Reply to the customer confirming order 4480 — waiting for your approval",
+                   "ref": "proposal id, event id, or null" } ],
+  "problems": [ { "text": "...", "ref": "event id or null" } ],
+  "status": "done | waiting | partial | failed" }
+"""
+
+SUMMARY_SYSTEM = FOUNDATION_LITE + "\n" + _STAGE
 
 
 def _compact(events):
@@ -49,17 +111,55 @@ def _compact(events):
     return "\n".join(out)
 
 
-def summarize_session(events, agent_name, model_fn):
+def _lines(items):
+    out = []
+    for it in items or []:
+        text = str((it.get("text") if isinstance(it, dict) else it) or "").strip()
+        if text:
+            out.append(text.rstrip("."))
+    return out
+
+
+def render_summary(account):
+    """The structured account as the one plain paragraph the activity view shows:
+    the headline, then what got done, what needs the worker, and any problems, each
+    only when non-empty. Returns "" for an account with nothing in it."""
+    if not isinstance(account, dict):
+        return ""
+    parts = []
+    headline = str(account.get("headline") or "").strip()
+    if headline:
+        parts.append(headline if headline.endswith((".", "!", "?")) else headline + ".")
+    for label, key in (("Done", "actions"), ("Needs you", "needs_you"),
+                       ("Problems", "problems")):
+        items = _lines(account.get(key))
+        if items:
+            parts.append(f"{label}: " + "; ".join(items) + ".")
+    return " ".join(parts)
+
+
+def summarize_session(events, agent_name, model_fn, mode=None):
     """A plain-language paragraph of what the agent did this session, or "" if nothing
-    to say / the model call fails (best-effort — never raises)."""
+    to say / the model call fails (best-effort — never raises). ``mode`` names the run
+    ("live" or "staged") when the caller knows it, so a staged run's proposals are
+    reported as waiting on the worker rather than as things done."""
     transcript = _compact(events)
     if not transcript.strip():
         return ""
-    user = f"Agent: {agent_name or 'agent'}\n\nSession transcript:\n{transcript}"
+    head = f"Agent: {agent_name or 'agent'}"
+    if mode:
+        head += f"\nMode: {mode}"
+    user = f"{head}\n\nSession transcript:\n{transcript}"
     try:
-        return (model_fn(SUMMARY_SYSTEM, user) or "").strip()
+        raw = (model_fn(SUMMARY_SYSTEM, user) or "").strip()
     except Exception:                                      # noqa: BLE001
         return ""
+    account = _parse_json_object(raw)
+    if account:
+        rendered = render_summary(account)
+        if rendered:
+            return rendered
+    return raw                                             # a plain-text reply is used as-is
 
 
 def extract_proposals(events):

@@ -23,7 +23,23 @@
           "evidence_event_ids": { "type": "array", "items": { "type": "string" } },
           "why_automatable": { "type": "string" },
           "rationale": { "type": "string" },
-          "confidence": { "type": "string", "enum": ["high", "medium", "low"] }
+          "confidence": { "type": "string", "enum": ["high", "medium", "low"] },
+          "apps": { "type": "array", "items": { "type": "string" },
+                    "description": "Optional (v2). The connectable apps the workflow runs in, as human names." },
+          "grouping_rationale": { "type": "string",
+                                  "description": "Optional (v2). One line: why these tasks belong to one agent." },
+          "unknowns": {
+            "type": "array",
+            "description": "Optional (v2). What capture could not see; later stages ask rather than assume.",
+            "items": {
+              "type": "object",
+              "required": ["what", "evidence"],
+              "properties": {
+                "what": { "type": "string" },
+                "evidence": { "type": "array", "items": { "type": "string" } }
+              }
+            }
+          }
         }
       }
     },
@@ -42,7 +58,21 @@
           "recommended_handling": { "type": "string" },
           "rationale": { "type": "string" },
           "evidence_event_ids": { "type": "array", "items": { "type": "string" } },
-          "confidence": { "type": "string", "enum": ["high", "medium", "low"] }
+          "confidence": { "type": "string", "enum": ["high", "medium", "low"] },
+          "apps": { "type": "array", "items": { "type": "string" } },
+          "trigger": { "type": "string" },
+          "steps": { "type": "array", "items": { "type": "string" } },
+          "reason": {
+            "type": "object",
+            "description": "Optional (v2). Why this is an anti-bundle: the unsupported app, or the step that needs judgment. reason.why is also written to why_judgment.",
+            "required": ["type", "why"],
+            "properties": {
+              "type": { "type": "string", "enum": ["unsupported_app", "judgment"] },
+              "app": { "type": ["string", "null"] },
+              "step": { "type": ["integer", "null"] },
+              "why": { "type": "string" }
+            }
+          }
         }
       }
     },

@@ -554,7 +554,7 @@ class UIDeployTest(unittest.TestCase):
                                   config_fn=fake_config_fn,
                                   # zero questions => records land "complete", satisfying
                                   # the mandatory-interview build gate offline
-                                  interview_fn=lambda b, ev, model_fn=None: {"questions": []},
+                                  interview_fn=lambda b, ev, model_fn=None, draft=None, **kw: {"questions": []},
                                   connect_fn=lambda: StubConnectClient(identity_email="worker@acme.com"),
                                   deploy_fn=_fake_deploy_fn)
         self.httpd, _ = app.build_server(port=0, state=self.state)

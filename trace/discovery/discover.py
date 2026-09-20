@@ -21,7 +21,7 @@ sees raw capture data and never sees any answer key.
 import json
 
 from . import validate
-from .prompt import SYSTEM_PROMPT
+from .prompt import SYSTEM_PROMPT, system_prompt  # noqa: F401 — SYSTEM_PROMPT re-exported for callers
 from trace.agent import model_call
 
 # Single, one-line default model tier (Open decision §11: trivially swappable).
@@ -54,8 +54,12 @@ def render_event_log(events):
         app = e.get("app", "") or ""
         window = e.get("window", "") or ""
         loc = f"{app} / {window}".strip(" /")
+        # target is optional on the contract; shown only when reconstruction wrote it,
+        # so an older log renders byte-identically.
+        target = e.get("target")
+        tgt = f" target={_trunc(target, 80)}" if isinstance(target, str) and target else ""
         lines.append(
-            f'{e.get("id", "?")} [{when}] ({loc}) {e.get("action", "")}'
+            f'{e.get("id", "?")} [{when}] ({loc}) {e.get("action", "")}{tgt}'
             f' [{e.get("confidence", "")}]: {_trunc(e.get("detail", ""))}'
         )
     return "\n".join(lines)
@@ -120,7 +124,9 @@ def discover(event_log_path, model=DEFAULT_MODEL, model_fn=None):
     if model_fn is None:
         model_fn = _default_model_fn(model)
 
-    raw_text = model_fn(SYSTEM_PROMPT, _build_user_content(events))
+    # The connectable-app list is injected here, at call time, from the connection
+    # layer's own table — never hardcoded in the prompt text.
+    raw_text = model_fn(system_prompt(), _build_user_content(events))
     obj = _parse_json_object(raw_text)
     discovery = validate.validate_discovery(obj, valid_ids, report)
     return discovery, report

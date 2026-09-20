@@ -1,17 +1,26 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "title": "Trace Config Generator content output",
-  "description": "The JSON the Config Generator model returns. CONTENT ONLY — all structural YAML fields (model, mcp_servers, tools, skills, permission policy, metadata) are produced by code, never by the model.",
+  "title": "Trace Agent Author content output",
+  "description": "The JSON the Agent Author model returns (Prompt Library v2). CONTENT ONLY — all structural YAML fields (model, mcp_servers, tools, skills, permission policy, metadata) are produced by code, never by the model. Code renders the sections into the agent's system prompt in a fixed order and builds the grounding record from the source tags.",
   "type": "object",
-  "required": ["description", "role", "tools_and_artifacts", "steps", "working_rules", "requirements"],
+  "required": ["name", "description", "role", "apps", "preflight", "steps", "working_rules",
+               "acceptance_criteria", "stop_conditions", "unknowns"],
   "additionalProperties": false,
   "properties": {
-    "description": {"type": "string", "description": "one sentence for a listing"},
-    "role": {"type": "string", "description": "one or two sentences naming the job"},
-    "tools_and_artifacts": {"type": "array", "items": {"type": "string"}},
-    "steps": {"type": "array", "items": {"$ref": "#/$defs/instruction"}},
+    "name": {"type": "string", "description": "outcome-named"},
+    "description": {"type": "string", "description": "one sentence for the agents dashboard"},
+    "role": {"type": "string", "description": "purpose, whose work, how to think"},
+    "apps": {"type": "array", "items": {"type": "string"}},
+    "preflight": {"type": "array", "items": {"$ref": "#/$defs/instruction"},
+                  "description": "what the agent opens and confirms at the start of every run"},
+    "steps": {"type": "array", "items": {"$ref": "#/$defs/step"}},
     "working_rules": {"type": "array", "items": {"$ref": "#/$defs/instruction"}},
-    "requirements": {"type": "array", "items": {"$ref": "#/$defs/instruction"}}
+    "acceptance_criteria": {"type": "array", "items": {"$ref": "#/$defs/instruction"},
+                            "description": "assertions checkable against a run without judgment"},
+    "stop_conditions": {"type": "array", "items": {"$ref": "#/$defs/instruction"},
+                        "description": "when the agent halts and asks instead of proceeding"},
+    "unknowns": {"type": "array", "items": {"$ref": "#/$defs/unknown"},
+                 "description": "what the worker must decide; the Gap Detector turns these into questions"}
   },
   "$defs": {
     "instruction": {
@@ -19,22 +28,39 @@
       "required": ["text", "source"],
       "properties": {
         "text": {"type": "string"},
-        "source": {"$ref": "#/$defs/source"}
+        "source": {"$ref": "#/$defs/source"},
+        "evidence": {"type": "array", "items": {"type": "string"},
+                     "description": "event ids; required when source is events"},
+        "q": {"type": "string", "description": "the question id; required when source is user_answer"},
+        "note": {"type": "string", "description": "optional; the correction, when source is user_test_feedback"}
+      }
+    },
+    "step": {
+      "allOf": [{"$ref": "#/$defs/instruction"}],
+      "properties": {
+        "n": {"type": "integer"},
+        "branch_if": {"type": ["string", "null"]}
+      }
+    },
+    "unknown": {
+      "type": "object",
+      "required": ["what", "why_it_matters"],
+      "properties": {
+        "what": {"type": "string"},
+        "lens": {"type": "string", "enum": ["capture_blind_spot", "undetermined_decision"]},
+        "why_it_matters": {"type": "string"},
+        "evidence": {"type": "array", "items": {"type": "string"}}
       }
     },
     "source": {
+      "description": "One tag per item. The flat string form is what the model writes; code also accepts the older {type, ...} object form.",
       "oneOf": [
-        {"type": "object", "required": ["type", "ids"],
-         "properties": {"type": {"const": "events"},
-                        "ids": {"type": "array", "items": {"type": "string"}}}},
+        {"type": "string", "enum": ["events", "discovery", "user_description", "user_answer", "user_test_feedback"]},
         {"type": "object", "required": ["type"],
-         "properties": {"type": {"const": "discovery"}}},
-        {"type": "object", "required": ["type", "q"],
-         "properties": {"type": {"const": "user_answer"}, "q": {"type": "string"}}},
-        {"type": "object", "required": ["type"],
-         "properties": {"type": {"const": "user_description"}}},
-        {"type": "object", "required": ["type"],
-         "properties": {"type": {"const": "user_test_feedback"},
+         "properties": {"type": {"type": "string",
+                                 "enum": ["events", "discovery", "user_description", "user_answer", "user_test_feedback"]},
+                        "ids": {"type": "array", "items": {"type": "string"}},
+                        "q": {"type": "string"},
                         "note": {"type": "string"}}}
       ]
     }
