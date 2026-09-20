@@ -13,7 +13,7 @@ pause-and-ask criterion per human checkpoint are guaranteed to appear exactly.
 - reclassified anti->bundle     -> built like any bundle, with the carried-over
                                    reason-for-judgment included as context.
 
-Model default: claude-sonnet-5 (single swappable default); ``model_fn`` injectable
+Model default: claude-fable-5-1 (single swappable default); ``model_fn`` injectable
 so the engine is testable without a key/network. Spec quality matters because it is
 what gets built from.
 """
@@ -26,7 +26,7 @@ from . import environment, review
 from .prompt import SYSTEM_PROMPT
 from trace.agent import model_call
 
-DEFAULT_MODEL = "claude-sonnet-5"
+DEFAULT_MODEL = "claude-fable-5-1"
 
 
 def load_json(path):

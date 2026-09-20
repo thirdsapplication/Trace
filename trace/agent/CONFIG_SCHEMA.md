@@ -53,7 +53,7 @@ memory contract, the uncertainty contract, the workflow's trigger, and (only whe
 human requires approval) the staging contract. See `deploy.finalize_system_prompt`.
 
 ## Stamped structural constants (code, never the model)
-`model: claude-sonnet-5`; test toolset `agent_toolset_20260401`; live adds the
+`model: claude-fable-5-1`; test toolset `agent_toolset_20260401`; live adds the
 Pipedream `mcp_toolset` with `permission_policy.type` = `always_ask`; `skills: []`;
 `metadata: {trace_bundle_id, variant}`. The Pipedream URL and the permission enum are
 flagged "confirm against current docs" in `config.py`.

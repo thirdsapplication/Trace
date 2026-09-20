@@ -89,7 +89,7 @@ class ReconstructPipelineTest(unittest.TestCase):
             self.assertEqual(a, b)
 
     def test_module_exports_default_model(self):
-        self.assertEqual(DEFAULT_MODEL, "claude-haiku-4-5")
+        self.assertEqual(DEFAULT_MODEL, "claude-fable-5-1")
 
 
 if __name__ == "__main__":

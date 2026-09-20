@@ -45,7 +45,10 @@ def _default_model_fn(model, timeout=None, max_retries=None):
     client = anthropic.Anthropic(**kw)
 
     def call(system, user):
-        return model_call.create_text(client, model, system, user, max_tokens=4000)
+        # 16000, not the old 4000: Fable thinks before it answers and that reasoning
+        # is billed against max_tokens, so a small ceiling can be spent before the
+        # JSON starts. 16000 is also the most a non-streaming request may ask for.
+        return model_call.create_text(client, model, system, user, max_tokens=16000)
 
     return call
 

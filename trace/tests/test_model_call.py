@@ -126,15 +126,24 @@ class StreamingMessages:
 
 
 class ModelCallTest(unittest.TestCase):
-    def test_temperature_is_sent_when_the_sdk_takes_it(self):
+    def test_the_default_sends_no_temperature(self):
+        # Every engine runs on Fable 5.1, which 400s any sampling parameter, so the
+        # default must not send one (or every call would pay a rejected round trip).
         m = Messages()
         out = model_call.create_text(Client(m), "m", "sys", "hi")
+        self.assertEqual(out, "ok")
+        self.assertEqual(len(m.calls), 1)
+        self.assertNotIn("temperature", m.calls[0])
+
+    def test_temperature_is_sent_when_the_sdk_takes_it(self):
+        m = Messages()
+        out = model_call.create_text(Client(m), "m", "sys", "hi", temperature=0)
         self.assertEqual(out, "ok")
         self.assertEqual(m.calls[0]["temperature"], 0)
 
     def test_it_retries_without_temperature_when_the_sdk_refuses(self):
         m = MessagesWithoutTemperature()
-        out = model_call.create_text(Client(m), "m", "sys", "hi")
+        out = model_call.create_text(Client(m), "m", "sys", "hi", temperature=0)
         self.assertEqual(out, "ok", "the whole build died here")
         self.assertNotIn("temperature", m.calls[-1])
 
@@ -158,7 +167,7 @@ class ModelCallTest(unittest.TestCase):
         Not a TypeError, so the original fallback never fired and every learning
         call died with no run."""
         m = MessagesRejectingSampling()
-        out = model_call.create_text(Client(m), "m", "sys", "hi")
+        out = model_call.create_text(Client(m), "m", "sys", "hi", temperature=0)
         self.assertEqual(out, "ok", "the whole learning cycle died here")
         self.assertNotIn("temperature", m.calls[-1])
 

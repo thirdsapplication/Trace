@@ -5647,7 +5647,9 @@ def _test_key(state):
     try:
         import anthropic
         client = anthropic.Anthropic(api_key=key)
-        client.messages.create(model="claude-haiku-4-5", max_tokens=1,
+        # Ping the model the pipeline actually runs on, so a key that is valid but
+        # whose org cannot use Fable 5.1 fails here rather than mid-run.
+        client.messages.create(model="claude-fable-5-1", max_tokens=1,
                                messages=[{"role": "user", "content": "ping"}])
         return {"valid": True, "detail": "Key accepted by Anthropic."}
     except Exception as e:

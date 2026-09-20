@@ -47,7 +47,7 @@ def _best_candidate(ak_item, candidates):
     return best, best_ov
 
 
-def _default_intent_judge(model="claude-sonnet-5"):
+def _default_intent_judge(model="claude-fable-5-1"):
     """LLM intent judge: confirms a candidate's description matches an intent.
     Lazily imported so the scorer loads without anthropic; injectable for tests."""
     import anthropic
@@ -65,7 +65,10 @@ def _default_intent_judge(model="claude-sonnet-5"):
             "Do they describe the same underlying workflow/intent? "
             "Answer with exactly one word: YES or NO."
         )
-        text = model_call.create_text(client, model, None, prompt, max_tokens=5)
+        # Not a tiny ceiling: Fable thinks before it answers and that reasoning is
+        # billed against max_tokens. At 5 the model spent the budget before emitting
+        # a word, the reply came back empty, and every judgement read as NO.
+        text = model_call.create_text(client, model, None, prompt, max_tokens=4000)
         return text.strip().upper().startswith("Y")
 
     return judge

@@ -3,16 +3,17 @@
 Implements handoff Section 5b end to end:
   1. load and order the raw stream (chunking.load_raw)
   2. chunk chronologically with overlap + a deterministic running summary
-  3. send each chunk to Haiku with the Section 6 prompt, temperature 0, JSON only
+  3. send each chunk to the model with the Section 6 prompt, JSON only
   4. parse, validate against the schema, stitch chunk outputs, renumber ids
   5. flag (not drop) typed values that look fragmented after stitching
 
-Determinism: temperature 0, a fixed model, and a deterministic running summary
-(built from already-emitted events, not a second LLM call) so the same raw input
-yields a materially identical log — Engine 2's recurrence detection depends on it.
+Determinism: a fixed model and a deterministic running summary (built from
+already-emitted events, not a second LLM call) so the same raw input yields a
+materially identical log — Engine 2's recurrence detection depends on it. Fable 5.1
+rejects sampling parameters, so temperature 0 is no longer part of that recipe.
 
 The Anthropic call is injected as ``model_fn`` so the pipeline is testable without
-network/keys; the default builds a real ``claude-haiku-4-5`` client.
+network/keys; the default builds a real ``claude-fable-5-1`` client.
 """
 
 import json
@@ -22,11 +23,11 @@ from . import augment, chunking, validate
 from .prompt import SYSTEM_PROMPT
 from trace.agent import model_call
 
-DEFAULT_MODEL = "claude-haiku-4-5"
+DEFAULT_MODEL = "claude-fable-5-1"
 
 
 def _default_model_fn(model):
-    """Build a temperature-0 Haiku caller. Imported lazily so the module loads
+    """Build the reconstruction caller. Imported lazily so the module loads
     without the anthropic package / API key (e.g. in tests)."""
     import anthropic
 

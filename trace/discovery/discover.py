@@ -25,7 +25,7 @@ from .prompt import SYSTEM_PROMPT
 from trace.agent import model_call
 
 # Single, one-line default model tier (Open decision §11: trivially swappable).
-DEFAULT_MODEL = "claude-sonnet-5"
+DEFAULT_MODEL = "claude-fable-5-1"
 
 
 def load_event_log(path):
@@ -71,7 +71,7 @@ def _build_user_content(events):
 
 
 def _default_model_fn(model):
-    """Build a Sonnet caller. Imported lazily so the module loads without the
+    """Build the discovery caller. Imported lazily so the module loads without the
     anthropic package / API key (e.g. in tests)."""
     import anthropic
 

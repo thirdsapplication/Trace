@@ -190,7 +190,7 @@ Expect `Ran 321 tests … OK`, and a printed system prompt + 3 rendered chunks.
 
 **Useful flags:**
 - UI: `python -m trace.ui.app --port 8765 --collector-port 8137 --sessions-root captures/sessions --no-open`
-- Reconstruct: `--model claude-haiku-4-5 --chunk-size 120 --overlap 20 --dry-run`
+- Reconstruct: `--model claude-fable-5-1 --chunk-size 120 --overlap 20 --dry-run`
 
 ## Architecture
 
@@ -320,7 +320,7 @@ python -m trace.reconstruct.cli captures/raw_events.jsonl -o captures/event_log.
 
 Reconstruction loads and orders the stream, chunks it chronologically with a
 small overlap and a running summary (so boundary-spanning actions aren't split),
-sends each chunk to `claude-haiku-4-5` at **temperature 0** with the perception
+sends each chunk to `claude-fable-5-1` with the perception
 prompt, then validates, stitches, and renumbers the result. Determinism matters:
 the same raw input yields a materially identical log, because Engine 2's
 recurrence detection depends on it.
@@ -359,7 +359,7 @@ A domain-neutral example stream is in `trace/samples/sample_raw_events.jsonl`.
 
 #### Anthropic API key (the Haiku step)
 
-The reconstruct step is the only part that calls a model — `claude-haiku-4-5` via
+The reconstruct step is the only part that calls a model — `claude-fable-5-1` via
 the Anthropic API — so it needs an **Anthropic API key**. (Capture, `--dry-run`,
 and the test suite need no key and make no API calls.)
 
@@ -492,7 +492,7 @@ visible. The contract is `trace/discovery/DISCOVERY_SCHEMA.md`.
 # render the prompt + whole event log that would be sent (free, no model call)
 python -m trace.discovery.cli trace/discovery/fixtures/marcy_event_log.json --dry-run
 
-# run discovery (needs ANTHROPIC_API_KEY; default model claude-sonnet-5)
+# run discovery (needs ANTHROPIC_API_KEY; default model claude-fable-5-1)
 export ANTHROPIC_API_KEY=sk-ant-...
 python -m trace.discovery.cli path/to/event_log.json -o discovery.json
 ```
@@ -543,7 +543,7 @@ frozen `reviewed_bundles.json` (contract in `trace/artifact/ARTIFACT_SCHEMA.md`)
 the only workflow input the Artifact Engine reads.
 
 **Artifact Engine (`trace/artifact/`).** For each item classified as a `bundle`
-with disposition `approve_for_build`, one model call (default `claude-sonnet-5`,
+with disposition `approve_for_build`, one model call (default `claude-fable-5-1`,
 injectable) produces the intent prose, example-supported acceptance criteria, and a
 representative/illustrative assessment of each example; deterministic code then
 assembles the three-layer **Artifact C** markdown spec so that the verbatim

@@ -30,15 +30,20 @@ AGENT_TOOLSET_TYPE = "agent_toolset_20260401"
 MCP_TOOLSET_TYPE = "mcp_toolset"
 
 # --- pipeline defaults (overridable) ---------------------------------------
-DEFAULT_MODEL = "claude-sonnet-5"
-# Lightweight model for summarizing an agent's session logs into plain language for
-# the activity view (cheap; cached per session).
-SUMMARY_MODEL = "claude-haiku-4-5"
+# Every model call in Trace runs on Claude Fable 5.1. One constant per role is kept
+# so a role can be moved to a different tier later without touching its call site.
+# Fable 5.1 differences that matter here: sampling parameters (temperature/top_p/
+# top_k) return 400, so nothing below may send one; thinking is always on and is
+# billed against max_tokens, so no call may use a tiny output ceiling.
+DEFAULT_MODEL = "claude-fable-5-1"
+# Model for summarizing an agent's session logs into plain language for the
+# activity view (cached per session).
+SUMMARY_MODEL = "claude-fable-5-1"
 # Fable-driven periodic learning: every N completed sessions, ONE analysis call
 # reviews the batch (transcripts + per-session token cost) plus the agent's memory
 # docs and rewrites lessons_learned.md so future sessions get more accurate and
 # more token-efficient. See trace/agent/learn.py.
-LEARNING_MODEL = "claude-fable-5"
+LEARNING_MODEL = "claude-fable-5-1"
 # N: eligible sessions per learning cycle. Overridable because a cycle only fires after N
 # REAL sessions — at a daily cadence that is five days, so testing collective learning
 # end-to-end was a week-long round trip. TRACE_LEARNING_CYCLE_SESSIONS=1 on a test
@@ -72,15 +77,17 @@ LEARNING_RETRIES = 1
 # agents, and therefore between customers. It stays dark until a human explicitly sets
 # TRACE_COLLECTIVE_ENABLED=1 on the host — off is the safe default; on is a decision.
 COLLECTIVE_ENABLED = (os.environ.get("TRACE_COLLECTIVE_ENABLED") or "0").strip() != "0"
-# De-identification pass run before a batch may leave its agent. TWO models on purpose:
-# a cheaper one writes the scrub, a stronger and independent one verifies it — a writer
-# grading its own redactions is not a second opinion (same posture as the per-lesson
-# gate in generalize.verify_lesson_scrub).
-SCRUB_MODEL = "claude-sonnet-5"
-SCRUB_VERIFY_MODEL = "claude-opus-5"
+# De-identification pass run before a batch may leave its agent. TWO calls on purpose:
+# one writes the scrub, a separate one that sees only the scrubbed text verifies it — a
+# writer grading its own redactions is not a second opinion (same posture as the
+# per-lesson gate in generalize.verify_lesson_scrub). Both run on Fable 5.1 now; the
+# independence comes from the verifier never seeing the originals, not from a
+# different model.
+SCRUB_MODEL = "claude-fable-5-1"
+SCRUB_VERIFY_MODEL = "claude-fable-5-1"
 SCRUB_MAX_TOKENS = 64_000                # the reply restates every session AND doc in full
-# Headroom for the privacy gate's reply. It answers one boolean, but Opus 5 thinks
-# adaptively by default and that reasoning is billed against max_tokens — the first
+# Headroom for the privacy gate's reply. It answers one boolean, but Fable thinks
+# before answering and that reasoning is billed against max_tokens — the first
 # value here was 100, which the model spent before emitting any text, so the gate
 # returned an empty string and every batch failed closed looking like a refusal.
 SCRUB_VERIFY_MAX_TOKENS = 4000
@@ -107,7 +114,7 @@ SCRUB_CHECKS_ENABLED = (os.environ.get("TRACE_SCRUB_CHECKS") or "1").strip() != 
 # number. It is a separate call from the analyst on purpose — in the cycle after a change
 # the analyst is about to be graded on that change, and a call that both sets the
 # difficulty and is measured against it can pass by calling the batch harder.
-SCORE_MODEL = "claude-sonnet-5"
+SCORE_MODEL = "claude-fable-5-1"
 SCORE_MAX_TOKENS = 4000                  # counts and a note per session, nothing more
 SCORE_REQUEST_TIMEOUT = 300
 SCORE_RETRIES = 1

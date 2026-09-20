@@ -1,6 +1,6 @@
 # Trace Engine 1 dependencies.
 
-# Reconstruction (Engine 1b) — calls claude-haiku-4-5.
+# Reconstruction (Engine 1b) — calls claude-fable-5-1 (every engine does).
 # Stage 4 (Managed Agents) needs the agent surface (client.beta.agents/sessions);
 # if "Compile & test agents" reports no Managed Agents API, run: pip install -U anthropic
 # PINNED BELOW 1.0 DELIBERATELY. This was `>=0.40.0`, unpinned, so Render's build

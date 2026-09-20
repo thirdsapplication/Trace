@@ -39,11 +39,11 @@ Linear; each stage's output feeds the next. Model + cost matter for UX (paid ste
 | # | Stage | Input → Output | Model | Cost | Notes |
 |---|-------|----------------|-------|------|-------|
 | 1 | **Capture** | worker activity → `raw_events.jsonl` | — | Free | macOS local capture + optional Chrome extension; redacted at ingest; no screenshots |
-| 2 | **Reconstruct** | raw → `event_log.json` | `claude-haiku-4-5` (temp 0) | **Paid** | Deterministic, chunked, has a progress bar; "Preview (dry run · free)" shows the exact prompt with no API call |
-| 3 | **Discovery** | event_log → `discovery.json` (**bundles** + **anti-bundles**) | `claude-sonnet-5` (one whole-day call) | **Paid** | Free prompt preview; plus a fixture loader + "Run gate score" (offline accuracy check vs an answer key — the *discovery scorer*, unrelated to the removed sandbox gate) |
+| 2 | **Reconstruct** | raw → `event_log.json` | `claude-fable-5-1` | **Paid** | Deterministic, chunked, has a progress bar; "Preview (dry run · free)" shows the exact prompt with no API call |
+| 3 | **Discovery** | event_log → `discovery.json` (**bundles** + **anti-bundles**) | `claude-fable-5-1` (one whole-day call) | **Paid** | Free prompt preview; plus a fixture loader + "Run gate score" (offline accuracy check vs an answer key — the *discovery scorer*, unrelated to the removed sandbox gate) |
 | 4 | **Review & edit** | discovery → `reviewed_bundles.json` | — | Free | Operator edits/reclassifies/approves; sets `disposition = approve_for_build | reject` |
-| 5 | **Interview** | reviewed bundle → `interview_<id>.json` | `claude-sonnet-5` | **Paid** | Up to 10 triaged "gap" questions (what capture couldn't see / decisions it couldn't make), and **none at all** when the workflow has no real unknowns; answers are authoritative |
-| 6 | **Build agents (Config)** | bundle + answers → `agent_<id>.live.yaml` + `grounding_<id>.json` | `claude-sonnet-5` | **Paid** | **Live-only.** Writes files locally — does **NOT** touch the Managed Agents console |
+| 5 | **Interview** | reviewed bundle → `interview_<id>.json` | `claude-fable-5-1` | **Paid** | Up to 10 triaged "gap" questions (what capture couldn't see / decisions it couldn't make), and **none at all** when the workflow has no real unknowns; answers are authoritative |
+| 6 | **Build agents (Config)** | bundle + answers → `agent_<id>.live.yaml` + `grounding_<id>.json` | `claude-fable-5-1` | **Paid** | **Live-only.** Writes files locally — does **NOT** touch the Managed Agents console |
 | 7 | **Connect your apps** | app list + worker email → `connection.json` | — | Free orchestration (real Pipedream/vault calls) | Per-app OAuth tap + "Verify"; identity-mismatch flagged & made unusable |
 | 8 | **Go live (Deploy)** | live YAML + connection → live agent | — | Paid (Managed Agents) | Creates the agent on the platform, injects the vault, holds outbound actions for approval |
 

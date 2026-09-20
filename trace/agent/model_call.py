@@ -26,15 +26,18 @@ so ``create_text_streaming`` is the same call with the streaming transport under
 """
 
 
-def create_text(client, model, system, user, max_tokens=4000, temperature=0):
+def create_text(client, model, system, user, max_tokens=4000, temperature=None):
     """Call Messages and return the concatenated text.
 
-    Sends ``temperature`` when the SDK and model accept it and retries without when
-    either does not -- distinguishing THOSE errors from genuine ones by the message,
-    so a real bug still raises rather than being retried into silence.
-    ``temperature=None`` omits the parameter entirely (for models like Fable 5 that
-    reject all sampling parameters), the same way an absent ``system`` is omitted
-    rather than sent as None.
+    The default is ``temperature=None``, which omits the parameter entirely, the same
+    way an absent ``system`` is omitted rather than sent as None. Every engine now runs
+    on Fable 5.1, which answers 400 to any sampling parameter, so sending one by
+    default would cost every call a rejected round trip before the retry below saved
+    it. A caller that explicitly passes a temperature (for an older model) still gets
+    the send-then-retry behaviour: the parameter goes out when the SDK and model
+    accept it and is dropped when either does not -- distinguishing THOSE errors from
+    genuine ones by the message, so a real bug still raises rather than being retried
+    into silence.
     """
     kwargs = dict(model=model, max_tokens=max_tokens,
                   messages=[{"role": "user", "content": user}])
