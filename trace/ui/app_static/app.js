@@ -3766,6 +3766,13 @@ async function renderConnect(sid) {
     let status = `<span class="pill pill-off">not connected</span>`;
     let action = `<button class="btn-primary btn-sm conn-go" data-slug="${esc(slug)}">Connect</button>`;
     if (a.usable) { status = `<span class="pill pill-on">● connected</span>`; action = ""; }
+    else if (a.connected && a.confirmable) {
+      // The app handed back no email to check against (QuickBooks, Shopify, Stripe…).
+      // The worker approved it seconds ago under their own account, so one tap vouches
+      // for it — the alternative was a dead end that read like a failed connection.
+      status = `<span class="pill pill-warn">confirm it's yours</span>`;
+      action = `<button class="btn-primary btn-sm conn-confirm" data-slug="${esc(slug)}">This is my account — use it</button>`;
+    }
     else if (a.connected && a.flag) { status = `<span class="pill pill-warn">check email</span>`; }
     // Frame 12 captions each app with the workflows that need it, and why it's staged.
     const used = (a.used_by || []).join(" · ");
@@ -3789,6 +3796,15 @@ async function renderConnect(sid) {
     $("#connMsg").textContent = r.ok ? "email confirmed" : friendly(r.data.error);
   };
   root.querySelectorAll(".conn-go").forEach(btn => btn.onclick = () => connectApp(sid, btn.dataset.slug));
+  root.querySelectorAll(".conn-confirm").forEach(btn => btn.onclick = async () => {
+    btn.disabled = true; btn.textContent = "Saving…";
+    const r = await upost(sid, `/connect/${btn.dataset.slug}/confirm`, {});
+    if (!r.ok) {
+      $("#connMsg").className = "msg err";
+      $("#connMsg").textContent = friendly((r.data && r.data.error) || "could not confirm");
+    }
+    await renderConnect(sid);
+  });
   $("#connContinue").onclick = () => goStep(6);
 }
 async function connectApp(sid, slug) {

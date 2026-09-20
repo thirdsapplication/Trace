@@ -254,10 +254,39 @@ def bind_and_verify(client, record, slug, expected_email):
         entry["verified"], entry["usable"] = "no", False
         entry["flag"] = (f"connected account {account.get('identity_email')!r} does not "
                          f"match the confirmed worker email {expected_email!r} — not used")
-    else:                                                # missing identity on either side
+    elif v["reason"] == "no_expected_identity":          # the worker never confirmed an email
         entry["verified"], entry["usable"] = "unverified", False
         entry["flag"] = ("could not verify the connected account's identity — "
-                         "confirm your work email") if v["reason"] == "no_expected_identity" \
-            else "the connected account exposed no identity email to verify"
+                         "confirm your work email")
+    else:                                                # the APP exposed no email to check
+        # Google labels its accounts with the email, so the check is automatic there.
+        # Many apps (QuickBooks, Shopify, Stripe, ...) hand Pipedream a token and a
+        # company or store name and no email at all — nothing Trace can compare. That
+        # is not a mismatch and not a failure of the connection: the worker approved
+        # this account seconds ago, under their own customer id. So the entry stays
+        # unusable until the worker confirms it is theirs (``confirm_by_worker``), and
+        # the UI offers that one tap instead of a dead end.
+        entry["verified"], entry["usable"] = "unverified", False
+        entry["confirmable"] = bool(account.get("connected"))
+        entry["flag"] = (f"{entry.get('label') or slug} doesn't share an account email, so "
+                         "palza couldn't check it automatically. If this is the account you "
+                         "just approved for work, confirm it below.")
     record["updated_at"] = _now()
     return record
+
+
+def confirm_by_worker(record, slug):
+    """The worker vouches for a connected account whose app exposed no email to verify.
+    Only an entry that is connected and awaiting exactly that confirmation can be
+    confirmed: a mismatch (a real email that differs) is never confirmable, and neither
+    is an app that was never connected. Returns the entry, or None when not applicable."""
+    entry = (record.get("apps") or {}).get(slug)
+    if not entry or not entry.get("confirmable") or not entry.get("connected"):
+        return None
+    if entry.get("verified") not in ("unverified", "worker_confirmed"):
+        return None
+    entry["verified"], entry["usable"], entry["flag"] = "worker_confirmed", True, None
+    entry["confirmable"] = False
+    entry["confirmed_at"] = _now()
+    record["updated_at"] = _now()
+    return entry

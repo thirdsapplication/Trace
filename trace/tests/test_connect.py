@@ -228,6 +228,44 @@ class BindAndVerifyTest(unittest.TestCase):
         self.assertTrue(g["flag"])
         self.assertTrue(g["connected"])      # the OAuth did happen; it's just flagged
 
+    def test_app_with_no_identity_email_is_confirmable_by_the_worker(self):
+        """QuickBooks, Shopify, Stripe and friends hand Pipedream a token and a company
+        name, never an email. That is not a mismatch: the entry waits for the worker's
+        one-tap confirmation instead of dead-ending on 'exposed no identity email'."""
+        client = StubConnectClient(identity_email=None)
+        rec = self._record("s1", expected="worker@acme.com")
+        connect.bind_and_verify(client, rec, "quickbooks", rec["expected_identity"])
+        q = rec["apps"]["quickbooks"]
+        self.assertEqual(q["verified"], "unverified")
+        self.assertFalse(q["usable"])                 # still nothing proceeds silently
+        self.assertTrue(q["confirmable"])
+        self.assertIn("doesn't share an account email", q["flag"])
+        self.assertIn("confirm it below", q["flag"])
+        # the worker vouches for it
+        entry = connect.confirm_by_worker(rec, "quickbooks")
+        self.assertEqual(entry["verified"], "worker_confirmed")
+        self.assertTrue(entry["usable"])
+        self.assertIsNone(entry["flag"])
+        self.assertFalse(entry["confirmable"])
+        self.assertTrue(entry["confirmed_at"])
+
+    def test_a_mismatch_or_an_unconnected_app_is_never_confirmable(self):
+        # a real email that differs is a mismatch — the worker cannot wave it through
+        client = StubConnectClient(identity_email="someone-else@gmail.com")
+        rec = self._record("s1", expected="worker@acme.com")
+        connect.bind_and_verify(client, rec, "gmail", rec["expected_identity"])
+        self.assertFalse(rec["apps"]["gmail"].get("confirmable"))
+        self.assertIsNone(connect.confirm_by_worker(rec, "gmail"))
+        self.assertFalse(rec["apps"]["gmail"]["usable"])
+        # an app that was never connected has nothing to confirm
+        self.assertIsNone(connect.confirm_by_worker(rec, "quickbooks"))
+        # and the missing-EXPECTED-email case is the worker's email to confirm, not this
+        client = StubConnectClient(identity_email=None)
+        rec = self._record("s1", expected="")
+        connect.bind_and_verify(client, rec, "quickbooks", "")
+        self.assertFalse(rec["apps"]["quickbooks"].get("confirmable"))
+        self.assertIn("confirm your work email", rec["apps"]["quickbooks"]["flag"])
+
     def test_isolation_distinct_external_user_ids(self):
         c1, c2 = StubConnectClient(), StubConnectClient()
         r1, r2 = self._record("s1"), self._record("s2")
@@ -645,6 +683,32 @@ class UIConnectTest(unittest.TestCase):
         self.assertEqual(g["verified"], "yes")
         self.assertTrue(g["usable"])
         self.assertTrue(data["record"]["vault_ref"])
+
+    def test_no_identity_app_is_confirmed_over_http(self):
+        """The QuickBooks case end to end: verify leaves the app awaiting the worker's
+        confirmation, the confirm endpoint makes it usable, and a second confirm (or a
+        confirm on an app that never needed one) is a 409, not a silent yes."""
+        self.req("POST", f"/api/sessions/{self.sid}/connection-identity", {"email": "worker@acme.com"})
+        self.stub.identity_email = None                    # the provider exposes no email
+        self.stub.authorized.add("gmail")
+        self.req("POST", f"/api/sessions/{self.sid}/connect/gmail/callback", {})
+        self.assertEqual(self._await_connect()["state"], "done")
+        _, data = self.req("GET", f"/api/sessions/{self.sid}/connection-data")
+        g = data["record"]["apps"]["gmail"]
+        self.assertEqual(g["verified"], "unverified")
+        self.assertFalse(g["usable"])
+        self.assertTrue(g["confirmable"])
+        code, body = self.req("POST", f"/api/sessions/{self.sid}/connect/gmail/confirm", {})
+        self.assertEqual(code, 200)
+        self.assertEqual(body["verified"], "worker_confirmed")
+        _, data = self.req("GET", f"/api/sessions/{self.sid}/connection-data")
+        g = data["record"]["apps"]["gmail"]
+        self.assertTrue(g["usable"])
+        self.assertFalse(g["confirmable"])
+        code, _ = self.req("POST", f"/api/sessions/{self.sid}/connect/gmail/confirm", {})
+        self.assertEqual(code, 409)                        # nothing left to confirm
+        code, _ = self.req("POST", f"/api/sessions/{self.sid}/connect/google_sheets/confirm", {})
+        self.assertEqual(code, 409)                        # never connected
 
     def test_mismatch_is_flagged_not_usable(self):
         self.req("POST", f"/api/sessions/{self.sid}/connection-identity", {"email": "worker@acme.com"})

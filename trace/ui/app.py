@@ -1836,6 +1836,17 @@ class AppState:
 
         threading.Thread(target=run, daemon=True).start()
 
+    def confirm_connection(self, sid, slug):
+        """Mark an app usable on the worker's word, when its provider handed back no
+        email to verify against. Returns the entry, or None when the app is not in that
+        state (never connected, a real mismatch, or already verified)."""
+        with self.lock:
+            rec, _ = self._load_connection(sid)
+            entry = agent_connect.confirm_by_worker(rec, slug)
+            if entry is not None:
+                self._save_connection(sid, rec)
+            return entry
+
     # --- Phase 6: live deployment ----------------------------------------
     def _refresh_stale_bindings(self, sid, conn):
         """WS5: re-mint + rotate the Pipedream token for EVERY usable app at deploy, so
@@ -4677,6 +4688,9 @@ def make_handler(state):
                 mcb = re.match(r"^connect/([^/]+)/callback$", sub)
                 if mcb:
                     return self._connect_callback(sid, mcb.group(1))
+                mcf = re.match(r"^connect/([^/]+)/confirm$", sub)
+                if mcf:
+                    return self._connect_confirm(sid, mcf.group(1))
                 mc = re.match(r"^connect/([^/]+)$", sub)
                 if mc:
                     return self._connect_start(sid, mc.group(1))
@@ -4858,6 +4872,9 @@ def make_handler(state):
             mcb = re.match(r"^/api/sessions/([^/]+)/connect/([^/]+)/callback$", p)
             if mcb:
                 return self._connect_callback(mcb.group(1), mcb.group(2))
+            mcf = re.match(r"^/api/sessions/([^/]+)/connect/([^/]+)/confirm$", p)
+            if mcf:
+                return self._connect_confirm(mcf.group(1), mcf.group(2))
             mc = re.match(r"^/api/sessions/([^/]+)/connect/([^/]+)$", p)
             if mc:
                 return self._connect_start(mc.group(1), mc.group(2))
@@ -5590,6 +5607,16 @@ def make_handler(state):
                     return self._json(409, {"error": "already_running"})
                 state.start_connect(sid, slug)
             return self._json(202, {"state": "running", "session_id": sid})
+
+        def _connect_confirm(self, sid, slug):
+            """The worker vouches for a connected account whose app exposed no email to
+            check (QuickBooks, Shopify, Stripe…). No platform call: the connection and
+            the vault binding already happened at verify; this only flips the flag."""
+            entry = state.confirm_connection(sid, slug)
+            if entry is None:
+                return self._json(409, {"error": "not_confirmable"})
+            return self._json(200, {"slug": slug, "verified": entry.get("verified"),
+                                    "usable": entry.get("usable")})
 
         def _connect_callback(self, sid, slug):
             if not state.keystore.get_key():
