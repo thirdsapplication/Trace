@@ -25,6 +25,15 @@ from trace.agent import model_call
 
 DEFAULT_MODEL = "claude-fable-5-1"
 
+# Output ceiling per chunk. A 120-event chunk can legitimately become 60-100 events
+# of ~120 tokens each, and Fable's thinking is billed against the same ceiling. The
+# old cap of 8000 was set for a model that did not think and a prompt that asked for
+# fewer, coarser events; under the v2 prompt it was hit routinely, the cut-off JSON
+# parsed as an empty chunk, and a full day reconstructed to nothing. Streaming is what
+# lets the cap be this large — above ~16K a non-streaming request hangs rather than
+# failing (see model_call).
+MAX_TOKENS = 32000
+
 
 def _default_model_fn(model):
     """Build the reconstruction caller. Imported lazily so the module loads
@@ -34,7 +43,8 @@ def _default_model_fn(model):
     client = anthropic.Anthropic()
 
     def call(system, user):
-        return model_call.create_text(client, model, system, user, max_tokens=8000)
+        return model_call.create_text_streaming(client, model, system, user,
+                                                max_tokens=MAX_TOKENS)
 
     return call
 
@@ -64,6 +74,22 @@ def _parse_json_array(text):
         # tolerate {"events": [...]}
         data = data.get("events", [])
     return data if isinstance(data, list) else []
+
+
+def _reply_was_readable(text):
+    """True when the reply parsed as JSON at all (a fenced ``[]`` is readable and empty;
+    prose, a refusal, or cut-off JSON is not). Tells a lost chunk from an empty one."""
+    if not text:
+        return False
+    t = text.strip()
+    fence = re.match(r"^```(?:json)?\s*(.*?)\s*```$", t, re.DOTALL)
+    if fence:
+        t = fence.group(1).strip()
+    try:
+        json.loads(t)
+        return True
+    except json.JSONDecodeError:
+        return False
 
 
 def _build_user_content(summary, rendered_lines):
@@ -113,6 +139,11 @@ def reconstruct(raw_path, model=DEFAULT_MODEL, chunk_size=120, overlap=20,
         user = _build_user_content(summary, rendered)
         raw_text = model_fn(SYSTEM_PROMPT, user)
         events = _parse_json_array(raw_text)
+        if not events and (raw_text or "").strip() and not _reply_was_readable(raw_text):
+            # A reply that parsed to nothing is a lost chunk, not an empty one. It used
+            # to vanish without a trace; the report is where a person looks.
+            report.error(f"chunk {i}/{total}: the model's reply was not a JSON event list "
+                         f"({len(raw_text)} chars) — that chunk's events were lost")
         chunk_outputs.append(events)
         # maintain a provisional validated view for the next chunk's summary
         for ev in events:

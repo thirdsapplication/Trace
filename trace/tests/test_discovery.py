@@ -119,6 +119,16 @@ class DiscoverPipelineTest(unittest.TestCase):
         self.assertEqual(out["anti_bundles"][0]["id"], "A1")
         self.assertTrue(any("e999" in e for e in report.errors))
 
+    def test_an_unreadable_reply_is_reported_not_mistaken_for_no_workflows(self):
+        path = write_log([{"id": "e001", "ts_start": "t", "app": "A", "window": "W",
+                           "action": "read_email", "detail": "read", "confidence": "high"}])
+        try:
+            out, report = discover(path, model_fn=lambda s, u: "I cannot produce that.")
+            self.assertEqual(out["bundles"], [])
+            self.assertTrue(any("could not be read" in e for e in report.errors))
+        finally:
+            os.remove(path)
+
     def test_empty_log_returns_empty_discovery(self):
         path = write_log([])
         try:

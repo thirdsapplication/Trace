@@ -125,6 +125,47 @@ class StreamingMessages:
         return self.streams[-1]
 
 
+class TruncatedResp(Resp):
+    """A reply the model had to cut off: stop_reason says so, the text is partial."""
+    stop_reason = "max_tokens"
+
+
+class MessagesTruncating(Messages):
+    def create(self, **kw):
+        self.calls.append(kw)
+        return TruncatedResp('{"events": [{"id": "e001", "det')
+
+
+class StreamingMessagesTruncating(StreamingMessages):
+    def stream(self, **kw):
+        self.calls.append(kw)
+        self.streams.append(Stream(TruncatedResp('{"bundles": [')))
+        return self.streams[-1]
+
+
+class TruncationTest(unittest.TestCase):
+    """A cut-off reply must raise, never return.
+
+    Every engine parses the reply as JSON, and cut-off JSON parses as nothing: an empty
+    chunk, an empty discovery, an agent with no steps. Returning the partial text is how
+    a full workday reconstructed to zero events with no error anywhere.
+    """
+
+    def test_create_text_raises_on_max_tokens(self):
+        with self.assertRaises(model_call.OutputTruncated) as cm:
+            model_call.create_text(Client(MessagesTruncating()), "m", "s", "u", max_tokens=8000)
+        self.assertIn("max_tokens=8000", str(cm.exception))
+
+    def test_streaming_raises_on_max_tokens(self):
+        with self.assertRaises(model_call.OutputTruncated):
+            model_call.create_text_streaming(Client(StreamingMessagesTruncating()),
+                                             "m", "s", "u", max_tokens=32000)
+
+    def test_a_complete_reply_without_a_stop_reason_field_still_works(self):
+        # fakes and older SDK shapes carry no stop_reason at all; that is not truncation
+        self.assertEqual(model_call.create_text(Client(Messages()), "m", "s", "u"), "ok")
+
+
 class ModelCallTest(unittest.TestCase):
     def test_the_default_sends_no_temperature(self):
         # Every engine runs on Fable 5.1, which 400s any sampling parameter, so the

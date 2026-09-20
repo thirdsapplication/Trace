@@ -26,6 +26,27 @@ so ``create_text_streaming`` is the same call with the streaming transport under
 """
 
 
+class OutputTruncated(RuntimeError):
+    """The model stopped because it hit ``max_tokens``, so the text is cut off.
+
+    Raised instead of returning the partial text, because every engine parses the
+    reply as JSON and a cut-off JSON document parses as NOTHING: an empty chunk, an
+    empty discovery, an agent with no steps. That failure used to be silent — the
+    reconstruction of a full workday came back as zero events and the UI said there
+    was nothing to review. Fable thinks before it answers and that reasoning is billed
+    against the same ceiling, so a cap that was generous for a model without thinking
+    is not generous now.
+    """
+
+
+def _check_complete(resp, max_tokens):
+    if getattr(resp, "stop_reason", None) == "max_tokens":
+        raise OutputTruncated(
+            f"model output was cut off at max_tokens={max_tokens} (stop_reason=max_tokens); "
+            "the reply is incomplete and was not used")
+    return resp
+
+
 def create_text(client, model, system, user, max_tokens=4000, temperature=None):
     """Call Messages and return the concatenated text.
 
@@ -45,7 +66,7 @@ def create_text(client, model, system, user, max_tokens=4000, temperature=None):
         kwargs["system"] = system    # system=None is not the same as omitting it
     if temperature is None:
         resp = client.messages.create(**kwargs)
-        return _text(resp)
+        return _text(_check_complete(resp, max_tokens))
     try:
         resp = client.messages.create(temperature=temperature, **kwargs)
     except TypeError as e:           # SDK signature drift (the 1.x incident)
@@ -57,7 +78,7 @@ def create_text(client, model, system, user, max_tokens=4000, temperature=None):
         if "temperature" not in msg and "sampling" not in msg:
             raise
         resp = client.messages.create(**kwargs)
-    return _text(resp)
+    return _text(_check_complete(resp, max_tokens))
 
 
 def create_text_streaming(client, model, system, user, max_tokens=16000):
@@ -79,7 +100,7 @@ def create_text_streaming(client, model, system, user, max_tokens=16000):
     # HTTP connection once get_final_message() has assembled the accumulated deltas.
     with client.messages.stream(**kwargs) as stream:
         resp = stream.get_final_message()
-    return _text(resp)
+    return _text(_check_complete(resp, max_tokens))
 
 
 def _text(resp):

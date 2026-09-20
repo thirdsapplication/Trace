@@ -431,6 +431,17 @@ class AppState:
                         "reconstruct", sid, _RECON_MODEL,
                         lambda: _recon_model_fn(_RECON_MODEL))
                 log, report = self.reconstruct_fn(raw_path, progress_cb=cb, **kw)
+                raw_count = sessions.artifacts(self.sessions_root, sid)["raw_event_count"]
+                if not log and raw_count:
+                    # A recording that captured activity but reconstructed to nothing is
+                    # a FAILED step, not an empty one. Writing an empty event log here
+                    # used to let discovery run over nothing and the review screen say
+                    # "Nothing to review" — which reads as "palza saw no work" when the
+                    # truth was "palza could not read the model's reply".
+                    why = "; ".join(report.errors[:3]) or "no events came back from the model"
+                    raise RuntimeError(
+                        f"reconstruction produced no events from {raw_count} captured "
+                        f"events ({why})")
                 with open(sessions.path(self.sessions_root, sid, sessions.EVENT_LOG),
                           "w", encoding="utf-8") as f:
                     json.dump(log, f, indent=2, ensure_ascii=False)

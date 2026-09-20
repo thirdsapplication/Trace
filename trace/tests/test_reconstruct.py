@@ -65,6 +65,22 @@ class ReconstructPipelineTest(unittest.TestCase):
             self.assertEqual(log[0]["evidence"], ["r0001"])
             self.assertEqual(log[0]["app"], "App")
 
+    def test_a_reply_that_parses_to_nothing_is_reported_as_a_lost_chunk(self):
+        """A chunk whose reply is not a JSON event list used to vanish silently; the
+        report now says which chunk, so an empty log has a visible cause."""
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "raw.jsonl")
+            write_raw(p, 6)
+            log, report = reconstruct(p, chunk_size=4, overlap=2,
+                                      model_fn=lambda s, u: "Sorry, I could not do that.")
+            self.assertEqual(log, [])
+            self.assertEqual(len(report.errors), 2)                 # one per chunk
+            self.assertIn("chunk 1/2", report.errors[0])
+            self.assertIn("events were lost", report.errors[0])
+            # a genuinely empty reply is not a lost chunk
+            _, quiet = reconstruct(p, chunk_size=4, overlap=2, model_fn=lambda s, u: "[]")
+            self.assertEqual(quiet.errors, [])
+
     def test_empty_stream(self):
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "raw.jsonl")

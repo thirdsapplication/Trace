@@ -26,6 +26,7 @@ from trace.agent import model_call
 
 # Single, one-line default model tier (Open decision §11: trivially swappable).
 DEFAULT_MODEL = "claude-fable-5-1"
+MAX_TOKENS = 32000
 
 
 def load_event_log(path):
@@ -82,7 +83,11 @@ def _default_model_fn(model):
     client = anthropic.Anthropic()
 
     def call(system, user):
-        return model_call.create_text(client, model, system, user, max_tokens=16000)
+        # Streaming with a large ceiling: the reply covers a whole day's workflows and
+        # Fable's thinking is billed against the same cap. A cut-off reply parses as an
+        # empty discovery, which reads as "no workflows" rather than "the call failed".
+        return model_call.create_text_streaming(client, model, system, user,
+                                                max_tokens=MAX_TOKENS)
 
     return call
 
@@ -128,5 +133,9 @@ def discover(event_log_path, model=DEFAULT_MODEL, model_fn=None):
     # layer's own table — never hardcoded in the prompt text.
     raw_text = model_fn(system_prompt(), _build_user_content(events))
     obj = _parse_json_object(raw_text)
+    if not obj and (raw_text or "").strip():
+        report.error(f"the model's reply was not a JSON object ({len(raw_text)} chars); "
+                     "discovery is empty because the reply could not be read, not "
+                     "because the day held no workflows")
     discovery = validate.validate_discovery(obj, valid_ids, report)
     return discovery, report
