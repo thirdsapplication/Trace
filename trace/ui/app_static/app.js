@@ -1980,6 +1980,19 @@ async function renderThread(agentId) {
         + (r.data.replying ? `<div class="dm-bubble them typing"><span></span><span></span><span></span></div>` : "");
       chat.scrollTop = chat.scrollHeight;
     }
+    const aw = r.data.awaiting || {};
+    const sug = $("#dmSuggest");
+    if (sug) {
+      const chips = aw.approvals ? ["approve", "reject"] : (aw.questions ? [] : SUGGESTIONS);
+      const note = aw.approvals
+        ? `Reply <b>approve</b> to run what it staged, or <b>reject</b> to drop it.`
+        : (aw.questions ? `It's waiting on you — reply with what it should do and it picks the run back up.` : "");
+      sug.innerHTML = chips.map(t => `<button class="chip ${aw.approvals ? "" : "chip-quiet"} dm-sug">${esc(t)}</button>`).join("")
+        + (note ? `<span class="sub muted" style="align-self:center;">${note}</span>` : "");
+      sug.querySelectorAll(".dm-sug").forEach(b => b.onclick = () => {
+        const i = $("#dmText"); if (i) { i.value = b.textContent; i.focus(); }
+      });
+    }
     return r.data;
   };
   const poll = async () => {
@@ -2757,46 +2770,28 @@ async function renderProfile(agentId) {
            ${escalationLine(data)}`
         : `<p class="sub muted" style="margin-top:4px;">No connected apps yet.</p>`);
     }
+    // Session history is the summarized transcript of each run and nothing more.
+    // Approvals and questions travel through the agent's message thread: the agent
+    // DMs what it staged or what it is stuck on, and the owner replies there.
     const logRow = (s) => {
-      const props = s.proposals || [];
-      const decs = s.decisions || [];
-      const approvable = props.filter(p => !p.status || p.status === "pending");
+      const waiting = (s.proposals || []).some(p => !p.status || p.status === "pending");
+      const asking = (s.decisions || []).length > 0;
       return `<div class="log-row" data-sess="${esc(s.run_session_id || "")}">
         <div class="row" style="gap:10px;">
           <span class="mono muted" style="font-size:12px;white-space:nowrap;">${esc(s.ran_at || "")}</span>
           ${runBadge(s.status)}
         </div>
         <div class="log-note">${esc(s.summary || "No summary yet — the run may still be in progress.")}</div>
-        ${decs.length ? `<div style="margin-top:8px;"><div class="label">Needs your input</div>
-          ${decs.map(decisionCard).join("")}
-        </div>` : ""}
-        ${props.length ? `<div style="margin-top:8px;"><div class="label">Proposed actions</div>
-          ${props.map(proposalRow).join("")}
-          ${approvable.length ? `<button class="btn-primary btn-sm approve-sel" style="margin-top:10px;">Approve &amp; run selected</button>` : ""}
-        </div>` : ""}
+        ${(waiting || asking) ? `<div class="sub muted" style="margin-top:6px;">${
+          asking ? "Waiting on your answer" : "Waiting on your approval"} — <a href="#" class="log-thread">reply in Messages</a></div>` : ""}
       </div>`;
     };
     const log = $("#pLog");
     if (log) log.innerHTML = sessionsList.length
       ? sessionsList.map(logRow).join("")
       : `<p class="muted">No sessions yet — hit Run now or set a schedule.</p>`;
-    root.querySelectorAll(".approve-sel").forEach(b => b.onclick = async () => {
-      const panel = b.closest("[data-sess]");
-      const ids = Array.from(panel.querySelectorAll(".prop")).filter(c => c.checked).map(c => c.dataset.id);
-      if (!ids.length) { b.textContent = "Select at least one"; return; }
-      b.disabled = true; b.textContent = "Running…";
-      await api("POST", `/api/u/agents/${agentId}/approve-actions`, { pending_ids: ids });
-      S._timers.push(setTimeout(() => { S.igHome = null; renderProfile(agentId); }, 4000));
-    });
-    // Approve & send / Edit first / Reject in Session history. These were never wired
-    // here — only in the story overlay — so all three did nothing on this screen.
-    wireProposalActions(root, agentId, () =>
-      S._timers.push(setTimeout(() => { S.igHome = null; renderProfile(agentId); }, 4000)));
-    root.querySelectorAll(".prop-edit").forEach(b => b.onclick = () => {
-      // Same as the overlay: opens the payload. Editing the content itself is still to
-      // build — the button at least does the visible half now instead of nothing.
-      const box = root.querySelector(`.pp-payload[data-for="${b.dataset.id}"]`);
-      if (box) box.hidden = false;
+    root.querySelectorAll(".log-thread").forEach(a => a.onclick = (e) => {
+      e.preventDefault(); renderThread(agentId);
     });
     root.querySelectorAll(".prop-autoapprove").forEach(b => b.onclick = async () => {
       if (await autoApproveApp(agentId, b.dataset.app)) { S.igHome = null; renderProfile(agentId); }

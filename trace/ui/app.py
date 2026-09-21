@@ -1070,11 +1070,106 @@ class AppState:
                 pass                                       # never stops the rest
         return wrote
 
-    def _session_proposals(self, agent, run_session_id, events, owner, rows=None):
+    # --- approvals and questions travel as messages ---------------------------
+    # Approval requests and blocking questions reach the owner as a DM from the agent,
+    # and the owner answers in the same thread: "approve" runs the staged actions,
+    # "reject" drops them, and any reply while a question is open is the answer the
+    # run resumes with. Session history is then just the summarized transcript of each
+    # run; nothing on it needs a button.
+    APPROVE_WORDS = frozenset((
+        "approve", "approved", "approve all", "approve them", "approve it", "yes approve",
+        "ok approve", "okay approve", "go ahead", "approve and send", "approve and run"))
+    REJECT_WORDS = frozenset((
+        "reject", "rejected", "reject all", "reject them", "reject it", "no reject",
+        "don't send", "do not send", "don't do it", "do not do it", "cancel", "cancel them"))
+
+    @staticmethod
+    def _dm_word(text):
+        """A reply normalised for the approve/reject match: lower-cased, trailing
+        punctuation dropped, whitespace collapsed."""
+        w = re.sub(r"\s+", " ", str(text or "").strip().lower())
+        return w.strip(" .!?,;:\"'")
+
+    @staticmethod
+    def _approval_request_text(items):
+        """The DM that asks for approval: every staged action listed in full, then how
+        to answer. The list IS the approval surface now, so it names the concrete
+        entities the way the proposal contract's summary line does."""
+        items = [it for it in items or [] if isinstance(it, dict)]
+        n = len(items)
+        lines = [f"I've staged {n} action{'s' if n != 1 else ''} for your approval:"]
+        for i, it in enumerate(items, start=1):
+            app_name = str(it.get("app") or "").strip()
+            summary = str(it.get("summary") or it.get("kind") or "an action").strip()
+            lines.append(f"{i}. {summary}" + (f" ({app_name})" if app_name else ""))
+            why = str(it.get("rationale") or "").strip()
+            if why:
+                lines.append(f"   why: {why}")
+        lines.append("")
+        lines.append('Reply "approve" and I\'ll run them, or "reject" to drop them. '
+                     "Or tell me what to change.")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _question_request_text(questions):
+        """The DM for a blocking question: the question, what the agent found, the
+        options if it offered any, and the ask to reply in this thread."""
+        qs = [q for q in questions or [] if isinstance(q, dict) and str(q.get("question") or "").strip()]
+        lines = ["I hit something I need your call on."]
+        for i, q in enumerate(qs, start=1):
+            prefix = f"{i}. " if len(qs) > 1 else ""
+            lines.append("")
+            lines.append(f"{prefix}{str(q.get('question')).strip()}")
+            ctx = str(q.get("context") or "").strip()
+            if ctx:
+                lines.append(f"What I found: {ctx}")
+            opts = [str(o).strip() for o in (q.get("options") or []) if str(o).strip()]
+            if opts:
+                lines.append("Options: " + " / ".join(opts))
+        lines.append("")
+        lines.append("Reply here with what I should do and I'll pick the run back up "
+                     "where I stopped.")
+        return "\n".join(lines)
+
+    def _open_approvals(self, agent):
+        """This agent's staged actions still awaiting a yes or no, oldest first."""
+        try:
+            rows = registry.pending_for_user(self.sessions_root, agent.get("owner_user_id"),
+                                             status="pending")
+        except Exception:                                  # noqa: BLE001
+            return []
+        aid = agent.get("agent_id")
+        mine = [r for r in rows if r.get("agent_id") == aid]
+        mine.sort(key=lambda r: (r.get("created_at") or "", str(r.get("id") or "")))
+        return mine
+
+    def _open_questions(self, agent):
+        """This agent's blocking questions still unanswered, oldest first."""
+        try:
+            rows = registry.decisions_for_user(self.sessions_root, agent.get("owner_user_id"),
+                                               status="pending")
+        except Exception:                                  # noqa: BLE001
+            return []
+        aid = agent.get("agent_id")
+        mine = [r for r in rows if r.get("agent_id") == aid]
+        mine.sort(key=lambda r: (r.get("created_at") or "", str(r.get("id") or "")))
+        return mine
+
+    def awaiting(self, agent):
+        """What this agent is waiting on its owner for, for the thread UI."""
+        return {"approvals": len(self._open_approvals(agent)),
+                "questions": len(self._open_questions(agent))}
+
+    def _session_proposals(self, agent, run_session_id, events, owner, rows=None,
+                           notify=True):
         """Persist this session's proposed actions as pending items (deduped) and return
         them — every status, not just pending, so a decided card renders its outcome on
         reload instead of vanishing. Falls back to the final message text when the agent
-        didn't emit a structured block, so nothing is lost."""
+        didn't emit a structured block, so nothing is lost.
+
+        ``notify``: when this call inserted NEW proposals, DM the owner the full list
+        and how to answer. The dedupe on insert is what keeps this to one message per
+        batch, however many times the session is re-read."""
         root = self.sessions_root
         agent_id = agent.get("agent_id")
         proposals = agent_activity.extract_proposals(events)
@@ -1101,7 +1196,11 @@ class AppState:
         # activity view uses directly.
         if rows is None or added:
             rows = list(registry.pending_for_user(root, owner, status=None))
-        return self._proposals_for_session(run_session_id, rows)
+        mine = self._proposals_for_session(run_session_id, rows)
+        if added and notify:
+            self._agent_dm(agent, self._approval_request_text(
+                [p for p in mine if p.get("status") == "pending"]))
+        return mine
 
     @staticmethod
     def _executing_went_stale(p, max_minutes=15):
@@ -1134,9 +1233,12 @@ class AppState:
                 "options": [str(o) for o in (ctx.get("options") or [])],
                 "rule": ctx.get("rule") or ""}
 
-    def _persist_decisions(self, agent, run_session_id, questions, owner, rows=None):
+    def _persist_decisions(self, agent, run_session_id, questions, owner, rows=None,
+                           notify=True):
         """Gap #3: persist a run's needs_input questions as answerable decision records
-        (deduped), returning the still-open ones for this session for the UI."""
+        (deduped), returning the still-open ones for this session for the UI.
+        ``notify``: when a NEW question was inserted, DM the owner the question(s) and
+        the ask to reply in the thread — the reply is the answer the run resumes with."""
         root = self.sessions_root
         tags = {"bundle_id": agent.get("bundle_id") or "",
                 "workflow": agent.get("name") or agent.get("bundle_id") or ""}
@@ -1161,6 +1263,8 @@ class AppState:
                 "tags": tags})
         if rows is None or added:                          # see _session_proposals
             rows = list(registry.decisions_for_user(root, owner, status="pending"))
+        if added and notify:
+            self._agent_dm(agent, self._question_request_text(questions))
         return self._decisions_for_session(run_session_id, rows)
 
     def _session_decisions(self, agent, run_session_id, events, owner, rows=None):
@@ -3117,6 +3221,16 @@ class AppState:
 
         def run():
             reply, err = "", None
+            # The thread is where approvals and answers happen. Before a chat session is
+            # spent on the message, see whether it IS an approval, a rejection, or the
+            # answer to a question the agent is waiting on — those are handled directly,
+            # and the agent's reply reports what it did.
+            handled = self._handle_thread_reply(agent, text)
+            if handled is not None:
+                registry.message_add(root, {"agent_id": aid, "owner_user_id": owner,
+                                            "sender": "agent", "text": handled})
+                job.update(state="done", error=None)
+                return
             try:
                 self._refresh_agent_binding(agent)
                 client = self._live_client()
@@ -3149,6 +3263,69 @@ class AppState:
             job.update(state=("error" if err else "done"), error=err)
 
         threading.Thread(target=run, daemon=True).start()
+
+    def _handle_thread_reply(self, agent, text):
+        """Act on a thread reply that answers something the agent is waiting on, and
+        return the agent's reply text — or None when the message is ordinary chat.
+
+        Order matters. Staged actions are checked first: "approve" or "reject" while
+        actions are waiting means those actions, whatever else is open. Otherwise, while
+        a question is open, ANY reply is taken as its answer — the agent asked for one
+        in plain words and a reply in plain words is what it gets — and the run resumes
+        with it. Only when nothing is waiting does the message go to the chat session.
+        Never raises: a failure becomes the reply."""
+        root = self.sessions_root
+        word = self._dm_word(text)
+        approvals = self._open_approvals(agent)
+        if approvals and word in self.APPROVE_WORDS:
+            try:
+                res = self.approve_actions(agent, [r.get("id") for r in approvals])
+            except Exception as e:                          # noqa: BLE001
+                res = {"status": "failed", "summary": f"{type(e).__name__}: {e}"}
+            n = len(approvals)
+            listed = "\n".join(f"- {r.get('summary') or r.get('kind') or 'an action'}"
+                               for r in approvals)
+            if res.get("status") == "executed":
+                return (f"Done — I ran {n} action{'s' if n != 1 else ''}:\n{listed}"
+                        + (f"\n\n{res.get('summary')}" if res.get("summary") else ""))
+            return (f"I tried to run {n} action{'s' if n != 1 else ''} but it didn't go "
+                    f"through: {res.get('summary') or 'no detail'}. Nothing was marked done; "
+                    "say \"approve\" again to retry.")
+        if approvals and word in self.REJECT_WORDS:
+            for r in approvals:
+                try:
+                    registry.pending_set_status(root, r.get("id"), "rejected",
+                                                reason="rejected in chat")
+                except Exception:                          # noqa: BLE001
+                    pass
+            n = len(approvals)
+            return (f"Okay — I've dropped {n} action{'s' if n != 1 else ''} and won't "
+                    "propose them again. If something should have gone out differently, "
+                    "tell me what to change.")
+        questions = self._open_questions(agent)
+        if questions:
+            q = questions[-1]                              # the most recent thing it asked
+            answer = str(text or "").strip()
+            try:
+                registry.decision_answer(root, q.get("id"), answer)
+            except Exception:                              # noqa: BLE001
+                pass
+            rec = self.resume_after_answer(agent, q, answer)
+            if not rec:
+                return ("Thanks — I've noted that, but I couldn't restart the run just "
+                        "now. I'll use your answer on the next run.")
+            status = rec.get("status")
+            outcome = str(rec.get("summary") or "").strip()
+            if status == "needs_input":
+                # run_agent already DM'd the new question; this reply just closes the
+                # loop on the one just answered.
+                return "Thanks — I picked the run back up with that, and hit one more thing (see below)."
+            if status in ("needs_approval",):
+                return "Thanks — I picked the run back up with that and staged what comes next (see below)."
+            if status == "failed":
+                return f"Thanks — I picked the run back up with that, but it hit a problem: {outcome}"
+            return "Thanks — I picked the run back up with that." + (f" {outcome}" if outcome else "")
+        return None
 
     # --- group chat: read-only broadcast Q&A -------------------------------
     def msg_rate_ok(self, uid):
@@ -3621,33 +3798,35 @@ class AppState:
             self._agent_dm(agent, f"My last run hit a problem: {rec['summary']}")
         elif rec["status"] == "needs_input":
             # Gap #3: the agent paused on a blocking edge case — persist the question(s)
-            # as answerable decisions, then surface them.
+            # as answerable decisions, then ask in the thread. The owner's reply there
+            # is the answer the run resumes with.
             self._persist_decisions(agent, rec.get("run_session_id"),
-                                    rec.get("questions"), agent.get("owner_user_id"))
-            qs = rec.get("questions") or []
-            first = (qs[0].get("question") if qs and isinstance(qs[0], dict) else "") \
-                or "something I wasn't sure about"
-            more = f" (+{len(qs) - 1} more)" if len(qs) > 1 else ""
-            self._agent_dm(agent, f"I hit something I need your call on: {first}{more} — "
-                                  "open my profile to answer.")
+                                    rec.get("questions"), agent.get("owner_user_id"),
+                                    notify=False)
+            qs = [q for q in (rec.get("questions") or []) if isinstance(q, dict)] \
+                or [{"question": "something I wasn't sure about"}]
+            self._agent_dm(agent, self._question_request_text(qs))
         else:
             # Staged agents propose rather than perform: extract this run's proposals
-            # NOW (one session read) so they land in the feed + an approval DM without
-            # waiting for the user to open the activity view.
+            # NOW (one session read) so they land as an approval DM listing every action,
+            # without waiting for the user to open the activity view. The pre-insert
+            # above means the session read dedupes to nothing new, so the DM is sent
+            # here, once, from what the run actually staged.
             staged_props = []
             if agent_config.approval_required(agent) and rec.get("run_session_id"):
                 try:
                     events = self._live_client().list_session_events(rec["run_session_id"])
                     staged_props = self._session_proposals(
-                        agent, rec["run_session_id"], events, agent.get("owner_user_id"))
+                        agent, rec["run_session_id"], events, agent.get("owner_user_id"),
+                        notify=False)
                 except Exception:                          # noqa: BLE001 — view-time still covers it
                     staged_props = []
-            n = (len([p for p in staged_props if p.get("status") == "pending"])
-                 or len(rec.get("pending") or [])
-                 or (1 if rec["status"] == "needs_approval" else 0))
-            if n:
-                self._agent_dm(agent, f"I've staged {n} action{'s' if n != 1 else ''} for "
-                                      "your approval — open my profile to review them.")
+            open_props = [p for p in staged_props if p.get("status") == "pending"] \
+                or list(rec.get("pending") or [])
+            if not open_props and rec["status"] == "needs_approval":
+                open_props = [{"summary": rec.get("summary") or "the action I prepared"}]
+            if open_props:
+                self._agent_dm(agent, self._approval_request_text(open_props))
         return rec
 
     def approve_pending(self, item):
@@ -4468,6 +4647,9 @@ def make_handler(state):
                 return self._json(200, {
                     "messages": registry.messages_for_agent(root, user["user_id"], aid),
                     "replying": (state.chat_jobs.get(aid) or {}).get("state") == "running",
+                    # what a reply in this thread would answer: staged actions waiting
+                    # on "approve"/"reject", or a question the next reply resolves
+                    "awaiting": state.awaiting(agent),
                     "agent": {"agent_id": aid, "name": agent.get("name") or aid}})
             maa = re.match(r"^/agents/([^/]+)/activity$", rest)
             if maa:                                          # real session activity (Haiku summaries)

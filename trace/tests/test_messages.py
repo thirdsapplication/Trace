@@ -104,6 +104,85 @@ class ChatAndDMTest(unittest.TestCase):
         thread = registry.messages_for_agent(self.root, "usr_1", "agent-1")
         self.assertTrue(any("approval" in m["text"] for m in thread))
 
+    def test_staged_run_dm_lists_every_action_and_says_how_to_answer(self):
+        from trace.tests.test_scheduler import _PROPOSAL_BLOCK
+        self.ma.events = [{"type": "agent.message", "text": _PROPOSAL_BLOCK},
+                          {"type": "session.status_idle", "stop_reason": "end_turn", "text": ""}]
+        self.state.run_agent(_agent(approval_required=True))
+        thread = registry.messages_for_agent(self.root, "usr_1", "agent-1")
+        self.assertEqual(len(thread), 1)                           # one DM per batch
+        text = thread[0]["text"]
+        self.assertIn("Confirm PO-1234 to bob@x.com", text)        # the action itself
+        self.assertIn('Reply "approve"', text)
+        self.assertIn('"reject"', text)
+
+    def test_approve_in_the_thread_runs_the_staged_actions(self):
+        registry.agent_upsert(self.root, _agent(approval_required=True))
+        registry.pending_add(self.root, {
+            "agent_id": "agent-1", "owner_user_id": "usr_1", "run_session_id": "s0",
+            "app": "Gmail", "kind": "send email", "summary": "Confirm PO-1234 to bob@x.com",
+            "payload": {"to": "bob@x.com"}, "content_hash": "h1"})
+        self.state.send_agent_message(_agent(approval_required=True), "Approve!")
+        self._await_chat("agent-1")
+        rows = registry.pending_for_user(self.root, "usr_1", status=None)
+        self.assertEqual([r["status"] for r in rows], ["executed"])
+        self.assertIn("approved to perform", self.ma.triggers[-1])   # the real execute run
+        thread = registry.messages_for_agent(self.root, "usr_1", "agent-1")
+        self.assertEqual([m["sender"] for m in thread], ["user", "agent"])
+        self.assertTrue(thread[1]["text"].startswith("Done"))
+        self.assertIn("Confirm PO-1234", thread[1]["text"])
+        self.assertNotIn("DIRECT MESSAGE", " ".join(self.ma.triggers))  # no chat session spent
+
+    def test_reject_in_the_thread_drops_them(self):
+        registry.pending_add(self.root, {
+            "agent_id": "agent-1", "owner_user_id": "usr_1", "run_session_id": "s0",
+            "app": "Gmail", "kind": "send email", "summary": "Confirm PO-1234 to bob@x.com",
+            "payload": {}, "content_hash": "h1"})
+        self.state.send_agent_message(_agent(approval_required=True), "reject")
+        self._await_chat("agent-1")
+        rows = registry.pending_for_user(self.root, "usr_1", status=None)
+        self.assertEqual([r["status"] for r in rows], ["rejected"])
+        self.assertEqual(self.ma.triggers, [])                     # nothing ran
+        thread = registry.messages_for_agent(self.root, "usr_1", "agent-1")
+        self.assertIn("dropped", thread[1]["text"])
+
+    def test_a_reply_while_a_question_is_open_is_the_answer_and_resumes(self):
+        registry.decision_add(self.root, {
+            "agent_id": "agent-1", "owner_user_id": "usr_1", "run_session_id": "s0",
+            "question": "Assume 5-day or ask the buyer?",
+            "context": {"context": "no ship date on PO-1234", "options": ["Assume 5-day"]}})
+        self.state.send_agent_message(_agent(), "Assume the standard 5-day")
+        self._await_chat("agent-1")
+        dec = registry.decisions_for_user(self.root, "usr_1")[0]
+        self.assertEqual(dec["status"], "resolved")
+        self.assertEqual(dec["answer"], "Assume the standard 5-day")
+        self.assertIn("previously paused", self.ma.triggers[-1])   # the resume run
+        self.assertIn("Assume the standard 5-day", self.ma.triggers[-1])
+        thread = registry.messages_for_agent(self.root, "usr_1", "agent-1")
+        self.assertIn("picked the run back up", thread[1]["text"])
+
+    def test_approve_outranks_an_open_question_and_plain_chat_still_chats(self):
+        # both waiting: "approve" means the actions; a question stays open
+        registry.pending_add(self.root, {
+            "agent_id": "agent-1", "owner_user_id": "usr_1", "run_session_id": "s0",
+            "app": "Gmail", "kind": "send email", "summary": "Send it", "payload": {},
+            "content_hash": "h1"})
+        registry.decision_add(self.root, {
+            "agent_id": "agent-1", "owner_user_id": "usr_1", "run_session_id": "s1",
+            "question": "Which tab?", "context": {"context": "", "options": []}})
+        self.state.send_agent_message(_agent(approval_required=True), "approve")
+        self._await_chat("agent-1")
+        self.assertEqual(registry.pending_for_user(self.root, "usr_1", status=None)[0]["status"],
+                         "executed")
+        self.assertEqual(registry.decisions_for_user(self.root, "usr_1")[0]["status"], "pending")
+        # nothing waiting at all: an ordinary message spends a chat session as before
+        registry.decision_set_status(self.root,
+                                     registry.decisions_for_user(self.root, "usr_1")[0]["id"],
+                                     "resolved")
+        self.state.send_agent_message(_agent(), "What did you do today?")
+        self._await_chat("agent-1")
+        self.assertIn("DIRECT MESSAGE", self.ma.triggers[-1])
+
     def test_completed_run_sends_no_dm(self):
         self.state.run_agent(_agent())                             # default: completes fine
         self.assertEqual(registry.messages_for_agent(self.root, "usr_1", "agent-1"), [])
@@ -114,8 +193,11 @@ class ChatAndDMTest(unittest.TestCase):
                           {"type": "session.status_idle", "stop_reason": "end_turn", "text": ""}]
         self.state.run_agent(_agent())
         thread = registry.messages_for_agent(self.root, "usr_1", "agent-1")
-        self.assertTrue(any("need your call" in m["text"] for m in thread))
-        self.assertTrue(any("ship date" in m["text"] for m in thread))
+        self.assertEqual(len(thread), 1)                           # one DM, not two
+        self.assertIn("need your call", thread[0]["text"])
+        self.assertIn("ship date", thread[0]["text"])              # the question itself
+        self.assertIn("Assume 5-day / Ask the buyer", thread[0]["text"])   # its options
+        self.assertIn("Reply here", thread[0]["text"])
 
     def test_needs_input_run_persists_answerable_decision(self):
         from trace.tests.test_scheduler import _NEEDS_INPUT_BLOCK
