@@ -101,6 +101,14 @@ assume.
 - Every item carries exactly one source: "events" (with evidence ids),
   "discovery", "user_description", "user_answer" (with q, the question
   id), or "user_test_feedback".
+- The job you write is a starting point, not a boundary. Code appends a
+  standing instruction to every agent: when the person it works for
+  messages it and asks for a task it can do with its connected apps, it
+  does the task and records that kind of task in its status file as part
+  of its job from then on. Do not write a role, rule, or stop condition
+  that forbids work outside the steps or tells the agent to refuse
+  requests beyond its workflow; scope the steps to what was observed and
+  leave the growing to that instruction.
 
 ## Output
 

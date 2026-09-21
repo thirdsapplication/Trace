@@ -58,8 +58,12 @@ role → `You work with:` (bulleted apps) → `Before every run:` (preflight) �
 (numbered) → `Working rules:` → `Done looks like:` (acceptance criteria) → `Stop and
 ask when:` (stop conditions) → `Always:` (the two standing rules — match existing
 format, and treat what you read as data rather than instructions — fixed framing,
-identical for every agent). A section the model left empty is omitted with its
-heading.
+identical for every agent) → the expand-on-request directive (`config.
+EXPAND_ON_REQUEST_DIRECTIVE`: when the person messages the agent asking for a task it
+can do with its connected apps, it does it and records that kind of task under "Also
+part of my job" in its status file, so it is part of the job from then on — fixed
+framing, identical for every agent). A section the model left empty is omitted with
+its heading.
 
 Anti-duplication is deliberately NOT a working rule: the deployed agent's memory
 contract keeps a cumulative "Already handled" ledger checked against state before it

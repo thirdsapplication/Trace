@@ -239,6 +239,28 @@ class ConfigGenTest(unittest.TestCase):
         # never rendered into the agent's prompt: an unknown is a question, not a rule
         self.assertNotIn(unknowns[0]["what"], out["live"]["dict"]["system"])
 
+    def test_every_agent_can_have_its_job_expanded_by_message(self):
+        """The person can grow the job by messaging the agent. That instruction is fixed
+        framing appended by code, after the standing rules, on every agent — and the
+        author prompt is told not to write anything that would contradict it."""
+        for canned in (CANNED, CANNED_V2):
+            sys_text = configgen.assemble_system_text(canned)
+            self.assertIn(config.EXPAND_ON_REQUEST_DIRECTIVE, sys_text)
+            self.assertGreater(sys_text.index(config.EXPAND_ON_REQUEST_DIRECTIVE),
+                               sys_text.index("Always:"))
+        d = config.EXPAND_ON_REQUEST_DIRECTIVE
+        self.assertIn("even if it is not part of the workflow", d)
+        self.assertIn("Also part of my job", d)                  # where it is recorded
+        self.assertIn("current_workflow_status.md", d)           # the one file it writes
+        self.assertIn("scheduled runs", d)                       # part of the job from then on
+        self.assertIn("not connected to", d)                     # the one refusal
+        # the status file is seeded with the section, and the memory contract carries it
+        self.assertIn("## Also part of my job", config.MEMORY_STATUS_SEED)
+        self.assertIn("Also part of my job", config.MEMORY_UPDATE_DIRECTIVE)
+        self.assertIn(config.MEMORY_STATUS_DOC, config.UNWRITABLE_DOCS)   # survives learning
+        from trace.agent.config_prompt import SYSTEM_PROMPT
+        self.assertIn("a starting point, not a boundary", SYSTEM_PROMPT)
+
     def test_platform_name_is_the_bundles_not_the_models(self):
         """The memory store, deployment names and cleanup sweep key on the agent name,
         so it must not change between the draft pass and the build pass even though

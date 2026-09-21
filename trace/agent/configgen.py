@@ -236,8 +236,9 @@ def normalize_content(model_out):
 def assemble_system_text(model_out):
     """Assemble the ``system`` prompt text in a fixed order: role; the apps it works
     in; what it checks before every run (preflight); the numbered steps; its working
-    rules; what done looks like (acceptance criteria); when it stops and asks; then the
-    two standing rules.
+    rules; what done looks like (acceptance criteria); when it stops and asks; the two
+    standing rules; then the expand-on-request directive (the person can grow the job
+    by messaging the agent).
 
     Empty sections are omitted, heading and all, so a workflow with no stop
     conditions does not carry an empty "Stop and ask when:" — a heading with nothing
@@ -259,6 +260,8 @@ def assemble_system_text(model_out):
             lines += [f"- {s['text']}" for s in items]
     lines += ["", "Always:"]
     lines += [f"- {r}" for r in config.STANDING_RULES]
+    # The job grows by being asked — fixed framing on every agent, after the rules.
+    lines += ["", config.EXPAND_ON_REQUEST_DIRECTIVE]
     return "\n".join(lines)
 
 
