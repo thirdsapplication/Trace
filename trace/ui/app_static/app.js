@@ -234,7 +234,7 @@ function renderBootError(err) {
 async function routeSignedIn() {
   const fr = await api("GET", "/api/u/first-run");
   if (!(fr.data && fr.data.terms_accepted_at)) return renderWelcome();
-  if (fr.data.first_run_completed_at) { S.igHome = null; return renderHome(); }
+  if (fr.data.first_run_completed_at) { S.igHome = null; return renderMessages(); }
   return loadAndRender();
 }
 
@@ -570,8 +570,7 @@ function ranWhen(iso) {
   return `ran ${d.toLocaleDateString(undefined, { month: "short", day: "numeric" })}, ${clock}`;
 }
 
-// (named threadStamp, not stamp: drawHome declares a local `const stamp` for its date
-// line, which would shadow this inside that function.)
+// A short relative stamp for a thread row or an agent row.
 function threadStamp(iso) {
   const t = Date.parse(iso || "");
   if (isNaN(t)) return "";
@@ -858,10 +857,10 @@ async function loadHome(force) {
 // shell to reuse, so it writes the whole thing; the shell's opening tags are left open
 // and innerHTML closes them at the end of the fragment, which is defined behaviour.
 const NAV = [
-  // Home paints from cache and revalidates behind it, so this no longer drops the
-  // cache — doing that forced a blocking refetch on every visit to the landing screen.
-  { key: "home", label: "Home", go: () => renderHome() },
+  // Messages first: approvals and questions are answered there now, so it is where a
+  // person goes most. Agents is the plain list — open one for its runs and settings.
   { key: "messages", label: "Messages", go: () => renderMessages() },
+  { key: "agents", label: "Agents", go: () => renderAgents() },
   { key: "groups", label: "Groups", go: () => renderGroups() },
   { key: "sharing", label: "Sharing", go: () => renderSettings() },
   // Settings used to open renderSettings too — two sidebar items, one screen. Sharing
@@ -922,7 +921,7 @@ function busy() {
 function agentsTopbar(unread, backFn, needsYou, active) {
   const ct = (n) => n > 9 ? "9+" : n;
   const initial = (S.user && S.user.email || "?").trim().charAt(0).toUpperCase();
-  const navKey = active || "home";
+  const navKey = active || "agents";
   const items = NAV.map(n => {
     const on = n.key === navKey;
     const badge = (n.key === "messages" && unread)
@@ -1634,17 +1633,20 @@ function agentColor(a) {
 
 // The full agent list, reached from the brief's "See all runs" — the detail behind the
 // headline, rather than the landing screen it used to be.
-async function renderAllRuns() {
+// The Agents screen: every agent, one row each, open one for its session history,
+// rules and settings. It replaced the morning brief ("4 things need you"), which
+// summarised what needed the person from cached rows — and lagged behind what had
+// already been handled in Messages, where approvals and questions now live.
+async function renderAgents() {
   busy();
   const home = await loadHome();
   const agents = home.agents || [];
-  const tb = agentsTopbar(home.unread_total, null, home.needs_you_total, "home");
+  const tb = agentsTopbar(home.unread_total, null, home.needs_you_total, "agents");
   const rows = agents.map(a => {
     const sched = a.schedule || null;
     const bits = [];
-    if (a.open_decisions) bits.push(`${a.open_decisions} awaiting your answer`);
-    if (a.pending_approvals) bits.push(`${a.pending_approvals} to approve`);
-    if (a.fyi_reviews) bits.push(`${a.fyi_reviews} to review`);
+    const waiting = (a.open_decisions || 0) + (a.pending_approvals || 0);
+    if (waiting) bits.push(`${waiting} waiting on you in Messages`);
     if (a.unread) bits.push(`${a.unread} new message${a.unread > 1 ? "s" : ""}`);
     bits.push(sched ? (sched.paused ? "schedule paused" : `runs ${cadenceToValue(sched.cadence) || "on its schedule"}`)
                     : "runs when you say");
@@ -1662,110 +1664,15 @@ async function renderAllRuns() {
       <div class="spread"><h2>Your agents</h2>
         <button id="recAnother" class="btn-secondary btn-sm">Record another workflow</button></div>
       <p class="lead">Every workflow you've automated. Open one to see its runs, rules and lessons.</p>
-      <div class="stack" style="margin-top:14px;">${rows || `<p class="muted">No agents yet.</p>`}</div>
+      <div class="stack" style="margin-top:14px;">${rows || `<p class="muted">No agents yet — record a workflow to build your first.</p>`}</div>
     </div>`);
   tb.wire();
   const ra = $("#recAnother"); if (ra) ra.onclick = recordAnother;
   root.querySelectorAll(".ag-row").forEach(b => b.onclick = () => renderProfile(b.dataset.agent));
 }
-
-// Home is the tab you come back to most, so it paints from the cached brief immediately
-// and refreshes behind it. The refresh only repaints if the brief actually changed AND
-// you are still on the screen it was painted for — SCREEN is bumped by every paint, so a
-// slow response that lands after you've navigated away is dropped instead of clobbering
-// whatever you opened.
-async function renderHome() {
-  const cached = S.igHome;
-  if (!cached) {
-    busy();
-    drawHome(await loadHome());
-    return;
-  }
-  drawHome(cached);
-  const token = SCREEN;
-  const fresh = await loadHome(true);
-  if (SCREEN === token && JSON.stringify(fresh) !== JSON.stringify(cached)) drawHome(fresh);
-}
-
-// Frame 14's footer strip. TWO figures, not the frame's three — "about 2h 10m of busywork
-// handled" has no source, and nothing measures run duration. Hidden entirely in a week
-// with nothing in it, because "0 runs · 0 actions approved" is a worse thing to read
-// under your morning brief than no line at all.
-function weekLine(week) {
-  const runs = (week && week.runs) || 0, ok = (week && week.approved) || 0;
-  if (!runs && !ok) return "";
-  const bits = [`${runs} run${runs === 1 ? "" : "s"}`];
-  if (ok) bits.push(`${ok} action${ok === 1 ? "" : "s"} approved`);
-  return `<div class="wk-line">This week: ${bits.join(" · ")}</div>`;
-}
-
-function drawHome(home) {
-  const agents = home.agents || [];
-  const tb = agentsTopbar(home.unread_total, null, home.needs_you_total, "home");
-  const need = agents.filter(a => a.needs_you > 0)
-    .sort((x, y) => (y.open_decisions - x.open_decisions) || (y.needs_you - x.needs_you));
-  const clean = agents.filter(a => !a.needs_you);
-  const total = home.needs_you_total || 0;
-
-  // The morning brief (14): headline states the situation, the sentence below names the
-  // agents involved in their own colors, and the Overnight strip is the per-agent detail.
-  const now = new Date();
-  const stamp = now.toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" })
-    + " · " + now.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
-  const headline = total
-    ? `${total === 1 ? "One thing needs" : total + " things need"} you.<br>Everything else ran clean.`
-    : "Everything ran clean.<br>Nothing needs you.";
-  const tint = (a) => `<span style="color:${esc(agentColor(a))};font-weight:600;">${esc(a.name)}</span>`;
-  const phrase = (a) => {
-    if (a.open_decisions) return `${tint(a)} hit ${a.open_decisions === 1 ? "a question" : a.open_decisions + " questions"} it can't settle`;
-    if (a.pending_approvals) return `${tint(a)} staged ${a.pending_approvals} ${a.pending_approvals === 1 ? "action" : "actions"} for your sign-off`;
-    return `${tint(a)} has a lesson to confirm`;
-  };
-  const lead = need.length
-    ? need.slice(0, 2).map(phrase).join(", and ") + "."
-      + (clean.length ? ` ${clean.slice(0, 3).map(a => esc(a.name)).join(", ")} finished with nothing to show you.` : "")
-    : "Your agents ran and handled everything themselves.";
-
-  const card = (a) => {
-    const bits = [];
-    if (a.open_decisions) bits.push(`${a.open_decisions} question${a.open_decisions > 1 ? "s" : ""}`);
-    if (a.pending_approvals) bits.push(`${a.pending_approvals} staged`);
-    if (!bits.length) bits.push(a.fyi_reviews ? `${a.fyi_reviews} run${a.fyi_reviews > 1 ? "s" : ""}, clean` : "nothing new");
-    const last = (a.stories || []).slice(-1)[0];
-    return `<button class="ov-card" data-agent="${esc(a.agent_id)}"${a.needs_you ? "" : ' style="opacity:.6;"'}>
-      <span class="row" style="gap:8px;">
-        <span class="ov-dot" style="background:${esc(agentColor(a))};"></span>
-        <span class="ov-name">${esc(a.name)}</span>
-        ${a.needs_you ? `<span class="ov-flag"></span>` : ""}
-      </span>
-      <span class="ov-sub">${esc(bits.join(" · "))}${last && last.ran_at ? " · " + esc(threadStamp(last.ran_at)) : ""}</span>
-    </button>`;
-  };
-
-  tb.paint(`
-    <div class="brief">
-      <div class="brief-stamp">${esc(stamp)}</div>
-      <h1 class="brief-head">${headline}</h1>
-      <p class="brief-lead">${lead}</p>
-      <div class="row" style="gap:10px;">
-        ${total ? `<button id="hmReview" class="btn-primary" style="padding:13px 26px;">Start review · ${total}</button>` : ""}
-        <button id="hmAll" class="btn-secondary" style="padding:13px 22px;">See all runs</button>
-      </div>
-      ${agents.length ? `<div class="ov-wrap">
-        <div class="label">Overnight</div>
-        <div class="ov-row">${need.concat(clean).map(card).join("")}</div>
-      </div>` : `<p class="muted">No agents yet — record a workflow to build your first.</p>`}
-      ${weekLine(home.week)}
-    </div>`);
-  tb.wire();
-  const first = need[0] || agents[0];
-  const rv = $("#hmReview");
-  if (rv && first) rv.onclick = () => renderReview(first.agent_id, 0);
-  $("#hmAll").onclick = renderAllRuns;
-  root.querySelectorAll(".ov-card").forEach(b =>
-    b.onclick = () => renderProfile(b.dataset.agent));
-}
-const renderDashboard = renderHome;                          // legacy entry points
+const renderHome = renderAgents;                             // legacy entry points
+const renderAllRuns = renderAgents;
+const renderDashboard = renderAgents;
 
 /* ---------------- REVIEW (stories): unreviewed sessions, oldest first ------ */
 function renderReview(agentId, startAt) {
@@ -2286,7 +2193,7 @@ async function renderProfile(agentId) {
   const cur = cadenceToValue(sched && sched.cadence);
   const paused = sched && sched.paused;
   const opts = CADENCES.map(c => `<option value="${c.v}" ${c.v === cur ? "selected" : ""}>${c.label}</option>`).join("");
-  const tb = agentsTopbar(home.unread_total, null, home.needs_you_total, "home");
+  const tb = agentsTopbar(home.unread_total, null, home.needs_you_total, "agents");
   tb.paint(`
     <div class="panel">
       <div class="row" style="gap:16px;align-items:center;">
