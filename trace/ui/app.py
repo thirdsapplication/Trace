@@ -2109,6 +2109,18 @@ class AppState:
                                     # it went live.
                                     "status": rec.get("status"),
                                     "deployed_at": rec.get("deployed_at")})
+                                # The schedule row is what the profile reads and edits
+                                # and what the scheduler keys on; the platform deployment
+                                # was created on the matching cron above. Keep the two in
+                                # step from the first run, not from the first edit.
+                                try:
+                                    if (start or {}).get("cadence"):
+                                        registry.schedule_set(root, rec["agent_id"], owner,
+                                                              start["cadence"], paused=False)
+                                    else:
+                                        registry.schedule_clear(root, rec["agent_id"])
+                                except Exception:          # noqa: BLE001 — never fail a deploy
+                                    pass
                                 if dropped:
                                     # The agent IS registered — agent_upsert dropped
                                     # what the database would not take rather than
@@ -4154,7 +4166,10 @@ def make_handler(state):
             if not agent:
                 return self._json(404, {"error": "not_found"})
             if action == "schedule":
-                cadence = (body or {}).get("cadence")
+                try:                                      # daily, weekly, or null (manual)
+                    cadence = agent_config.valid_cadence((body or {}).get("cadence"))
+                except ValueError as e:
+                    return self._json(400, {"error": "bad_cadence", "detail": str(e)})
                 if cadence is None:                       # null cadence = turn scheduling off
                     registry.schedule_clear(root, agent_id)
                 else:
@@ -5823,8 +5838,22 @@ def make_handler(state):
             approval = b.get("approval_required")
             if approval is None:
                 approval = bool([x for x in (b.get("staged_apps") or []) if x])
-            start = {"trigger": b.get("trigger"), "schedule": b.get("schedule"),
-                     "approval_required": bool(approval)}
+            # The schedule the agent starts on. An explicit ``cadence`` in the body wins
+            # (null meaning manual); otherwise the default follows the approval setting —
+            # daily for an agent that stages its actions, manual for one that acts on
+            # its own. The cron expression the platform deployment needs is derived from
+            # it, and the cadence itself is what the profile shows and edits.
+            if "cadence" in b:
+                try:
+                    cadence = agent_config.valid_cadence(b.get("cadence"))
+                except ValueError as e:
+                    return self._json(400, {"error": "bad_cadence", "detail": str(e)})
+            else:
+                cadence = agent_config.default_cadence(bool(approval))
+            cron = agent_config.cadence_to_cron(cadence) if cadence else None
+            start = {"trigger": b.get("trigger"),
+                     "schedule": b.get("schedule") or (cron["expression"] if cron else None),
+                     "cadence": cadence, "approval_required": bool(approval)}
             with state.lock:
                 existing = state.deploy_jobs.get(sid)
                 if existing and existing.get("state") == "running":

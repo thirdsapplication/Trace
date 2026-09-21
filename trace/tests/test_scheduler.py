@@ -612,6 +612,24 @@ def _dep_agent(agent_id="agent-d1", deployment_id="dep_live", store="mem_live",
             "deployments": deployments or {}}
 
 
+class CadenceChoicesTest(unittest.TestCase):
+    """What a person can choose (daily, weekly, or manual) and what an agent starts on."""
+
+    def test_valid_cadence_normalises_and_refuses_legacy_kinds(self):
+        self.assertIsNone(agent_config.valid_cadence(None))
+        self.assertEqual(agent_config.valid_cadence({"kind": "daily", "time": "9:00"}),
+                         {"kind": "daily", "time": "09:00"})
+        self.assertEqual(agent_config.valid_cadence({"kind": "weekly", "weekday": "8", "time": "junk"}),
+                         {"kind": "weekly", "weekday": 1, "time": "09:00"})
+        for bad in ({"kind": "hourly"}, {"kind": "interval", "minutes": 15}, {"kind": "x"}, "daily"):
+            with self.assertRaises(ValueError):
+                agent_config.valid_cadence(bad)
+
+    def test_default_follows_the_approval_setting(self):
+        self.assertEqual(agent_config.default_cadence(True), {"kind": "daily", "time": "09:00"})
+        self.assertIsNone(agent_config.default_cadence(False))
+
+
 class CadenceToCronTest(unittest.TestCase):
     def test_daily_and_weekly_honor_stored_time(self):
         self.assertEqual(agent_config.cadence_to_cron({"kind": "daily", "time": "09:00"}),

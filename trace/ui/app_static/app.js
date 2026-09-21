@@ -3879,9 +3879,20 @@ async function renderGolive(sid) {
     let toDeploy = [];
     try { toDeploy = ((await uget(sid, "/deploy-bundles")).data || {}).bundles || []; }
     catch (e) { /* the generic tile below still stands in */ }
+    // The schedule as a sentence. A deployed agent carries its cron; before deploy the
+    // line shows the default the go-live will apply — every day for an agent that
+    // stages its actions (the checkbox above, on by default), manual otherwise.
+    const cronLabel = (v) => {
+      const m = /^(\d+) (\d+) \* \* (\*|\d)$/.exec(String(v || ""));
+      if (!m) return v ? `Runs ${esc(v)}` : "Runs when you say so";
+      const h = +m[2], t = `${(h % 12) || 12}${m[1] === "0" ? "" : ":" + m[1]}${h < 12 ? "am" : "pm"}`;
+      return m[3] === "*" ? `Runs every day at ${t}` : `Runs weekly at ${t}`;
+    };
     const startLine = (b) => {
-      const v = (b.start || {}).value || "";
-      const sched = v ? `Runs ${esc(v)}` : "Runs when you say so";
+      const st = b.start || null;
+      const sched = st
+        ? (st.mode === "deployment-schedule" ? cronLabel(st.value) : "Runs when you say so")
+        : (staging.length ? "Runs every day at 9am" : "Runs when you say so");
       return staging.length ? `${sched} · outbound staged for you` : sched;
     };
     const meetCard = (b, i) => `<div class="card" style="text-align:left;display:flex;gap:14px;align-items:center;">

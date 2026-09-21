@@ -7,6 +7,7 @@ harvestable for deletion; runs unchanged on both fixtures.
 """
 
 import json
+import os
 import threading
 import time
 import unittest
@@ -16,7 +17,7 @@ from trace.agent import config, configgen, deploy
 from trace.tests.test_configgen import _bundle, _load, _stub as _config_stub
 from trace.tests.test_ui_agent import EVENTS, REVIEWED, FakeKeystore, fake_config_fn
 from trace.tests.test_connect import StubConnectClient
-from trace.ui import app, sessions
+from trace.ui import app, registry, sessions
 
 CONNECTION = {"external_user_id": "trace-s1", "vault_ref": "vlt-s1",
               "apps": {"gmail": {"usable": True, "binding_ref": "bind-gmail"}}}
@@ -601,6 +602,59 @@ class UIDeployTest(unittest.TestCase):
         self.req("POST", f"/api/sessions/{self.sid}/connection-identity", {"email": "worker@acme.com"})
         self.req("POST", f"/api/sessions/{self.sid}/connect/gmail/callback", {})
         self._await("connect")
+
+    def test_a_staged_agent_starts_on_a_daily_schedule(self):
+        """Default schedule follows the approval setting: an agent that stages its
+        actions runs every day at 9, the deployment is created on that cron, and the
+        schedule row the profile edits says the same thing from the first run."""
+        self._full_chain()
+        sessions.update_meta(self.root, self.sid, owner_user_id="usr_1")   # an owned session
+        code, _ = self.req("POST", f"/api/sessions/{self.sid}/deploy",
+                           {"trigger": "on inbound", "approval_required": True})
+        self.assertEqual(code, 202)
+        self.assertEqual(self._await("deploy")["state"], "done")
+        rec = sessions._read_json(os.path.join(
+            sessions.path(self.root, self.sid, sessions.SPECS_DIR), sessions.deploy_record_name("B1")))
+        # the fake deploy records the cron it was handed as the start value
+        self.assertEqual(rec["start"], {"mode": "schedule", "value": "0 9 * * *"})
+        sched = registry.schedule_get(self.root, rec["agent_id"])
+        self.assertEqual(sched["cadence"], {"kind": "daily", "time": "09:00"})
+        self.assertFalse(sched["paused"])
+
+    def test_an_autonomous_agent_starts_manual(self):
+        self._full_chain()
+        sessions.update_meta(self.root, self.sid, owner_user_id="usr_1")
+        self.req("POST", f"/api/sessions/{self.sid}/deploy",
+                 {"trigger": "on inbound", "approval_required": False})
+        self.assertEqual(self._await("deploy")["state"], "done")
+        rec = sessions._read_json(os.path.join(
+            sessions.path(self.root, self.sid, sessions.SPECS_DIR), sessions.deploy_record_name("B1")))
+        self.assertEqual(rec["start"], {"mode": "trigger", "value": "on inbound"})   # no cron
+        self.assertIsNone(registry.schedule_get(self.root, rec["agent_id"]))
+
+    def test_an_explicit_cadence_at_go_live_wins_and_junk_is_refused(self):
+        self._full_chain()
+        sessions.update_meta(self.root, self.sid, owner_user_id="usr_1")
+        code, body = self.req("POST", f"/api/sessions/{self.sid}/deploy",
+                              {"approval_required": True, "cadence": {"kind": "hourly"}})
+        self.assertEqual((code, body["error"]), (400, "bad_cadence"))
+        self.req("POST", f"/api/sessions/{self.sid}/deploy",
+                 {"approval_required": True,
+                  "cadence": {"kind": "weekly", "weekday": 4, "time": "7:30"}})
+        self.assertEqual(self._await("deploy")["state"], "done")
+        rec = sessions._read_json(os.path.join(
+            sessions.path(self.root, self.sid, sessions.SPECS_DIR), sessions.deploy_record_name("B1")))
+        self.assertEqual(rec["start"]["value"], "30 7 * * 5")
+        self.assertEqual(registry.schedule_get(self.root, rec["agent_id"])["cadence"],
+                         {"kind": "weekly", "weekday": 4, "time": "07:30"})
+        # and a staged agent explicitly set to manual stays manual
+        self.req("POST", f"/api/sessions/{self.sid}/deploy",
+                 {"approval_required": True, "cadence": None})
+        self.assertEqual(self._await("deploy")["state"], "done")
+        rec = sessions._read_json(os.path.join(
+            sessions.path(self.root, self.sid, sessions.SPECS_DIR), sessions.deploy_record_name("B1")))
+        self.assertEqual(rec["start"]["mode"], "trigger")
+        self.assertIsNone(registry.schedule_get(self.root, rec["agent_id"]))
 
     def test_not_eligible_until_config_and_connection(self):
         code, data = self.req("POST", f"/api/sessions/{self.sid}/deploy", {})

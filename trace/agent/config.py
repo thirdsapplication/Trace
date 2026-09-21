@@ -802,6 +802,43 @@ GROUP_DIRECT_DIRECTIVE = (
 TRACE_SCHEDULE_TZ = (os.environ.get("TRACE_SCHEDULE_TZ") or "").strip() or "America/New_York"
 
 
+# The cadences a person can choose: daily or weekly, or none (manual, "when you say
+# so"). ``hourly`` and ``interval`` are legacy — still honoured by the scheduler for a
+# row that already has one, never offered or accepted again.
+CADENCE_KINDS = ("daily", "weekly")
+DEFAULT_CADENCE_TIME = "09:00"
+
+
+def valid_cadence(cadence):
+    """A cadence dict normalised to what the product offers, or None when the input is
+    None (manual). Raises ValueError for anything else — an unknown kind, a malformed
+    time or weekday — so the endpoint can say so instead of storing junk."""
+    if cadence is None:
+        return None
+    if not isinstance(cadence, dict) or cadence.get("kind") not in CADENCE_KINDS:
+        raise ValueError("cadence must be null, or {kind: daily|weekly, time, weekday?}")
+    hh, mm = _cadence_time(cadence)
+    out = {"kind": cadence["kind"], "time": f"{hh:02d}:{mm:02d}"}
+    if cadence["kind"] == "weekly":
+        try:
+            out["weekday"] = int(cadence.get("weekday", 0)) % 7
+        except (TypeError, ValueError):
+            out["weekday"] = 0
+    return out
+
+
+def default_cadence(approval_required):
+    """The schedule an agent starts on when the person chose none at go-live.
+
+    An agent that stages its actions for approval runs every day: it cannot do harm on
+    its own, and a daily run is what keeps the approvals flowing. An agent that acts
+    autonomously starts MANUAL — it runs when the person says so — because the first
+    time it acts unattended should be a choice they make, not a default they missed.
+    """
+    return ({"kind": "daily", "time": DEFAULT_CADENCE_TIME}
+            if approval_required else None)
+
+
 def _cadence_time(cadence):
     """(hh, mm) from a cadence dict's "time", tolerant like runner.schedule_due."""
     try:
