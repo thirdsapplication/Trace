@@ -10,8 +10,10 @@ The desktop app is a thin **Tauri** shell that:
 No secrets ship in the app. Your cloud (Phase 1, Render) holds the Anthropic +
 Pipedream credentials and runs the pipeline. The user just signs in.
 
-> This build is **unsigned** (Apple signing/notarization is deferred). Users do a
-> one-time Gatekeeper override and grant macOS capture permissions once.
+> Release builds are **signed with a Developer ID and notarized**. Users grant the
+> macOS capture permissions once. Staple the notarization ticket before making the
+> DMG (see "Sign, notarize, staple" below). Do NOT ad-hoc re-sign a notarized
+> bundle — that replaces the Developer ID signature and breaks notarization.
 
 ---
 
@@ -70,14 +72,13 @@ hanging), launch with `TRACE_STARTUP_DELAY_S=30`.
 
 ---
 
-## Installing the unsigned build (what the user/co-founder does)
-1. Open the `.dmg`, drag **Trace.app** to **Applications**.
-2. First launch: double-click it, dismiss the "cannot be opened" dialog, then open
-   System Settings → Privacy & Security, scroll to the bottom and click **Open
-   Anyway** (macOS asks for your password or Touch ID). **Right-click → Open no
-   longer bypasses Gatekeeper on macOS 15.1 and later.** If macOS says the app "is
-   damaged", the quarantine flag is the cause; clear it and try again:
-   `xattr -cr /Applications/Trace.app`
+## Installing (what the user/co-founder does)
+1. Open the `.dmg`, drag the app to **Applications**.
+2. First launch: double-click. A signed, notarized, stapled build opens without a
+   Gatekeeper dialog. If macOS says the app "cannot be opened" or "is damaged", the
+   build was not stapled or the signature was altered after notarization — check it
+   with `spctl -a -vv /Applications/Trace.app` (must say `source=Notarized Developer
+   ID`) rather than telling testers to bypass Gatekeeper.
 3. Grant capture permissions when prompted (or proactively in System Settings →
    Privacy & Security). The pane names depend on the macOS release:
    - **Accessibility** → enable **Trace** (focused element, clicked control, window
@@ -118,37 +119,44 @@ Tauri shell ──spawns──▶ trace-node sidecar (127.0.0.1:<port>, desktop 
                              └─ on capture Stop: POST raw_events.jsonl ─▶ cloud (new session)
 ```
 
-## Re-sign after every build (REQUIRED on macOS)
+## Sign, notarize, staple (release builds)
 
-`cargo tauri build` emits a bundle whose signature claims sealed resources while
-sealing none:
-
-    /Applications/Trace.app: code has no resources but signature indicates they must be present
-
-macOS silently refuses to honour ANY permission grant for an app whose signature
-does not verify. The symptom is brutal to debug: System Settings shows Trace
-ticked under Accessibility, and the app still reports `granted: false` forever.
-Diagnosed 2026-08-19 after several wasted capture sessions.
-
-Run these after every build, before installing:
+Sign with the Developer ID certificate (Tauri does this when `signingIdentity` is
+set in `tauri.conf.json` or `APPLE_SIGNING_IDENTITY` is exported), submit for
+notarization, then **staple the ticket into the bundle before building the DMG**:
 
 ```bash
 BUNDLE=src-tauri/target/release/bundle/macos/Trace.app
-xattr -cr "$BUNDLE"                       # extended attributes block signing
-codesign --force --deep --sign - "$BUNDLE"
-codesign --verify --deep --strict "$BUNDLE"   # must say "valid on disk"
+xcrun stapler staple "$BUNDLE"
+xcrun stapler validate "$BUNDLE"        # must say: The validate action worked
+spctl -a -vv "$BUNDLE"                  # must say: source=Notarized Developer ID
 ```
 
-`xattr -cr` is not optional — without it codesign fails with "resource fork,
-Finder information, or similar detritus not allowed".
+Without stapling, every launch asks Apple's servers to verify the ticket; on a
+flaky or locked-down network the tester gets a hard "damaged / cannot be opened"
+failure with no bypass.
 
-Re-signing changes the code hash, so every existing TCC entry goes stale: remove
-Trace from Accessibility / Screen Recording / Input Monitoring with the minus
-button, re-add it, and relaunch. Verify with:
+### Why permission grants went stale (history, and the one-time migration)
+
+Earlier builds were ad-hoc signed (`codesign --sign -`). macOS keys every
+permission row on bundle id **plus** code signature, so each rebuild changed the
+signature and orphaned the row: System Settings showed Trace ticked under
+Accessibility while the app reported `granted: false` forever. Diagnosed
+2026-08-19 after several wasted capture sessions.
+
+A Developer ID signature is stable across builds, so this stops recurring. Testers
+who had an ad-hoc build still carry a dead row under the same bundle id. Either
+change the `identifier` in `tauri.conf.json` (clean slate for everyone; note it also
+moves the app data folder under `~/Library/Application Support/`, orphaning locally
+stored sessions — cloud sessions are unaffected) or have them run once:
+
+```bash
+tccutil reset Accessibility com.trace.desktop
+```
+
+then relaunch and grant fresh. Verify what macOS is actually honouring with:
 
 ```bash
 grep "reported port" ~/Library/Application\ Support/com.trace.desktop/logs/trace-node.log
 curl -s http://127.0.0.1:<port>/api/permissions | python -m json.tool
 ```
-
-A Developer ID signature removes this whole dance permanently and is the real fix.
