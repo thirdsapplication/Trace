@@ -72,13 +72,26 @@ hanging), launch with `TRACE_STARTUP_DELAY_S=30`.
 
 ## Installing the unsigned build (what the user/co-founder does)
 1. Open the `.dmg`, drag **Trace.app** to **Applications**.
-2. First launch: **right-click → Open** (or System Settings → Privacy & Security →
-   **Open Anyway**) to clear the one-time Gatekeeper quarantine.
+2. First launch: double-click it, dismiss the "cannot be opened" dialog, then open
+   System Settings → Privacy & Security, scroll to the bottom and click **Open
+   Anyway** (macOS asks for your password or Touch ID). **Right-click → Open no
+   longer bypasses Gatekeeper on macOS 15.1 and later.** If macOS says the app "is
+   damaged", the quarantine flag is the cause; clear it and try again:
+   `xattr -cr /Applications/Trace.app`
 3. Grant capture permissions when prompted (or proactively in System Settings →
-   Privacy & Security):
-   - **Input Monitoring** → enable **Trace** (keystroke capture, `pynput`)
-   - **Accessibility** → enable **Trace** (active-window titles, `osascript`)
+   Privacy & Security). The pane names depend on the macOS release:
+   - **Accessibility** → enable **Trace** (focused element, clicked control, window
+     title). **On macOS 27 this pane is called "Device Control and Data Access"** and
+     is no longer under Privacy & Security — search System Settings for it. This is
+     the one that matters most; the app's Record screen can trigger the prompt.
+   - **Input Monitoring** → enable **Trace** (keystrokes and clicks, `pynput`). macOS
+     never prompts for this one; add it by hand, then quit and relaunch.
+   - **Screen Recording** (called **Screen & System Audio Recording** on macOS 26 and
+     later) → optional; window titles come from Accessibility when it is off. Fully
+     quit and relaunch after granting it.
    The grants attach to `Trace.app`; the sidecar inherits them as a child process.
+   The app reports what macOS is actually honouring at `/api/permissions` (see the
+   verify commands at the end of this file) — trust that over the ticked switches.
 4. Load the **Chrome extension** (browser-DOM half of capture): `chrome://extensions`
    → enable **Developer mode** → **Load unpacked** → select `trace/extension/`.
 5. **Sign in** (cloud account), **Record** a short bit of work, then run the
