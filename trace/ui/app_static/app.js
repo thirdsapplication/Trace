@@ -324,15 +324,11 @@ function renderTerms() {
       <button id="frAccept" class="btn-primary full" disabled>Agree &amp; continue</button>
     </div>`;
   $("#frAgree").onchange = (e) => { $("#frAccept").disabled = !e.target.checked; };
-  // Frame 05 makes these links. They were flat grey text, which meant asking someone to
-  // agree to documents they could not open — on the one screen where that matters, since
-  // the thing being agreed to is recording their work.
-  //
-  // No formal documents exist in this repo yet. Rather than a dead link or invented legal
-  // prose, each opens what the product ACTUALLY does — enforced in code, and checkable —
-  // and says plainly that the formal document is still to be published.
-  $("#frTerms").onclick = (e) => { e.preventDefault(); showPolicy("terms"); };
-  $("#frPriv").onclick = (e) => { e.preventDefault(); showPolicy("privacy"); };
+  // Frame 05 makes these links. One Google Doc holds the terms of service and the
+  // privacy policy together, so both open it — in the user's browser, since the desktop
+  // webview blocks external navigation (see openExternal).
+  $("#frTerms").onclick = (e) => { e.preventDefault(); openExternal(TERMS_URL); };
+  $("#frPriv").onclick = (e) => { e.preventDefault(); openExternal(TERMS_URL); };
   $("#frAccept").onclick = async () => {
     $("#frAccept").disabled = true;
     await api("POST", "/api/u/first-run/terms", {});
@@ -341,45 +337,8 @@ function renderTerms() {
   };
 }
 
-// What the product commits to, stated as behaviour rather than as law. Every line here
-// is enforced somewhere in the code and can be checked; none of it is drafted legal
-// prose, because inventing that would be worse than admitting it isn't written yet.
-const POLICY = {
-  terms: ["Terms of service", [
-    ["What palza does", "Records a workday you start, finds the work that repeats, and builds an agent for each. You decide which workflows become agents and you can delete any of them."],
-    ["Nothing outbound without you", "Every email, sheet edit and upload an agent proposes is staged and shown to you in full before it happens. That gate cannot be turned off for outbound actions."],
-    ["Your agents are yours", "You can pause, rename, recolour or delete any agent at any time, and revoke an app's access from Settings."],
-  ]],
-  privacy: ["Privacy policy", [
-    ["Recording is opt-in and visible", "Capture only runs during a session you start, with a live indicator, and you can pause or stop it at any moment."],
-    ["What is captured", "Window titles, the text you type, and the labels and values of the controls you use — the buttons, fields and dropdowns you actually touch. Still no screenshots and no images of your screen: palza reads these as text, the same way a screen reader does. Password fields are never read, and sensitive text is removed before anything is saved."],
-    ["What it is used for", "Building and improving your own agents. Delete every recording at any time from Settings → Privacy & data."],
-    ["Sharing is yours to set", "Lessons your agents learn can be shared with your team or turned off entirely, in Sharing. Lessons carry the rule, never the email, data or recording it came from."],
-  ]],
-};
-
-function showPolicy(kind) {
-  const [title, sections] = POLICY[kind] || POLICY.terms;
-  const el = document.createElement("div");
-  el.className = "pop-back";
-  el.innerHTML = `<div class="pop" role="dialog" aria-modal="true" aria-label="${esc(title)}">
-      <div class="row"><div class="pop-title">${esc(title)}</div>
-        <button class="pop-x" aria-label="Close">✕</button></div>
-      <div class="pol-body">${sections.map(([h, b]) =>
-        `<div class="pol-sec"><div class="pol-h">${esc(h)}</div>
-          <div class="pol-p">${esc(b)}</div></div>`).join("")}</div>
-      <p class="pop-note">This describes how palza behaves today, and each point is
-        enforced in the product. The full legal document is not published yet — ask us
-        before relying on it for anything contractual.</p>
-      <div class="cf-acts"><button class="btn-primary" id="polOk">Close</button></div>
-    </div>`;
-  document.body.appendChild(el);
-  const close = () => el.remove();
-  el.onclick = (e) => { if (e.target === el) close(); };
-  el.querySelector(".pop-x").onclick = close;
-  el.querySelector("#polOk").onclick = close;
-  el.querySelector("#polOk").focus();
-}
+// The published terms of service, which also cover privacy.
+const TERMS_URL = "https://docs.google.com/document/d/1NstVm02vuDPN56xpEYCm0iwCceMY8Hh2nC71PrQvgMs/edit?tab=t.0";
 
 /* ---------------- auth ---------------- */
 function renderAuth(mode) {
