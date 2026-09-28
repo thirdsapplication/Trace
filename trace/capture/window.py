@@ -15,6 +15,8 @@ segment is attributed to the window it was typed in, then (2) emit the window
 event, then (3) point the coalescer at the new window.
 """
 
+import sys
+
 from .raw_writer import now_iso
 
 
@@ -138,3 +140,11 @@ def window_loop(stop, writer, coalescer, interval=0.5, title_fallback=None):
             coalescer.set_window(title)
             last = cur
         stop.wait(interval)
+
+
+# Windows reads the same two facts from the window manager instead of Quartz; the
+# poll loop above is shared. Rebinding here means everything that imports these
+# names from this module — window_loop, ax.AXAdapter, permissions — gets the right
+# one without a platform check of its own.
+if sys.platform == "win32":
+    from .win_window import frontmost, frontmost_pid  # noqa: E402,F811

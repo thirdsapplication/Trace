@@ -2895,7 +2895,7 @@ function renderRecBody(mode, started, wasPaused) {
     <div class="rec-mid">
       <h1 class="rec-head">Record your day</h1>
       <p class="rec-copy">Palza watches how you work for a while and learns your routines.
-        On your Mac · no screenshots · reads the fields and buttons you use ·
+        On your computer · no screenshots · reads the fields and buttons you use ·
         sensitive text removed before saving.</p>
       <div id="permStrip"></div>
       <p id="recMsg" class="msg err"></p>
@@ -3906,7 +3906,7 @@ function captureStopError(data) {
   if (e === "upload_failed")
     return `Recorded ${(data && data.raw_event_count) || 0} events, but they could not be `
          + "uploaded to palza. Check your connection and try again — the recording is "
-         + "still on this Mac.";
+         + "still on this computer.";
   return friendly(e || "the recording could not be saved");
 }
 

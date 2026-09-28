@@ -69,7 +69,12 @@ class KeystrokeCoalescer:
             # A character typed while cmd/ctrl/alt is held is a shortcut (Cmd+C,
             # Cmd+V, Cmd+Tab), not text the worker entered. Drop it rather than
             # letting it pollute the segment.
-            if self._mods and not key_repr.startswith("Key."):
+            #
+            # Except under AltGr. On European keyboards AltGr is how @, €, { and \
+            # are typed, and Windows reports it as Ctrl+Alt — so without this an
+            # email address typed on a German or French layout loses its @.
+            if (self._mods and not key_repr.startswith("Key.")
+                    and "Key.alt_gr" not in self._mods):
                 return
             if not self._buf:
                 self._seg_start_ts = ts

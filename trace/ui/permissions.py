@@ -1,4 +1,7 @@
-"""macOS permission + browser-capture status checks (handoff §4.1).
+"""Capture permission + browser-capture status checks (handoff §4.1).
+
+macOS needs three grants, described below. Windows needs none of them; the checks
+report that plainly rather than "can't detect", so nothing on Windows nags.
 
 Capture uses three macOS permissions, and which of them matter changed when
 Accessibility capture landed:
@@ -40,6 +43,21 @@ def _is_macos():
     return sys.platform == "darwin"
 
 
+def _is_windows():
+    return sys.platform == "win32"
+
+
+# Windows has no counterpart to these three grants: UI Automation, keyboard/mouse
+# hooks and window titles are open to any ordinary process. The one real limit is
+# that a normal process cannot read an app running as Administrator.
+WINDOWS_NOTE = ("Windows does not require this permission. Apps you run as "
+                "Administrator can't be read, so run them normally while recording.")
+
+
+def _windows_check(name):
+    return {"name": name, "granted": True, "detail": WINDOWS_NOTE, "fix": None}
+
+
 # The pane names moved with the OS: macOS 27 renamed Accessibility to "Device Control
 # and Data Access" and took it out of Privacy & Security; Tahoe (26) renamed Screen
 # Recording to "Screen & System Audio Recording". The fix-it text names both so a
@@ -77,6 +95,8 @@ def request_accessibility():
     False forever, which is why the permission has sat unrequested. Safe to call
     repeatedly — macOS shows the dialog at most once per process.
     """
+    if _is_windows():
+        return True
     if not _is_macos():
         return False
     try:
@@ -92,9 +112,16 @@ def check_accessibility():
     """Accessibility (element labels/values, click targets, window titles). Uses
     AXIsProcessTrusted via pyobjc when available; otherwise falls back to probing
     the active-window poller."""
+    if _is_windows():
+        from ..capture.uia import UIAAdapter
+        if UIAAdapter().available():
+            return _windows_check("Accessibility")
+        return {"name": "Accessibility", "granted": None,
+                "detail": "UI Automation could not be reached on this machine.",
+                "fix": None}
     if not _is_macos():
         return {"name": "Accessibility", "granted": None,
-                "detail": "Not macOS — capture is macOS-only.", "fix": ACCESSIBILITY_FIX}
+                "detail": "Capture runs on macOS and Windows.", "fix": ACCESSIBILITY_FIX}
     try:
         from ApplicationServices import AXIsProcessTrusted
         granted = bool(AXIsProcessTrusted())
@@ -117,9 +144,11 @@ def check_accessibility():
 def check_input_monitoring():
     """Input Monitoring (keystrokes). Uses IOHIDCheckAccess via pyobjc/Quartz when
     available (0 = granted, 1 = denied, 2 = unknown); otherwise not auto-detectable."""
+    if _is_windows():
+        return _windows_check("Input Monitoring")
     if not _is_macos():
         return {"name": "Input Monitoring", "granted": None,
-                "detail": "Not macOS — capture is macOS-only.", "fix": INPUT_MONITORING_FIX}
+                "detail": "Capture runs on macOS and Windows.", "fix": INPUT_MONITORING_FIX}
     try:
         from Quartz import IOHIDCheckAccess, kIOHIDRequestTypeListenEvent
         rc = IOHIDCheckAccess(kIOHIDRequestTypeListenEvent)
@@ -140,9 +169,11 @@ def check_input_monitoring():
 def check_screen_recording():
     """Screen Recording (window titles via kCGWindowName). Uses the preflight call so
     this never triggers the system prompt as a side effect of a status check."""
+    if _is_windows():
+        return _windows_check("Screen Recording")
     if not _is_macos():
         return {"name": "Screen Recording", "granted": None,
-                "detail": "Not macOS — capture is macOS-only.", "fix": SCREEN_RECORDING_FIX}
+                "detail": "Capture runs on macOS and Windows.", "fix": SCREEN_RECORDING_FIX}
     try:
         from Quartz import CGPreflightScreenCaptureAccess
         granted = bool(CGPreflightScreenCaptureAccess())

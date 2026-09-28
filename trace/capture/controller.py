@@ -8,7 +8,7 @@ collector — so a front end can drive the real engine unchanged. No capture log
 lives here; this is composition + lifecycle only.
 
 ``pynput`` is imported lazily inside ``start()`` so this module (and the UI
-backend that imports it) loads on any platform; capture itself is macOS-only.
+backend that imports it) loads on any platform; capture itself runs on macOS and Windows.
 """
 
 import threading
@@ -101,7 +101,12 @@ class CaptureController:
             if self._running:
                 raise RuntimeError("capture already running")
 
-            from pynput import keyboard  # lazy: macOS-only dependency
+            # Windows: must precede the first mouse hook, or clicks on a scaled
+            # display resolve against the wrong coordinates. No-op elsewhere.
+            from .uia import make_dpi_aware
+            make_dpi_aware()
+
+            from pynput import keyboard  # lazy: capture-only dependency
 
             self._writer = RawWriter(self.out_path, reset=True)
             self._coalescer = KeystrokeCoalescer(self._writer)
@@ -168,7 +173,7 @@ class CaptureController:
             return None
         try:
             from . import ax as ax_mod
-            adapter = self._ax or ax_mod.AXAdapter()
+            adapter = self._ax or ax_mod.default_adapter()
             if not adapter.available():
                 return None
             self._ax = adapter

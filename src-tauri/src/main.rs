@@ -167,8 +167,16 @@ fn spawn_node(
     portfile: &Path,
     log: &StartupLog,
 ) -> std::io::Result<Child> {
-    Command::new(node_exe)
-        .env("HOST", "127.0.0.1")
+    let mut cmd = Command::new(node_exe);
+    // Windows: the node is a console program (its stdout is the log), so without
+    // this every launch would open a black terminal window beside the app.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd.env("HOST", "127.0.0.1")
         .env("PORT", "0") // the node binds :0 itself and reports via the portfile
         .env("TRACE_PORTFILE", portfile)
         .env("TRACE_CLOUD_BACKEND", cloud)
@@ -376,8 +384,10 @@ fn main() {
 
             // Resolve the trace-node executable inside the bundled resources.
             // In a .app bundle: Contents/Resources/binaries/trace-node/trace-node
+            // In the Windows install dir: binaries\trace-node\trace-node.exe
+            let exe_name = if cfg!(windows) { "trace-node.exe" } else { "trace-node" };
             let node_exe = match app.path().resource_dir() {
-                Ok(d) => d.join("binaries").join("trace-node").join("trace-node"),
+                Ok(d) => d.join("binaries").join("trace-node").join(exe_name),
                 Err(e) => {
                     // The window exists; report on the splash instead of panicking.
                     splash_fatal(&handle, &log,

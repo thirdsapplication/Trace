@@ -14,9 +14,12 @@
 # Managed Agents surface lives here too, so the migration needs its own testing pass.
 anthropic>=0.40.0,<1.0
 
-# Local capture (Engine 1a, macOS only). Not needed to run reconstruction or
-# the test suite; install on the capture machine.
-pynput>=1.7.6 ; sys_platform == "darwin"
+# Local capture (Engine 1a, macOS and Windows). Not needed to run reconstruction
+# or the test suite; install on the capture machine.
+pynput>=1.7.6 ; sys_platform == "darwin" or sys_platform == "win32"
+# Windows capture reads the focused control and the clicked element through UI
+# Automation (trace/capture/uia.py), a COM API; comtypes is the bridge.
+comtypes>=1.4 ; sys_platform == "win32"
 
 # The macOS capture spine has depended on these since window capture moved to
 # CGWindowList, and Accessibility capture (trace/capture/ax.py) needs

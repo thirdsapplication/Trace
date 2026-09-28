@@ -58,6 +58,8 @@ def main():
                     help="disable Accessibility capture of native-app elements")
     args = ap.parse_args()
 
+    from .uia import make_dpi_aware
+    make_dpi_aware()           # Windows: before any mouse hook; no-op elsewhere
     writer = RawWriter(args.out, reset=not args.append)
     coalescer = KeystrokeCoalescer(writer)
     stop = threading.Event()
@@ -66,7 +68,7 @@ def main():
     # reader. Silently absent when the permission is missing.
     adapter = None
     if not args.no_accessibility:
-        adapter = ax.AXAdapter()
+        adapter = ax.default_adapter()
         if adapter.available():
             threading.Thread(target=ax.ax_loop, args=(stop, writer, adapter),
                              daemon=True).start()

@@ -1,4 +1,4 @@
-# Trace Desktop App (macOS) — Build & Run
+# Trace Desktop App (macOS and Windows) — Build & Run
 
 The desktop app is a thin **Tauri** shell that:
 - launches the bundled **Python capture node** (`trace-node`, a frozen build of
@@ -99,6 +99,42 @@ hanging), launch with `TRACE_STARTUP_DELAY_S=30`.
    pipeline — capture uploads to the cloud on Stop and reconstruct/discover run there.
 
 ---
+
+## Windows
+
+Same app, same code: a separate installer built from this repo. The cloud side —
+workflow finding, agents, approvals — is identical; only capture and packaging
+differ.
+
+**Build:** GitHub Actions does it (`.github/workflows/windows-build.yml`, on every
+push to `windows-port` or by hand from the Actions tab → *windows-build* → *Run
+workflow*). The run's **trace-windows-installer** artifact is the installer,
+`Trace_<version>_x64-setup.exe`. On a Windows PC by hand it is the Mac steps with
+Windows paths: `pyinstaller desktop/trace-node.spec`, copy `dist/trace-node` to
+`src-tauri/binaries/trace-node`, then `cargo tauri build`. `tauri.windows.conf.json`
+is layered over `tauri.conf.json` automatically and switches the output to an NSIS
+installer.
+
+**What the run checks:** the capture tests; a live recording against Notepad through
+the real `CaptureController` (`desktop/windows_smoke.py` — also runnable by hand on
+any Windows PC); and that the *packaged* node still reaches UI Automation, which is
+the failure packaging would otherwise hide.
+
+**How capture differs:**
+- UI Automation (`trace/capture/uia.py`) stands in for the macOS Accessibility API
+  behind the same adapter interface, so `ax.py`'s logic is shared.
+- No permission prompts at all. The one limit: apps run **as Administrator** cannot
+  be read, and record as window titles only.
+- Window titles and app names come from the window manager (`win_window.py`); the
+  clipboard is read only when Windows says it changed (`clipboard.py`).
+
+**Installing (tester):** run the installer — per-user, no admin rights needed. Until
+the installer is code-signed, SmartScreen warns: **More info → Run anyway**.
+Antivirus or company security software may flag an app that records keystrokes;
+that is expected for this category of app and is what signing mitigates. Then load
+the Chrome extension exactly as on macOS.
+
+**Logs:** `%APPDATA%\com.trace.desktop\logs\trace-node.log`.
 
 ## Dual-run (cloud vs local backend)
 The node is switched only by configuration:

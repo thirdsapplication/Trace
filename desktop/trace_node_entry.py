@@ -19,13 +19,36 @@ def _watch_parent():
 
     On macOS/Linux, when the parent exits the PPID changes to 1 (launchd/init
     adopts the orphan). Poll every 2 seconds — cheap and reliable.
+
+    Windows never re-parents an orphan: ``os.getppid()`` keeps returning the dead
+    parent's id, so the check above would never fire and every quit would leave a
+    node running. There the parent's process handle is waited on instead; it is
+    signalled the moment the parent exits.
     """
     import time
     parent_pid = os.getppid()
+    if sys.platform == "win32":
+        _watch_parent_windows(parent_pid)
+        return
     while True:
         time.sleep(2)
         if os.getppid() != parent_pid:
             os._exit(0)
+
+
+def _watch_parent_windows(parent_pid):
+    import ctypes
+    from ctypes import wintypes
+    SYNCHRONIZE, INFINITE, WAIT_OBJECT_0 = 0x00100000, 0xFFFFFFFF, 0
+    kernel32 = ctypes.windll.kernel32
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    handle = kernel32.OpenProcess(SYNCHRONIZE, False, parent_pid)
+    if not handle:
+        os._exit(0)          # the parent is already gone
+    if kernel32.WaitForSingleObject(handle, INFINITE) == WAIT_OBJECT_0:
+        os._exit(0)
 
 
 if __name__ == "__main__":

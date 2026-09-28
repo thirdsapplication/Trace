@@ -85,7 +85,7 @@ def show_permissions():
 def dump_tree():
     """One-shot dump of the focused window's element tree — the fastest way to see
     whether an app is worth capturing at all."""
-    adapter = ax.AXAdapter()
+    adapter = ax.default_adapter()
     if not adapter.available():
         print("Accessibility not granted; nothing to dump.")
         return
@@ -115,7 +115,7 @@ def main():
         dump_tree()
         return
 
-    adapter = ax.AXAdapter()
+    adapter = ax.default_adapter()
     if not adapter.available():
         print("Accessibility capture is OFF — nothing below would be captured.")
         return

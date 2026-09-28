@@ -397,6 +397,17 @@ class AXAdapter:
             return None
 
 
+def default_adapter():
+    """The adapter for this OS: UI Automation on Windows, Accessibility on macOS.
+    Either reports ``available() == False`` where it cannot run, so callers need no
+    platform check of their own."""
+    import sys
+    if sys.platform == "win32":
+        from .uia import UIAAdapter
+        return UIAAdapter()
+    return AXAdapter()
+
+
 # --- capture loops --------------------------------------------------------
 
 def ax_loop(stop, writer, ax=None, interval=0.4, read_interval=20.0, clock=now_iso):
@@ -406,7 +417,7 @@ def ax_loop(stop, writer, ax=None, interval=0.4, read_interval=20.0, clock=now_i
     Emits nothing at all when Accessibility is unavailable, so callers can start
     this unconditionally.
     """
-    ax = ax or AXAdapter()
+    ax = ax or default_adapter()
     if not ax.available():
         return
 
@@ -493,29 +504,55 @@ def click_listener(writer, ax=None, clock=now_iso):
     dependency and already needs Input Monitoring, so this adds no new permission
     beyond the Accessibility grant AX itself requires. Returns the started
     listener, or None when unavailable.
+
+    The hook only records WHERE and WHEN; a worker thread resolves the element.
+    Resolving is a cross-process call into the clicked app, and both OSes punish a
+    slow input hook silently: Windows unhooks one that overruns its timeout, macOS
+    disables the event tap. Either way every later click would vanish with no
+    error. The timestamp is taken in the hook, so ordering is unchanged.
     """
-    ax = ax or AXAdapter()
+    ax = ax or default_adapter()
     if not ax.available():
         return None
     try:
         from pynput import mouse
     except Exception:
         return None
+    import queue
+    import threading
+
+    pending = queue.Queue()
+
+    def resolve():
+        while True:
+            item = pending.get()
+            if item is None:
+                return
+            x, y, button, ts = item
+            try:
+                detail = target_detail(ax, ax.element_at(x, y))
+                writer.write("click",
+                             {"x": x, "y": y, "button": _button_name(button),
+                              "target": detail},
+                             ts=ts)
+            except Exception:
+                pass
 
     def on_click(x, y, button, pressed):
-        if not pressed:
-            return
-        try:
-            detail = target_detail(ax, ax.element_at(x, y))
-            writer.write("click",
-                         {"x": x, "y": y, "button": _button_name(button),
-                          "target": detail},
-                         ts=clock())
-        except Exception:
-            pass
+        if pressed:
+            pending.put((x, y, button, clock()))
 
+    threading.Thread(target=resolve, daemon=True).start()
     listener = mouse.Listener(on_click=on_click)
     listener.start()
+    # Stopping the listener also ends the worker, so a finished session leaves
+    # no thread behind.
+    stop = listener.stop
+
+    def stop_both():
+        stop()
+        pending.put(None)
+    listener.stop = stop_both
     return listener
 
 
