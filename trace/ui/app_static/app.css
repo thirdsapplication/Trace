@@ -313,6 +313,13 @@ input:focus, textarea:focus { outline: none; border-color: var(--accent); backgr
 .pol-sec { display: flex; flex-direction: column; gap: 3px; }
 .pol-h { font-weight: 700; font-size: 13.5px; }
 .pol-p { font-size: 13px; color: var(--ink-2); line-height: 1.55; }
+.pop-wide { width: 680px; }
+.tos-body { max-height: 62vh; gap: 8px; padding-right: 6px; }
+.tos-body .pol-p { margin: 0; }
+.tos-h1 { font-family: var(--display); font-weight: 800; font-size: 16px; margin-top: 14px; }
+.tos-h1:first-child { margin-top: 0; }
+.tos-h2 { font-weight: 700; font-size: 14.5px; margin-top: 12px; }
+.tos-h3 { font-weight: 700; font-size: 13px; margin-top: 6px; }
 
 /* sharing (25): each agent's override listed beside the account dials, so you can see at
    a glance which agents are not following them. */

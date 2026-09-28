@@ -318,17 +318,14 @@ function renderTerms() {
       <label class="row" style="gap:10px;margin-top:4px;cursor:pointer;">
         <input type="checkbox" id="frAgree">
         <span style="font-size:12.5px;color:var(--ink-2);">I agree to the
-          <button type="button" class="fr-link" id="frTerms">terms of service</button> and
-          <button type="button" class="fr-link" id="frPriv">privacy policy</button></span>
+          <button type="button" class="fr-link" id="frTerms">terms of service</button></span>
       </label>
       <button id="frAccept" class="btn-primary full" disabled>Agree &amp; continue</button>
     </div>`;
   $("#frAgree").onchange = (e) => { $("#frAccept").disabled = !e.target.checked; };
-  // Frame 05 makes these links. One Google Doc holds the terms of service and the
-  // privacy policy together, so both open it — in the user's browser, since the desktop
-  // webview blocks external navigation (see openExternal).
-  $("#frTerms").onclick = (e) => { e.preventDefault(); openExternal(TERMS_URL); };
-  $("#frPriv").onclick = (e) => { e.preventDefault(); openExternal(TERMS_URL); };
+  // Frame 05 makes this a link: agreeing to a document you cannot open is no agreement.
+  // The terms cover privacy too, so there is one link, not two.
+  $("#frTerms").onclick = (e) => { e.preventDefault(); showTerms(); };
   $("#frAccept").onclick = async () => {
     $("#frAccept").disabled = true;
     await api("POST", "/api/u/first-run/terms", {});
@@ -337,8 +334,39 @@ function renderTerms() {
   };
 }
 
-// The published terms of service, which also cover privacy.
-const TERMS_URL = "https://docs.google.com/document/d/1NstVm02vuDPN56xpEYCm0iwCceMY8Hh2nC71PrQvgMs/edit?tab=t.0";
+// The full terms of service, read from terms_of_service.txt beside this file. Lines
+// starting "# ", "## " and "### " are headings; every other line is a paragraph.
+async function showTerms() {
+  const el = document.createElement("div");
+  el.className = "pop-back";
+  el.innerHTML = `<div class="pop pop-wide" role="dialog" aria-modal="true" aria-label="Terms of service">
+      <div class="row"><div class="pop-title">Terms of service</div>
+        <button class="pop-x" aria-label="Close">✕</button></div>
+      <div class="pol-body tos-body"><p class="pol-p">Loading…</p></div>
+      <div class="cf-acts"><button class="btn-primary" id="polOk">Close</button></div>
+    </div>`;
+  document.body.appendChild(el);
+  const close = () => el.remove();
+  el.onclick = (e) => { if (e.target === el) close(); };
+  el.querySelector(".pop-x").onclick = close;
+  el.querySelector("#polOk").onclick = close;
+  el.querySelector("#polOk").focus();
+  const body = el.querySelector(".tos-body");
+  try {
+    const r = await fetch("/app/terms_of_service.txt", { cache: "no-store" });
+    const text = r.ok ? await r.text() : "";
+    // A missing file comes back as the app's index.html (SPA fallback), not a 404.
+    if (!text || /^\s*</.test(text)) throw new Error("terms unavailable");
+    body.innerHTML = text.split("\n").filter((l) => l.trim()).map((l) => {
+      const m = l.match(/^(#{1,3}) (.*)$/);
+      return m ? `<div class="tos-h${m[1].length}">${esc(m[2])}</div>`
+               : `<p class="pol-p">${esc(l)}</p>`;
+    }).join("");
+  } catch (e) {
+    body.innerHTML = `<p class="pol-p">The terms could not be loaded. Check your connection
+      and try again, or email emmanuel@palza.ai for a copy.</p>`;
+  }
+}
 
 /* ---------------- auth ---------------- */
 function renderAuth(mode) {
