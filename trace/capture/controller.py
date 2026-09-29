@@ -16,7 +16,7 @@ from http.server import ThreadingHTTPServer
 
 import json
 
-from . import sources
+from . import diag, sources
 from .clipboard import clipboard_loop
 from .collector import CollectorStats, make_handler
 from .keystrokes import KeystrokeCoalescer
@@ -108,6 +108,7 @@ class CaptureController:
 
             from pynput import keyboard  # lazy: capture-only dependency
 
+            diag.reset()       # one controller == one session == one report
             self._writer = RawWriter(self.out_path, reset=True)
             self._coalescer = KeystrokeCoalescer(self._writer)
             self._stop = threading.Event()
@@ -174,6 +175,8 @@ class CaptureController:
         try:
             from . import ax as ax_mod
             adapter = self._ax or ax_mod.default_adapter()
+            diag.fact("adapter", type(adapter).__name__)
+            diag.fact("adapter_available", bool(adapter.available()))
             if not adapter.available():
                 return None
             self._ax = adapter
@@ -181,8 +184,10 @@ class CaptureController:
                              args=(self._stop, self._writer, adapter),
                              daemon=True).start()
             self._mouse_listener = ax_mod.click_listener(self._writer, adapter)
+            diag.fact("click_listener", self._mouse_listener is not None)
             return adapter
-        except Exception:
+        except Exception as e:
+            diag.note("start_accessibility", e)
             return None
 
     def pause(self):

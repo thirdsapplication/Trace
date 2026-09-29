@@ -49,6 +49,7 @@ what it captured before.
 
 import re
 
+from . import diag
 from .raw_writer import now_iso
 
 # --- vocabulary -----------------------------------------------------------
@@ -476,10 +477,11 @@ def ax_loop(stop, writer, ax=None, interval=0.4, read_interval=20.0, clock=now_i
                                   "window": window_title, "elements": elements},
                                  ts=now)
                 last_read_at, read_window = now, window_title
-        except Exception:
+        except Exception as e:
             # A capture loop must never take the session down with it; a transient
-            # AX failure (app quit mid-read) is expected, not exceptional.
-            pass
+            # AX failure (app quit mid-read) is expected, not exceptional. Noted, so
+            # a failure on EVERY tick is distinguishable from a quiet session.
+            diag.note("focus_poll", e)
         stop.wait(interval)
 
     flush_text_field()
@@ -535,8 +537,8 @@ def click_listener(writer, ax=None, clock=now_iso):
                              {"x": x, "y": y, "button": _button_name(button),
                               "target": detail},
                              ts=ts)
-            except Exception:
-                pass
+            except Exception as e:
+                diag.note("click_resolve", e)
 
     def on_click(x, y, button, pressed):
         if pressed:

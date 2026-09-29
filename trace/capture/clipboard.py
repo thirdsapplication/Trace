@@ -22,6 +22,7 @@ import subprocess
 import sys
 import time
 
+from . import diag
 from .raw_writer import now_iso
 
 
@@ -78,7 +79,8 @@ def _read_windows_clipboard():
             user32.CloseClipboard()
         _win_seq, _win_text = seq, text
         return text
-    except Exception:
+    except Exception as e:
+        diag.note("clipboard_windows", e)
         return None
 
 

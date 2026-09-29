@@ -3995,7 +3995,22 @@ def make_handler(state):
             self.end_headers()
             self.wfile.write(data)
 
-        def _upload_raw_to_cloud(self, local_sid):
+        def _capture_diagnostics(self, controller, health):
+            """What the cloud needs to diagnose this recording without the machine in
+            front of it: OS and display facts, capture errors that were swallowed, and
+            the tail of the node's log. Counts and messages only — no captured content
+            (see trace.capture.diag). Never raises; a report must not cost a recording."""
+            try:
+                from ..capture import diag
+                log = os.path.join(os.path.dirname(os.path.abspath(root)),
+                                   "logs", "trace-node.log")
+                return diag.report(capture_status=controller.status(),
+                                   capture_health=health,
+                                   log_tail=diag.log_tail(log))
+            except Exception as e:
+                return {"report_error": f"{type(e).__name__}: {e}"[:300]}
+
+        def _upload_raw_to_cloud(self, local_sid, diagnostics=None):
             """Desktop: POST the just-captured raw_events.jsonl to the cloud, which
             creates a cloud-owned session from it. Returns the cloud session id (or
             None on failure). Forwards the auth cookie so the cloud scopes ownership
@@ -4007,7 +4022,16 @@ def make_handler(state):
                     raw_text = f.read()
             except FileNotFoundError:
                 raw_text = ""
-            payload = json.dumps({"raw": raw_text}).encode("utf-8")
+            body = {"raw": raw_text}
+            if diagnostics:
+                body["diagnostics"] = diagnostics
+                try:
+                    with open(sessions.path(root, local_sid, sessions.DIAGNOSTICS), "w",
+                              encoding="utf-8") as f:
+                        json.dump(diagnostics, f, indent=1, default=str)
+                except OSError:
+                    pass
+            payload = json.dumps(body, default=str).encode("utf-8")
             fwd = {"Content-Type": "application/json"}
             if self.headers.get("Cookie"):
                 fwd["Cookie"] = self.headers.get("Cookie")
@@ -4081,7 +4105,10 @@ def make_handler(state):
             raw_text = (body or {}).get("raw")
             if raw_text is None:
                 return self._json(400, {"error": "missing_raw"})
-            sid, count = sessions.create_upload_session(root, user["user_id"], raw_text)
+            diagnostics = (body or {}).get("diagnostics")
+            sid, count = sessions.create_upload_session(
+                root, user["user_id"], raw_text,
+                diagnostics=diagnostics if isinstance(diagnostics, dict) else None)
             return self._json(200, {"session_id": sid, "raw_event_count": count})
 
         def _json_auth(self, code, body, set_token=None, clear=False):
@@ -5397,10 +5424,12 @@ def make_handler(state):
                 state.controller = None
                 state.current_sid = None
             # Outside the lock: stop capture and sync (non-blocking for state).
+            diagnostics = None
             try:
                 controller.stop()
                 count = sessions.artifacts(root, sid)["raw_event_count"]
                 health = controller.summary()
+                diagnostics = self._capture_diagnostics(controller, health)
                 sessions.update_meta(root, sid, stopped_at=sessions._now(),
                                      raw_event_count=count,
                                      source_summary=health["by_source"],
@@ -5420,7 +5449,7 @@ def make_handler(state):
             # stream up and hand the UI back the CLOUD session id — its subsequent
             # (proxied) reconstruct/discover then target the cloud session.
             if state.cloud_backend:
-                cloud_sid = self._upload_raw_to_cloud(sid)
+                cloud_sid = self._upload_raw_to_cloud(sid, diagnostics)
                 if not cloud_sid:
                     return self._json(502, {"error": "upload_failed",
                                             "local_session_id": sid,

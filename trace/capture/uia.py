@@ -37,6 +37,8 @@ Differences from macOS worth knowing:
 import sys
 import threading
 
+from . import diag
+
 # UIA control type ids (UIAutomationClient.h) -> the AX role that ax.py already
 # understands. Roles AX has no name for are given one that ``normalize_role``
 # passes through lowercased, matching the extension's vocabulary.
@@ -171,8 +173,12 @@ class UIAAdapter:
             except Exception:
                 pass          # Windows 7: no timeouts, but still usable
             local.uia, local.mod = uia, mod
-        except Exception:
+        except Exception as e:
+            # The one failure that silently removes all click and field capture on
+            # Windows (e.g. comtypes bindings missing from a packaged build).
             local.uia = None
+            diag.note("uia_init", e)
+            diag.fact("uia_unavailable", f"{type(e).__name__}: {e}"[:300])
         return local.uia
 
     def _mod(self):

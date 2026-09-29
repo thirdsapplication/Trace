@@ -20,6 +20,8 @@ import os
 import sys
 from ctypes import wintypes
 
+from . import diag
+
 _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 _names = {}          # exe path -> display name; a process never renames itself
 
@@ -60,7 +62,8 @@ def _foreground():
         pid = wintypes.DWORD()
         _user32().GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
         return hwnd, (pid.value or None)
-    except Exception:
+    except Exception as e:
+        diag.note("window_foreground", e)
         return None, None
 
 
@@ -93,7 +96,8 @@ def exe_path(pid):
             return ""
         finally:
             kernel32.CloseHandle(handle)
-    except Exception:
+    except Exception as e:
+        diag.note("window_exe_path", e)
         return ""
 
 

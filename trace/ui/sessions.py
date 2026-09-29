@@ -36,6 +36,10 @@ REVIEWED = "reviewed_bundles.json"
 SPECS_DIR = "specs"
 CONNECTION = "connection.json"      # Phase 4: per-session (per-customer) connection record
 META = "meta.json"
+# Desktop capture diagnostics (machine facts, swallowed capture errors, log tail).
+# Stored beside the recording so the delete-by-prefix removes it with it.
+DIAGNOSTICS = "diagnostics.json"
+MAX_DIAGNOSTICS_BYTES = 256 * 1024
 
 
 def connection_filename():
@@ -147,8 +151,11 @@ def _unique_session_id(root):
     return sid
 
 
-def create_upload_session(root, owner_user_id, raw_text):
-    """Phase 2: materialize a session from raw events uploaded by a desktop client."""
+def create_upload_session(root, owner_user_id, raw_text, diagnostics=None):
+    """Phase 2: materialize a session from raw events uploaded by a desktop client.
+
+    ``diagnostics`` is the desktop's report on how capture went on that machine; it
+    is stored as its own file so a failed recording can be diagnosed remotely."""
     sid = _unique_session_id(root)
     os.makedirs(session_dir(root, sid), exist_ok=True)
     meta = {"id": sid, "label": None, "created_at": _now(),
@@ -159,6 +166,13 @@ def create_upload_session(root, owner_user_id, raw_text):
         f.write(raw_text or "")
     count = artifacts(root, sid)["raw_event_count"]
     update_meta(root, sid, raw_event_count=count)
+    has_diag = False
+    if diagnostics:
+        blob = json.dumps(diagnostics, indent=1, default=str)
+        if len(blob.encode("utf-8")) <= MAX_DIAGNOSTICS_BYTES:
+            with open(path(root, sid, DIAGNOSTICS), "w", encoding="utf-8") as f:
+                f.write(blob)
+            has_diag = True
 
     if supa.is_configured() and owner_user_id:
         admin = supa.get_admin()
@@ -171,6 +185,11 @@ def create_upload_session(root, owner_user_id, raw_text):
         }).execute()
         # Upload raw_events to Storage
         _upload_to_storage(root, sid, RAW, owner_user_id)
+        if has_diag:
+            try:
+                _upload_to_storage(root, sid, DIAGNOSTICS, owner_user_id)
+            except Exception:
+                pass      # diagnostics are a convenience; never fail the upload
 
     return sid, count
 
