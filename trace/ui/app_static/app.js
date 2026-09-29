@@ -2937,7 +2937,7 @@ async function paintPermissions() {
   const host = $("#permStrip");
   if (!host) return;
   const { ok, data } = await api("GET", "/api/u/permissions");
-  if (!ok || !data || data.platform !== "darwin") return;   // capture is macOS-only
+  if (!ok || !data || data.platform !== "darwin") return;   // only macOS has grants to fix
   const denied = ["accessibility", "input_monitoring", "screen_recording"]
     .map((k) => data[k]).filter((c) => c && c.granted === false);
   if (!denied.length) { host.innerHTML = ""; return; }

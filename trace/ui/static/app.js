@@ -182,7 +182,7 @@ $("startStop").onclick = async () => {
     if (!ok) {
       const detail = data && (data.detail || data.error) || "could not start";
       alert("Start failed: " + detail +
-        (String(detail).includes("pynput") ? "\n\nCapture is macOS-only and needs `pip install pynput`." : ""));
+        (String(detail).includes("pynput") ? "\n\nCapture runs on macOS and Windows and needs `pip install pynput`." : ""));
       return;
     }
     applyStatus(data);
