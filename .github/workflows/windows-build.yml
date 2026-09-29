@@ -47,20 +47,16 @@ jobs:
       - name: Capture tests
         run: python -m pytest trace/tests/test_windows_capture.py trace/tests/test_ax.py trace/tests/test_keystrokes.py -q
 
-      # The rest of the suite has never run on Windows. Reported, not gating, until
-      # it has been through once and any path/permission assumptions are fixed.
-      - name: Full test suite (informational)
-        continue-on-error: true
+      - name: Full test suite
         run: python -m pytest trace/tests -q
 
       - name: Live capture session (Notepad)
         run: python desktop/windows_smoke.py
 
-      # Can the recorder see inside a web page with no extension installed? Reported
-      # rather than gating: the answer decides whether a tester needs the extension,
-      # and the installer should still be built either way.
+      # Can the recorder see inside a web page with no extension installed? It can
+      # (first measured 2026-09-29), and a tester without the extension depends on
+      # it, so this now gates the build.
       - name: Live capture session (Chrome, no extension)
-        continue-on-error: true
         run: python desktop/windows_smoke.py --chrome
 
       - name: Build the capture node (PyInstaller)
@@ -96,6 +92,37 @@ jobs:
 
       - name: Build the installer (Tauri)
         run: npx --yes @tauri-apps/cli@2 build
+
+      # Install it the way a tester will, launch it, and check the whole startup:
+      # the shell finds trace-node.exe, the node answers /health, the window loads.
+      # Then kill the app outright — no clean exit — and check the node's watchdog
+      # takes it down too, instead of leaving it running in the background.
+      - name: Install and launch the app
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem src-tauri/target/release/bundle/nsis/*.exe | Select-Object -First 1
+          Start-Process $installer.FullName -ArgumentList "/S" -Wait
+          $dir = Join-Path $env:LOCALAPPDATA "Trace"
+          if (-not (Test-Path $dir)) { throw "installer did not create $dir" }
+          $node = Get-ChildItem -Recurse $dir -Filter trace-node.exe | Select-Object -First 1
+          if (-not $node) { throw "installed app has no trace-node.exe" }
+          Write-Host "node: $($node.FullName)"
+          $app = Get-ChildItem $dir -Filter *.exe | Where-Object { $_.Name -notlike "uninstall*" } | Select-Object -First 1
+          Write-Host "app: $($app.FullName)"
+          $log = Join-Path $env:APPDATA "com.trace.desktop\logs\trace-node.log"
+          $p = Start-Process $app.FullName -PassThru
+          $ok = $false
+          foreach ($i in 1..120) {
+            Start-Sleep 1
+            if ((Test-Path $log) -and (Select-String -Path $log -Pattern "navigated to app" -Quiet)) { $ok = $true; break }
+          }
+          if (Test-Path $log) { Get-Content $log -Tail 40 }
+          if (-not $ok) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue; throw "app never reached its UI" }
+          Stop-Process -Id $p.Id -Force
+          Start-Sleep 6
+          $left = Get-Process trace-node -ErrorAction SilentlyContinue
+          if ($left) { throw "trace-node kept running after the app was killed" }
+          Write-Host "OK: installed, launched, loaded, and shut down cleanly"
 
       - uses: actions/upload-artifact@v4
         with:

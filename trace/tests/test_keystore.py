@@ -1,4 +1,5 @@
 import os
+import sys
 import tempfile
 import unittest
 
@@ -46,6 +47,10 @@ class KeystoreFileFallbackTest(unittest.TestCase):
         self.assertEqual(keystore.save_key("sk-ant-abc123"), "file")
         self.assertEqual(keystore.get_key(), "sk-ant-abc123")
 
+    # Windows has no owner/group/other mode bits: chmod(0o600) only clears the
+    # read-only flag and stat reports 0o666. The file sits in the user's own profile,
+    # which Windows already restricts to them — and the desktop app keeps no key.
+    @unittest.skipIf(sys.platform == "win32", "POSIX file modes do not exist on Windows")
     def test_file_is_0600(self):
         keystore.save_key("sk-ant-xyz")
         mode = os.stat(keystore._FALLBACK_PATH).st_mode & 0o777

@@ -153,6 +153,14 @@ class UrlTest(unittest.TestCase):
         a, page = self.browser("quarterly invoices")
         self.assertEqual(a.url_of(page), "")
 
+    def test_chrome_puts_the_url_on_the_page_itself(self):
+        # What Chrome actually did on a Windows runner: the Document's value IS the
+        # URL, and a file:// address has no dot-name for the address-bar heuristic.
+        a, _ = self.browser("")
+        page = FakeUIAElement(DOCUMENT, "Trace smoke form",
+                              value="file:///C:/Users/runner/form.html")
+        self.assertEqual(a.url_of(page), "file:///C:/Users/runner/form.html")
+
     def test_a_native_window_has_no_url(self):
         a, _ = self.browser("mail.google.com")
         self.assertEqual(a.url_of(FakeUIAElement(PANE, "Toolbar")), "")

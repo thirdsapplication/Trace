@@ -284,9 +284,10 @@ class UIAAdapter:
     def url_of(self, element):
         """The page URL when ``element`` is a browser page, else "".
 
-        macOS puts the URL on the page (``AXURL``); UIA does not, so it is read from
-        the browser's own address bar in the same window — a bounded search by the
-        box's accessible name.
+        Chromium exposes the URL as the page element's own value — measured on a
+        Windows runner, Chrome's Document reported ``file:///C:/...form.html`` — so
+        that is read first. The browser's address bar, found by its accessible name,
+        is the fallback for browsers that do not.
         """
         if element is None:
             return ""
@@ -295,6 +296,9 @@ class UIAAdapter:
                 return ""
         except Exception:
             return ""
+        own = self._value(element)
+        if isinstance(own, str) and looks_like_url(own):
+            return normalize_url(own)
         bar = self._find_address_bar(self.focused_window(), ADDRESS_BAR_MAX_DEPTH)
         value = self._value(bar) if bar is not None else None
         return normalize_url(value) if looks_like_url(value or "") else ""
