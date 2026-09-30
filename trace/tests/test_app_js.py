@@ -185,5 +185,97 @@ class CaptureStopSurvivesTest(unittest.TestCase):
         self.assertLess(body.index("return;", zero), body.index("loadAndRender", zero))
 
 
+def _poll_job_source(src):
+    start = src.index("async function pollJob(")
+    return src[start:src.index("\n}\n", start) + 2]
+
+
+_POLL_HARNESS = r"""
+%(poll)s
+let clock = 0;
+Date.now = () => clock;
+const wait = (ms) => { clock += ms; return Promise.resolve(); };
+async function run(states, action, opts) {
+  let i = 0, calls = 0;
+  clock = 0;
+  globalThis.uget = async () => {
+    calls++;
+    return { data: { state: states[Math.min(i++, states.length - 1)] } };
+  };
+  try {
+    const d = await pollJob("s1", action, null, opts);
+    return { result: d.state, calls, clock };
+  } catch (e) {
+    return { error: e.message, code: e.code || null, calls, clock };
+  }
+}
+(async () => {
+  const out = {};
+  out.done = await run(["running", "running", "done"], "reconstruct");
+  out.lost = await run(["running", "idle", "idle", "idle"], "reconstruct",
+                       { idleIsLost: true, everyMs: 3000, maxMs: 7200000 });
+  out.idleWaits = await run(["idle"], "discover");
+  out.longWait = await run(["running"], "reconstruct", { everyMs: 3000, maxMs: 7200000 });
+  out.failed = await run(["running", "error"], "discover");
+  console.log(JSON.stringify(out));
+})();
+"""
+
+
+@unittest.skipIf(shutil.which("node") is None, "node is not installed")
+class PollJobTest(unittest.TestCase):
+    """pollJob run for real in node, with the server and the clock faked. A 28-minute
+    recording took ~20 minutes to reconstruct; the screen gave up at 16 and skipped
+    discovery, so the tester never saw her workflows."""
+
+    @classmethod
+    def setUpClass(cls):
+        import json
+        js = _POLL_HARNESS % {"poll": _poll_job_source(_source())}
+        r = subprocess.run(["node", "-e", js], capture_output=True, text=True, timeout=60)
+        if r.returncode:
+            raise AssertionError(r.stderr)
+        cls.out = json.loads(r.stdout)
+
+    def test_a_finished_job_returns(self):
+        self.assertEqual(self.out["done"]["result"], "done")
+
+    def test_a_job_the_server_lost_stops_quickly_and_says_so(self):
+        lost = self.out["lost"]
+        self.assertEqual(lost["code"], "lost")
+        self.assertLess(lost["clock"], 60 * 1000, "a lost job must not be waited out")
+
+    def test_other_steps_keep_the_sixteen_minute_wait(self):
+        idle = self.out["idleWaits"]
+        self.assertEqual(idle["code"], "timeout")
+        self.assertEqual(idle["clock"], 16 * 60 * 1000)
+
+    def test_the_long_wait_lasts_two_hours(self):
+        self.assertEqual(self.out["longWait"]["code"], "timeout")
+        self.assertEqual(self.out["longWait"]["clock"], 2 * 60 * 60 * 1000)
+
+    def test_a_server_error_is_still_thrown(self):
+        self.assertEqual(self.out["failed"]["error"], "discover failed")
+
+
+class ReconstructWaitTest(unittest.TestCase):
+    def _run_workflows(self):
+        src = _source()
+        start = src.index("async function runWorkflows(")
+        return src[start:src.index("\n}\n", start)]
+
+    def test_the_timeline_step_waits_hours_and_detects_a_lost_job(self):
+        body = self._run_workflows()
+        call = body[body.index('await pollJob(sid, "reconstruct"'):]
+        call = call[:call.index(");") + 2]
+        self.assertIn("idleIsLost: true", call)
+        self.assertIn("maxMs: 2 * 60 * 60 * 1000", call)
+
+    def test_a_timeout_is_not_reported_as_a_failure(self):
+        body = self._run_workflows()
+        self.assertIn('e.code === "timeout"', body)
+        self.assertIn('e.code === "lost"', body)
+
+
 if __name__ == "__main__":
     unittest.main()

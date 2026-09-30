@@ -88,16 +88,26 @@ function openExternal(url) {
 function clearTimers() { S._timers.forEach(clearTimeout); S._timers = []; }
 function wait(ms) { return new Promise(res => { const t = setTimeout(res, ms); S._timers.push(t); }); }
 
-/* Poll a session job's /status until done|error. onTick(data) renders progress. */
-async function pollJob(sid, action, onTick) {
-  for (let i = 0; i < 1200; i++) {
+/* Poll a session job's /status until done|error. onTick(data) renders progress.
+   opts.maxMs / opts.everyMs: how long to wait, how often to ask (default 16 min / 0.8s).
+   opts.idleIsLost: the job was started before polling, so "idle" means the server lost
+   it (jobs live in memory; a Render restart drops them) — stop instead of waiting out
+   the whole limit. Timeouts and lost jobs throw errors carrying .code so the caller can
+   say what actually happened: a timeout here is the SCREEN giving up, not the server. */
+async function pollJob(sid, action, onTick, opts = {}) {
+  const maxMs = opts.maxMs || 16 * 60 * 1000, everyMs = opts.everyMs || 800;
+  const t0 = Date.now();
+  let idle = 0;
+  while (Date.now() - t0 < maxMs) {
     const { data } = await uget(sid, `/${action}/status`);
     if (onTick) onTick(data);
     if (data.state === "done") return data;
     if (data.state === "error") throw new Error(data.error || `${action} failed`);
-    await wait(800);
+    idle = data.state === "idle" ? idle + 1 : 0;
+    if (opts.idleIsLost && idle >= 3) throw Object.assign(new Error("job_lost"), { code: "lost" });
+    await wait(everyMs);
   }
-  throw new Error("timed out");
+  throw Object.assign(new Error("timed out"), { code: "timeout" });
 }
 
 /* ---------------- bootstrap ---------------- */
@@ -2997,7 +3007,18 @@ async function runWorkflows(sid, a) {
       msg.textContent = "Reading your day…";
       const r = await upost(sid, "/reconstruct", { force: true });
       if (r.status === 409) { /* short recording -> proceed */ await upost(sid, "/reconstruct", { force: true }); }
-      await pollJob(sid, "reconstruct", d => { if (d.total) bar.style.width = Math.round(40 * (d.current || 0) / d.total) + "%"; });
+      // A long recording is many chunks; at ~75s each it can outlast the default wait,
+      // and the screen giving up used to skip discovery for a recording the server went
+      // on to finish (a 28-minute session took ~20 minutes). So this step waits hours,
+      // says how far along it is, and tells a lost job from a slow one.
+      const hint = $(".wf-wait");
+      if (hint) hint.textContent = "Longer recordings take a few minutes — you can leave this open or come back later.";
+      await pollJob(sid, "reconstruct", d => {
+        if (!d.total) return;
+        bar.style.width = Math.round(40 * (d.current || 0) / d.total) + "%";
+        if (d.total > 1) msg.textContent = `Reading your day… part ${Math.min((d.current || 0) + 1, d.total)} of ${d.total}`;
+      }, { maxMs: 2 * 60 * 60 * 1000, everyMs: 3000, idleIsLost: true });
+      if (hint) hint.textContent = "still looking…";
     }
     bar.style.width = "45%";
     msg.textContent = "Looking for repeatable workflows…";
@@ -3006,7 +3027,10 @@ async function runWorkflows(sid, a) {
     bar.style.width = "100%";
     await loadAndRender();
   } catch (e) {
-    $("#wfErr").textContent = friendly(e.message);
+    $("#wfErr").textContent =
+      e.code === "timeout" ? "Still working on your recording. Reopen it later — it picks up where it left off."
+      : e.code === "lost" ? "Reading your recording was interrupted. Reopen it to start again."
+      : friendly(e.message);
   }
 }
 
