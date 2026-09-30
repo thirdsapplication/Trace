@@ -141,5 +141,101 @@ class ReconstructPipelineTest(unittest.TestCase):
             self.assertIn(verb, SYSTEM_PROMPT)          # the controlled vocabulary survives
 
 
+def _chunk_first_id(user):
+    """The first raw id in a chunk's stream (the summary above it carries no ids)."""
+    stream = user.split("RAW CAPTURE STREAM", 1)[1]
+    return stream.split("[", 1)[1].split(" @", 1)[0]
+
+
+class ConcurrentChunksTest(unittest.TestCase):
+    """Chunks go to the model at once; the log must not depend on which finishes first."""
+
+    def _one_event_per_chunk(self, delays=None, fail_on=None):
+        import threading
+        import time
+        seen, lock = [], threading.Lock()
+
+        def model_fn(system, user):
+            first = _chunk_first_id(user)
+            with lock:
+                seen.append(user)
+            if delays:
+                time.sleep(delays.get(first, 0))
+            if first == fail_on:
+                raise RuntimeError("rate limited")
+            return json.dumps([{"action": "navigate", "detail": f"chunk at {first}",
+                                "evidence": [first], "confidence": "high"}])
+        return model_fn, seen
+
+    def test_out_of_order_finishes_still_build_an_ordered_log(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "raw.jsonl")
+            write_raw(p, 10)   # chunk_size 4, overlap 1 -> chunks start r0001, r0004, r0007
+            # the first chunk finishes last
+            model_fn, _ = self._one_event_per_chunk(delays={"r0001": 0.2})
+            progress = []
+            log, _ = reconstruct(p, chunk_size=4, overlap=1, model_fn=model_fn,
+                                 workers=3, progress_cb=lambda a, b: progress.append((a, b)))
+            self.assertEqual([e["evidence"] for e in log], [["r0001"], ["r0004"], ["r0007"]])
+            self.assertEqual(progress, [(0, 3), (1, 3), (2, 3), (3, 3)])
+
+    def test_concurrent_and_sequential_agree_when_the_model_is_stateless(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "raw.jsonl")
+            write_raw(p, 10)
+            model_fn, _ = self._one_event_per_chunk()
+            seq, _ = reconstruct(p, chunk_size=4, overlap=1, model_fn=model_fn, workers=1)
+            par, _ = reconstruct(p, chunk_size=4, overlap=1, model_fn=model_fn, workers=4)
+            self.assertEqual(seq, par)
+
+    def test_the_summary_describes_what_came_before_without_citable_ids(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "raw.jsonl")
+            write_raw(p, 10)
+            model_fn, seen = self._one_event_per_chunk()
+            reconstruct(p, chunk_size=4, overlap=1, model_fn=model_fn, workers=3)
+            later = next(u for u in seen if _chunk_first_id(u) == "r0007")
+            summary = later.split("RAW CAPTURE STREAM", 1)[0]
+            self.assertIn('title="window-6"', summary)   # the raw events before the chunk
+            self.assertNotIn("r000", summary)              # ...but nothing to cite
+            first = next(u for u in seen if _chunk_first_id(u) == "r0001")
+            self.assertIn("(none yet)", first)
+
+    def test_one_failing_chunk_fails_the_reconstruction(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "raw.jsonl")
+            write_raw(p, 10)
+            model_fn, _ = self._one_event_per_chunk(fail_on="r0004")
+            with self.assertRaises(RuntimeError):
+                reconstruct(p, chunk_size=4, overlap=1, model_fn=model_fn, workers=3)
+
+    def test_no_more_chunks_run_at_once_than_workers(self):
+        import threading
+        import time
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "raw.jsonl")
+            write_raw(p, 30)
+            lock, live, peak = threading.Lock(), [0], [0]
+
+            def model_fn(system, user):
+                with lock:
+                    live[0] += 1
+                    peak[0] = max(peak[0], live[0])
+                time.sleep(0.05)
+                with lock:
+                    live[0] -= 1
+                return "[]"
+            reconstruct(p, chunk_size=4, overlap=1, model_fn=model_fn, workers=2)
+            self.assertEqual(peak[0], 2)
+
+    def test_one_worker_keeps_the_model_output_summary(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "raw.jsonl")
+            write_raw(p, 10)
+            model_fn, seen = self._one_event_per_chunk()
+            reconstruct(p, chunk_size=4, overlap=1, model_fn=model_fn, workers=1)
+            self.assertIn("chunk at r0001", seen[1])       # chunk 2 saw chunk 1's reading
+
+
 if __name__ == "__main__":
     unittest.main()

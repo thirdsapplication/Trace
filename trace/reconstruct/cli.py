@@ -24,6 +24,8 @@ def main():
     ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--chunk-size", type=int, default=120)
     ap.add_argument("--overlap", type=int, default=20)
+    ap.add_argument("--workers", type=int, default=None,
+                    help="chunks sent at once (default TRACE_RECON_WORKERS or 8; 1 = sequential)")
     ap.add_argument("--dry-run", action="store_true",
                     help="render chunked prompts only; do not call the model")
     args = ap.parse_args()
@@ -42,7 +44,7 @@ def main():
 
     event_log, report = reconstruct(
         args.raw, model=args.model,
-        chunk_size=args.chunk_size, overlap=args.overlap,
+        chunk_size=args.chunk_size, overlap=args.overlap, workers=args.workers,
     )
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump(event_log, f, indent=2, ensure_ascii=False)

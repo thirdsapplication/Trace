@@ -17,7 +17,10 @@ network/keys; the default builds a real ``claude-fable-5-1`` client.
 """
 
 import json
+import os
 import re
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 from . import augment, chunking, validate
 from .prompt import SYSTEM_PROMPT
@@ -34,13 +37,24 @@ DEFAULT_MODEL = "claude-fable-5-1"
 # failing (see model_call).
 MAX_TOKENS = 32000
 
+# Chunks sent to the model at once. Each chunk is ~75s of Fable, so one after another a
+# 28-minute recording (9 chunks) took ~20 minutes — past the UI's wait, which is how a
+# real tester's recording never reached discovery. Concurrency costs nothing extra (the
+# same chunks are sent) and is bounded by the account's rate limits, shared by everyone
+# reconstructing at once. 1 restores the sequential path exactly.
+WORKERS = max(1, int(os.environ.get("TRACE_RECON_WORKERS", "8") or 8))
+
+# The SDK's own backoff on 429/529. Concurrent chunks make a rate-limit answer likelier,
+# and one chunk failing fails the whole reconstruction, so it gets more than the default 2.
+MAX_RETRIES = 5
+
 
 def _default_model_fn(model):
     """Build the reconstruction caller. Imported lazily so the module loads
     without the anthropic package / API key (e.g. in tests)."""
     import anthropic
 
-    client = anthropic.Anthropic()
+    client = anthropic.Anthropic(max_retries=MAX_RETRIES)
 
     def call(system, user):
         return model_call.create_text_streaming(client, model, system, user,
@@ -101,9 +115,69 @@ def _build_user_content(summary, rendered_lines):
     )
 
 
+def _run_chunk(model_fn, summary, ch, i, total, report):
+    """One chunk through the model. Returns its (unvalidated) events; a reply that is
+    not a JSON list is recorded on ``report`` as a lost chunk."""
+    rendered = [chunking.render_event(ev) for ev in ch]
+    raw_text = model_fn(SYSTEM_PROMPT, _build_user_content(summary, rendered))
+    events = _parse_json_array(raw_text)
+    if not events and (raw_text or "").strip() and not _reply_was_readable(raw_text):
+        # A reply that parsed to nothing is a lost chunk, not an empty one. It used
+        # to vanish without a trace; the report is where a person looks.
+        report.error(f"chunk {i}/{total}: the model's reply was not a JSON event list "
+                     f"({len(raw_text)} chars) — that chunk's events were lost")
+    return events
+
+
+def _run_sequential(chunks, model_fn, raw_by_id, report, progress_cb):
+    """Each chunk sees the model's own reading of the chunks before it."""
+    total = len(chunks)
+    outputs = []
+    running = []  # accumulated *validated* events, for the running summary only
+    for i, ch in enumerate(chunks, start=1):
+        events = _run_chunk(model_fn, chunking.summarize(running), ch, i, total, report)
+        outputs.append(events)
+        # maintain a provisional validated view for the next chunk's summary
+        for ev in events:
+            cleaned = validate.validate_event(ev, raw_by_id, validate.ValidationReport())
+            if cleaned:
+                running.append(cleaned)
+        if progress_cb:
+            progress_cb(i, total)
+    return outputs
+
+
+def _run_concurrent(chunks, raw, model_fn, report, progress_cb, workers):
+    """All chunks at once, ``workers`` at a time. Outputs come back in chunk order —
+    ``stitch`` keeps the first of two duplicates, so order is what makes this as
+    deterministic as the sequential path. The first chunk to fail fails the whole
+    reconstruction, as it does sequentially; chunks not yet started are cancelled."""
+    total = len(chunks)
+    position = {r["id"]: n for n, r in enumerate(raw)}
+    summaries = [chunking.summarize_raw(raw[:position[ch[0]["id"]]]) for ch in chunks]
+    lock = threading.Lock()
+    done = [0]
+
+    def one(i):
+        events = _run_chunk(model_fn, summaries[i - 1], chunks[i - 1], i, total, report)
+        if progress_cb:
+            with lock:
+                done[0] += 1
+                progress_cb(done[0], total)
+        return events
+
+    pool = ThreadPoolExecutor(max_workers=min(workers, total))
+    try:
+        futures = [pool.submit(one, i) for i in range(1, total + 1)]
+        return [f.result() for f in futures]
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
+
+
 def reconstruct(raw_path, model=DEFAULT_MODEL, chunk_size=120, overlap=20,
                 model_fn=None, progress_cb=None,
-                open_persistence_seconds=augment.DEFAULT_OPEN_PERSISTENCE_SECONDS):
+                open_persistence_seconds=augment.DEFAULT_OPEN_PERSISTENCE_SECONDS,
+                workers=None):
     """Reconstruct an event log from a raw stream.
 
     Returns ``(event_log, report)`` where ``event_log`` is a list of event dicts
@@ -116,6 +190,11 @@ def reconstruct(raw_path, model=DEFAULT_MODEL, chunk_size=120, overlap=20,
     ``open_persistence_seconds`` is the dwell threshold for surfacing a sustained
     window focus as an "opened/viewed" action (symmetric across browser/native
     apps; see ``augment``).
+
+    ``workers`` is how many chunks go to the model at once (default ``WORKERS``). With
+    more than one, each chunk's running summary is built from the raw events before it
+    rather than from the previous chunk's output, and ``progress_cb`` counts chunks as
+    they finish, not in order.
     """
     raw = chunking.load_raw(raw_path)
     raw_by_id = {r["id"]: r for r in raw}
@@ -131,27 +210,11 @@ def reconstruct(raw_path, model=DEFAULT_MODEL, chunk_size=120, overlap=20,
     if progress_cb:
         progress_cb(0, total)
 
-    chunk_outputs = []
-    running = []  # accumulated *validated* events, for the running summary only
-    for i, ch in enumerate(chunks, start=1):
-        summary = chunking.summarize(running)
-        rendered = [chunking.render_event(ev) for ev in ch]
-        user = _build_user_content(summary, rendered)
-        raw_text = model_fn(SYSTEM_PROMPT, user)
-        events = _parse_json_array(raw_text)
-        if not events and (raw_text or "").strip() and not _reply_was_readable(raw_text):
-            # A reply that parsed to nothing is a lost chunk, not an empty one. It used
-            # to vanish without a trace; the report is where a person looks.
-            report.error(f"chunk {i}/{total}: the model's reply was not a JSON event list "
-                         f"({len(raw_text)} chars) — that chunk's events were lost")
-        chunk_outputs.append(events)
-        # maintain a provisional validated view for the next chunk's summary
-        for ev in events:
-            cleaned = validate.validate_event(ev, raw_by_id, validate.ValidationReport())
-            if cleaned:
-                running.append(cleaned)
-        if progress_cb:
-            progress_cb(i, total)
+    workers = WORKERS if workers is None else max(1, workers)
+    if workers == 1 or total == 1:
+        chunk_outputs = _run_sequential(chunks, model_fn, raw_by_id, report, progress_cb)
+    else:
+        chunk_outputs = _run_concurrent(chunks, raw, model_fn, report, progress_cb, workers)
 
     event_log = validate.stitch(chunk_outputs, raw_by_id, report)
     # Symmetric document-open detection: surface sustained, otherwise-unrepresented

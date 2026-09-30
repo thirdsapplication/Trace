@@ -104,3 +104,19 @@ def summarize(events, max_items=6):
     for e in tail:
         lines.append(f'- {e.get("action","?")} in "{e.get("window","")}": {_trunc(e.get("detail"), 160)}')
     return "\n".join(lines)
+
+
+def summarize_raw(raw_before, max_items=6):
+    """The running summary when chunks run concurrently: the last raw lines BEFORE the
+    chunk, rendered, since the previous chunk's reconstructed events do not exist yet.
+    Still deterministic. It carries less than ``summarize`` (what happened, not what the
+    model made of it); the overlap already puts the preceding 20 raw events in the
+    chunk itself, and the stitcher dedupes what both chunks then emit.
+
+    The ``[rNNNN @ ts]`` head is dropped: these lines are context, not this chunk's
+    evidence, and an id in view is an id the model can cite for an action it would
+    then log a second time."""
+    if not raw_before:
+        return "(none yet)"
+    return "\n".join("- (raw, before this chunk) " + render_event(ev).split("] ", 1)[-1]
+                     for ev in raw_before[-max_items:])
