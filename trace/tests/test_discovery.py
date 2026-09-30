@@ -40,6 +40,15 @@ class RenderTest(unittest.TestCase):
             self.assertIn(f"e{i:03d}", content)
 
 
+class AnswerLimitTest(unittest.TestCase):
+    def test_the_reply_can_cite_a_long_day(self):
+        """Every event id is cited somewhere in the reply, so it grows with the
+        recording; a cut-off reply reads as "no workflows", not as a failure."""
+        mod = importlib.import_module("trace.discovery.discover")   # the package's
+        # `discover` attribute is the function, which shadows the module
+        self.assertGreaterEqual(mod.MAX_TOKENS, 128000)
+
+
 class ParseTest(unittest.TestCase):
     def test_plain_object(self):
         self.assertEqual(_parse_json_object('{"bundles":[]}'), {"bundles": []})

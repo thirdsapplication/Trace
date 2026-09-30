@@ -26,7 +26,11 @@ from trace.agent import model_call
 
 # Single, one-line default model tier (Open decision §11: trivially swappable).
 DEFAULT_MODEL = "claude-fable-5-1"
-MAX_TOKENS = 32000
+# Fable 5.1's own output maximum. The reply cites EVERY event id (in a workflow or as
+# noise), so it grows with the recording: ~1.3K tokens for 41 events, an estimated
+# 17K-55K for 2-3 hours before thinking, which shares this cap. At 32K a long day cut
+# off mid-JSON and read as "no workflows". Only tokens actually written are billed.
+MAX_TOKENS = 128000
 
 
 def load_event_log(path):
