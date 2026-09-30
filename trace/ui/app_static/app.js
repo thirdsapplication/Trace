@@ -308,23 +308,11 @@ function renderWelcome() {
 
 function renderTerms() {
   root.className = "wrap";
-  const points = [
-    ["#FF6655", "Recording is opt-in, always visible",
-     "Capture only runs during a session you start, with a live indicator you can stop anytime."],
-    ["#45B86B", "Your capture data stays yours",
-     "Used only to build your agents. Delete it any time from any agent's settings."],
-    ["#315EF6", "Nothing leaves without approval",
-     "Every outbound email, edit, or upload is staged for you to approve first."],
-  ];
   root.innerHTML = `
     <div class="panel first-run" style="align-items:stretch;text-align:left;">
       <h1 class="fr-title" style="font-size:26px;">Before we begin</h1>
       <p class="fr-lead" style="max-width:none;">Palza is built on recording your work.
-        Here is exactly how that is handled.</p>
-      ${points.map(([c, t, d]) => `<div class="fr-point">
-        <span class="fr-bullet" style="background:${c};"></span>
-        <div><div class="fr-point-t">${t}</div><div class="fr-point-d">${d}</div></div>
-      </div>`).join("")}
+        Please read and agree to the terms before you start.</p>
       <label class="row" style="gap:10px;margin-top:4px;cursor:pointer;">
         <input type="checkbox" id="frAgree">
         <span style="font-size:12.5px;color:var(--ink-2);">I agree to the
