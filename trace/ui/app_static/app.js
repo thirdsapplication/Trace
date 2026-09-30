@@ -3018,10 +3018,10 @@ async function runWorkflows(sid, a) {
         bar.style.width = Math.round(40 * (d.current || 0) / d.total) + "%";
         if (d.total > 1) msg.textContent = `Reading your day… part ${Math.min((d.current || 0) + 1, d.total)} of ${d.total}`;
         // The server knows the chunk count at once, so a long wait is announced up
-        // front. It continues to discovery on its own, so closing Trace loses nothing.
+        // front. It continues to discovery on its own, so closing Palza loses nothing.
         if (hint && d.estimate_seconds > 10 * 60)
           hint.textContent = `This will take about ${Math.round(d.estimate_seconds / 60)} minutes. ` +
-            "You can close Trace — your workflows will be waiting when you come back.";
+            "You can close Palza — your workflows will be waiting when you come back.";
       }, { maxMs: 2 * 60 * 60 * 1000, everyMs: 3000, idleIsLost: true });
       if (hint) hint.textContent = "still looking…";
     }

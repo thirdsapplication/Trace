@@ -5,7 +5,7 @@
 # is the only place the Windows-only code paths (UI Automation, the window reader,
 # the clipboard, the hidden console, the parent watchdog) actually execute.
 #
-# Output: the NSIS installer (Trace_<version>_x64-setup.exe) as a downloadable
+# Output: the NSIS installer (Palza_<version>_x64-setup.exe) as a downloadable
 # artifact on the run. Unsigned until a code-signing certificate is set up, so
 # Windows SmartScreen will warn on install ("More info" -> "Run anyway").
 
@@ -102,7 +102,7 @@ jobs:
         run: |
           $installer = Get-ChildItem src-tauri/target/release/bundle/nsis/*.exe | Select-Object -First 1
           Start-Process $installer.FullName -ArgumentList "/S" -Wait
-          $dir = Join-Path $env:LOCALAPPDATA "Trace"
+          $dir = Join-Path $env:LOCALAPPDATA "Palza"
           if (-not (Test-Path $dir)) { throw "installer did not create $dir" }
           $node = Get-ChildItem -Recurse $dir -Filter trace-node.exe | Select-Object -First 1
           if (-not $node) { throw "installed app has no trace-node.exe" }

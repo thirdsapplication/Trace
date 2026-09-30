@@ -317,7 +317,7 @@ fn run_node(
             Ok(c) => c,
             Err(e) => {
                 splash_fatal(&handle, &log, &format!(
-                    "Trace couldn't start its background service ({}). Try reinstalling the app.", e));
+                    "Palza couldn't start its background service ({}). Try reinstalling the app.", e));
                 return;
             }
         };
@@ -352,13 +352,13 @@ fn run_node(
             }
             Err(e) => {
                 splash_fatal(&handle, &log, &format!(
-                    "Trace started, but its window failed to load ({}).", e));
+                    "Palza started, but its window failed to load ({}).", e));
                 return;
             }
         }
     }
     splash_fatal(&handle, &log,
-        "Trace's background service keeps exiting during startup.");
+        "Palza's background service keeps exiting during startup.");
 }
 
 fn main() {

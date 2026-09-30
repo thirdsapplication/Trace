@@ -283,7 +283,7 @@ class ReconstructWaitTest(unittest.TestCase):
     def test_a_long_wait_is_announced_from_the_estimate(self):
         body = self._run_workflows()
         self.assertIn("d.estimate_seconds > 10 * 60", body)
-        self.assertIn("You can close Trace", body)
+        self.assertIn("You can close Palza", body)
 
     def test_a_timeout_is_not_reported_as_a_failure(self):
         body = self._run_workflows()

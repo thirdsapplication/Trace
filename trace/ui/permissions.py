@@ -66,23 +66,23 @@ def _windows_check(name):
 ACCESSIBILITY_FIX = (
     "Grant in System Settings → Privacy & Security → Accessibility (on macOS 27 it is "
     "called Device Control and Data Access — search System Settings for it), then "
-    "add/enable the Trace app. If Trace already shows as enabled, remove it with the "
+    "add/enable the Palza app. If Palza already shows as enabled, remove it with the "
     "minus button, add it again and relaunch — an updated app keeps its old, stale "
-    "entry. Without it Trace can see that you worked in an app but not which buttons "
+    "entry. Without it Palza can see that you worked in an app but not which buttons "
     "you pressed or which fields you filled, so workflows outside Chrome cannot be "
     "rebuilt."
 )
 INPUT_MONITORING_FIX = (
     "Grant in System Settings → Privacy & Security → Input Monitoring, then add/enable "
-    "the Trace app and quit and relaunch it. macOS never prompts for this one on its "
+    "the Palza app and quit and relaunch it. macOS never prompts for this one on its "
     "own, and an entry left over from an earlier version of the app silently stops "
     "working — remove and re-add it if it already shows as enabled."
 )
 SCREEN_RECORDING_FIX = (
     "Grant in System Settings → Privacy & Security → Screen Recording (called Screen & "
-    "System Audio Recording on macOS 26 and later), then add/enable the Trace app and "
+    "System Audio Recording on macOS 26 and later), then add/enable the Palza app and "
     "FULLY QUIT AND RELAUNCH it — macOS does not apply this permission to an "
-    "already-running process. Trace reads window titles from Accessibility when this "
+    "already-running process. Palza reads window titles from Accessibility when this "
     "is off, so grant it only if titles still come back blank."
 )
 

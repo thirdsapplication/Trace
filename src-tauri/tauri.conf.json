@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Trace",
+  "productName": "Palza",
   "version": "0.1.0",
   "identifier": "com.trace.desktop",
   "build": {
@@ -10,7 +10,7 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "Trace",
+        "title": "Palza",
         "width": 1200,
         "height": 820,
         "minWidth": 900,
@@ -26,7 +26,7 @@
     "active": true,
     "targets": ["app", "dmg"],
     "category": "Productivity",
-    "shortDescription": "Capture your work; Trace builds the agents.",
+    "shortDescription": "Capture your work; Palza builds the agents.",
     "resources": ["binaries/trace-node/**/*"],
     "icon": ["icons/icon.icns"],
     "macOS": {
