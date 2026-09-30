@@ -271,6 +271,20 @@ class ReconstructWaitTest(unittest.TestCase):
         self.assertIn("idleIsLost: true", call)
         self.assertIn("maxMs: 2 * 60 * 60 * 1000", call)
 
+    def test_the_screen_joins_the_servers_discovery_instead_of_starting_another(self):
+        """The server starts discovery itself; a second POST after it finished would
+        pay for a second run over the same log."""
+        body = self._run_workflows()
+        check = body.index('uget(sid, "/discover/status")')
+        start = body.index('upost(sid, "/discover"')
+        self.assertLess(check, start)
+        self.assertIn('["running", "done"].includes(disc.state)', body[check:start + 40])
+
+    def test_a_long_wait_is_announced_from_the_estimate(self):
+        body = self._run_workflows()
+        self.assertIn("d.estimate_seconds > 10 * 60", body)
+        self.assertIn("You can close Trace", body)
+
     def test_a_timeout_is_not_reported_as_a_failure(self):
         body = self._run_workflows()
         self.assertIn('e.code === "timeout"', body)

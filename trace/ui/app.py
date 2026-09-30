@@ -40,6 +40,7 @@ from ..reconstruct.reconstruct import reconstruct as _real_reconstruct
 # package __init__ re-exports as the function (so `.DEFAULT_MODEL` would AttributeError,
 # the "Find work" breakage).
 from ..reconstruct.reconstruct import (DEFAULT_MODEL as _RECON_MODEL,
+                                       WORKERS as _RECON_WORKERS,
                                        _default_model_fn as _recon_model_fn)
 from ..discovery import scorer as discovery_scorer
 from ..discovery import describe as discovery_describe
@@ -342,6 +343,8 @@ class AppState:
         self.prompt_lock = threading.Lock()
         self.started_at = time.time()
         self.lock = threading.Lock()
+        # Start discovery as soon as reconstruction finishes (see start_reconstruction).
+        self.auto_discover = True
         os.makedirs(sessions_root, exist_ok=True)
 
     def ui_cache_get(self, rel):
@@ -408,6 +411,16 @@ class AppState:
         return ManagedAgentsClient(api_key=key)
 
     # --- reconstruction job ----------------------------------------------
+    @staticmethod
+    def estimate_processing_seconds(chunks, workers=None):
+        """Rough seconds from "Reading your day" to workflows found, known as soon as
+        the recording is chunked. Measured 2026-09-30: ~75s per reconstruction chunk
+        (chunks run ``workers`` at a time); discovery took ~30s for a small log and
+        grows with it. A guess to set expectations, not a promise."""
+        workers = max(1, workers or _RECON_WORKERS)
+        rounds = -(-max(chunks, 0) // workers)
+        return rounds * 75 + 60 + 8 * max(chunks, 0)
+
     def start_reconstruction(self, sid):
         raw_path = sessions.path(self.sessions_root, sid, sessions.RAW)
         job = {"state": "running", "current": 0, "total": 0, "error": None,
@@ -424,6 +437,8 @@ class AppState:
 
                 def cb(done, total):
                     job["current"], job["total"] = done, total
+                    if done == 0:
+                        job["estimate_seconds"] = self.estimate_processing_seconds(total)
 
                 kw = {}
                 if self.reconstruct_fn is _real_reconstruct:   # tap the real engine's calls
@@ -465,6 +480,16 @@ class AppState:
                                             meta.get("owner_user_id") or "")
                 job.update(state="done", flags=len(report.flags),
                            errors=len(report.errors))
+                # Discovery used to start only when the SCREEN asked for it after
+                # polling this job to done. A screen that gave up, or was closed,
+                # never asked — a 28-minute recording reconstructed fine and never
+                # reached discovery. The server moves on by itself now; the screen
+                # joins the running job instead of starting a second one.
+                if self.auto_discover:
+                    with self.lock:
+                        existing = self.discover_jobs.get(sid)
+                        if not (existing and existing.get("state") == "running"):
+                            self.start_discovery(sid)
             except Exception as e:  # surface real detail (handoff §4.5)
                 job.update(state="error", error=_why(e))
 

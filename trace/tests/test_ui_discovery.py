@@ -142,5 +142,73 @@ class UIDiscoveryTest(unittest.TestCase):
         self.assertEqual(data["error"], "not_discovered")
 
 
+class AutoDiscoveryTest(unittest.TestCase):
+    """Reconstruction hands straight on to discovery on the server. It used to wait for
+    the screen to ask, and a screen that gave up or was closed never did."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.discovered = []
+
+        def discovery(log_path, **kw):
+            self.discovered.append(log_path)
+            return fake_discovery(log_path)
+
+        def reconstruct(raw_path, progress_cb=None, **kw):
+            if progress_cb:
+                progress_cb(0, 9)
+                progress_cb(9, 9)
+            return [{"id": "e001", "action": "navigate"}], _Report()
+
+        self.state = app.AppState(self._tmp.name, key_store=FakeKeystore("k"),
+                                  reconstruct_fn=reconstruct, discovery_fn=discovery)
+        self.sid = sessions.create_session(self._tmp.name)
+        with open(sessions.path(self._tmp.name, self.sid, sessions.RAW), "w") as f:
+            f.write(json.dumps({"ts": "t", "source": "window", "payload": {}}) + "\n")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _wait(self, jobs, state="done"):
+        for _ in range(300):
+            job = jobs.get(self.sid)
+            if job and job.get("state") in (state, "error"):
+                return job
+            time.sleep(0.01)
+        self.fail(f"job never reached {state}")
+
+    def test_discovery_starts_when_reconstruction_finishes(self):
+        self.state.start_reconstruction(self.sid)
+        self._wait(self.state.recon_jobs)
+        job = self._wait(self.state.discover_jobs)
+        self.assertEqual(job["state"], "done", job)
+        self.assertEqual(len(self.discovered), 1)
+
+    def test_the_estimate_is_known_once_the_recording_is_chunked(self):
+        self.state.start_reconstruction(self.sid)
+        job = self._wait(self.state.recon_jobs)
+        self.assertEqual(job["estimate_seconds"],
+                         app.AppState.estimate_processing_seconds(9))
+
+    def test_a_long_recording_is_estimated_past_ten_minutes(self):
+        self.assertLess(app.AppState.estimate_processing_seconds(2, workers=8), 10 * 60)
+        self.assertGreater(app.AppState.estimate_processing_seconds(60, workers=8), 10 * 60)
+        # one at a time is slower than eight at once
+        self.assertGreater(app.AppState.estimate_processing_seconds(9, workers=1),
+                           app.AppState.estimate_processing_seconds(9, workers=8))
+
+    def test_it_can_be_turned_off(self):
+        self.state.auto_discover = False
+        self.state.start_reconstruction(self.sid)
+        self._wait(self.state.recon_jobs)
+        time.sleep(0.05)
+        self.assertEqual(self.discovered, [])
+        self.assertIsNone(self.state.discover_jobs.get(self.sid))
+
+
+class _Report:
+    errors, flags = [], []
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -3017,12 +3017,21 @@ async function runWorkflows(sid, a) {
         if (!d.total) return;
         bar.style.width = Math.round(40 * (d.current || 0) / d.total) + "%";
         if (d.total > 1) msg.textContent = `Reading your day… part ${Math.min((d.current || 0) + 1, d.total)} of ${d.total}`;
+        // The server knows the chunk count at once, so a long wait is announced up
+        // front. It continues to discovery on its own, so closing Trace loses nothing.
+        if (hint && d.estimate_seconds > 10 * 60)
+          hint.textContent = `This will take about ${Math.round(d.estimate_seconds / 60)} minutes. ` +
+            "You can close Trace — your workflows will be waiting when you come back.";
       }, { maxMs: 2 * 60 * 60 * 1000, everyMs: 3000, idleIsLost: true });
       if (hint) hint.textContent = "still looking…";
     }
     bar.style.width = "45%";
     msg.textContent = "Looking for repeatable workflows…";
-    await upost(sid, "/discover", {});
+    // The server starts discovery itself when reconstruction finishes. Asking again
+    // after it FINISHED would start a second, paid run over the same log, so only
+    // start one when nothing is running or done.
+    const { data: disc } = await uget(sid, "/discover/status");
+    if (!disc || !["running", "done"].includes(disc.state)) await upost(sid, "/discover", {});
     await pollJob(sid, "discover", () => { bar.style.width = "80%"; });
     bar.style.width = "100%";
     await loadAndRender();
