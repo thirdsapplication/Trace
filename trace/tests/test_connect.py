@@ -776,6 +776,12 @@ class BroaderAppTableTest(unittest.TestCase):
         self.assertEqual(connect._slug_for("sheets.google.com")["slug"], "google_sheets")
         self.assertEqual(connect._slug_for("admin.shopify.com")["slug"], "shopify")
 
+    def test_outlook_uses_pipedreams_slug(self):
+        """The first Windows tester's Outlook connect page said "link invalid": the
+        table sent "outlook", which Pipedream does not have."""
+        for seen in ("Microsoft Outlook", "outlook.office.com", "Inbox - Outlook"):
+            self.assertEqual(connect._slug_for(seen)["slug"], "microsoft_outlook")
+
     def test_every_entry_is_well_formed(self):
         """A malformed row fails at connect time in front of the worker."""
         for observed, entry in config.CONNECT_APP_TABLE.items():

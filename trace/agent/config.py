@@ -934,7 +934,9 @@ CONNECT_APP_TABLE = {
 
     # --- comms + files ---
     "slack":                {"slug": "slack",            "label": "Slack"},
-    "outlook":              {"slug": "outlook",          "label": "Outlook"},
+    # Pipedream's slug is microsoft_outlook — bare "outlook" is not in the catalogue,
+    # and its hosted Connect page answers "link invalid" (seen live, 2026-09-30).
+    "outlook":              {"slug": "microsoft_outlook", "label": "Outlook"},
     "calendar":             {"slug": "google_calendar",  "label": "Google Calendar"},
     "dropbox":              {"slug": "dropbox",          "label": "Dropbox"},
     "calendly":             {"slug": "calendly",         "label": "Calendly"},
