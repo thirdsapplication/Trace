@@ -41,6 +41,13 @@ def _trunc(s, n=400):
     return s if len(s) <= n else s[: n - 1] + "…"
 
 
+# Clicked/focused element text. It was cut at 80 characters, which is where a sentence
+# in an email body is cut: the first Outlook test clicked "…for product "Napkins" in
+# quantity 10." and the model got it without the quantity, so discovery reported the
+# count had "no visible source in the emails" when it was in every one of them.
+TARGET_TEXT = 400
+
+
 def render_event(ev):
     """Render one raw event to a single compact line for the model, prefixed with
     its id and timestamp so the model can cite it in ``evidence``."""
@@ -54,10 +61,10 @@ def render_event(ev):
         return f'{head} TYPED in "{_trunc(p.get("window"), 100)}": "{_trunc(p.get("text"))}"'
     if src == "click":
         t = p.get("target") or {}
-        tgt = f'role={t.get("role","")} label="{_trunc(t.get("label"),80)}" value="{_trunc(t.get("value"),120)}"' if t else "target=unknown"
+        tgt = f'role={t.get("role","")} label="{_trunc(t.get("label"), TARGET_TEXT)}" value="{_trunc(t.get("value"), TARGET_TEXT)}"' if t else "target=unknown"
         return f'{head} CLICK {p.get("button","left")} ({p.get("x")},{p.get("y")}) {tgt}'
     if src == "target":
-        return f'{head} FOCUS role={p.get("role","")} label="{_trunc(p.get("label"),80)}" value="{_trunc(p.get("value"),120)}"'
+        return f'{head} FOCUS role={p.get("role","")} label="{_trunc(p.get("label"), TARGET_TEXT)}" value="{_trunc(p.get("value"), TARGET_TEXT)}"'
     if src == "clipboard":
         return f'{head} CLIPBOARD {p.get("op","")} "{_trunc(p.get("content"))}"'
     if src == "structured_read":

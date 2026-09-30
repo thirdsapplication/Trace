@@ -58,6 +58,19 @@ class ChunkingTest(unittest.TestCase):
         self.assertIn("CLIPBOARD", chunking.render_event(ev))
         self.assertIn("SKU-9", chunking.render_event(ev))
 
+    def test_email_body_text_reaches_the_model_whole(self):
+        body = ("I am writing to inform you of an order arriving 09/29/2027, "
+                "for product \u201cNapkins\u201d in quantity 10.")
+        row = ("Unread Philip Oravitan Order Napkins 11:46 PM Hello, " + body +
+               " Please confirm receipt of this email. Thanks.")
+        click = {"id": "r0001", "ts": "t", "source": "click",
+                 "payload": {"button": "left", "x": 1, "y": 2,
+                             "target": {"role": "text", "label": body}}}
+        focus = {"id": "r0002", "ts": "t", "source": "target",
+                 "payload": {"role": "row", "label": row}}
+        self.assertIn("in quantity 10.", chunking.render_event(click))
+        self.assertIn("Please confirm receipt", chunking.render_event(focus))
+
     def test_summarize_empty(self):
         self.assertEqual(chunking.summarize([]), "(none yet)")
 
