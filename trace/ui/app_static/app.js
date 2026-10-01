@@ -2830,7 +2830,7 @@ function renderRecBody(mode, started, wasPaused) {
       const { ok, data } = await api("POST", "/api/u/capture/stop", {});
       // Every outcome used to end at loadAndRender(). When the stop had actually
       // FAILED that call finds no new session, deriveStep sees no raw artifact and
-      // returns 0, and the wizard repaints "Record your day" — so a failed upload, a
+      // returns 0, and the wizard repaints "Record your work" — so a failed upload, a
       // controller lost to a restart, and a recording that captured nothing were all
       // one silent bounce back to the start with no reason given. The server said
       // which it was every time; nothing read the answer.
@@ -2891,10 +2891,7 @@ function renderRecBody(mode, started, wasPaused) {
   }
   b.innerHTML = `
     <div class="rec-mid">
-      <h1 class="rec-head">Record your day</h1>
-      <p class="rec-copy">Palza watches how you work for a while and learns your routines.
-        On your computer · no screenshots · reads the fields and buttons you use ·
-        sensitive text removed before saving.</p>
+      <h1 class="rec-head">Record your work</h1>
       <div id="permStrip"></div>
       <p id="recMsg" class="msg err"></p>
     </div>
