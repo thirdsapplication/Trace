@@ -5108,10 +5108,16 @@ def make_handler(state):
             # the desktop node cannot pass the /api/u/ auth gate below. With no auth,
             # require the JSON content type the app always sends: another site's page
             # cannot send it cross-origin without a CORS preflight this server never
-            # approves, so it cannot pop System Settings open on a visitor's Mac.
-            if p in ("/api/u/permissions/request", "/api/u/permissions/open") and \
-                    not (self.headers.get("Content-Type") or "").startswith("application/json"):
-                return self._json(415, {"error": "json_required"})
+            # approves, so it cannot pop System Settings open on a visitor's Mac. And
+            # require a loopback Host: a DNS-rebound name pointed at 127.0.0.1 makes the
+            # page same-origin (so the JSON check alone passes), but its Host stays the
+            # attacker's name.
+            if p in ("/api/u/permissions/request", "/api/u/permissions/open"):
+                if not (self.headers.get("Content-Type") or "").startswith("application/json"):
+                    return self._json(415, {"error": "json_required"})
+                host = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]").lower()
+                if host not in ("127.0.0.1", "localhost", "::1"):
+                    return self._json(403, {"error": "forbidden"})
             if p == "/api/u/permissions/request":
                 # Triggers the macOS Accessibility dialog. AXIsProcessTrusted on its
                 # own returns False forever without ever asking.
