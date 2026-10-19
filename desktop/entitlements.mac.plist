@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Hardened-runtime exceptions for the bundled Python node (trace-node), applied by
+     desktop/sign_mac.sh. Notarization requires the hardened runtime; a frozen Python
+     needs these two to run under it:
+     - allow-unsigned-executable-memory: ctypes (the IOKit permission calls) and
+       pyobjc write executable trampolines.
+     - disable-library-validation: the interpreter loads its extension modules from
+       _internal/ at runtime. -->
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+</dict>
+</plist>
