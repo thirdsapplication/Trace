@@ -16,13 +16,13 @@
 #      NOTARY_PROFILE (default: palza).
 #      ADHOC_TEST=1 signs with "-" and skips notarization: checks the signing steps
 #      and that the node still starts under the hardened runtime, on any Mac.
-#      YES=1 skips the "does the hash match" prompt (for CI).
+#      EXPECTED_SHA256=<hash> checks the zip against it instead of prompting (for CI).
 #
 # Output: Palza-<version>-<sha>.dmg next to the input. The script fails rather than
 # produce a DMG that macOS would not accept as a notarized Developer ID app.
 set -euo pipefail
 
-IN="${1:?usage: sign_mac.sh <Palza-...-unsigned.zip | Palza.app>}"
+IN="${1:?usage: sign_mac.sh <Palza-...-unsigned.zip>}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ENTITLEMENTS="$HERE/entitlements.mac.plist"
 NOTARY_PROFILE="${NOTARY_PROFILE:-palza}"
@@ -39,12 +39,22 @@ echo "== identity: $IDENTITY"
 
 # Whatever is in this file gets the company's signature. Confirm the hash with the
 # person who built it over a different channel than the one the file came through.
+# A real signing run takes only the zip, so there is always a file to hash.
+if [ -z "$ADHOC" ]; then
+  [[ "$IN" == *.zip && -f "$IN" ]] || { echo "Sign the .zip from build_mac.sh, not a folder."; exit 1; }
+fi
 if [ -f "$IN" ]; then
+  HASH="$(shasum -a 256 "$IN" | cut -d' ' -f1)"
   echo "== sha256 of $(basename "$IN"):"
-  echo "   $(shasum -a 256 "$IN" | cut -d' ' -f1)"
-  if [ -z "$ADHOC" ] && [ -z "${YES:-}" ]; then
-    read -r -p "Matches what the builder sent you? [y/N] " ok
-    [[ "$ok" == [yY]* ]] || { echo "Not signing."; exit 1; }
+  echo "   $HASH"
+  if [ -z "$ADHOC" ]; then
+    if [ -n "${EXPECTED_SHA256:-}" ]; then
+      [ "$HASH" = "$(echo "$EXPECTED_SHA256" | tr 'A-F' 'a-f')" ] \
+        || { echo "Hash does not match EXPECTED_SHA256. Not signing."; exit 1; }
+    else
+      read -r -p "Matches what the builder sent you? [y/N] " ok
+      [[ "$ok" == [yY]* ]] || { echo "Not signing."; exit 1; }
+    fi
   fi
 fi
 
