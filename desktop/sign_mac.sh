@@ -16,6 +16,7 @@
 #      NOTARY_PROFILE (default: palza).
 #      ADHOC_TEST=1 signs with "-" and skips notarization: checks the signing steps
 #      and that the node still starts under the hardened runtime, on any Mac.
+#      YES=1 skips the "does the hash match" prompt (for CI).
 #
 # Output: Palza-<version>-<sha>.dmg next to the input. The script fails rather than
 # produce a DMG that macOS would not accept as a notarized Developer ID app.
@@ -35,6 +36,17 @@ else
   [ -n "$IDENTITY" ] || { echo "No Developer ID Application certificate in the keychain."; exit 1; }
 fi
 echo "== identity: $IDENTITY"
+
+# Whatever is in this file gets the company's signature. Confirm the hash with the
+# person who built it over a different channel than the one the file came through.
+if [ -f "$IN" ]; then
+  echo "== sha256 of $(basename "$IN"):"
+  echo "   $(shasum -a 256 "$IN" | cut -d' ' -f1)"
+  if [ -z "$ADHOC" ] && [ -z "${YES:-}" ]; then
+    read -r -p "Matches what the builder sent you? [y/N] " ok
+    [[ "$ok" == [yY]* ]] || { echo "Not signing."; exit 1; }
+  fi
+fi
 
 WORK="$(mktemp -d /tmp/palza-sign.XXXXXX)"
 case "$IN" in
@@ -75,9 +87,14 @@ echo "== verifying signature"
 codesign --verify --deep --strict --verbose=2 "$APP"
 if codesign -dv "$APP" 2>&1 | grep -q "Sealed Resources=none"; then echo "empty seal"; exit 1; fi
 
-echo "== node starts under the hardened runtime"
-"$NODE_DIR/trace-node" --help >/dev/null 2>&1 \
-  || { echo "trace-node failed to start once signed (check entitlements)"; exit 1; }
+# Running the node proves the entitlements suffice, but executing a received binary
+# on the Mac that holds the company's signing key is not something this script does
+# by default: only the ADHOC_TEST run (on the builder's own Mac) starts it.
+if [ -n "$ADHOC" ]; then
+  echo "== node starts under the hardened runtime"
+  "$NODE_DIR/trace-node" --help >/dev/null 2>&1 \
+    || { echo "trace-node failed to start once signed (check entitlements)"; exit 1; }
+fi
 
 if [ -z "$ADHOC" ]; then
   echo "== notarizing app (a few minutes)"

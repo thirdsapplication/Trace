@@ -60,4 +60,6 @@ ditto -c -k --keepParent "$APP" "$ZIP"
 rm -rf "$WORK"
 echo
 echo "Built $ZIP"
+echo "sha256: $(shasum -a 256 "$ZIP" | cut -d' ' -f1)"
+echo "Send the signer this hash separately (e.g. by text), not alongside the file."
 echo "Send it to whoever signs; they run: desktop/sign_mac.sh \"$(basename "$ZIP")\""
