@@ -5105,7 +5105,13 @@ def make_handler(state):
                     return self._capture_ctl("resume")
             body = self._body()
             # Like GET /api/u/permissions: these act on the machine serving them, and
-            # the desktop node cannot pass the /api/u/ auth gate below.
+            # the desktop node cannot pass the /api/u/ auth gate below. With no auth,
+            # require the JSON content type the app always sends: another site's page
+            # cannot send it cross-origin without a CORS preflight this server never
+            # approves, so it cannot pop System Settings open on a visitor's Mac.
+            if p in ("/api/u/permissions/request", "/api/u/permissions/open") and \
+                    not (self.headers.get("Content-Type") or "").startswith("application/json"):
+                return self._json(415, {"error": "json_required"})
             if p == "/api/u/permissions/request":
                 # Triggers the macOS Accessibility dialog. AXIsProcessTrusted on its
                 # own returns False forever without ever asking.
