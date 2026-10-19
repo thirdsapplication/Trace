@@ -429,7 +429,11 @@ async function renderMacPermissions() {
       </div>` : "";
     if ($("#mpRestartGo")) $("#mpRestartGo").onclick = () => {
       $("#mpRestartGo").disabled = true;
-      tauri.invoke("restart_app").catch(() => { $("#mpRestartGo").disabled = false; });
+      tauri.invoke("restart_app").catch((e) => {
+        $("#mpRestartGo").disabled = false;
+        $("#mpRestart").insertAdjacentHTML("beforeend", `<p class="msg err">Palza couldn't
+          restart itself (${esc(String(e))}). Quit it from the menu bar and open it again.</p>`);
+      });
     };
     const required = grants.filter((g) => !g.optional);
     $("#mpGo").textContent = required.every((g) => (data[g.key] || {}).granted === true)

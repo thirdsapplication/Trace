@@ -1,0 +1,8 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "local-node",
+  "description": "The UI is served by the bundled trace-node on 127.0.0.1:<random port>. Tauri v2 treats that as a remote origin and refuses its IPC unless a capability names it, so without this restart_app and open_external were silently rejected.",
+  "windows": ["main"],
+  "remote": { "urls": ["http://127.0.0.1:*/*", "http://localhost:*/*"] },
+  "permissions": ["core:default"]
+}
