@@ -5045,6 +5045,11 @@ def make_handler(state):
             if p == "/api/auth/me":                         # WS3
                 return self._json(200, {"user": self._current_user(),
                                         "signup_enabled": _signup_enabled()})
+            # Permission probes describe the machine serving them, and the desktop node
+            # has no local user store — behind the /api/u/ auth gate below they always
+            # answered 401, so no Mac ever saw its permission status.
+            if p == "/api/u/permissions":
+                return self._json(200, permissions.check_all())
             if p == "/api/u" or p.startswith("/api/u/"):    # scoped end-user API
                 u = self._current_user()
                 if not u:
@@ -5099,6 +5104,18 @@ def make_handler(state):
                 if p in ("/api/u/capture/resume", "/api/capture/resume"):
                     return self._capture_ctl("resume")
             body = self._body()
+            # Like GET /api/u/permissions: these act on the machine serving them, and
+            # the desktop node cannot pass the /api/u/ auth gate below.
+            if p == "/api/u/permissions/request":
+                # Triggers the macOS Accessibility dialog. AXIsProcessTrusted on its
+                # own returns False forever without ever asking.
+                permissions.request_accessibility()
+                return self._json(200, permissions.check_all())
+            if p == "/api/u/permissions/open":
+                # Opens THIS Mac's System Settings on one grant's pane.
+                if not permissions.open_settings((body or {}).get("key")):
+                    return self._json(400, {"error": "cannot open that setting here"})
+                return self._json(200, permissions.check_all())
             if p == "/api/auth/signup":                     # WS3
                 return self._auth_signup(body)
             if p == "/api/auth/login":

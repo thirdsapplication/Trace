@@ -328,7 +328,93 @@ function renderTerms() {
     $("#frAccept").disabled = true;
     await api("POST", "/api/u/first-run/terms", {});
     await api("POST", "/api/u/first-run/complete", {});
-    await loadAndRender();                       // straight into the wizard at Record
+    await renderMacPermissions();                // Mac only; otherwise straight to Record
+  };
+}
+
+// After the terms, a Mac gets one screen with the three capture grants, each with a
+// button that opens System Settings on its exact pane. Anywhere else (Windows, or the
+// browser against the cloud, which reports the server's platform) goes straight to
+// Record. The status re-reads when the window regains focus — i.e. when the person
+// comes back from System Settings — so each row turns green on its own.
+// Pane names follow the release (Palza supports macOS 11+): Screen Recording became
+// Screen & System Audio Recording in 15 (Sequoia), and 27 renamed Accessibility to
+// Device Control and Data Access. Before 13 (Ventura) the app is System Preferences.
+// The deep links are the same on every one of these (checked on 27.0).
+function macGrants(version) {
+  const major = parseInt(version || "0", 10) || 0;
+  return [
+    { key: "accessibility", title: major >= 27 ? "Device Control and Data Access" : "Accessibility",
+      why: "Lets Palza see which buttons you press and which fields you fill.",
+      who: "Switch on Palza." },
+    { key: "input_monitoring", title: "Input Monitoring",
+      why: "Lets Palza record your keystrokes and clicks.",
+      who: "Switch on Palza, then quit and reopen Palza." },
+    { key: "screen_recording", optional: true,
+      title: major >= 15 ? "Screen & System Audio Recording" : "Screen Recording",
+      why: "Reads window titles. Optional: the first permission usually covers this.",
+      who: "Switch on Palza, then quit and reopen Palza." },
+  ];
+}
+
+function macSettingsApp(version) {
+  const major = parseInt(version || "0", 10) || 0;
+  return major && major < 13 ? "System Preferences" : "System Settings";
+}
+
+async function readPermissions() {
+  const r = await api("GET", "/api/u/permissions");
+  return r.ok && r.data && r.data.platform ? r.data : null;
+}
+
+async function renderMacPermissions() {
+  const first = await readPermissions();
+  if (!first || first.platform !== "darwin") return loadAndRender();
+  root.className = "wrap";
+  root.innerHTML = `
+    <div class="panel first-run" style="align-items:stretch;text-align:left;">
+      <h1 class="fr-title" style="font-size:26px;">Allow Palza on this Mac</h1>
+      <p class="fr-lead" style="max-width:none;">macOS asks you to switch these on yourself.
+        Each button opens the right page in ${macSettingsApp(first.macos_version)}.</p>
+      <div id="mpRows"></div>
+      <button id="mpGo" class="btn-primary full">Continue</button>
+    </div>`;
+  const grants = macGrants(first.macos_version);
+  const paint = (data) => {
+    const host = $("#mpRows");
+    if (!host) return;
+    host.innerHTML = grants.map((g) => {
+      const c = data[g.key] || {};
+      const state = c.granted === true ? "On" : c.granted === false ? "Off" : "Not checked";
+      return `<div class="mp-row">
+          <div class="mp-txt">
+            <div class="mp-title">${g.title}${g.optional ? ' <span class="mp-opt">optional</span>' : ""}
+              <span class="mp-state ${c.granted === true ? "on" : ""}">${state}</span></div>
+            <div class="mp-why">${g.why}</div>
+            <div class="mp-who">${g.who}</div>
+          </div>
+          ${c.granted === true ? "" : `<button type="button" class="btn-secondary btn-sm mp-open" data-key="${g.key}">Open settings</button>`}
+        </div>`;
+    }).join("");
+    host.querySelectorAll(".mp-open").forEach((b) => b.onclick = async () => {
+      b.disabled = true;
+      const r = await api("POST", "/api/u/permissions/open", { key: b.dataset.key });
+      b.disabled = false;
+      if (r.ok && r.data) paint(r.data);
+    });
+    const required = grants.filter((g) => !g.optional);
+    $("#mpGo").textContent = required.every((g) => (data[g.key] || {}).granted === true)
+      ? "Continue" : "Continue for now";
+  };
+  const refresh = async () => {
+    const data = await readPermissions();
+    if (data) paint(data);
+  };
+  paint(first);
+  window.addEventListener("focus", refresh);
+  $("#mpGo").onclick = async () => {
+    window.removeEventListener("focus", refresh);
+    await loadAndRender();
   };
 }
 
@@ -2931,8 +3017,8 @@ function renderRecBody(mode, started, wasPaused) {
 async function paintPermissions() {
   const host = $("#permStrip");
   if (!host) return;
-  const { ok, data } = await api("GET", "/api/u/permissions");
-  if (!ok || !data || data.platform !== "darwin") return;   // only macOS has grants to fix
+  const data = await readPermissions();
+  if (!data || data.platform !== "darwin") return;   // only macOS has grants to fix
   const denied = ["accessibility", "input_monitoring", "screen_recording"]
     .map((k) => data[k]).filter((c) => c && c.granted === false);
   if (!denied.length) { host.innerHTML = ""; return; }

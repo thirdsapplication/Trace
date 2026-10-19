@@ -59,7 +59,7 @@ def _windows_check(name):
 
 
 # The pane names moved with the OS: macOS 27 renamed Accessibility to "Device Control
-# and Data Access" and took it out of Privacy & Security; Tahoe (26) renamed Screen
+# and Data Access" and took it out of Privacy & Security; Sequoia (15) renamed Screen
 # Recording to "Screen & System Audio Recording". The fix-it text names both so a
 # person on either release can find the switch. The underlying TCC service (and the
 # API each check calls) is unchanged.
@@ -80,7 +80,7 @@ INPUT_MONITORING_FIX = (
 )
 SCREEN_RECORDING_FIX = (
     "Grant in System Settings → Privacy & Security → Screen Recording (called Screen & "
-    "System Audio Recording on macOS 26 and later), then add/enable the Palza app and "
+    "System Audio Recording on macOS 15 and later), then add/enable the Palza app and "
     "FULLY QUIT AND RELAUNCH it — macOS does not apply this permission to an "
     "already-running process. Palza reads window titles from Accessibility when this "
     "is off, so grant it only if titles still come back blank."
@@ -104,6 +104,60 @@ def request_accessibility():
             AXIsProcessTrustedWithOptions, kAXTrustedCheckOptionPrompt,
         )
         return bool(AXIsProcessTrustedWithOptions({kAXTrustedCheckOptionPrompt: True}))
+    except Exception:
+        return False
+
+
+# The System Settings anchor for each grant. These deep links open the exact list
+# the switch lives in; on a release that has moved a pane (macOS 27's Device Control
+# and Data Access), System Settings still opens on Privacy & Security.
+SETTINGS_URLS = {
+    "accessibility":
+        "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+    "input_monitoring":
+        "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent",
+    "screen_recording":
+        "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
+}
+
+
+def _iokit():
+    """IOKit via ctypes. pyobjc wraps neither IOHIDCheckAccess nor IOHIDRequestAccess."""
+    import ctypes
+    lib = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/IOKit.framework/IOKit")
+    lib.IOHIDCheckAccess.argtypes = [ctypes.c_uint32]
+    lib.IOHIDCheckAccess.restype = ctypes.c_uint32
+    lib.IOHIDRequestAccess.argtypes = [ctypes.c_uint32]
+    lib.IOHIDRequestAccess.restype = ctypes.c_bool
+    return lib
+
+
+def _request(key):
+    """Ask macOS for one grant. Beyond any dialog, asking is what puts the app in the
+    pane's list — without it the person has to find the app and add it with "+"."""
+    try:
+        if key == "accessibility":
+            request_accessibility()
+        elif key == "input_monitoring":
+            _iokit().IOHIDRequestAccess(1)         # 1 = kIOHIDRequestTypeListenEvent
+        elif key == "screen_recording":
+            from Quartz import CGRequestScreenCaptureAccess
+            CGRequestScreenCaptureAccess()
+    except Exception:
+        pass
+
+
+def open_settings(key):
+    """Request one grant, then open System Settings on its pane. Returns False for an
+    unknown key or when not on macOS; never raises."""
+    url = SETTINGS_URLS.get(key)
+    if not url or not _is_macos():
+        return False
+    _request(key)
+    try:
+        import subprocess
+        subprocess.Popen(["open", url])
+        return True
     except Exception:
         return False
 
@@ -142,16 +196,16 @@ def check_accessibility():
 
 
 def check_input_monitoring():
-    """Input Monitoring (keystrokes). Uses IOHIDCheckAccess via pyobjc/Quartz when
-    available (0 = granted, 1 = denied, 2 = unknown); otherwise not auto-detectable."""
+    """Input Monitoring (keystrokes). Uses IOHIDCheckAccess from IOKit (0 = granted,
+    1 = denied, 2 = unknown). pyobjc's Quartz does not wrap it — importing it from
+    there always failed, so this used to report "unknown" on every Mac."""
     if _is_windows():
         return _windows_check("Input Monitoring")
     if not _is_macos():
         return {"name": "Input Monitoring", "granted": None,
                 "detail": "Capture runs on macOS and Windows.", "fix": INPUT_MONITORING_FIX}
     try:
-        from Quartz import IOHIDCheckAccess, kIOHIDRequestTypeListenEvent
-        rc = IOHIDCheckAccess(kIOHIDRequestTypeListenEvent)
+        rc = _iokit().IOHIDCheckAccess(1)          # 1 = kIOHIDRequestTypeListenEvent
         if rc == 0:
             return {"name": "Input Monitoring", "granted": True,
                     "detail": "IOHIDCheckAccess=granted", "fix": None}
@@ -162,7 +216,7 @@ def check_input_monitoring():
                 "detail": "IOHIDCheckAccess=unknown (not yet requested)", "fix": INPUT_MONITORING_FIX}
     except Exception:
         return {"name": "Input Monitoring", "granted": None,
-                "detail": "could not auto-detect (install pyobjc for a definitive check)",
+                "detail": "could not auto-detect",
                 "fix": INPUT_MONITORING_FIX}
 
 
@@ -196,6 +250,23 @@ def check_screen_recording():
                 "detail": f"could not auto-detect ({e})", "fix": SCREEN_RECORDING_FIX}
 
 
+def _macos_version():
+    """e.g. "27.0", or "" off macOS. A Python built against an SDK older than 11
+    is told "10.16" on every release since Big Sur, so ask sw_vers in that case."""
+    if not _is_macos():
+        return ""
+    import platform
+    v = platform.mac_ver()[0]
+    if v.startswith("10.16"):
+        try:
+            import subprocess
+            v = subprocess.run(["sw_vers", "-productVersion"], capture_output=True,
+                               text=True, timeout=3).stdout.strip() or v
+        except Exception:
+            pass
+    return v
+
+
 def check_all():
     """All three checks plus a single verdict the UI can gate a recording on.
 
@@ -215,6 +286,8 @@ def check_all():
                 if REQUIRED.get(k) == "required" and c["granted"] is False]
     return {
         "platform": sys.platform,
+        # e.g. "27.0" — the UI names each pane the way this release labels it.
+        "macos_version": _macos_version(),
         "ready": not blocking,
         "blocking": blocking,
         **checks,
