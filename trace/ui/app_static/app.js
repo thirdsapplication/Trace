@@ -245,7 +245,9 @@ async function routeSignedIn() {
   const fr = await api("GET", "/api/u/first-run");
   if (!(fr.data && fr.data.terms_accepted_at)) return renderWelcome();
   if (fr.data.first_run_completed_at) { S.igHome = null; return renderMessages(); }
-  return loadAndRender();
+  // Terms accepted but setup not finished: on a Mac that is the permissions step —
+  // including right after "Restart Palza" relaunched the app from it.
+  return renderMacPermissions();
 }
 
 async function refreshSession() {
@@ -327,9 +329,15 @@ function renderTerms() {
   $("#frAccept").onclick = async () => {
     $("#frAccept").disabled = true;
     await api("POST", "/api/u/first-run/terms", {});
-    await api("POST", "/api/u/first-run/complete", {});
     await renderMacPermissions();                // Mac only; otherwise straight to Record
   };
+}
+
+// First run ends after the permissions step, not at the terms, so a restart from that
+// step comes back to it (routeSignedIn) instead of skipping ahead.
+async function finishFirstRun() {
+  await api("POST", "/api/u/first-run/complete", {});
+  await loadAndRender();                         // straight into the wizard at Record
 }
 
 // After the terms, a Mac gets one screen with the three capture grants, each with a
@@ -369,7 +377,7 @@ async function readPermissions() {
 
 async function renderMacPermissions() {
   const first = await readPermissions();
-  if (!first || first.platform !== "darwin") return loadAndRender();
+  if (!first || first.platform !== "darwin") return finishFirstRun();
   root.className = "wrap";
   root.innerHTML = `
     <div class="panel first-run" style="align-items:stretch;text-align:left;">
@@ -377,12 +385,23 @@ async function renderMacPermissions() {
       <p class="fr-lead" style="max-width:none;">macOS asks you to switch these on yourself.
         Each button opens the right page in ${macSettingsApp(first.macos_version)}.</p>
       <div id="mpRows"></div>
+      <div id="mpRestart"></div>
       <button id="mpGo" class="btn-primary full">Continue</button>
     </div>`;
   const grants = macGrants(first.macos_version);
+  // macOS applies Input Monitoring and Screen Recording only to a fresh launch, so a
+  // row someone just switched on can stay Off until Palza restarts. Offer the restart
+  // once they have opened one of those panes and it still reads Off.
+  const NEEDS_RESTART = ["input_monitoring", "screen_recording"];
+  const opened = new Set();
+  const tauri = window.__TAURI__ && window.__TAURI__.core;
+  let last = "";
   const paint = (data) => {
     const host = $("#mpRows");
     if (!host) return;
+    const sig = JSON.stringify(grants.map((g) => (data[g.key] || {}).granted)) + [...opened].join();
+    if (sig === last) return;                    // polled and unchanged: leave buttons alone
+    last = sig;
     host.innerHTML = grants.map((g) => {
       const c = data[g.key] || {};
       const state = c.granted === true ? "On" : c.granted === false ? "Off" : "Not checked";
@@ -398,10 +417,20 @@ async function renderMacPermissions() {
     }).join("");
     host.querySelectorAll(".mp-open").forEach((b) => b.onclick = async () => {
       b.disabled = true;
+      opened.add(b.dataset.key);
       const r = await api("POST", "/api/u/permissions/open", { key: b.dataset.key });
       b.disabled = false;
       if (r.ok && r.data) paint(r.data);
     });
+    const pending = NEEDS_RESTART.filter((k) => opened.has(k) && (data[k] || {}).granted !== true);
+    $("#mpRestart").innerHTML = pending.length && tauri ? `<div class="mp-restart">
+        <span>Switched it on? macOS applies this after Palza restarts.</span>
+        <button type="button" class="btn-secondary btn-sm" id="mpRestartGo">Restart Palza</button>
+      </div>` : "";
+    if ($("#mpRestartGo")) $("#mpRestartGo").onclick = () => {
+      $("#mpRestartGo").disabled = true;
+      tauri.invoke("restart_app").catch(() => { $("#mpRestartGo").disabled = false; });
+    };
     const required = grants.filter((g) => !g.optional);
     $("#mpGo").textContent = required.every((g) => (data[g.key] || {}).granted === true)
       ? "Continue" : "Continue for now";
@@ -411,10 +440,13 @@ async function renderMacPermissions() {
     if (data) paint(data);
   };
   paint(first);
-  window.addEventListener("focus", refresh);
+  // Poll while the screen is up: the window's focus event does not reliably fire when
+  // someone comes back from System Settings inside the desktop app.
+  const timer = setInterval(() => { if ($("#mpRows")) refresh(); else clearInterval(timer); }, 2000);
   $("#mpGo").onclick = async () => {
-    window.removeEventListener("focus", refresh);
-    await loadAndRender();
+    clearInterval(timer);
+    $("#mpGo").disabled = true;
+    await finishFirstRun();
   };
 }
 

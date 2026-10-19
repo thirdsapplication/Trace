@@ -54,6 +54,22 @@ fn open_external(url: String) -> Result<(), String> {
     opener::open(&url).map_err(|e| e.to_string())
 }
 
+// Relaunch the app. macOS applies Input Monitoring and Screen Recording only to a
+// fresh process, so the onboarding permissions step offers this after those are
+// switched on. restart() does not emit RunEvent::Exit, so the sidecar is killed here
+// first — otherwise every restart would orphan a trace-node.
+#[tauri::command]
+fn restart_app(app: AppHandle) {
+    if let Some(state) = app.try_state::<Sidecar>() {
+        let mut guard = state.0.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(mut child) = guard.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+    app.restart();
+}
+
 fn cloud_backend() -> String {
     std::env::var("TRACE_CLOUD_BACKEND").unwrap_or_else(|_| DEFAULT_CLOUD_BACKEND.to_string())
 }
@@ -364,7 +380,7 @@ fn run_node(
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
-        .invoke_handler(tauri::generate_handler![open_external])
+        .invoke_handler(tauri::generate_handler![open_external, restart_app])
         .manage(Sidecar(Mutex::new(None)))
         .setup(|app| {
             let handle = app.handle().clone();
